@@ -99,18 +99,6 @@ static void mddev_detach(struct mddev *mddev);
 static void export_rdev(struct md_rdev *rdev, struct mddev *mddev);
 static void md_wakeup_thread_directly(struct md_thread __rcu *thread);
 
-enum md_ro_state {
-	MD_RDWR,
-	MD_RDONLY,
-	MD_AUTO_READ,
-	MD_MAX_STATE
-};
-
-static bool md_is_rdwr(struct mddev *mddev)
-{
-	return (mddev->ro == MD_RDWR);
-}
-
 /*
  * Default number of read corrections we'll attempt on an rdev
  * before ejecting it from the array. We divide the read error
@@ -449,6 +437,10 @@ int mddev_suspend(struct mddev *mddev, bool interruptible)
 {
 	int err = 0;
 
+	/* Array is supended from dm_suspend() for dm-raid. */
+	if (!mddev->gendisk)
+		return 0;
+
 	/*
 	 * hold reconfig_mutex to wait for normal io will deadlock, because
 	 * other context can't update super_block, and normal io can rely on
@@ -500,6 +492,13 @@ EXPORT_SYMBOL_GPL(mddev_suspend);
 
 static void __mddev_resume(struct mddev *mddev, bool recovery_needed)
 {
+	/*
+	 * Array is supended from dm_suspend() and resumed from dm_resume() for
+	 * dm-raid.
+	 */
+	if (!mddev->gendisk)
+		return;
+
 	lockdep_assert_not_held(&mddev->reconfig_mutex);
 
 	mutex_lock(&mddev->suspend_mutex);
@@ -4944,16 +4943,45 @@ static void stop_sync_thread(struct mddev *mddev, bool locked, bool check_seq)
 		mddev_lock_nointr(mddev);
 }
 
+void md_idle_sync_thread(struct mddev *mddev)
+{
+	lockdep_assert_held(&mddev->reconfig_mutex);
+
+	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+	stop_sync_thread(mddev, true, true);
+}
+EXPORT_SYMBOL_GPL(md_idle_sync_thread);
+
+void md_frozen_sync_thread(struct mddev *mddev)
+{
+	lockdep_assert_held(&mddev->reconfig_mutex);
+
+	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+	stop_sync_thread(mddev, true, false);
+}
+EXPORT_SYMBOL_GPL(md_frozen_sync_thread);
+
+void md_unfrozen_sync_thread(struct mddev *mddev)
+{
+	lockdep_assert_held(&mddev->reconfig_mutex);
+
+	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+	set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+	md_wakeup_thread(mddev->thread);
+	sysfs_notify_dirent_safe(mddev->sysfs_action);
+}
+EXPORT_SYMBOL_GPL(md_unfrozen_sync_thread);
+
 static void idle_sync_thread(struct mddev *mddev)
 {
 	mutex_lock(&mddev->sync_mutex);
-	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
 
 	if (mddev_lock(mddev)) {
 		mutex_unlock(&mddev->sync_mutex);
 		return;
 	}
 
+	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
 	stop_sync_thread(mddev, false, true);
 	mutex_unlock(&mddev->sync_mutex);
 }
@@ -4961,13 +4989,13 @@ static void idle_sync_thread(struct mddev *mddev)
 static void frozen_sync_thread(struct mddev *mddev)
 {
 	mutex_lock(&mddev->sync_mutex);
-	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
 
 	if (mddev_lock(mddev)) {
 		mutex_unlock(&mddev->sync_mutex);
 		return;
 	}
 
+	set_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
 	stop_sync_thread(mddev, false, false);
 	mutex_unlock(&mddev->sync_mutex);
 }
