@@ -2334,10 +2334,6 @@ static int intel_crtc_compute_config(struct intel_atomic_state *state,
 		intel_atomic_get_new_crtc_state(state, crtc);
 	int ret;
 
-	ret = intel_dpll_crtc_compute_clock(state, crtc);
-	if (ret)
-		return ret;
-
 	ret = intel_crtc_compute_pipe_src(crtc_state);
 	if (ret)
 		return ret;
@@ -3940,8 +3936,7 @@ int intel_dotclock_calculate(int link_freq,
 	if (!m_n->link_n)
 		return 0;
 
-	return DIV_ROUND_UP_ULL(mul_u32_u32(m_n->link_m, link_freq),
-				m_n->link_n);
+	return div_u64(mul_u32_u32(m_n->link_m, link_freq), m_n->link_n);
 }
 
 int intel_crtc_dotclock(const struct intel_crtc_state *pipe_config)
@@ -4835,14 +4830,46 @@ bool intel_fuzzy_clock_check(int clock1, int clock2)
 }
 
 static bool
+intel_compare_m_n(unsigned int m, unsigned int n,
+		  unsigned int m2, unsigned int n2,
+		  bool exact)
+{
+	if (m == m2 && n == n2)
+		return true;
+
+	if (exact || !m || !n || !m2 || !n2)
+		return false;
+
+	BUILD_BUG_ON(DATA_LINK_M_N_MASK > INT_MAX);
+
+	if (n > n2) {
+		while (n > n2) {
+			m2 <<= 1;
+			n2 <<= 1;
+		}
+	} else if (n < n2) {
+		while (n < n2) {
+			m <<= 1;
+			n <<= 1;
+		}
+	}
+
+	if (n != n2)
+		return false;
+
+	return intel_fuzzy_clock_check(m, m2);
+}
+
+static bool
 intel_compare_link_m_n(const struct intel_link_m_n *m_n,
-		       const struct intel_link_m_n *m2_n2)
+		       const struct intel_link_m_n *m2_n2,
+		       bool exact)
 {
 	return m_n->tu == m2_n2->tu &&
-		m_n->data_m == m2_n2->data_m &&
-		m_n->data_n == m2_n2->data_n &&
-		m_n->link_m == m2_n2->link_m &&
-		m_n->link_n == m2_n2->link_n;
+		intel_compare_m_n(m_n->data_m, m_n->data_n,
+				  m2_n2->data_m, m2_n2->data_n, exact) &&
+		intel_compare_m_n(m_n->link_m, m_n->link_n,
+				  m2_n2->link_m, m2_n2->link_n, exact);
 }
 
 static bool
@@ -5085,7 +5112,8 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
 
 #define PIPE_CONF_CHECK_M_N(name) do { \
 	if (!intel_compare_link_m_n(&current_config->name, \
-				    &pipe_config->name)) { \
+				    &pipe_config->name,\
+				    !fastset)) { \
 		pipe_config_mismatch(fastset, crtc, __stringify(name), \
 				     "(expected tu %i data %i/%i link %i/%i, " \
 				     "found tu %i, data %i/%i link %i/%i)", \
@@ -5132,6 +5160,16 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
 				     (mask), \
 				     current_config->name & (mask), \
 				     pipe_config->name & (mask)); \
+		ret = false; \
+	} \
+} while (0)
+
+#define PIPE_CONF_CHECK_CLOCK_FUZZY(name) do { \
+	if (!intel_fuzzy_clock_check(current_config->name, pipe_config->name)) { \
+		pipe_config_mismatch(fastset, crtc, __stringify(name), \
+				     "(expected %i, found %i)", \
+				     current_config->name, \
+				     pipe_config->name); \
 		ret = false; \
 	} \
 } while (0)
@@ -5280,7 +5318,7 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
 		PIPE_CONF_CHECK_RECT(pch_pfit.dst);
 
 		PIPE_CONF_CHECK_I(scaler_state.scaler_id);
-		PIPE_CONF_CHECK_I(pixel_rate);
+		PIPE_CONF_CHECK_CLOCK_FUZZY(pixel_rate);
 
 		PIPE_CONF_CHECK_X(gamma_mode);
 		if (IS_CHERRYVIEW(dev_priv))
@@ -5354,10 +5392,10 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
 		PIPE_CONF_CHECK_I(pipe_bpp);
 
 	if (!fastset || !pipe_config->update_m_n) {
-		PIPE_CONF_CHECK_I(hw.pipe_mode.crtc_clock);
-		PIPE_CONF_CHECK_I(hw.adjusted_mode.crtc_clock);
+		PIPE_CONF_CHECK_CLOCK_FUZZY(hw.pipe_mode.crtc_clock);
+		PIPE_CONF_CHECK_CLOCK_FUZZY(hw.adjusted_mode.crtc_clock);
 	}
-	PIPE_CONF_CHECK_I(port_clock);
+	PIPE_CONF_CHECK_CLOCK_FUZZY(port_clock);
 
 	PIPE_CONF_CHECK_I(min_voltage_level);
 
@@ -5400,6 +5438,7 @@ intel_pipe_config_compare(const struct intel_crtc_state *current_config,
 #undef PIPE_CONF_CHECK_BOOL_INCOMPLETE
 #undef PIPE_CONF_CHECK_P
 #undef PIPE_CONF_CHECK_FLAGS
+#undef PIPE_CONF_CHECK_CLOCK_FUZZY
 #undef PIPE_CONF_CHECK_COLOR_LUT
 #undef PIPE_CONF_CHECK_TIMINGS
 #undef PIPE_CONF_CHECK_RECT
@@ -5576,6 +5615,23 @@ static void intel_crtc_check_fastset(const struct intel_crtc_state *old_crtc_sta
 
 	if (!intel_crtc_needs_modeset(new_crtc_state))
 		new_crtc_state->update_pipe = true;
+}
+
+static void intel_crtc_copy_fastset(const struct intel_crtc_state *old_crtc_state,
+				    struct intel_crtc_state *new_crtc_state)
+{
+	/*
+	 * If we're not doing the full modeset we want to
+	 * keep the current M/N values as they may be
+	 * sufficiently different to the computed values
+	 * to cause problems.
+	 *
+	 * FIXME: should really copy more fuzzy state here
+	 */
+	new_crtc_state->fdi_m_n = old_crtc_state->fdi_m_n;
+	new_crtc_state->dp_m_n = old_crtc_state->dp_m_n;
+	new_crtc_state->dp_m2_n2 = old_crtc_state->dp_m2_n2;
+	new_crtc_state->has_drrs = old_crtc_state->has_drrs;
 }
 
 static int intel_crtc_add_planes_to_state(struct intel_atomic_state *state,
@@ -6327,12 +6383,21 @@ int intel_atomic_check(struct drm_device *dev,
 
 	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
 					    new_crtc_state, i) {
-		if (!intel_crtc_needs_modeset(new_crtc_state))
+		if (intel_crtc_needs_modeset(new_crtc_state)) {
+			any_ms = true;
+
+			ret = intel_dpll_crtc_compute_clock(state, crtc);
+			if (ret)
+				goto fail;
+
+			intel_release_shared_dplls(state, crtc);
+			continue;
+		}
+
+		if (!new_crtc_state->update_pipe)
 			continue;
 
-		any_ms = true;
-
-		intel_release_shared_dplls(state, crtc);
+		intel_crtc_copy_fastset(old_crtc_state, new_crtc_state);
 	}
 
 	if (any_ms && !check_digital_port_conflicts(state)) {
