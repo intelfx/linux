@@ -178,14 +178,19 @@ else
         cflags-$(CONFIG_MPSC)		+= -march=nocona
         cflags-$(CONFIG_MCORE2)		+= -march=core2
         cflags-$(CONFIG_MATOM)		+= -march=atom
+      ifeq ($(CONFIG_X86_64_ISA_LEVEL),1)
         cflags-$(CONFIG_GENERIC_CPU)	+= -mtune=generic
+        rustflags-$(CONFIG_GENERIC_CPU)	+= -Ztune-cpu=generic
+      else
+        cflags-$(CONFIG_GENERIC_CPU)	+= -march=x86-64-v$(CONFIG_X86_64_ISA_LEVEL)
+        rustflags-$(CONFIG_GENERIC_CPU)	+= -Ctarget-cpu=x86-64-v$(CONFIG_X86_64_ISA_LEVEL)
+      endif
         KBUILD_CFLAGS += $(cflags-y)
 
         rustflags-$(CONFIG_MK8)		+= -Ctarget-cpu=k8
         rustflags-$(CONFIG_MPSC)	+= -Ctarget-cpu=nocona
         rustflags-$(CONFIG_MCORE2)	+= -Ctarget-cpu=core2
         rustflags-$(CONFIG_MATOM)	+= -Ctarget-cpu=atom
-        rustflags-$(CONFIG_GENERIC_CPU)	+= -Ztune-cpu=generic
         KBUILD_RUSTFLAGS += $(rustflags-y)
 
         KBUILD_CFLAGS += -mno-red-zone
