@@ -39,6 +39,8 @@ DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_llc_shared_map);
 /* Shared L2 cache maps */
 DEFINE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_l2c_shared_map);
 
+static cpumask_var_t cpu_cacheinfo_mask;
+
 /* Kernel controls MTRR and/or PAT MSRs. */
 unsigned int memory_caching_control __ro_after_init;
 
@@ -659,6 +661,42 @@ static int find_num_cache_leaves(struct cpuinfo_x86 *c)
 	return i;
 }
 
+void cacheinfo_topoext_init_l2c_id(struct cpuinfo_x86 *c, int cpu)
+{
+	u32 eax, ebx, ecx, edx, num_sharing_cache;
+	int i = 0, bits;
+
+	/* Check if L2 cache identifiers exists. */
+	if (!cpuid_ecx(0x80000006))
+		return;
+
+	while (true) {
+		u32 level;
+
+		cpuid_count(0x8000001d, i, &eax, &ebx, &ecx, &edx);
+		if (!eax)
+			return;
+
+		/*
+		 * Check if the current leaf is for L2 cache using
+		 * eax[7:5] used to describe the cache level.
+		 */
+		level = (eax >> 5) & 0x7;
+		if (level == 2)
+			break;
+
+		++i;
+	}
+
+	/*
+	 * L2 ID is calculated from the number of threads
+	 * sharing the L2 cache.
+	 */
+	num_sharing_cache = ((eax >> 14) & 0xfff) + 1;
+	bits = get_count_order(num_sharing_cache);
+	per_cpu(cpu_l2c_id, cpu) = c->apicid >> bits;
+}
+
 void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c, int cpu)
 {
 	/*
@@ -1172,8 +1210,10 @@ void cache_bp_restore(void)
 		cache_cpu_init();
 }
 
-static int cache_ap_init(unsigned int cpu)
+static int cache_ap_online(unsigned int cpu)
 {
+	cpumask_set_cpu(cpu, cpu_cacheinfo_mask);
+
 	if (!memory_caching_control || get_cache_aps_delayed_init())
 		return 0;
 
@@ -1191,8 +1231,14 @@ static int cache_ap_init(unsigned int cpu)
 	 *      lock to prevent MTRR entry changes
 	 */
 	stop_machine_from_inactive_cpu(cache_rendezvous_handler, NULL,
-				       cpu_callout_mask);
+				       cpu_cacheinfo_mask);
 
+	return 0;
+}
+
+static int cache_ap_offline(unsigned int cpu)
+{
+	cpumask_clear_cpu(cpu, cpu_cacheinfo_mask);
 	return 0;
 }
 
@@ -1210,9 +1256,12 @@ void cache_aps_init(void)
 
 static int __init cache_ap_register(void)
 {
+	zalloc_cpumask_var(&cpu_cacheinfo_mask, GFP_KERNEL);
+	cpumask_set_cpu(smp_processor_id(), cpu_cacheinfo_mask);
+
 	cpuhp_setup_state_nocalls(CPUHP_AP_CACHECTRL_STARTING,
 				  "x86/cachectrl:starting",
-				  cache_ap_init, NULL);
+				  cache_ap_online, cache_ap_offline);
 	return 0;
 }
-core_initcall(cache_ap_register);
+early_initcall(cache_ap_register);
