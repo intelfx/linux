@@ -73,7 +73,8 @@
 #define UVC_QUIRK_FORCE_Y8		0x00000800
 #define UVC_QUIRK_FORCE_BPP		0x00001000
 #define UVC_QUIRK_WAKE_AUTOSUSPEND	0x00002000
-#define UVC_QUIRK_NO_RESET_RESUME	0x00004000
+#define UVC_QUIRK_INVALID_DEVICE_SOF	0x00004000
+#define UVC_QUIRK_NO_RESET_RESUME	0x00008000
 
 /* Format flags */
 #define UVC_FMT_FLAG_COMPRESSED		0x00000001
@@ -499,6 +500,7 @@ struct uvc_streaming {
 		unsigned int head;
 		unsigned int count;
 		unsigned int size;
+		unsigned int last_sof_overflow;
 
 		u16 last_sof;
 		u16 sof_offset;
