@@ -3324,6 +3324,10 @@ EXPORT_SYMBOL_GPL(cpu_mitigations_auto_nosmt);
 #else
 static int __init mitigations_parse_cmdline(char *arg)
 {
+	/* do not warn if mitigations=off is used on a kernel without mitigations */
+	if (!strcmp(arg, "off"))
+		return 0;
+
 	pr_crit("Kernel compiled without mitigations, ignoring 'mitigations'; system may still be vulnerable\n");
 	return 0;
 }
