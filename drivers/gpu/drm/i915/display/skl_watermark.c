@@ -3779,7 +3779,6 @@ static void skl_dbuf_sanitize(struct intel_display *display)
 static void skl_wm_sanitize(struct intel_display *display)
 {
 	skl_mbus_sanitize(display);
-	skl_dbuf_sanitize(display);
 }
 
 void skl_wm_crtc_disable_noatomic(struct intel_crtc *crtc)
