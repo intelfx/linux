@@ -119,8 +119,24 @@ struct scan_control {
 	/* There is easily reclaimable cold cache in the current node */
 	unsigned int cache_trim_mode:1;
 
+#if defined(CONFIG_UNEVICTABLE_FILE)
+	/* The file pages on the current node are low */
+	unsigned int file_is_low:1;
+
+	/* The file pages on the current node are minimal */
+	unsigned int file_is_min:1;
+#endif
+
 	/* The file pages on the current node are dangerously low */
 	unsigned int file_is_tiny:1;
+
+#if defined(CONFIG_UNEVICTABLE_ANON)
+	/* The anonymous pages on the current node are low */
+	unsigned int anon_is_low:1;
+
+	/* The anonymous pages on the current node are minimal */
+	unsigned int anon_is_min:1;
+#endif
 
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
@@ -170,6 +186,78 @@ struct scan_control {
 #else
 #define prefetchw_prev_lru_page(_page, _base, _field) do { } while (0)
 #endif
+
+#if defined(CONFIG_UNEVICTABLE_FILE)
+#if CONFIG_UNEVICTABLE_FILE_KBYTES_LOW < 0
+#error "CONFIG_UNEVICTABLE_FILE_KBYTES_LOW must be >= 0"
+#endif
+#if CONFIG_UNEVICTABLE_FILE_KBYTES_MIN < 0
+#error "CONFIG_UNEVICTABLE_FILE_KBYTES_MIN must be >= 0"
+#endif
+#if CONFIG_UNEVICTABLE_FILE_KBYTES_LOW < CONFIG_UNEVICTABLE_FILE_KBYTES_MIN
+#error "CONFIG_UNEVICTABLE_FILE_KBYTES_LOW must be >= CONFIG_UNEVICTABLE_FILE_KBYTES_MIN"
+#endif
+unsigned long vm_unevictable_file_kbytes_low __read_mostly =
+	CONFIG_UNEVICTABLE_FILE_KBYTES_LOW;
+unsigned long vm_unevictable_file_kbytes_min __read_mostly =
+	CONFIG_UNEVICTABLE_FILE_KBYTES_MIN;
+
+static int __init vm_unevictable_file_kbytes_low_setup(char *str)
+{
+	vm_unevictable_file_kbytes_low = memparse(str, NULL) >> 10;
+	if (vm_unevictable_file_kbytes_low < vm_unevictable_file_kbytes_min)
+	    vm_unevictable_file_kbytes_min = vm_unevictable_file_kbytes_low;
+
+	return 1;
+}
+__setup("vm_unevictable_file_kbytes_low=", vm_unevictable_file_kbytes_low_setup);
+
+static int __init vm_unevictable_file_kbytes_min_setup(char *str)
+{
+	vm_unevictable_file_kbytes_min = memparse(str, NULL) >> 10;
+	if (vm_unevictable_file_kbytes_min > vm_unevictable_file_kbytes_low)
+	    vm_unevictable_file_kbytes_low = vm_unevictable_file_kbytes_min;
+
+	return 1;
+}
+__setup("vm_unevictable_file_kbytes_min=", vm_unevictable_file_kbytes_min_setup);
+#endif /* CONFIG_UNEVICTABLE_FILE */
+
+#if defined(CONFIG_UNEVICTABLE_ANON)
+#if CONFIG_UNEVICTABLE_ANON_KBYTES_LOW < 0
+#error "CONFIG_UNEVICTABLE_ANON_KBYTES_LOW must be >= 0"
+#endif
+#if CONFIG_UNEVICTABLE_ANON_KBYTES_MIN < 0
+#error "CONFIG_UNEVICTABLE_ANON_KBYTES_MIN must be >= 0"
+#endif
+#if CONFIG_UNEVICTABLE_ANON_KBYTES_LOW < CONFIG_UNEVICTABLE_ANON_KBYTES_MIN
+#error "CONFIG_UNEVICTABLE_ANON_KBYTES_LOW must be >= CONFIG_UNEVICTABLE_ANON_KBYTES_MIN"
+#endif
+unsigned long vm_unevictable_anon_kbytes_low __read_mostly =
+	CONFIG_UNEVICTABLE_ANON_KBYTES_LOW;
+unsigned long vm_unevictable_anon_kbytes_min __read_mostly =
+	CONFIG_UNEVICTABLE_ANON_KBYTES_MIN;
+
+static int __init vm_unevictable_anon_kbytes_low_setup(char *str)
+{
+	vm_unevictable_anon_kbytes_low = memparse(str, NULL) >> 10;
+	if (vm_unevictable_anon_kbytes_low < vm_unevictable_anon_kbytes_min)
+	    vm_unevictable_anon_kbytes_min = vm_unevictable_anon_kbytes_low;
+
+	return 1;
+}
+__setup("vm_unevictable_anon_kbytes_low=", vm_unevictable_anon_kbytes_low_setup);
+
+static int __init vm_unevictable_anon_kbytes_min_setup(char *str)
+{
+	vm_unevictable_anon_kbytes_min = memparse(str, NULL) >> 10;
+	if (vm_unevictable_anon_kbytes_min > vm_unevictable_anon_kbytes_low)
+	    vm_unevictable_anon_kbytes_low = vm_unevictable_anon_kbytes_min;
+
+	return 1;
+}
+__setup("vm_unevictable_anon_kbytes_min=", vm_unevictable_anon_kbytes_min_setup);
+#endif /* CONFIG_UNEVICTABLE_ANON */
 
 /*
  * From 0 .. 200.  Higher means more swappy.
@@ -2764,6 +2852,23 @@ out:
 			BUG();
 		}
 
+#if defined(CONFIG_UNEVICTABLE_FILE)
+		if (file && scan) {
+			if (sc->file_is_low)
+				scan = min(scan, SWAP_CLUSTER_MAX >> sc->priority);
+			else if (sc->file_is_min)
+				scan = 0;
+		}
+#endif
+#if defined(CONFIG_UNEVICTABLE_ANON)
+		if (!file && scan) {
+			if (sc->anon_is_low)
+				scan = min(scan, SWAP_CLUSTER_MAX >> sc->priority);
+			else if (sc->anon_is_min)
+				scan = 0;
+		}
+#endif
+
 		nr[lru] = scan;
 	}
 }
@@ -3026,6 +3131,10 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
 }
 
+#if defined(CONFIG_UNEVICTABLE_FILE) || defined(CONFIG_UNEVICTABLE_ANON)
+#define K(x) ((x) << (PAGE_SHIFT - 10))
+#endif
+
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	struct reclaim_state *reclaim_state = current->reclaim_state;
@@ -3109,11 +3218,26 @@ again:
 	if (!cgroup_reclaim(sc)) {
 		unsigned long total_high_wmark = 0;
 		unsigned long free, anon;
+#if defined(CONFIG_UNEVICTABLE_FILE)
+		unsigned long reclaimable_file, clean_file, dirty_file;
+#endif
+#if defined(CONFIG_UNEVICTABLE_ANON)
+		unsigned long reclaimable_anon;
+#endif
 		int z;
 
 		free = sum_zone_node_page_state(pgdat->node_id, NR_FREE_PAGES);
 		file = node_page_state(pgdat, NR_ACTIVE_FILE) +
 			   node_page_state(pgdat, NR_INACTIVE_FILE);
+#if defined(CONFIG_UNEVICTABLE_FILE)
+		reclaimable_file = file + node_page_state(pgdat, NR_ISOLATED_FILE);
+		dirty_file = node_page_state(pgdat, NR_FILE_DIRTY);
+#endif
+#if defined(CONFIG_UNEVICTABLE_ANON)
+		reclaimable_anon = node_page_state(pgdat, NR_ACTIVE_ANON) +
+				   node_page_state(pgdat, NR_INACTIVE_ANON) +
+				   node_page_state(pgdat, NR_ISOLATED_ANON);
+#endif
 
 		for (z = 0; z < MAX_NR_ZONES; z++) {
 			struct zone *zone = &pgdat->node_zones[z];
@@ -3134,6 +3258,32 @@ again:
 			file + free <= total_high_wmark &&
 			!(sc->may_deactivate & DEACTIVATE_ANON) &&
 			anon >> sc->priority;
+
+#if defined(CONFIG_UNEVICTABLE_FILE)
+		/*
+		 * node_page_state() sum can go out of sync since
+		 * all the values are not read at once
+		 */
+		if (unlikely(reclaimable_file < dirty_file))
+			/*
+			 * in this case assume the system does not have
+			 * clean file pages anymore
+			 */
+			clean_file = 0;
+		else
+			clean_file = reclaimable_file - dirty_file;
+
+		sc->file_is_low = K(clean_file) < vm_unevictable_file_kbytes_low &&
+			          K(clean_file) > vm_unevictable_file_kbytes_min;
+
+		sc->file_is_min = K(clean_file) <= vm_unevictable_file_kbytes_min;
+#endif
+#if defined(CONFIG_UNEVICTABLE_ANON)
+		sc->anon_is_low = K(reclaimable_anon) < vm_unevictable_anon_kbytes_low &&
+				  K(reclaimable_anon) > vm_unevictable_anon_kbytes_min;
+
+		sc->anon_is_min = K(reclaimable_anon) <= vm_unevictable_anon_kbytes_min;
+#endif
 	}
 
 	shrink_node_memcgs(pgdat, sc);
