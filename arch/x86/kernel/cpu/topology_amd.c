@@ -183,6 +183,9 @@ static void parse_topology_amd(struct topo_scan *tscan)
 	 */
 	bool has_xtopology = cpu_parse_topology_ext(tscan);
 
+	if (cpu_feature_enabled(X86_FEATURE_AMD_HETEROGENEOUS_CORES))
+		tscan->c->topo.cpu_type = cpuid_ebx(0x80000026);
+
 	/*
 	 * If XTOPOLOGY leaves (0x26/0xb) are not available, try to
 	 * get the CORE shift from leaf 0x8000_0008 first.
