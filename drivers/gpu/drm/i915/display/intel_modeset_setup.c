@@ -714,7 +714,6 @@ void intel_modeset_setup_hw_state(struct drm_i915_private *i915,
 		vlv_wm_sanitize(i915);
 	} else if (DISPLAY_VER(i915) >= 9) {
 		skl_wm_get_hw_state(i915);
-		skl_wm_sanitize(i915);
 	} else if (HAS_PCH_SPLIT(i915)) {
 		ilk_wm_get_hw_state(i915);
 	}
