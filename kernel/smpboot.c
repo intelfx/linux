@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/sched/task.h>
+#include <linux/scs.h>
 #include <linux/export.h>
 #include <linux/percpu.h>
 #include <linux/kthread.h>
@@ -27,12 +28,20 @@
  */
 static DEFINE_PER_CPU(struct task_struct *, idle_threads);
 
-struct task_struct *idle_thread_get(unsigned int cpu)
+struct task_struct *idle_thread_get(unsigned int cpu, bool unpoison)
 {
 	struct task_struct *tsk = per_cpu(idle_threads, cpu);
 
 	if (!tsk)
 		return ERR_PTR(-ENOMEM);
+
+	if (unpoison) {
+		/*
+		 * Reset stale stack state from last time this CPU was online.
+		 */
+		scs_task_reset(tsk);
+		kasan_unpoison_task_stack(tsk);
+	}
 	return tsk;
 }
 
