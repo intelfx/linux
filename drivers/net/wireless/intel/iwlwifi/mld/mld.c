@@ -56,7 +56,11 @@ static void iwl_mld_hw_set_regulatory(struct iwl_mld *mld)
 {
 	struct wiphy *wiphy = mld->wiphy;
 
-	wiphy->regulatory_flags |= REGULATORY_WIPHY_SELF_MANAGED;
+	if (!iwlwifi_mod_params.lar_disable)
+		wiphy->regulatory_flags |= REGULATORY_WIPHY_SELF_MANAGED;
+	else
+		wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG |
+					   REGULATORY_DISABLE_BEACON_HINTS;
 	wiphy->regulatory_flags |= REGULATORY_ENABLE_RELAX_NO_IR;
 }
 
