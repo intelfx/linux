@@ -2064,9 +2064,5 @@ const struct font_desc font_ter_16x32 = {
 	.height = 32,
 	.charcount = 256,
 	.data	= fontdata_ter16x32.data,
-#ifdef __sparc__
-	.pref	= 5,
-#else
-	.pref	= -1,
-#endif
+	.pref	= 1,
 };
