@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 6
 SUBLEVEL = 59
-EXTRAVERSION = -arch0
+EXTRAVERSION = -arch0pf6
 NAME = Pinguïn Aangedreven
 
 # *DOCUMENTATION*
