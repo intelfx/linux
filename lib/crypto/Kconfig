@@ -48,7 +48,7 @@ config CRYPTO_LIB_BLAKE2S_ARCH
 	default y if X86_64
 
 config CRYPTO_LIB_CHACHA
-	tristate
+	tristate "Chacha encryption algorithm"
 	select CRYPTO_LIB_UTILS
 	help
 	  Enable the ChaCha library interface.  Select this if your module uses
@@ -102,7 +102,7 @@ config CRYPTO_LIB_MD5_ARCH
 	default y if SPARC64
 
 config CRYPTO_LIB_POLY1305
-	tristate
+	tristate "Poly1305 authentication algorithm"
 	help
 	  The Poly1305 library functions.  Select this if your module uses any
 	  of the functions from <crypto/poly1305.h>.
