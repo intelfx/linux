@@ -56,7 +56,7 @@ static int perf_session__process_compressed_event(struct perf_session *session,
 		return -1;
 	}
 
-	decomp_size = zstd_decompress_stream(session->active_decomp->zstd_decomp, src, src_size,
+	decomp_size = zstd_decompress_buffer(session->active_decomp->zstd_decomp, src, src_size,
 				&(decomp->data[decomp_last_rem]), decomp_len - decomp_last_rem);
 	if (!decomp_size) {
 		munmap(decomp, mmap_len);
