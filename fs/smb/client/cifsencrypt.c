@@ -25,6 +25,7 @@
 #include <crypto/aead.h>
 #include <crypto/arc4.h>
 #include <crypto/md5.h>
+#include <crypto/utils.h>
 #include <crypto/sha2.h>
 
 static int cifs_sig_update(struct cifs_calc_sig_ctx *ctx,
@@ -232,7 +233,7 @@ int cifs_verify_signature(struct smb_rqst *rqst,
 /*	cifs_dump_mem("what we think it should be: ",
 		      what_we_think_sig_should_be, 16); */
 
-	if (memcmp(server_response_sig, what_we_think_sig_should_be, 8))
+	if (crypto_memneq(server_response_sig, what_we_think_sig_should_be, 8))
 		return -EACCES;
 	else
 		return 0;
