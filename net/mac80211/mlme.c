@@ -149,6 +149,113 @@ static int ecw2cw(int ecw)
 	return (1 << ecw) - 1;
 }
 
+static const char *ieee80211_chanwidth_text(enum nl80211_chan_width width)
+{
+	switch (width) {
+	case NL80211_CHAN_WIDTH_20_NOHT:
+		return "20-NOHT";
+	case NL80211_CHAN_WIDTH_20:
+		return "20";
+	case NL80211_CHAN_WIDTH_40:
+		return "40";
+	case NL80211_CHAN_WIDTH_80:
+		return "80";
+	case NL80211_CHAN_WIDTH_80P80:
+		return "80+80";
+	case NL80211_CHAN_WIDTH_160:
+		return "160";
+	case NL80211_CHAN_WIDTH_320:
+		return "320";
+	case NL80211_CHAN_WIDTH_5:
+		return "5";
+	case NL80211_CHAN_WIDTH_10:
+		return "10";
+	case NL80211_CHAN_WIDTH_1:
+		return "1";
+	case NL80211_CHAN_WIDTH_2:
+		return "2";
+	case NL80211_CHAN_WIDTH_4:
+		return "4";
+	case NL80211_CHAN_WIDTH_8:
+		return "8";
+	case NL80211_CHAN_WIDTH_16:
+		return "16";
+	}
+	return "<invalid>";
+}
+
+static const char *ieee80211_band_text(enum nl80211_band band)
+{
+	switch (band) {
+	case NL80211_BAND_2GHZ:
+		return "2.4GHz";
+	case NL80211_BAND_5GHZ:
+		return "5GHz";
+	case NL80211_BAND_60GHZ:
+		return "60GHz";
+	case NL80211_BAND_6GHZ:
+		return "6GHz";
+	case NL80211_BAND_S1GHZ:
+		return "S1GHz";
+	case NL80211_BAND_LC:
+		return "LC";
+	default:
+		return "<invalid>";
+	}
+}
+
+/*
+ * Pretty-print every field and state of a struct cfg80211_chan_def into the
+ * caller-provided buffer, for debugging the channel definitions produced by
+ * the ieee80211_chandef_*_oper() helpers. Returns @buf so it can be used
+ * inline as a "%s" printf argument. A buffer of ~120 bytes is plenty.
+ */
+static const char *
+ieee80211_chandef_text(char *buf, size_t len,
+		       const struct cfg80211_chan_def *chandef)
+{
+	char *p = buf, *end = buf + len;
+
+	if (!chandef) {
+		scnprintf(buf, len, "(null)");
+		return buf;
+	}
+
+	p += scnprintf(p, end - p, "width=%s MHz",
+		       ieee80211_chanwidth_text(chandef->width));
+
+	if (chandef->chan)
+		p += scnprintf(p, end - p,
+			       " control=%d.%03d MHz (chan %d, %s)",
+			       chandef->chan->center_freq,
+			       chandef->chan->freq_offset,
+			       chandef->chan->hw_value,
+			       ieee80211_band_text(chandef->chan->band));
+	else
+		p += scnprintf(p, end - p, " control=(none)");
+
+	p += scnprintf(p, end - p, " center1=%d.%03d MHz",
+		       chandef->center_freq1, chandef->freq1_offset);
+
+	if (chandef->width == NL80211_CHAN_WIDTH_80P80)
+		p += scnprintf(p, end - p, " center2=%d MHz",
+			       chandef->center_freq2);
+
+	if (chandef->punctured)
+		p += scnprintf(p, end - p, " punctured=0x%04x",
+			       chandef->punctured);
+
+	if (chandef->edmg.channels || chandef->edmg.bw_config)
+		p += scnprintf(p, end - p, " edmg=ch:0x%02x/bw:%d",
+			       chandef->edmg.channels, chandef->edmg.bw_config);
+
+	if (chandef->chan && chandef->chan->band == NL80211_BAND_S1GHZ)
+		p += scnprintf(p, end - p, " s1g_primary_2mhz=%d",
+			       chandef->s1g_primary_2mhz);
+
+	return buf;
+}
+
 static enum ieee80211_conn_mode
 ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 			    struct ieee80211_channel *channel,
@@ -167,6 +274,14 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 	struct cfg80211_chan_def vht_chandef;
 	bool no_vht = false;
 	u32 ht_cfreq;
+	char dbg[160];
+
+	#define CHANDEF_DBG(var, fmt, ...) \
+		do { \
+			sdata_dbg(sdata, "chandef: " fmt ": %s\n", \
+				  ##__VA_ARGS__, \
+				  ieee80211_chandef_text(dbg, sizeof(dbg), (var))); \
+		} while (0)
 
 	if (ieee80211_hw_check(&sdata->local->hw, STRICT))
 		ignore_ht_channel_mismatch = false;
@@ -177,6 +292,7 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		.center_freq1 = channel->center_freq,
 		.freq1_offset = channel->freq_offset,
 	};
+	CHANDEF_DBG(chandef, "legacy");
 
 	/* get special S1G case out of the way */
 	if (sband->band == NL80211_BAND_S1GHZ) {
@@ -187,6 +303,7 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 			chandef->s1g_primary_2mhz = false;
 		}
 
+		CHANDEF_DBG(chandef, "S1G");
 		return IEEE80211_CONN_MODE_S1G;
 	}
 
@@ -199,8 +316,8 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 			return IEEE80211_CONN_MODE_LEGACY;
 
 		if (!elems->he_6ghz_capa || !elems->he_cap) {
-			sdata_info(sdata,
-				   "HE 6 GHz AP is missing HE/HE 6 GHz band capability\n");
+			sdata_notice(sdata,
+				     "HE 6 GHz AP is missing HE/HE 6 GHz band capability\n");
 			return IEEE80211_CONN_MODE_LEGACY;
 		}
 
@@ -211,9 +328,10 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 
 		if (!ieee80211_chandef_he_6ghz_oper(sdata->local, he_oper,
 						    eht_oper, chandef)) {
-			sdata_info(sdata, "bad HE/EHT 6 GHz operation\n");
+			sdata_notice(sdata, "bad HE/EHT 6 GHz operation\n");
 			return IEEE80211_CONN_MODE_LEGACY;
 		}
+		CHANDEF_DBG(chandef, "HE 6GHz");
 
 		return mode;
 	}
@@ -238,14 +356,15 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		 * since we look at probe response/beacon data here
 		 * it should be OK.
 		 */
-		sdata_info(sdata,
-			   "Wrong control channel: center-freq: %d ht-cfreq: %d ht->primary_chan: %d band: %d - Disabling HT\n",
-			   channel->center_freq, ht_cfreq,
-			   ht_oper->primary_chan, channel->band);
+		sdata_notice(sdata,
+			     "Wrong control channel (center-freq: %d, control-freq: %d (chan: %d, band: %d)), disabling HT\n",
+			     channel->center_freq, ht_cfreq,
+			     ht_oper->primary_chan, channel->band);
 		return IEEE80211_CONN_MODE_LEGACY;
 	}
 
 	ieee80211_chandef_ht_oper(ht_oper, chandef);
+	CHANDEF_DBG(chandef, "HT");
 
 	if (conn->mode < IEEE80211_CONN_MODE_VHT)
 		return IEEE80211_CONN_MODE_HT;
@@ -270,8 +389,8 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		if (!ieee80211_chandef_vht_oper(&sdata->local->hw, vht_cap_info,
 						&he_oper_vht_cap, ht_oper,
 						&vht_chandef)) {
-			sdata_info(sdata,
-				   "HE AP VHT information is invalid, disabling HE\n");
+			sdata_notice(sdata,
+				     "HE AP VHT information is invalid, disabling HE\n");
 			/* this will cause us to re-parse as VHT STA */
 			return IEEE80211_CONN_MODE_VHT;
 		}
@@ -288,15 +407,43 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 					       vht_cap_info,
 					       vht_oper, ht_oper,
 					       &vht_chandef)) {
-		sdata_info(sdata,
-			   "AP VHT information is invalid, disabling VHT\n");
+		sdata_notice(sdata,
+			     "AP VHT information is invalid, disabling VHT\n");
 		return IEEE80211_CONN_MODE_HT;
 	}
 
+	CHANDEF_DBG(&vht_chandef, "VHT");
+
 	if (!cfg80211_chandef_compatible(chandef, &vht_chandef)) {
-		sdata_info(sdata,
-			   "AP VHT information doesn't match HT, disabling VHT\n");
-		return IEEE80211_CONN_MODE_HT;
+		/*
+		 * Some APs (notably iPhone personal hotspots) advertise an HT
+		 * secondary channel offset that contradicts the control-channel
+		 * position implied by the VHT channel center, so the HT and VHT
+		 * chandefs come out incompatible. The VHT operation is the more
+		 * authoritative source for the operating width, and the forced
+		 * VHT chandef is self-consistent on its own: everything
+		 * downstream (including the iwlwifi PHY context) re-derives the
+		 * control-channel position from control vs. center frequency and
+		 * never consults the HT secondary offset again. So as long as
+		 * VHT keeps the very same control channel and merely widens it,
+		 * force VHT instead of dropping back to HT.
+		 *
+		 * Note: comparing the control channel and width (rather than the
+		 * segment center) is deliberate. For a properly contained
+		 * narrower channel the centers *should* differ, since the 40 MHz
+		 * lives in one half of the 80 MHz; they coincide here only
+		 * because of the degenerate (and per-spec invalid) alignment
+		 * that triggered the mismatch in the first place.
+		 */
+		if (vht_chandef.chan != chandef->chan ||
+		    vht_chandef.width <= chandef->width) {
+			sdata_notice(sdata,
+				     "AP VHT information doesn't match HT, disabling VHT\n");
+			return IEEE80211_CONN_MODE_HT;
+		}
+
+		sdata_notice(sdata,
+			     "AP VHT information doesn't match HT, using VHT anyway\n");
 	}
 
 	*chandef = vht_chandef;
@@ -328,15 +475,17 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		eht_chandef.punctured =
 			ieee80211_eht_oper_dis_subchan_bitmap(eht_oper);
 
+		CHANDEF_DBG(&eht_chandef, "EHT");
+
 		if (!cfg80211_chandef_valid(&eht_chandef)) {
-			sdata_info(sdata,
-				   "AP EHT information is invalid, disabling EHT\n");
+			sdata_notice(sdata,
+				     "AP EHT information is invalid, disabling EHT\n");
 			return IEEE80211_CONN_MODE_HE;
 		}
 
 		if (!cfg80211_chandef_compatible(chandef, &eht_chandef)) {
-			sdata_info(sdata,
-				   "AP EHT information doesn't match HT/VHT/HE, disabling EHT\n");
+			sdata_notice(sdata,
+				     "AP EHT information doesn't match HT/VHT/HE, disabling EHT\n");
 			return IEEE80211_CONN_MODE_HE;
 		}
 
