@@ -692,31 +692,21 @@ static void end_bbio_data_read(struct btrfs_bio *bbio)
 int btrfs_alloc_page_array(unsigned int nr_pages, struct page **page_array,
 			   gfp_t extra_gfp)
 {
+	const gfp_t gfp = GFP_NOFS | extra_gfp;
 	unsigned int allocated;
 
 	for (allocated = 0; allocated < nr_pages;) {
 		unsigned int last = allocated;
 
-		allocated = alloc_pages_bulk_array(GFP_NOFS | extra_gfp,
-						   nr_pages, page_array);
-
-		if (allocated == nr_pages)
-			return 0;
-
-		/*
-		 * During this iteration, no page could be allocated, even
-		 * though alloc_pages_bulk_array() falls back to alloc_page()
-		 * if  it could not bulk-allocate. So we must be out of memory.
-		 */
-		if (allocated == last) {
+		allocated = alloc_pages_bulk_array(gfp, nr_pages, page_array);
+		if (unlikely(allocated == last)) {
+			/* No progress, fail and do cleanup. */
 			for (int i = 0; i < allocated; i++) {
 				__free_page(page_array[i]);
 				page_array[i] = NULL;
 			}
 			return -ENOMEM;
 		}
-
-		memalloc_retry_wait(GFP_NOFS);
 	}
 	return 0;
 }
@@ -2756,7 +2746,7 @@ static int emit_last_fiemap_cache(struct fiemap_extent_info *fieinfo,
 
 static int fiemap_next_leaf_item(struct btrfs_inode *inode, struct btrfs_path *path)
 {
-	struct extent_buffer *clone;
+	struct extent_buffer *clone = path->nodes[0];
 	struct btrfs_key key;
 	int slot;
 	int ret;
@@ -2765,29 +2755,45 @@ static int fiemap_next_leaf_item(struct btrfs_inode *inode, struct btrfs_path *p
 	if (path->slots[0] < btrfs_header_nritems(path->nodes[0]))
 		return 0;
 
+	/*
+	 * Add a temporary extra ref to an already cloned extent buffer to
+	 * prevent btrfs_next_leaf() freeing it, we want to reuse it to avoid
+	 * the cost of allocating a new one.
+	 */
+	ASSERT(test_bit(EXTENT_BUFFER_UNMAPPED, &clone->bflags));
+	atomic_inc(&clone->refs);
+
 	ret = btrfs_next_leaf(inode->root, path);
 	if (ret != 0)
-		return ret;
+		goto out;
 
 	/*
 	 * Don't bother with cloning if there are no more file extent items for
 	 * our inode.
 	 */
 	btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0]);
-	if (key.objectid != btrfs_ino(inode) || key.type != BTRFS_EXTENT_DATA_KEY)
-		return 1;
+	if (key.objectid != btrfs_ino(inode) || key.type != BTRFS_EXTENT_DATA_KEY) {
+		ret = 1;
+		goto out;
+	}
 
 	/* See the comment at fiemap_search_slot() about why we clone. */
-	clone = btrfs_clone_extent_buffer(path->nodes[0]);
-	if (!clone)
-		return -ENOMEM;
+	copy_extent_buffer_full(clone, path->nodes[0]);
+	/*
+	 * Important to preserve the start field, for the optimizations when
+	 * checking if extents are shared (see extent_fiemap()).
+	 */
+	clone->start = path->nodes[0]->start;
 
 	slot = path->slots[0];
 	btrfs_release_path(path);
 	path->nodes[0] = clone;
 	path->slots[0] = slot;
+out:
+	if (ret)
+		free_extent_buffer(clone);
 
-	return 0;
+	return ret;
 }
 
 /*
@@ -4256,6 +4262,13 @@ void set_extent_buffer_uptodate(struct extent_buffer *eb)
 	}
 }
 
+static void clear_extent_buffer_reading(struct extent_buffer *eb)
+{
+	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
+	smp_mb__after_atomic();
+	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
+}
+
 static void end_bbio_meta_read(struct btrfs_bio *bbio)
 {
 	struct extent_buffer *eb = bbio->private;
@@ -4263,6 +4276,13 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
 	bool uptodate = !bbio->bio.bi_status;
 	struct folio_iter fi;
 	u32 bio_offset = 0;
+
+	/*
+	 * If the extent buffer is marked UPTODATE before the read operation
+	 * completes, other calls to read_extent_buffer_pages() will return
+	 * early without waiting for the read to finish, causing data races.
+	 */
+	WARN_ON(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags));
 
 	eb->read_mirror = bbio->mirror_num;
 
@@ -4290,9 +4310,7 @@ static void end_bbio_meta_read(struct btrfs_bio *bbio)
 		bio_offset += len;
 	}
 
-	clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
-	smp_mb__after_atomic();
-	wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
+	clear_extent_buffer_reading(eb);
 	free_extent_buffer(eb);
 
 	bio_put(&bbio->bio);
@@ -4326,9 +4344,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
 	 * will now be set, and we shouldn't read it in again.
 	 */
 	if (unlikely(test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))) {
-		clear_bit(EXTENT_BUFFER_READING, &eb->bflags);
-		smp_mb__after_atomic();
-		wake_up_bit(&eb->bflags, EXTENT_BUFFER_READING);
+		clear_extent_buffer_reading(eb);
 		return 0;
 	}
 
