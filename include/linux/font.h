@@ -33,8 +33,11 @@ struct font_desc {
 #define ACORN8x8_IDX	8
 #define	MINI4x6_IDX	9
 #define FONT6x10_IDX	10
-#define TER16x32_IDX	11
-#define FONT6x8_IDX	12
+#define TER6x12_IDX     11
+#define TER8x16_IDX     12
+#define TER12x24_IDX    13
+#define TER16x32_IDX	14
+#define FONT6x8_IDX	15
 
 extern const struct font_desc	font_vga_8x8,
 			font_vga_8x16,
@@ -47,6 +50,9 @@ extern const struct font_desc	font_vga_8x8,
 			font_acorn_8x8,
 			font_mini_4x6,
 			font_6x10,
+			font_ter_6x12,
+			font_ter_8x16,
+			font_ter_12x24,
 			font_ter_16x32,
 			font_6x8;
 
