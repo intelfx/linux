@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0
 
 config XOR_BLOCKS
-	tristate
+	tristate "Accelerated block XOR algorithm"
 
 # selected by architectures that provide an optimized XOR implementation
 config XOR_BLOCKS_ARCH
