@@ -69,6 +69,8 @@ Currently, these files are in /proc/sys/vm:
 - stat_refresh
 - numa_stat
 - swappiness
+- unevictable_activefile_kbytes_low
+- unevictable_activefile_kbytes_min
 - unprivileged_userfaultfd
 - user_reserve_kbytes
 - vfs_cache_pressure
@@ -879,6 +881,31 @@ userfaultfd system calls, or set this to 0 to restrict userfaultfd to only
 privileged users (with SYS_CAP_PTRACE capability).
 
 The default value is 1.
+
+
+unevictable_activefile_kbytes_low
+=================================
+
+Keep some active file pages still mapped under memory pressure to avoid
+potential disk thrashing that may occur due to evicting running executables
+code. This implements soft eviction throttling, and some file pages can still
+be discarded.
+
+Setting it to 0 effectively disables this feature.
+
+The default value is 512 MiB.
+
+
+unevictable_activefile_kbytes_min
+=================================
+
+Keep all active file pages still mapped under memory pressure to avoid
+potential disk thrashing that may occur due to evicting running executables
+code. This is the hard limit.
+
+Setting it to 0 effectively disables this feature.
+
+The default value is 256 MiB.
 
 
 user_reserve_kbytes
