@@ -592,12 +592,6 @@ static int bringup_cpu(unsigned int cpu)
 	int ret;
 
 	/*
-	 * Reset stale stack state from the last time this CPU was online.
-	 */
-	scs_task_reset(idle);
-	kasan_unpoison_task_stack(idle);
-
-	/*
 	 * Some architectures have to walk the irq descriptors to
 	 * setup the vector space for the cpu which comes online.
 	 * Prevent irq alloc/free across the bringup.
@@ -1383,6 +1377,12 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
 			ret = PTR_ERR(idle);
 			goto out;
 		}
+
+		/*
+		 * Reset stale stack state from the last time this CPU was online.
+		 */
+		scs_task_reset(idle);
+		kasan_unpoison_task_stack(idle);
 	}
 
 	cpuhp_tasks_frozen = tasks_frozen;
@@ -1504,13 +1504,45 @@ int bringup_hibernate_cpu(unsigned int sleep_cpu)
 
 void bringup_nonboot_cpus(unsigned int setup_max_cpus)
 {
-	unsigned int cpu;
+	unsigned int cpu, n = num_online_cpus();
 
+	/*
+	 * On architectures which have setup the CPUHP_BP_PARALLEL_STARTUP
+	 * state, this invokes all BP prepare states and the parallel
+	 * startup state sends the startup IPI to each of the to be onlined
+	 * APs. This avoids waiting for each AP to respond to the startup
+	 * IPI in CPUHP_BRINGUP_CPU. The APs proceed through the low level
+	 * bringup code and then wait for the control CPU to release them
+	 * one by one for the final onlining procedure in the loop below.
+	 *
+	 * For architectures which do not support parallel bringup all
+	 * states are fully serialized in the loop below.
+	 */
+	if (!cpuhp_step_empty(true, cpuhp_get_step(CPUHP_BP_PARALLEL_STARTUP))) {
+		for_each_present_cpu(cpu) {
+			if (n++ >= setup_max_cpus)
+				break;
+			cpu_up(cpu, CPUHP_BP_PARALLEL_STARTUP);
+		}
+	}
+
+	/* Do the per CPU serialized bringup to ONLINE state */
 	for_each_present_cpu(cpu) {
 		if (num_online_cpus() >= setup_max_cpus)
 			break;
-		if (!cpu_online(cpu))
-			cpu_up(cpu, CPUHP_ONLINE);
+
+		if (!cpu_online(cpu)) {
+			struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+			int ret = cpu_up(cpu, CPUHP_ONLINE);
+
+			/*
+			 * Due to the above preparation loop a failed online attempt
+			 * might have only rolled back to CPUHP_BP_PARALLEL_STARTUP. Do the
+			 * remaining cleanups. NOOP for the non parallel case.
+			 */
+			if (ret && can_rollback_cpu(st))
+				WARN_ON(cpuhp_invoke_callback_range(false, cpu, st, CPUHP_OFFLINE));
+		}
 	}
 }
 
