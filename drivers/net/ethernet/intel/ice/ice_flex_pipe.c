@@ -1404,7 +1404,7 @@ static int ice_prof_inc_ref(struct ice_hw *hw, enum ice_block blk, u8 prof_id)
  * @idx: index of the FV which will use the mask
  * @mask: the 16-bit mask
  */
-static void
+static noinline void
 ice_write_prof_mask_reg(struct ice_hw *hw, enum ice_block blk, u16 mask_idx,
 			u16 idx, u16 mask)
 {
