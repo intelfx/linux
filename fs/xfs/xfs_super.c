@@ -102,11 +102,11 @@ static const struct constant_table dax_param_enums[] = {
  * Table driven mount option parser.
  */
 enum {
-	Opt_logbufs, Opt_logbsize, Opt_logdev, Opt_rtdev,
+	Op_deprecated, Opt_logbufs, Opt_logbsize, Opt_logdev, Opt_rtdev,
 	Opt_wsync, Opt_noalign, Opt_swalloc, Opt_sunit, Opt_swidth, Opt_nouuid,
 	Opt_grpid, Opt_nogrpid, Opt_bsdgroups, Opt_sysvgroups,
-	Opt_allocsize, Opt_norecovery, Opt_inode64, Opt_inode32, Opt_ikeep,
-	Opt_noikeep, Opt_largeio, Opt_nolargeio, Opt_attr2, Opt_noattr2,
+	Opt_allocsize, Opt_norecovery, Opt_inode64, Opt_inode32,
+	Opt_largeio, Opt_nolargeio,
 	Opt_filestreams, Opt_quota, Opt_noquota, Opt_usrquota, Opt_grpquota,
 	Opt_prjquota, Opt_uquota, Opt_gquota, Opt_pquota,
 	Opt_uqnoenforce, Opt_gqnoenforce, Opt_pqnoenforce, Opt_qnoenforce,
@@ -114,7 +114,21 @@ enum {
 	Opt_lifetime, Opt_nolifetime, Opt_max_atomic_write,
 };
 
+#define fsparam_dead(NAME) \
+	__fsparam(NULL, (NAME), Op_deprecated, fs_param_deprecated, NULL)
+
 static const struct fs_parameter_spec xfs_fs_parameters[] = {
+	/*
+	 * These mount options were supposed to be deprecated in September 2025
+	 * but the deprecation warning was buggy, so not all users were
+	 * notified.  The deprecation is now obnoxiously loud and postponed to
+	 * September 2030.
+	 */
+	fsparam_dead("attr2"),
+	fsparam_dead("noattr2"),
+	fsparam_dead("ikeep"),
+	fsparam_dead("noikeep"),
+
 	fsparam_u32("logbufs",		Opt_logbufs),
 	fsparam_string("logbsize",	Opt_logbsize),
 	fsparam_string("logdev",	Opt_logdev),
@@ -133,12 +147,8 @@ static const struct fs_parameter_spec xfs_fs_parameters[] = {
 	fsparam_flag("norecovery",	Opt_norecovery),
 	fsparam_flag("inode64",		Opt_inode64),
 	fsparam_flag("inode32",		Opt_inode32),
-	fsparam_flag("ikeep",		Opt_ikeep),
-	fsparam_flag("noikeep",		Opt_noikeep),
 	fsparam_flag("largeio",		Opt_largeio),
 	fsparam_flag("nolargeio",	Opt_nolargeio),
-	fsparam_flag("attr2",		Opt_attr2),
-	fsparam_flag("noattr2",		Opt_noattr2),
 	fsparam_flag("filestreams",	Opt_filestreams),
 	fsparam_flag("quota",		Opt_quota),
 	fsparam_flag("noquota",		Opt_noquota),
@@ -175,13 +185,11 @@ xfs_fs_show_options(
 {
 	static struct proc_xfs_info xfs_info_set[] = {
 		/* the few simple ones we can get from the mount struct */
-		{ XFS_FEAT_IKEEP,		",ikeep" },
 		{ XFS_FEAT_WSYNC,		",wsync" },
 		{ XFS_FEAT_NOALIGN,		",noalign" },
 		{ XFS_FEAT_SWALLOC,		",swalloc" },
 		{ XFS_FEAT_NOUUID,		",nouuid" },
 		{ XFS_FEAT_NORECOVERY,		",norecovery" },
-		{ XFS_FEAT_ATTR2,		",attr2" },
 		{ XFS_FEAT_FILESTREAMS,		",filestreams" },
 		{ XFS_FEAT_GRPID,		",grpid" },
 		{ XFS_FEAT_DISCARD,		",discard" },
@@ -541,7 +549,8 @@ xfs_setup_devices(
 {
 	int			error;
 
-	error = xfs_configure_buftarg(mp->m_ddev_targp, mp->m_sb.sb_sectsize);
+	error = xfs_configure_buftarg(mp->m_ddev_targp, mp->m_sb.sb_sectsize,
+			mp->m_sb.sb_dblocks);
 	if (error)
 		return error;
 
@@ -551,7 +560,7 @@ xfs_setup_devices(
 		if (xfs_has_sector(mp))
 			log_sector_size = mp->m_sb.sb_logsectsize;
 		error = xfs_configure_buftarg(mp->m_logdev_targp,
-					    log_sector_size);
+				log_sector_size, mp->m_sb.sb_logblocks);
 		if (error)
 			return error;
 	}
@@ -565,7 +574,7 @@ xfs_setup_devices(
 		mp->m_rtdev_targp = mp->m_ddev_targp;
 	} else if (mp->m_rtname) {
 		error = xfs_configure_buftarg(mp->m_rtdev_targp,
-					    mp->m_sb.sb_sectsize);
+				mp->m_sb.sb_sectsize, mp->m_sb.sb_rblocks);
 		if (error)
 			return error;
 	}
@@ -1088,15 +1097,6 @@ xfs_finish_flags(
 	}
 
 	/*
-	 * V5 filesystems always use attr2 format for attributes.
-	 */
-	if (xfs_has_crc(mp) && xfs_has_noattr2(mp)) {
-		xfs_warn(mp, "Cannot mount a V5 filesystem as noattr2. "
-			     "attr2 is always enabled for V5 filesystems.");
-		return -EINVAL;
-	}
-
-	/*
 	 * prohibit r/w mounts of read-only filesystems
 	 */
 	if ((mp->m_sb.sb_flags & XFS_SBF_READONLY) && !xfs_is_readonly(mp)) {
@@ -1430,6 +1430,9 @@ xfs_fs_parse_param(
 		return opt;
 
 	switch (opt) {
+	case Op_deprecated:
+		xfs_fs_warn_deprecated(fc, param);
+		return 0;
 	case Opt_logbufs:
 		parsing_mp->m_logbufs = result.uint_32;
 		return 0;
@@ -1550,23 +1553,6 @@ xfs_fs_parse_param(
 		xfs_mount_set_dax_mode(parsing_mp, result.uint_32);
 		return 0;
 #endif
-	/* Following mount options will be removed in September 2025 */
-	case Opt_ikeep:
-		xfs_fs_warn_deprecated(fc, param);
-		parsing_mp->m_features |= XFS_FEAT_IKEEP;
-		return 0;
-	case Opt_noikeep:
-		xfs_fs_warn_deprecated(fc, param);
-		parsing_mp->m_features &= ~XFS_FEAT_IKEEP;
-		return 0;
-	case Opt_attr2:
-		xfs_fs_warn_deprecated(fc, param);
-		parsing_mp->m_features |= XFS_FEAT_ATTR2;
-		return 0;
-	case Opt_noattr2:
-		xfs_fs_warn_deprecated(fc, param);
-		parsing_mp->m_features |= XFS_FEAT_NOATTR2;
-		return 0;
 	case Opt_max_open_zones:
 		parsing_mp->m_max_open_zones = result.uint_32;
 		return 0;
@@ -1601,16 +1587,6 @@ xfs_fs_validate_params(
 		xfs_warn(mp, "no-recovery mounts must be read-only.");
 		return -EINVAL;
 	}
-
-	/*
-	 * We have not read the superblock at this point, so only the attr2
-	 * mount option can set the attr2 feature by this stage.
-	 */
-	if (xfs_has_attr2(mp) && xfs_has_noattr2(mp)) {
-		xfs_warn(mp, "attr2 and noattr2 cannot both be specified.");
-		return -EINVAL;
-	}
-
 
 	if (xfs_has_noalign(mp) && (mp->m_dalign || mp->m_swidth)) {
 		xfs_warn(mp,
@@ -1710,7 +1686,10 @@ xfs_fs_fill_super(
 	if (error)
 		return error;
 
-	sb_min_blocksize(sb, BBSIZE);
+	if (!sb_min_blocksize(sb, BBSIZE)) {
+		xfs_err(mp, "unable to set blocksize");
+		return -EINVAL;
+	}
 	sb->s_xattr = xfs_xattr_handlers;
 	sb->s_export_op = &xfs_export_operations;
 #ifdef CONFIG_XFS_QUOTA
@@ -2185,21 +2164,6 @@ xfs_fs_reconfigure(
 	error = xfs_fs_validate_params(new_mp);
 	if (error)
 		return error;
-
-	/* attr2 -> noattr2 */
-	if (xfs_has_noattr2(new_mp)) {
-		if (xfs_has_crc(mp)) {
-			xfs_warn(mp,
-			"attr2 is always enabled for a V5 filesystem - can't be changed.");
-			return -EINVAL;
-		}
-		mp->m_features &= ~XFS_FEAT_ATTR2;
-		mp->m_features |= XFS_FEAT_NOATTR2;
-	} else if (xfs_has_attr2(new_mp)) {
-		/* noattr2 -> attr2 */
-		mp->m_features &= ~XFS_FEAT_NOATTR2;
-		mp->m_features |= XFS_FEAT_ATTR2;
-	}
 
 	/* Validate new max_atomic_write option before making other changes */
 	if (mp->m_awu_max_bytes != new_mp->m_awu_max_bytes) {
