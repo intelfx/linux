@@ -453,9 +453,17 @@ static u32 ieee80211_get_rate_duration(struct ieee80211_hw *hw,
 		return 0;
 	}
 
-	if (WARN_ON_ONCE((status->encoding != RX_ENC_HE && streams > 4) ||
-			 (status->encoding == RX_ENC_HE && streams > 8)))
+	if (unlikely(status->encoding != RX_ENC_HE && streams > 4)) {
+		pr_warn_once("status->encoding != RX_ENC_HE (%u != %d) && streams > 4 (%d > 4)\n",
+			     status->encoding, RX_ENC_HE, streams);
 		return 0;
+	}
+
+	if (unlikely(status->encoding == RX_ENC_HE && streams > 8)) {
+		pr_warn_once("status->encoding == RX_ENC_HE (%u == %d) && streams > 8 (%d > 8)\n",
+			     status->encoding, RX_ENC_HE, streams);
+		return 0;
+	}
 
 	duration = airtime_mcs_groups[group].duration[idx];
 	duration <<= airtime_mcs_groups[group].shift;
