@@ -362,6 +362,17 @@ generate_smb3signingkey(struct cifs_ses *ses,
 				  SMB2_NTLMV2_SESSKEY_SIZE);
 		if (rc)
 			return rc;
+		/*
+		 * Per MS-SMB2 3.2.5.3.1, signing key always uses Session.SessionKey
+		 * (first 16 bytes). Encryption/decryption keys use
+		 * Session.FullSessionKey when dialect is 3.1.1 and cipher is
+		 * AES-256-CCM or AES-256-GCM, otherwise Session.SessionKey.
+		 */
+
+		if (server->dialect == SMB311_PROT_ID &&
+		    (server->cipher_type == SMB2_ENCRYPTION_AES256_CCM ||
+		     server->cipher_type == SMB2_ENCRYPTION_AES256_GCM))
+			full_key_size = ses->auth_key.len;
 
 		/*
 		 * Per MS-SMB2 3.2.5.3.1, signing key always uses Session.SessionKey
