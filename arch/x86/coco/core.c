@@ -129,6 +129,11 @@ u64 cc_mkdec(u64 val)
 }
 EXPORT_SYMBOL_GPL(cc_mkdec);
 
+enum cc_vendor cc_get_vendor(void)
+{
+	return vendor;
+}
+
 __init void cc_set_vendor(enum cc_vendor v)
 {
 	vendor = v;

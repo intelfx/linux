@@ -133,6 +133,28 @@ enum cpuhp_state {
 	CPUHP_MIPS_SOC_PREPARE,
 	CPUHP_BP_PREPARE_DYN,
 	CPUHP_BP_PREPARE_DYN_END		= CPUHP_BP_PREPARE_DYN + 20,
+	/*
+	 * This is an optional state if the architecture supports parallel
+	 * startup. It's used to start bringing the CPU online (e.g. send
+	 * the startup IPI) so that the APs can run in parallel through
+	 * the low level startup code instead of waking them one by one in
+	 * CPUHP_BRINGUP_CPU. This avoids waiting for the AP to react and
+	 * shortens the serialized phase of the bringup.
+	 *
+	 * If the architecture registers this state, all APs will be taken
+	 * to it (and thus through all prior states) before any is taken
+	 * to the subsequent CPUHP_BRINGUP_CPU state.
+	 */
+	CPUHP_BP_PARALLEL_STARTUP,
+
+	/*
+	 * This step brings the AP online and takes it to the point where it
+	 * manages its own state from here on. For the time being, the rest
+	 * of the AP bringup is fully serialized despite running on the AP.
+	 * If the architecture doesn't use the CPUHP_BP_PARALLEL_STARTUP
+	 * state, this step also does all the work of bringing the CPU
+	 * online.
+	 */
 	CPUHP_BRINGUP_CPU,
 
 	/*
