@@ -151,6 +151,8 @@ quiet_cmd_xz = XZ      $@
       cmd_xz = $(XZ) --check=crc32 --lzma2=dict=1MiB -f $<
 quiet_cmd_zstd = ZSTD    $@
       cmd_zstd = $(ZSTD) --rm -f -q $<
+quiet_cmd_zstd22 = ZSTD22  $@
+      cmd_zstd22 = $(ZSTD) -22 --ultra --rm -f -q $<
 
 $(dst)/%.ko.gz: $(dst)/%.ko FORCE
 	$(call cmd,gzip)
@@ -159,7 +161,7 @@ $(dst)/%.ko.xz: $(dst)/%.ko FORCE
 	$(call cmd,xz)
 
 $(dst)/%.ko.zst: $(dst)/%.ko FORCE
-	$(call cmd,zstd)
+	$(call cmd,zstd22)
 
 PHONY += FORCE
 FORCE:
