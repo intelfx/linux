@@ -32,7 +32,7 @@ EXPORT_SYMBOL(__max_die_per_package);
 /*
  * Check if given CPUID extended topology "leaf" is implemented
  */
-static int check_extended_topology_leaf(int leaf)
+int check_extended_topology_leaf(int leaf)
 {
 	unsigned int eax, ebx, ecx, edx;
 
