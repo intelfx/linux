@@ -356,14 +356,14 @@ void netfs_wait_for_in_progress_stream(struct netfs_io_request *rreq,
 	DEFINE_WAIT(myself);
 
 	list_for_each_entry(subreq, &stream->subrequests, rreq_link) {
-		if (!test_bit(NETFS_SREQ_IN_PROGRESS, &subreq->flags))
+		if (!netfs_check_subreq_in_progress(subreq))
 			continue;
 
 		trace_netfs_rreq(rreq, netfs_rreq_trace_wait_queue);
 		for (;;) {
 			prepare_to_wait(&rreq->waitq, &myself, TASK_UNINTERRUPTIBLE);
 
-			if (!test_bit(NETFS_SREQ_IN_PROGRESS, &subreq->flags))
+			if (!netfs_check_subreq_in_progress(subreq))
 				break;
 
 			trace_netfs_sreq(subreq, netfs_sreq_trace_wait_for);
@@ -383,7 +383,7 @@ static int netfs_collect_in_app(struct netfs_io_request *rreq,
 {
 	bool need_collect = false, inactive = true, done = true;
 
-	if (!test_bit(NETFS_RREQ_IN_PROGRESS, &rreq->flags)) {
+	if (!netfs_check_rreq_in_progress(rreq)) {
 		trace_netfs_rreq(rreq, netfs_rreq_trace_recollect);
 		return 1; /* Done */
 	}
@@ -400,7 +400,7 @@ static int netfs_collect_in_app(struct netfs_io_request *rreq,
 						  struct netfs_io_subrequest,
 						  rreq_link);
 		if (subreq &&
-		    (!test_bit(NETFS_SREQ_IN_PROGRESS, &subreq->flags) ||
+		    (!netfs_check_subreq_in_progress(subreq) ||
 		     test_bit(NETFS_SREQ_MADE_PROGRESS, &subreq->flags))) {
 			need_collect = true;
 			break;
@@ -447,14 +447,14 @@ static ssize_t netfs_wait_for_in_progress(struct netfs_io_request *rreq,
 			case 1:
 				goto all_collected;
 			case 2:
-				if (!test_bit(NETFS_RREQ_IN_PROGRESS, &rreq->flags))
+				if (!netfs_check_rreq_in_progress(rreq))
 					break;
 				cond_resched();
 				continue;
 			}
 		}
 
-		if (!test_bit(NETFS_RREQ_IN_PROGRESS, &rreq->flags))
+		if (!netfs_check_rreq_in_progress(rreq))
 			break;
 
 		schedule();
@@ -517,7 +517,7 @@ static void netfs_wait_for_pause(struct netfs_io_request *rreq,
 			case 1:
 				goto all_collected;
 			case 2:
-				if (!test_bit(NETFS_RREQ_IN_PROGRESS, &rreq->flags) ||
+				if (!netfs_check_rreq_in_progress(rreq) ||
 				    !test_bit(NETFS_RREQ_PAUSE, &rreq->flags))
 					break;
 				cond_resched();
@@ -525,7 +525,7 @@ static void netfs_wait_for_pause(struct netfs_io_request *rreq,
 			}
 		}
 
-		if (!test_bit(NETFS_RREQ_IN_PROGRESS, &rreq->flags) ||
+		if (!netfs_check_rreq_in_progress(rreq) ||
 		    !test_bit(NETFS_RREQ_PAUSE, &rreq->flags))
 			break;
 

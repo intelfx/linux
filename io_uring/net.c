@@ -195,7 +195,6 @@ static inline void io_mshot_prep_retry(struct io_kiocb *req,
 	sr->done_io = 0;
 	sr->retry_flags = 0;
 	sr->len = 0; /* get from the provided buffer */
-	req->buf_index = sr->buf_group;
 }
 
 static int io_net_import_vec(struct io_kiocb *req, struct io_async_msghdr *iomsg,
@@ -576,6 +575,7 @@ static int io_send_select_buffer(struct io_kiocb *req, unsigned int issue_flags,
 		.iovs = &kmsg->fast_iov,
 		.max_len = min_not_zero(sr->len, INT_MAX),
 		.nr_iovs = 1,
+		.buf_group = sr->buf_group,
 	};
 
 	if (kmsg->vec.iovec) {
@@ -1074,6 +1074,7 @@ static int io_recv_buf_select(struct io_kiocb *req, struct io_async_msghdr *kmsg
 			.iovs = &kmsg->fast_iov,
 			.nr_iovs = 1,
 			.mode = KBUF_MODE_EXPAND,
+			.buf_group = sr->buf_group,
 		};
 
 		if (kmsg->vec.iovec) {
