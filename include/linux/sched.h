@@ -20,7 +20,7 @@
 #include <linux/hrtimer.h>
 #include <linux/irqflags.h>
 #include <linux/seccomp.h>
-#include <linux/nodemask.h>
+#include <linux/nodemask_types.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
 #include <linux/resource.h>
@@ -870,6 +870,7 @@ struct task_struct {
 
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
+	struct address_space		*faults_disabled_mapping;
 
 	int				exit_state;
 	int				exit_code;
@@ -1162,7 +1163,7 @@ struct task_struct {
 #endif
 
 #ifdef CONFIG_LOCKDEP
-# define MAX_LOCK_DEPTH			48UL
+# define MAX_LOCK_DEPTH			63UL
 	u64				curr_chain_key;
 	int				lockdep_depth;
 	unsigned int			lockdep_recursion;
