@@ -659,6 +659,42 @@ static int find_num_cache_leaves(struct cpuinfo_x86 *c)
 	return i;
 }
 
+void cacheinfo_topoext_init_l2c_id(struct cpuinfo_x86 *c, int cpu)
+{
+	u32 eax, ebx, ecx, edx, num_sharing_cache;
+	int i = 0, bits;
+
+	/* Check if L2 cache identifiers exists. */
+	if (!cpuid_ecx(0x80000006))
+		return;
+
+	while (true) {
+		u32 level;
+
+		cpuid_count(0x8000001d, i, &eax, &ebx, &ecx, &edx);
+		if (!eax)
+			return;
+
+		/*
+		 * Check if the current leaf is for L2 cache using
+		 * eax[7:5] used to describe the cache level.
+		 */
+		level = (eax >> 5) & 0x7;
+		if (level == 2)
+			break;
+
+		++i;
+	}
+
+	/*
+	 * L2 ID is calculated from the number of threads
+	 * sharing the L2 cache.
+	 */
+	num_sharing_cache = ((eax >> 14) & 0xfff) + 1;
+	bits = get_count_order(num_sharing_cache);
+	per_cpu(cpu_l2c_id, cpu) = c->apicid >> bits;
+}
+
 void cacheinfo_amd_init_llc_id(struct cpuinfo_x86 *c, int cpu)
 {
 	/*
