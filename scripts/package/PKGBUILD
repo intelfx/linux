@@ -49,6 +49,10 @@ build() {
 	_prologue
 
 	${MAKE} KERNELRELEASE="${KERNELRELEASE}" KBUILD_BUILD_VERSION="${pkgrel}"
+	# hack: do not leak a (relative) $srctree into a subdir Makefile
+	srctree= objtree= \
+	${MAKE} KERNELRELEASE="${KERNELRELEASE}" KBUILD_BUILD_VERSION="${pkgrel}" \
+		-C tools/bpf/bpftool vmlinux.h feature-clang-bpf-co-re=1
 }
 
 _package() {
@@ -89,6 +93,10 @@ _package-headers() {
 	if grep -q CONFIG_MODULES=y include/config/auto.conf; then
 		echo "Installing build files..."
 		"${srctree}/scripts/package/install-extmod-build" "${builddir}"
+		# install the CO-RE vmlinux.h we built separately
+		install -Dt "$builddir" -m644 "${srctree}/tools/bpf/bpftool/vmlinux.h"
+		# add a symlink historically present in Arch kernel packages
+		ln -srt "$builddir" "$builddir/scripts/gdb/vmlinux-gdb.py"
 	fi
 
 	echo "Installing System.map and config..."
