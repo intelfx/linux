@@ -104,7 +104,7 @@
 
 struct closure;
 struct closure_syncer;
-typedef void (closure_fn) (struct closure *);
+typedef void (closure_fn) (struct work_struct *);
 extern struct dentry *bcache_debug;
 
 struct closure_waitlist {
@@ -154,10 +154,12 @@ struct closure {
 	struct closure		*parent;
 
 	atomic_t		remaining;
+	bool			closure_get_happened;
 
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+#ifdef CONFIG_DEBUG_CLOSURES
 #define CLOSURE_MAGIC_DEAD	0xc054dead
 #define CLOSURE_MAGIC_ALIVE	0xc054a11e
+#define CLOSURE_MAGIC_STACK	0xc05451cc
 
 	unsigned int		magic;
 	struct list_head	all;
@@ -172,6 +174,11 @@ void __closure_wake_up(struct closure_waitlist *list);
 bool closure_wait(struct closure_waitlist *list, struct closure *cl);
 void __closure_sync(struct closure *cl);
 
+static inline unsigned closure_nr_remaining(struct closure *cl)
+{
+	return atomic_read(&cl->remaining) & CLOSURE_REMAINING_MASK;
+}
+
 /**
  * closure_sync - sleep until a closure a closure has nothing left to wait on
  *
@@ -180,19 +187,33 @@ void __closure_sync(struct closure *cl);
  */
 static inline void closure_sync(struct closure *cl)
 {
-	if ((atomic_read(&cl->remaining) & CLOSURE_REMAINING_MASK) != 1)
+#ifdef CONFIG_DEBUG_CLOSURES
+	BUG_ON(closure_nr_remaining(cl) != 1 && !cl->closure_get_happened);
+#endif
+
+	if (cl->closure_get_happened)
 		__closure_sync(cl);
 }
 
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+int __closure_sync_timeout(struct closure *cl, unsigned long timeout);
 
-void closure_debug_init(void);
+static inline int closure_sync_timeout(struct closure *cl, unsigned long timeout)
+{
+#ifdef CONFIG_DEBUG_CLOSURES
+	BUG_ON(closure_nr_remaining(cl) != 1 && !cl->closure_get_happened);
+#endif
+	return cl->closure_get_happened
+		? __closure_sync_timeout(cl, timeout)
+		: 0;
+}
+
+#ifdef CONFIG_DEBUG_CLOSURES
+
 void closure_debug_create(struct closure *cl);
 void closure_debug_destroy(struct closure *cl);
 
 #else
 
-static inline void closure_debug_init(void) {}
 static inline void closure_debug_create(struct closure *cl) {}
 static inline void closure_debug_destroy(struct closure *cl) {}
 
@@ -200,21 +221,21 @@ static inline void closure_debug_destroy(struct closure *cl) {}
 
 static inline void closure_set_ip(struct closure *cl)
 {
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+#ifdef CONFIG_DEBUG_CLOSURES
 	cl->ip = _THIS_IP_;
 #endif
 }
 
 static inline void closure_set_ret_ip(struct closure *cl)
 {
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+#ifdef CONFIG_DEBUG_CLOSURES
 	cl->ip = _RET_IP_;
 #endif
 }
 
 static inline void closure_set_waiting(struct closure *cl, unsigned long f)
 {
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+#ifdef CONFIG_DEBUG_CLOSURES
 	cl->waiting_on = f;
 #endif
 }
@@ -230,8 +251,6 @@ static inline void set_closure_fn(struct closure *cl, closure_fn *fn,
 	closure_set_ip(cl);
 	cl->fn = fn;
 	cl->wq = wq;
-	/* between atomic_dec() in closure_put() */
-	smp_mb__before_atomic();
 }
 
 static inline void closure_queue(struct closure *cl)
@@ -243,11 +262,12 @@ static inline void closure_queue(struct closure *cl)
 	 */
 	BUILD_BUG_ON(offsetof(struct closure, fn)
 		     != offsetof(struct work_struct, func));
+
 	if (wq) {
 		INIT_WORK(&cl->work, cl->work.func);
 		BUG_ON(!queue_work(wq, &cl->work));
 	} else
-		cl->fn(cl);
+		cl->fn(&cl->work);
 }
 
 /**
@@ -255,12 +275,29 @@ static inline void closure_queue(struct closure *cl)
  */
 static inline void closure_get(struct closure *cl)
 {
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+	cl->closure_get_happened = true;
+
+#ifdef CONFIG_DEBUG_CLOSURES
 	BUG_ON((atomic_inc_return(&cl->remaining) &
 		CLOSURE_REMAINING_MASK) <= 1);
 #else
 	atomic_inc(&cl->remaining);
 #endif
+}
+
+/**
+ * closure_get_not_zero
+ */
+static inline bool closure_get_not_zero(struct closure *cl)
+{
+	unsigned old = atomic_read(&cl->remaining);
+	do {
+		if (!(old & CLOSURE_REMAINING_MASK))
+			return false;
+
+	} while (!atomic_try_cmpxchg_acquire(&cl->remaining, &old, old + 1));
+
+	return true;
 }
 
 /**
@@ -271,12 +308,13 @@ static inline void closure_get(struct closure *cl)
  */
 static inline void closure_init(struct closure *cl, struct closure *parent)
 {
-	memset(cl, 0, sizeof(struct closure));
+	cl->fn = NULL;
 	cl->parent = parent;
 	if (parent)
 		closure_get(parent);
 
 	atomic_set(&cl->remaining, CLOSURE_REMAINING_INITIALIZER);
+	cl->closure_get_happened = false;
 
 	closure_debug_create(cl);
 	closure_set_ip(cl);
@@ -286,6 +324,18 @@ static inline void closure_init_stack(struct closure *cl)
 {
 	memset(cl, 0, sizeof(struct closure));
 	atomic_set(&cl->remaining, CLOSURE_REMAINING_INITIALIZER);
+#ifdef CONFIG_DEBUG_CLOSURES
+	cl->magic = CLOSURE_MAGIC_STACK;
+#endif
+}
+
+static inline void closure_init_stack_release(struct closure *cl)
+{
+	memset(cl, 0, sizeof(struct closure));
+	atomic_set_release(&cl->remaining, CLOSURE_REMAINING_INITIALIZER);
+#ifdef CONFIG_DEBUG_CLOSURES
+	cl->magic = CLOSURE_MAGIC_STACK;
+#endif
 }
 
 /**
@@ -298,6 +348,11 @@ static inline void closure_wake_up(struct closure_waitlist *list)
 	smp_mb();
 	__closure_wake_up(list);
 }
+
+#define CLOSURE_CALLBACK(name)	void name(struct work_struct *ws)
+#define closure_type(name, type, member)				\
+	struct closure *cl = container_of(ws, struct closure, work);	\
+	type *name = container_of(cl, type, member)
 
 /**
  * continue_at - jump to another function with barrier
@@ -327,6 +382,8 @@ do {									\
  * thought of as returning to the parent closure.
  */
 #define closure_return(_cl)	continue_at((_cl), NULL, NULL)
+
+void closure_return_sync(struct closure *cl);
 
 /**
  * continue_at_nobarrier - jump to another function without barrier
@@ -374,5 +431,27 @@ static inline void closure_call(struct closure *cl, closure_fn fn,
 	closure_init(cl, parent);
 	continue_at_nobarrier(cl, fn, wq);
 }
+
+#define __closure_wait_event(waitlist, _cond)				\
+do {									\
+	struct closure cl;						\
+									\
+	closure_init_stack(&cl);					\
+									\
+	while (1) {							\
+		closure_wait(waitlist, &cl);				\
+		if (_cond)						\
+			break;						\
+		closure_sync(&cl);					\
+	}								\
+	closure_wake_up(waitlist);					\
+	closure_sync(&cl);						\
+} while (0)
+
+#define closure_wait_event(waitlist, _cond)				\
+do {									\
+	if (!(_cond))							\
+		__closure_wait_event(waitlist, _cond);			\
+} while (0)
 
 #endif /* _LINUX_CLOSURE_H */
