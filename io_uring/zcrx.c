@@ -400,6 +400,7 @@ static int io_allocate_rbuf_ring(struct io_ring_ctx *ctx,
 	ifq->rq_ring = (struct io_uring *)ptr;
 	ifq->rqes = (struct io_uring_zcrx_rqe *)(ptr + off);
 
+	memset(ifq->rq_ring, 0, sizeof(*ifq->rq_ring));
 	return 0;
 }
 
