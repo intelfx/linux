@@ -400,6 +400,7 @@ static int io_allocate_rbuf_ring(struct io_ring_ctx *ctx,
 	ifq->rq_ring = (struct io_uring *)ptr;
 	ifq->rqes = (struct io_uring_zcrx_rqe *)(ptr + off);
 
+	memset(ifq->rq_ring, 0, sizeof(*ifq->rq_ring));
 	return 0;
 }
 
@@ -587,6 +588,8 @@ static void io_zcrx_return_niov_freelist(struct net_iov *niov)
 	struct io_zcrx_area *area = io_zcrx_iov_to_area(niov);
 
 	spin_lock_bh(&area->freelist_lock);
+	if (WARN_ON_ONCE(area->free_count >= area->nia.num_niovs))
+		return;
 	area->freelist[area->free_count++] = net_iov_idx(niov);
 	spin_unlock_bh(&area->freelist_lock);
 }
