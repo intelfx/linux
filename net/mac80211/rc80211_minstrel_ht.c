@@ -438,8 +438,13 @@ minstrel_ht_get_tp_avg(struct minstrel_ht_sta *mi, int group, int rate,
 
 	if (minstrel_ht_is_legacy_group(group))
 		overhead = mi->overhead_legacy;
-	else
+	else {
 		ampdu_len = minstrel_ht_avg_ampdu_len(mi);
+		if (unlikely(!ampdu_len)) {
+			pr_err_once("%s: ampdu_len == 0!\n", __func__);
+			ampdu_len = 1;
+		}
+	}
 
 	nsecs = 1000 * overhead / ampdu_len;
 	nsecs += minstrel_mcs_groups[group].duration[rate] <<
