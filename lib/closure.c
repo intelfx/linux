@@ -6,21 +6,36 @@
  * Copyright 2012 Google, Inc.
  */
 
+#include <linux/closure.h>
 #include <linux/debugfs.h>
-#include <linux/module.h>
+#include <linux/export.h>
+#include <linux/rcupdate.h>
 #include <linux/seq_file.h>
 #include <linux/sched/debug.h>
 
-#include "closure.h"
-
-static inline void closure_put_after_sub(struct closure *cl, int flags)
+static inline void closure_put_after_sub_checks(int flags)
 {
 	int r = flags & CLOSURE_REMAINING_MASK;
 
-	BUG_ON(flags & CLOSURE_GUARD_MASK);
-	BUG_ON(!r && (flags & ~CLOSURE_DESTRUCTOR));
+	if (WARN(flags & CLOSURE_GUARD_MASK,
+		 "closure has guard bits set: %x (%u)",
+		 flags & CLOSURE_GUARD_MASK, (unsigned) __fls(r)))
+		r &= ~CLOSURE_GUARD_MASK;
 
-	if (!r) {
+	WARN(!r && (flags & ~CLOSURE_DESTRUCTOR),
+	     "closure ref hit 0 with incorrect flags set: %x (%u)",
+	     flags & ~CLOSURE_DESTRUCTOR, (unsigned) __fls(flags));
+}
+
+static inline void closure_put_after_sub(struct closure *cl, int flags)
+{
+	closure_put_after_sub_checks(flags);
+
+	if (!(flags & CLOSURE_REMAINING_MASK)) {
+		smp_acquire__after_ctrl_dep();
+
+		cl->closure_get_happened = false;
+
 		if (cl->fn && !(flags & CLOSURE_DESTRUCTOR)) {
 			atomic_set(&cl->remaining,
 				   CLOSURE_REMAINING_INITIALIZER);
@@ -32,7 +47,7 @@ static inline void closure_put_after_sub(struct closure *cl, int flags)
 			closure_debug_destroy(cl);
 
 			if (destructor)
-				destructor(cl);
+				destructor(&cl->work);
 
 			if (parent)
 				closure_put(parent);
@@ -43,16 +58,18 @@ static inline void closure_put_after_sub(struct closure *cl, int flags)
 /* For clearing flags with the same atomic op as a put */
 void closure_sub(struct closure *cl, int v)
 {
-	closure_put_after_sub(cl, atomic_sub_return(v, &cl->remaining));
+	closure_put_after_sub(cl, atomic_sub_return_release(v, &cl->remaining));
 }
+EXPORT_SYMBOL(closure_sub);
 
 /*
  * closure_put - decrement a closure's refcount
  */
 void closure_put(struct closure *cl)
 {
-	closure_put_after_sub(cl, atomic_dec_return(&cl->remaining));
+	closure_put_after_sub(cl, atomic_dec_return_release(&cl->remaining));
 }
+EXPORT_SYMBOL(closure_put);
 
 /*
  * closure_wake_up - wake up all closures on a wait list, without memory barrier
@@ -74,6 +91,7 @@ void __closure_wake_up(struct closure_waitlist *wait_list)
 		closure_sub(cl, CLOSURE_WAITING + 1);
 	}
 }
+EXPORT_SYMBOL(__closure_wake_up);
 
 /**
  * closure_wait - add a closure to a waitlist
@@ -87,20 +105,23 @@ bool closure_wait(struct closure_waitlist *waitlist, struct closure *cl)
 	if (atomic_read(&cl->remaining) & CLOSURE_WAITING)
 		return false;
 
+	cl->closure_get_happened = true;
 	closure_set_waiting(cl, _RET_IP_);
 	atomic_add(CLOSURE_WAITING + 1, &cl->remaining);
 	llist_add(&cl->list, &waitlist->list);
 
 	return true;
 }
+EXPORT_SYMBOL(closure_wait);
 
 struct closure_syncer {
 	struct task_struct	*task;
 	int			done;
 };
 
-static void closure_sync_fn(struct closure *cl)
+static CLOSURE_CALLBACK(closure_sync_fn)
 {
+	struct closure *cl = container_of(ws, struct closure, work);
 	struct closure_syncer *s = cl->s;
 	struct task_struct *p;
 
@@ -127,8 +148,81 @@ void __sched __closure_sync(struct closure *cl)
 
 	__set_current_state(TASK_RUNNING);
 }
+EXPORT_SYMBOL(__closure_sync);
 
-#ifdef CONFIG_BCACHE_CLOSURES_DEBUG
+/*
+ * closure_return_sync - finish running a closure, synchronously (i.e. waiting
+ * for outstanding get()s to finish) and returning once closure refcount is 0.
+ *
+ * Unlike closure_sync() this doesn't reinit the ref to 1; subsequent
+ * closure_get_not_zero() calls waill fail.
+ */
+void __sched closure_return_sync(struct closure *cl)
+{
+	struct closure_syncer s = { .task = current };
+
+	cl->s = &s;
+	set_closure_fn(cl, closure_sync_fn, NULL);
+
+	unsigned flags = atomic_sub_return_release(1 + CLOSURE_RUNNING - CLOSURE_DESTRUCTOR,
+						   &cl->remaining);
+
+	closure_put_after_sub_checks(flags);
+
+	if (unlikely(flags & CLOSURE_REMAINING_MASK)) {
+		while (1) {
+			set_current_state(TASK_UNINTERRUPTIBLE);
+			if (s.done)
+				break;
+			schedule();
+		}
+
+		__set_current_state(TASK_RUNNING);
+	}
+
+	if (cl->parent)
+		closure_put(cl->parent);
+}
+EXPORT_SYMBOL(closure_return_sync);
+
+int __sched __closure_sync_timeout(struct closure *cl, unsigned long timeout)
+{
+	struct closure_syncer s = { .task = current };
+	int ret = 0;
+
+	cl->s = &s;
+	continue_at(cl, closure_sync_fn, NULL);
+
+	while (1) {
+		set_current_state(TASK_UNINTERRUPTIBLE);
+		if (s.done)
+			break;
+		if (!timeout) {
+			/*
+			 * Carefully undo the continue_at() - but only if it
+			 * hasn't completed, i.e. the final closure_put() hasn't
+			 * happened yet:
+			 */
+			unsigned old, new, v = atomic_read(&cl->remaining);
+			do {
+				old = v;
+				if (!old || (old & CLOSURE_RUNNING))
+					goto success;
+
+				new = old + CLOSURE_REMAINING_INITIALIZER;
+			} while ((v = atomic_cmpxchg(&cl->remaining, old, new)) != old);
+			ret = -ETIME;
+		}
+
+		timeout = schedule_timeout(timeout);
+	}
+success:
+	__set_current_state(TASK_RUNNING);
+	return ret;
+}
+EXPORT_SYMBOL(__closure_sync_timeout);
+
+#ifdef CONFIG_DEBUG_CLOSURES
 
 static LIST_HEAD(closure_list);
 static DEFINE_SPINLOCK(closure_list_lock);
@@ -144,10 +238,14 @@ void closure_debug_create(struct closure *cl)
 	list_add(&cl->all, &closure_list);
 	spin_unlock_irqrestore(&closure_list_lock, flags);
 }
+EXPORT_SYMBOL(closure_debug_create);
 
 void closure_debug_destroy(struct closure *cl)
 {
 	unsigned long flags;
+
+	if (cl->magic == CLOSURE_MAGIC_STACK)
+		return;
 
 	BUG_ON(cl->magic != CLOSURE_MAGIC_ALIVE);
 	cl->magic = CLOSURE_MAGIC_DEAD;
@@ -156,8 +254,7 @@ void closure_debug_destroy(struct closure *cl)
 	list_del(&cl->all);
 	spin_unlock_irqrestore(&closure_list_lock, flags);
 }
-
-static struct dentry *closure_debug;
+EXPORT_SYMBOL(closure_debug_destroy);
 
 static int debug_show(struct seq_file *f, void *data)
 {
@@ -181,7 +278,7 @@ static int debug_show(struct seq_file *f, void *data)
 			seq_printf(f, " W %pS\n",
 				   (void *) cl->waiting_on);
 
-		seq_printf(f, "\n");
+		seq_puts(f, "\n");
 	}
 
 	spin_unlock_irq(&closure_list_lock);
@@ -190,18 +287,11 @@ static int debug_show(struct seq_file *f, void *data)
 
 DEFINE_SHOW_ATTRIBUTE(debug);
 
-void  __init closure_debug_init(void)
+static int __init closure_debug_init(void)
 {
-	if (!IS_ERR_OR_NULL(bcache_debug))
-		/*
-		 * it is unnecessary to check return value of
-		 * debugfs_create_file(), we should not care
-		 * about this.
-		 */
-		closure_debug = debugfs_create_file(
-			"closures", 0400, bcache_debug, NULL, &debug_fops);
+	debugfs_create_file("closures", 0400, NULL, NULL, &debug_fops);
+	return 0;
 }
-#endif
+late_initcall(closure_debug_init)
 
-MODULE_AUTHOR("Kent Overstreet <koverstreet@google.com>");
-MODULE_LICENSE("GPL");
+#endif
