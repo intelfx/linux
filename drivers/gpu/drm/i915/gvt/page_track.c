@@ -146,6 +146,7 @@ int intel_vgpu_disable_page_track(struct intel_vgpu *vgpu, unsigned long gfn)
 	return 0;
 }
 
+int ppgtt_invalidate_spt(struct intel_vgpu_ppgtt_spt *spt);
 /**
  * intel_vgpu_page_track_handler - called when write to write-protected page
  * @vgpu: a vGPU
@@ -161,12 +162,28 @@ int intel_vgpu_page_track_handler(struct intel_vgpu *vgpu, u64 gpa,
 {
 	struct intel_vgpu_page_track *page_track;
 	int ret = 0;
+	struct intel_vgpu_ppgtt_spt *spt = 0;
 
 	mutex_lock(&vgpu->vgpu_lock);
 
 	page_track = intel_vgpu_find_page_track(vgpu, gpa >> PAGE_SHIFT);
 	if (!page_track) {
 		ret = -ENXIO;
+		goto out;
+	}
+
+	/**
+	 * Workaround for buggy guest drivers where the driver re-uses PPGTT memory prior to sending an invalidation command
+	 * via a g2v_notification. Under normal circumstances, the GVT code allows 4 and 8 byte write accesses to PPGTT.
+	 * Field testing has however showed that, at least when using Windows 10 as a guest, only 8 byte access are issued from the driver-
+	 * We use this knowledge here so we can detect when we get page track accesses on memoy that is not used for a PPGTT anymore.
+	 * This is of course not 100% bullet prove but it improves the situation quite a lot.
+	 */
+	if (bytes != 8) {
+		printk(KERN_ERR "Invalid PPGTT access size (%d), ignoring write and untracking page\n", bytes);
+		spt = page_track->priv_data;
+		ppgtt_invalidate_spt(spt);
+		ret = 0;
 		goto out;
 	}
 

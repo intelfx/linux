@@ -1359,7 +1359,8 @@ iwl_parse_mei_nvm_data(struct iwl_trans *trans, const struct iwl_cfg *cfg,
 	}
 
 	if (data->lar_enabled &&
-	    fw_has_capa(&fw->ucode_capa, IWL_UCODE_TLV_CAPA_LAR_SUPPORT))
+	    fw_has_capa(&fw->ucode_capa, IWL_UCODE_TLV_CAPA_LAR_SUPPORT) &&
+	    !iwlwifi_mod_params.lar_disable)
 		sbands_flags |= IWL_NVM_SBANDS_FLAGS_LAR;
 
 	iwl_init_sbands(trans, data, mei_nvm->channels, tx_chains, rx_chains,
@@ -1443,8 +1444,7 @@ iwl_parse_nvm_data(struct iwl_trans *trans, const struct iwl_cfg *cfg,
 				 NVM_LAR_OFFSET;
 
 		lar_config = le16_to_cpup(regulatory + lar_offset);
-		data->lar_enabled = !!(lar_config &
-				       NVM_LAR_ENABLED);
+		data->lar_enabled = !!(lar_config & NVM_LAR_ENABLED);
 		lar_enabled = data->lar_enabled;
 		ch_section = &regulatory[NVM_CHANNELS_EXTENDED];
 	}
@@ -1456,7 +1456,8 @@ iwl_parse_nvm_data(struct iwl_trans *trans, const struct iwl_cfg *cfg,
 	}
 
 	if (lar_enabled &&
-	    fw_has_capa(&fw->ucode_capa, IWL_UCODE_TLV_CAPA_LAR_SUPPORT))
+	    fw_has_capa(&fw->ucode_capa, IWL_UCODE_TLV_CAPA_LAR_SUPPORT) &&
+	    !iwlwifi_mod_params.lar_disable)
 		sbands_flags |= IWL_NVM_SBANDS_FLAGS_LAR;
 
 	if (iwl_nvm_no_wide_in_5ghz(trans, cfg, nvm_hw))
@@ -1982,7 +1983,8 @@ struct iwl_nvm_data *iwl_get_nvm(struct iwl_trans *trans,
 
 	if (le32_to_cpu(rsp->regulatory.lar_enabled) &&
 	    fw_has_capa(&fw->ucode_capa,
-			IWL_UCODE_TLV_CAPA_LAR_SUPPORT)) {
+			IWL_UCODE_TLV_CAPA_LAR_SUPPORT) &&
+	    !iwlwifi_mod_params.lar_disable) {
 		nvm->lar_enabled = true;
 		sbands_flags |= IWL_NVM_SBANDS_FLAGS_LAR;
 	}
