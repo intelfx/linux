@@ -146,14 +146,16 @@ static int no_open(struct inode *inode, struct file *file)
 }
 
 /**
- * inode_init_always - perform inode structure initialisation
+ * inode_init_always_gfp - perform inode structure initialisation
  * @sb: superblock inode belongs to
  * @inode: inode to initialise
+ * @gfp: allocation flags
  *
  * These are initializations that need to be done on every inode
  * allocation as the fields are not initialised by slab allocation.
+ * If there are additional allocations required @gfp is used.
  */
-int inode_init_always(struct super_block *sb, struct inode *inode)
+int inode_init_always_gfp(struct super_block *sb, struct inode *inode, gfp_t gfp)
 {
 	static const struct inode_operations empty_iops;
 	static const struct file_operations no_open_fops = {.open = no_open};
@@ -229,13 +231,13 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 #endif
 	inode->i_flctx = NULL;
 
-	if (unlikely(security_inode_alloc(inode)))
+	if (unlikely(security_inode_alloc(inode, gfp)))
 		return -ENOMEM;
 	this_cpu_inc(nr_inodes);
 
 	return 0;
 }
-EXPORT_SYMBOL(inode_init_always);
+EXPORT_SYMBOL(inode_init_always_gfp);
 
 void free_inode_nonrcu(struct inode *inode)
 {
@@ -434,14 +436,6 @@ static void init_once(void *foo)
 	struct inode *inode = (struct inode *) foo;
 
 	inode_init_once(inode);
-}
-
-/*
- * inode->i_lock must be held
- */
-void __iget(struct inode *inode)
-{
-	atomic_inc(&inode->i_count);
 }
 
 /*
@@ -2102,7 +2096,7 @@ static int __remove_privs(struct mnt_idmap *idmap,
 	return notify_change(idmap, dentry, &newattrs, NULL);
 }
 
-static int __file_remove_privs(struct file *file, unsigned int flags)
+int file_remove_privs_flags(struct file *file, unsigned int flags)
 {
 	struct dentry *dentry = file_dentry(file);
 	struct inode *inode = file_inode(file);
@@ -2127,6 +2121,7 @@ static int __file_remove_privs(struct file *file, unsigned int flags)
 		inode_has_no_xattr(inode);
 	return error;
 }
+EXPORT_SYMBOL_GPL(file_remove_privs_flags);
 
 /**
  * file_remove_privs - remove special file privileges (suid, capabilities)
@@ -2139,7 +2134,7 @@ static int __file_remove_privs(struct file *file, unsigned int flags)
  */
 int file_remove_privs(struct file *file)
 {
-	return __file_remove_privs(file, 0);
+	return file_remove_privs_flags(file, 0);
 }
 EXPORT_SYMBOL(file_remove_privs);
 
@@ -2231,7 +2226,7 @@ static int file_modified_flags(struct file *file, int flags)
 	 * Clear the security bits if the process is not being run by root.
 	 * This keeps people from modifying setuid and setgid binaries.
 	 */
-	ret = __file_remove_privs(file, flags);
+	ret = file_remove_privs_flags(file, flags);
 	if (ret)
 		return ret;
 
@@ -2605,6 +2600,7 @@ bool in_group_or_capable(struct mnt_idmap *idmap,
 		return true;
 	return false;
 }
+EXPORT_SYMBOL(in_group_or_capable);
 
 /**
  * mode_strip_sgid - handle the sgid bit for non-directories
