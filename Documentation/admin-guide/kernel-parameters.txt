@@ -6153,6 +6153,22 @@
 			  P	Enable page structure init time poisoning
 			  -	Disable all of the above options
 
+	vm_unevictable_file_kbytes_low=nn[KMG]	[KNL]
+		Keep some file pages still mapped under memory pressure,
+		value defines a threshold to activate file pages eviction throttling.
+
+	vm_unevictable_file_kbytes_min=nn[KMG]	[KNL]
+		Keep some file pages still mapped under memory pressure,
+		value defines a hard limit.
+
+	vm_unevictable_anon_kbytes_low=nn[KMG]	[KNL]
+		Keep some anonymous pages under memory pressure,
+		value defines a threshold to throttle swapping of anonymous pages.
+
+	vm_unevictable_anon_kbytes_min=nn[KMG]	[KNL]
+		Keep some anonymous pages under memory pressure,
+		value defines a hard limit.
+
 	vmalloc=nn[KMG]	[KNL,BOOT] Forces the vmalloc area to have an exact
 			size of <nn>. This can be used to increase the
 			minimum size (128MB on x86). It can also be used to
