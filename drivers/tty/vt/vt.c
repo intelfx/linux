@@ -682,9 +682,9 @@ static u8 build_attr(struct vc_data *vc, u8 _color,
 	if (_reverse)
 		a = (a & 0x88) | (((a >> 4) | (a << 4)) & 0x77);
 	if (_blink)
-		a ^= 0x80;
+		a |= 0x80;
 	if (_intensity == VCI_BOLD)
-		a ^= 0x08;
+		a |= 0x08;
 	if (vc->vc_hi_font_mask == 0x100)
 		a <<= 1;
 	return a;
@@ -1806,8 +1806,7 @@ static void csi_m(struct vc_data *vc)
 				(vc->state.color & 0x0f);
 			break;
 		case CSI_m_BRIGHT_FG_COLOR_BEG ... CSI_m_BRIGHT_FG_COLOR_END:
-			vc->state.intensity = VCI_BOLD;
-			vc->vc_par[i] -= CSI_m_BRIGHT_FG_COLOR_OFF;
+			vc->vc_par[i] -= CSI_m_BRIGHT_FG_COLOR_OFF - 8;
 			fallthrough;
 		case CSI_m_FG_COLOR_BEG ... CSI_m_FG_COLOR_END:
 			vc->vc_par[i] -= CSI_m_FG_COLOR_BEG;
@@ -1815,7 +1814,7 @@ static void csi_m(struct vc_data *vc)
 				(vc->state.color & 0xf0);
 			break;
 		case CSI_m_BRIGHT_BG_COLOR_BEG ... CSI_m_BRIGHT_BG_COLOR_END:
-			vc->vc_par[i] -= CSI_m_BRIGHT_BG_COLOR_OFF;
+			vc->vc_par[i] -= CSI_m_BRIGHT_BG_COLOR_OFF - 8;
 			fallthrough;
 		case CSI_m_BG_COLOR_BEG ... CSI_m_BG_COLOR_END:
 			vc->vc_par[i] -= CSI_m_BG_COLOR_BEG;
