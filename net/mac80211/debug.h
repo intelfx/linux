@@ -115,6 +115,12 @@ do {									\
 			 (sdata)->name, ##__VA_ARGS__);			\
 } while (0)
 
+#define _sdata_notice(sdata, fmt, ...)					\
+do {									\
+	pr_notice("%s: " fmt,						\
+	          (sdata)->name, ##__VA_ARGS__);			\
+} while (0)
+
 #define _sdata_err(sdata, fmt, ...)					\
 do {									\
 	pr_err("%s: " fmt,						\
@@ -130,6 +136,8 @@ do {									\
 
 #define sdata_info(sdata, fmt, ...)					\
 	_sdata_info(sdata, fmt, ##__VA_ARGS__)
+#define sdata_notice(sdata, fmt, ...)					\
+	_sdata_notice(sdata, fmt, ##__VA_ARGS__)
 #define sdata_err(sdata, fmt, ...)					\
 	_sdata_err(sdata, fmt, ##__VA_ARGS__)
 #define sdata_dbg(sdata, fmt, ...)					\
