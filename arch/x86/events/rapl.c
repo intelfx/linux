@@ -915,7 +915,7 @@ static int __init rapl_pmu_init(void)
 		return ret;
 
 	rapl_pmus_pkg->cntr_mask = perf_msr_probe(rapl_model->rapl_pkg_msrs,
-						  PERF_RAPL_PKG_EVENTS_MAX, false,
+						  PERF_RAPL_PKG_EVENTS_MAX, true,
 						  (void *) &rapl_model->pkg_events);
 
 	ret = perf_pmu_register(&rapl_pmus_pkg->pmu, "power", -1);
@@ -932,7 +932,7 @@ static int __init rapl_pmu_init(void)
 		}
 
 		rapl_pmus_core->cntr_mask = perf_msr_probe(rapl_model->rapl_core_msrs,
-						     PERF_RAPL_CORE_EVENTS_MAX, false,
+						     PERF_RAPL_CORE_EVENTS_MAX, true,
 						     (void *) &rapl_model->core_events);
 
 		ret = perf_pmu_register(&rapl_pmus_core->pmu, "power_core", -1);
