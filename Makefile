@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 2
 SUBLEVEL = 13
-EXTRAVERSION = -arch1
+EXTRAVERSION = -arch1pf7
 NAME = Hurr durr I'ma ninja sloth
 
 # *DOCUMENTATION*
