@@ -575,30 +575,11 @@ unsigned int cpufreq_policy_transition_delay_us(struct cpufreq_policy *policy)
 		return policy->transition_delay_us;
 
 	latency = policy->cpuinfo.transition_latency / NSEC_PER_USEC;
-	if (latency) {
-		unsigned int max_delay_us = 2 * MSEC_PER_SEC;
+	if (latency)
+		/* Give a 50% breathing room between updates */
+		return latency + (latency >> 1);
 
-		/*
-		 * If the platform already has high transition_latency, use it
-		 * as-is.
-		 */
-		if (latency > max_delay_us)
-			return latency;
-
-		/*
-		 * For platforms that can change the frequency very fast (< 2
-		 * us), the above formula gives a decent transition delay. But
-		 * for platforms where transition_latency is in milliseconds, it
-		 * ends up giving unrealistic values.
-		 *
-		 * Cap the default transition delay to 2 ms, which seems to be
-		 * a reasonable amount of time after which we should reevaluate
-		 * the frequency.
-		 */
-		return min(latency * LATENCY_MULTIPLIER, max_delay_us);
-	}
-
-	return LATENCY_MULTIPLIER;
+	return USEC_PER_MSEC;
 }
 EXPORT_SYMBOL_GPL(cpufreq_policy_transition_delay_us);
 
@@ -1380,6 +1361,7 @@ static int cpufreq_online(unsigned int cpu)
 	bool new_policy;
 	unsigned long flags;
 	unsigned int j;
+	u32 init_min_freq = FREQ_QOS_MIN_DEFAULT_VALUE;
 	int ret;
 
 	pr_debug("%s: bringing CPU%u online\n", __func__, cpu);
@@ -1464,9 +1446,12 @@ static int cpufreq_online(unsigned int cpu)
 			goto out_destroy_policy;
 		}
 
+		if (cpufreq_driver->get_init_min_freq)
+			init_min_freq = cpufreq_driver->get_init_min_freq(policy);
+
 		ret = freq_qos_add_request(&policy->constraints,
 					   policy->min_freq_req, FREQ_QOS_MIN,
-					   FREQ_QOS_MIN_DEFAULT_VALUE);
+					   init_min_freq);
 		if (ret < 0) {
 			/*
 			 * So we don't call freq_qos_remove_request() for an
