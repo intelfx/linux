@@ -664,7 +664,8 @@ static void rate_fixup_ratelist(struct ieee80211_vif *vif,
 		 * needs to be fixed.
 		 */
 		if (rates[i].flags & IEEE80211_TX_RC_MCS) {
-			WARN_ON(rates[i].idx > 76);
+			if (unlikely(rates[i].idx > 76))
+				pr_warn("rates[%d].idx == %d > 76\n", i, rates[i].idx);
 
 			if (!(rates[i].flags & IEEE80211_TX_RC_USE_RTS_CTS) &&
 			    info->control.use_cts_prot)
@@ -674,7 +675,9 @@ static void rate_fixup_ratelist(struct ieee80211_vif *vif,
 		}
 
 		if (rates[i].flags & IEEE80211_TX_RC_VHT_MCS) {
-			WARN_ON(ieee80211_rate_get_vht_mcs(&rates[i]) > 9);
+			if (unlikely(ieee80211_rate_get_vht_mcs(&rates[i]) > 9))
+				pr_warn("ieee80211_rate_get_vht_mcs(&rates[%d]) == %d > 9\n",
+					i, ieee80211_rate_get_vht_mcs(&rates[i]));
 			continue;
 		}
 
@@ -685,7 +688,9 @@ static void rate_fixup_ratelist(struct ieee80211_vif *vif,
 		}
 
 		/* RC is busted */
-		if (WARN_ON_ONCE(rates[i].idx >= sband->n_bitrates)) {
+		if (unlikely(rates[i].idx >= sband->n_bitrates)) {
+			pr_warn_once("rates[%d].idx == %d >= sband->n_bitrates == %d\n",
+						 i, rates[i].idx, sband->n_bitrates);
 			rates[i].idx = -1;
 			continue;
 		}
