@@ -259,6 +259,8 @@ struct amdgpu_watchdog_timer amdgpu_watchdog_timer = {
 	.period = 0x0, /* default to 0x0 (timeout disable) */
 };
 
+struct workqueue_struct *amdgpu_reclaim_wq;
+
 /**
  * DOC: vramlimit (int)
  * Restrict the total amount of VRAM in MiB for testing.  The default is 0 (Use full VRAM).
@@ -3046,12 +3048,31 @@ static struct pci_driver amdgpu_kms_pci_driver = {
 	.dev_groups = amdgpu_sysfs_groups,
 };
 
+static int amdgpu_wq_init(void)
+{
+	amdgpu_reclaim_wq =
+		alloc_workqueue("amdgpu-reclaim", WQ_MEM_RECLAIM, 0);
+	if (!amdgpu_reclaim_wq)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void amdgpu_wq_fini(void)
+{
+	destroy_workqueue(amdgpu_reclaim_wq);
+}
+
 static int __init amdgpu_init(void)
 {
 	int r;
 
 	if (drm_firmware_drivers_only())
 		return -EINVAL;
+
+	r = amdgpu_wq_init();
+	if (r)
+		goto error_wq;
 
 	r = amdgpu_sync_init();
 	if (r)
@@ -3075,6 +3096,9 @@ error_fence:
 	amdgpu_sync_fini();
 
 error_sync:
+	amdgpu_wq_fini();
+
+error_wq:
 	return r;
 }
 
@@ -3086,6 +3110,7 @@ static void __exit amdgpu_exit(void)
 	amdgpu_acpi_release();
 	amdgpu_sync_fini();
 	amdgpu_fence_slab_fini();
+	amdgpu_wq_fini();
 	mmu_notifier_synchronize();
 	amdgpu_xcp_drv_release();
 }
