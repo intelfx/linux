@@ -660,7 +660,8 @@ struct inode {
 	unsigned long		dirtied_when;	/* jiffies of first dirtying */
 	unsigned long		dirtied_time_when;
 
-	struct hlist_node	i_hash;
+	struct hlist_bl_node	i_hash;
+	struct hlist_bl_head	*i_hash_head;
 	struct list_head	i_io_list;	/* backing dev IO list */
 #ifdef CONFIG_CGROUP_WRITEBACK
 	struct bdi_writeback	*i_wb;		/* the associated cgroup wb */
@@ -726,7 +727,7 @@ static inline unsigned int i_blocksize(const struct inode *node)
 
 static inline int inode_unhashed(struct inode *inode)
 {
-	return hlist_unhashed(&inode->i_hash);
+	return hlist_bl_unhashed(&inode->i_hash);
 }
 
 /*
@@ -737,7 +738,7 @@ static inline int inode_unhashed(struct inode *inode)
  */
 static inline void inode_fake_hash(struct inode *inode)
 {
-	hlist_add_fake(&inode->i_hash);
+	hlist_bl_add_fake(&inode->i_hash);
 }
 
 /*
@@ -2729,11 +2730,7 @@ int setattr_should_drop_sgid(struct mnt_idmap *idmap,
  * This must be used for allocating filesystems specific inodes to set
  * up the inode reclaim context correctly.
  */
-static inline void *
-alloc_inode_sb(struct super_block *sb, struct kmem_cache *cache, gfp_t gfp)
-{
-	return kmem_cache_alloc_lru(cache, &sb->s_inode_lru, gfp);
-}
+#define alloc_inode_sb(_sb, _cache, _gfp) kmem_cache_alloc_lru(_cache, &_sb->s_inode_lru, _gfp)
 
 extern void __insert_inode_hash(struct inode *, unsigned long hashval);
 static inline void insert_inode_hash(struct inode *inode)
@@ -2744,7 +2741,7 @@ static inline void insert_inode_hash(struct inode *inode)
 extern void __remove_inode_hash(struct inode *);
 static inline void remove_inode_hash(struct inode *inode)
 {
-	if (!inode_unhashed(inode) && !hlist_fake(&inode->i_hash))
+	if (!inode_unhashed(inode) && !hlist_bl_fake(&inode->i_hash))
 		__remove_inode_hash(inode);
 }
 
