@@ -17,11 +17,13 @@
 #include "btree/update.h"
 #include "btree/write_buffer.h"
 
-#include "data/ec.h"
+#include "data/ec/trigger.h"
 #include "data/move.h"
 #include "data/copygc.h"
 
 #include "init/error.h"
+
+#include "sb/counters.h"
 
 #include "util/clock.h"
 
@@ -230,7 +232,7 @@ static int bch2_copygc_get_stripe_buckets(struct moving_context *ctxt,
 				continue;
 
 			const struct bch_extent_ptr *ptr = s->ptrs + i;
-			CLASS(bch2_dev_tryget, ca)(trans->c, ptr->dev);
+			CLASS(bch2_dev_bkey_tryget, ca)(trans->c, s_k, ptr->dev);
 			if (unlikely(!ca))
 				continue;
 
@@ -354,7 +356,10 @@ err:
 
 	sectors_seen	= atomic64_read(&ctxt->stats->sectors_seen) - sectors_seen;
 	sectors_moved	= atomic64_read(&ctxt->stats->sectors_moved) - sectors_moved;
-	trace_and_count(c, copygc, c, buckets_in_flight->to_evacuate.nr, sectors_seen, sectors_moved);
+	event_inc_trace(c, copygc, buf, ({
+		prt_printf(&buf, "buckets %zu sectors seen %llu moved %llu",
+			   buckets_in_flight->to_evacuate.nr, sectors_seen, sectors_moved);
+	}));
 
 	darray_for_each(buckets_in_flight->to_evacuate, i)
 		if (*i)
@@ -363,7 +368,7 @@ err:
 	return ret;
 }
 
-static u64 bch2_copygc_dev_wait_amount(struct bch_dev *ca)
+u64 bch2_copygc_dev_wait_amount(struct bch_dev *ca)
 {
 	struct bch_dev_usage_full usage_full = bch2_dev_usage_full_read(ca);
 	struct bch_dev_usage usage;
@@ -371,14 +376,22 @@ static u64 bch2_copygc_dev_wait_amount(struct bch_dev *ca)
 	for (unsigned i = 0; i < BCH_DATA_NR; i++)
 		usage.buckets[i] = usage_full.d[i].buckets;
 
-	s64 fragmented_allowed = ((__dev_buckets_available(ca, usage, BCH_WATERMARK_stripe) *
+	/* Don't start until less than 20% of the device is free */
+	u64 available = (usage.buckets[BCH_DATA_free] +
+			 usage.buckets[BCH_DATA_need_gc_gens] +
+			 usage.buckets[BCH_DATA_need_discard]);
+	s64 wait = available * 5 - ca->mi.nbuckets;
+	if (wait > 0)
+		return wait;
+
+	s64 fragmented_allowed = (((__dev_buckets_available(ca, usage, BCH_WATERMARK_stripe) +
+				    (ca->mi.nbuckets >> 6)) * /* Copygc hard reserve */
 				   ca->mi.bucket_size) >> 1);
 	s64 fragmented = 0;
 
 	for (unsigned i = 0; i < BCH_DATA_NR; i++)
 		if (data_type_movable(i))
-			fragmented += usage_full.d[i].buckets * ca->mi.bucket_size -
-				usage_full.d[i].sectors;
+			fragmented += usage_full.d[i].fragmented;
 
 	return max(0LL, fragmented_allowed - fragmented);
 }
@@ -410,19 +423,20 @@ u64 bch2_copygc_wait_amount(struct bch_fs *c)
 void bch2_copygc_wait_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	printbuf_tabstop_push(out, 32);
-	prt_printf(out, "running:\t%u\n",		c->copygc_running);
-	prt_printf(out, "copygc_wait:\t%llu\n",		c->copygc_wait);
-	prt_printf(out, "copygc_wait_at:\t%llu\n",	c->copygc_wait_at);
+	prt_printf(out, "running:\t%u\n",		c->copygc.running);
+	prt_printf(out, "run count:\t%u\n",		c->copygc.run_count);
+	prt_printf(out, "copygc_wait:\t%llu\n",		c->copygc.wait);
+	prt_printf(out, "copygc_wait_at:\t%llu\n",	c->copygc.wait_at);
 
 	prt_printf(out, "Currently waiting for:\t");
-	prt_human_readable_u64(out, max(0LL, c->copygc_wait -
+	prt_human_readable_u64(out, max(0LL, c->copygc.wait -
 					atomic64_read(&c->io_clock[WRITE].now)) << 9);
 	prt_newline(out);
 
 	prt_printf(out, "Currently waiting since:\t");
 	prt_human_readable_u64(out, max(0LL,
 					atomic64_read(&c->io_clock[WRITE].now) -
-					c->copygc_wait_at) << 9);
+					c->copygc.wait_at) << 9);
 	prt_newline(out);
 
 	bch2_printbuf_make_room(out, 4096);
@@ -437,7 +451,7 @@ void bch2_copygc_wait_to_text(struct printbuf *out, struct bch_fs *c)
 			prt_newline(out);
 		}
 
-		t = rcu_dereference(c->copygc_thread);
+		t = rcu_dereference(c->copygc.thread);
 		if (t)
 			get_task_struct(t);
 	}
@@ -473,10 +487,12 @@ static int bch2_copygc_thread(void *arg)
 	 */
 	kthread_wait_freezable(c->recovery.pass_done > BCH_RECOVERY_PASS_check_snapshots ||
 			       kthread_should_stop());
+	if (kthread_should_stop())
+		goto out;
 
 	bch2_move_stats_init(&move_stats, "copygc");
 	bch2_moving_ctxt_init(&ctxt, c, NULL, &move_stats,
-			      writepoint_ptr(&c->copygc_write_point),
+			      writepoint_ptr(&c->copygc.write_point),
 			      false);
 
 	while (!ret && !kthread_should_stop()) {
@@ -501,22 +517,22 @@ static int bch2_copygc_thread(void *arg)
 		wait = bch2_copygc_wait_amount(c);
 
 		if (wait > clock->max_slop) {
-			c->copygc_wait_at = last;
-			c->copygc_wait = last + wait;
+			c->copygc.wait_at = last;
+			c->copygc.wait = last + wait;
 			move_buckets_wait(&ctxt, &buckets, true);
-			trace_and_count(c, copygc_wait, c, wait, last + wait);
-			bch2_kthread_io_clock_wait(clock, last + wait,
+			bch2_kthread_io_clock_wait_once(clock, last + wait,
 					MAX_SCHEDULE_TIMEOUT);
 			continue;
 		}
 
-		c->copygc_wait = 0;
+		c->copygc.wait = 0;
 
-		c->copygc_running = true;
+		c->copygc.running = true;
 		ret = bch2_copygc(&ctxt, &buckets, &did_work);
-		c->copygc_running = false;
+		c->copygc.running = false;
+		c->copygc.run_count++;
 
-		wake_up(&c->copygc_running_wq);
+		wake_up(&c->copygc.running_wq);
 
 		if (!wait && !did_work) {
 			u64 min_member_capacity = bch2_min_rw_member_capacity(c);
@@ -525,15 +541,16 @@ static int bch2_copygc_thread(void *arg)
 				min_member_capacity = 128 * 2048;
 
 			move_buckets_wait(&ctxt, &buckets, true);
-			bch2_kthread_io_clock_wait(clock, last + (min_member_capacity >> 6),
+			bch2_kthread_io_clock_wait_once(clock, last + (min_member_capacity >> 6),
 					MAX_SCHEDULE_TIMEOUT);
 		}
 	}
 
 	move_buckets_wait(&ctxt, &buckets, true);
-	rhashtable_destroy(buckets.table);
 	bch2_moving_ctxt_exit(&ctxt);
 	bch2_move_stats_exit(&move_stats, c);
+out:
+	rhashtable_destroy(buckets.table);
 err:
 	kfree(buckets.table);
 	return ret;
@@ -541,43 +558,53 @@ err:
 
 void bch2_copygc_stop(struct bch_fs *c)
 {
-	if (c->copygc_thread) {
-		kthread_stop(c->copygc_thread);
-		put_task_struct(c->copygc_thread);
+	struct task_struct *t = rcu_dereference_protected(c->copygc.thread, true);
+	if (t) {
+		kthread_stop(t);
+		put_task_struct(t);
 	}
-	c->copygc_thread = NULL;
+	c->copygc.thread = NULL;
 }
 
 int bch2_copygc_start(struct bch_fs *c)
 {
-	struct task_struct *t;
-	int ret;
-
-	if (c->copygc_thread)
-		return 0;
-
 	if (c->opts.nochanges)
 		return 0;
 
 	if (bch2_fs_init_fault("copygc_start"))
 		return -ENOMEM;
 
-	t = kthread_create(bch2_copygc_thread, c, "bch-copygc/%s", c->name);
-	ret = PTR_ERR_OR_ZERO(t);
-	bch_err_msg(c, ret, "creating copygc thread");
-	if (ret)
-		return ret;
+	if (!c->copygc.wq &&
+	    !(c->copygc.wq = alloc_workqueue("bcachefs_copygc",
+				WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM|WQ_CPU_INTENSIVE, 1)))
+		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
-	get_task_struct(t);
+	if (!c->copygc.thread) {
+		struct task_struct *t =
+			kthread_create(bch2_copygc_thread, c, "bch-copygc/%s", c->name);
+		int ret = PTR_ERR_OR_ZERO(t);
+		bch_err_msg(c, ret, "creating copygc thread");
+		if (ret)
+			return ret;
 
-	c->copygc_thread = t;
-	wake_up_process(c->copygc_thread);
+		get_task_struct(t);
+
+		c->copygc.thread = t;
+		rcu_assign_pointer(c->copygc.thread, t);
+		wake_up_process(c->copygc.thread);
+	}
 
 	return 0;
 }
 
+void bch2_fs_copygc_exit(struct bch_fs *c)
+{
+	if (c->copygc.wq)
+		destroy_workqueue(c->copygc.wq);
+}
+
 void bch2_fs_copygc_init(struct bch_fs *c)
 {
-	init_waitqueue_head(&c->copygc_running_wq);
-	c->copygc_running = false;
+	init_waitqueue_head(&c->copygc.running_wq);
+	c->copygc.running = false;
 }

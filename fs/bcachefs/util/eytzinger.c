@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include "eytzinger.h"
+#include <linux/sched.h>
 
 /**
  * is_aligned - is this pointer & size okay for word-wide copying?
@@ -166,10 +167,10 @@ static inline void eytzinger1_do_swap(void *base1, size_t n, size_t size,
 		size, swap_func, priv);
 }
 
-static void eytzinger1_sort_r(void *base1, size_t n, size_t size,
-			      cmp_r_func_t cmp_func,
-			      swap_r_func_t swap_func,
-			      const void *priv)
+void eytzinger1_sort_r(void *base1, size_t n, size_t size,
+		       cmp_r_func_t cmp_func,
+		       swap_r_func_t swap_func,
+		       const void *priv)
 {
 	unsigned i, j, k;
 
@@ -205,6 +206,8 @@ static void eytzinger1_sort_r(void *base1, size_t n, size_t size,
 			j /= 2;
 			eytzinger1_do_swap(base1, n, size, swap_func, priv, j, k);
 		}
+
+		cond_resched();
 	}
 
 	/* sort */
@@ -228,7 +231,21 @@ static void eytzinger1_sort_r(void *base1, size_t n, size_t size,
 			j /= 2;
 			eytzinger1_do_swap(base1, n, size, swap_func, priv, j, k);
 		}
+
+		cond_resched();
 	}
+}
+
+void eytzinger1_sort(void *base, size_t n, size_t size,
+		     cmp_func_t cmp_func,
+		     swap_func_t swap_func)
+{
+	struct wrapper w = {
+		.cmp  = cmp_func,
+		.swap_func = swap_func,
+	};
+
+	return eytzinger1_sort_r(base, n, size, _CMP_WRAPPER, SWAP_WRAPPER, &w);
 }
 
 void eytzinger0_sort_r(void *base, size_t n, size_t size,
@@ -279,10 +296,9 @@ static int test(void)
 	size_t N, i;
 	ktime_t start, end;
 	s64 delta;
-	u32 *arr;
 
 	for (N = 10000; N <= 100000; N += 10000) {
-		arr = kmalloc_array(N, sizeof(u32), GFP_KERNEL);
+		u32 *arr __free(kfree) = kmalloc_array(N, sizeof(u32), GFP_KERNEL);
 		cmp_count = 0;
 
 		for (i = 0; i < N; i++)
@@ -300,16 +316,12 @@ static int test(void)
 
 		eytzinger0_for_each(i, N) {
 			if (prev > arr[i])
-				goto err;
+				return -1;
 			prev = arr[i];
 		}
 
 		kfree(arr);
 	}
 	return 0;
-
-err:
-	kfree(arr);
-	return -1;
 }
 #endif

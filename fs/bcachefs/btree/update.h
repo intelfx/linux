@@ -102,7 +102,7 @@ static inline int bch2_insert_snapshot_whiteouts(struct btree_trans *trans,
 	    bkey_eq(old_pos, new_pos))
 		return 0;
 
-	snapshot_id_list s;
+	CLASS(snapshot_id_list, s)();
 	try(bch2_get_snapshot_overwrites(trans, btree, old_pos, &s));
 
 	return s.nr
@@ -121,6 +121,7 @@ static inline enum bch_bkey_type extent_whiteout_type(struct bch_fs *c, enum btr
 	 */
 	return btree_id_is_extents_snapshots(btree) &&
 		bkey_deleted(k) &&
+		bch2_snapshot_is_leaf(c, k->p.snapshot) &&
 		!bch2_request_incompat_feature(c, bcachefs_metadata_version_extent_snapshot_whiteouts)
 		? KEY_TYPE_extent_whiteout
 		: KEY_TYPE_whiteout;
@@ -210,8 +211,7 @@ int bch2_btree_write_buffer_insert_err(struct bch_fs *, enum btree_id, struct bk
 static inline int bch2_btree_write_buffer_insert_checks(struct bch_fs *c, enum btree_id btree,
 							struct bkey_i *k)
 {
-	if (unlikely(!btree_type_uses_write_buffer(btree) ||
-		     k->k.u64s > BTREE_WRITE_BUFERED_U64s_MAX))
+	if (unlikely(!btree_type_uses_write_buffer(btree)))
 		try(bch2_btree_write_buffer_insert_err(c, btree, k));
 
 	return 0;

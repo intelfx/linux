@@ -8,14 +8,14 @@
 
 static inline bool bch2_btree_write_buffer_should_flush(struct bch_fs *c)
 {
-	struct btree_write_buffer *wb = &c->btree_write_buffer;
+	struct bch_fs_btree_write_buffer *wb = &c->btree.write_buffer;
 
 	return wb->inc.keys.nr + wb->flushing.keys.nr > wb->inc.keys.size / 4;
 }
 
 static inline bool bch2_btree_write_buffer_must_wait(struct bch_fs *c)
 {
-	struct btree_write_buffer *wb = &c->btree_write_buffer;
+	struct bch_fs_btree_write_buffer *wb = &c->btree.write_buffer;
 
 	return wb->inc.keys.nr > wb->inc.keys.size * 3 / 4;
 }
@@ -23,7 +23,6 @@ static inline bool bch2_btree_write_buffer_must_wait(struct bch_fs *c)
 struct btree_trans;
 int bch2_btree_write_buffer_flush_sync(struct btree_trans *);
 bool bch2_btree_write_buffer_flush_going_ro(struct bch_fs *);
-int bch2_btree_write_buffer_flush_nocheck_rw(struct btree_trans *);
 int bch2_btree_write_buffer_tryflush(struct btree_trans *);
 
 struct wb_maybe_flush {
@@ -72,7 +71,7 @@ int bch2_accounting_key_to_wb_slowpath(struct bch_fs *,
 static inline int bch2_accounting_key_to_wb(struct bch_fs *c,
 			     enum btree_id btree, struct bkey_i_accounting *k)
 {
-	struct btree_write_buffer *wb = &c->btree_write_buffer;
+	struct bch_fs_btree_write_buffer *wb = &c->btree.write_buffer;
 	struct btree_write_buffered_key search;
 	search.btree = btree;
 	search.k.k.p = k->k.p;
@@ -93,19 +92,63 @@ int bch2_journal_key_to_wb_slowpath(struct bch_fs *,
 			     struct journal_keys_to_wb *,
 			     enum btree_id, struct bkey_i *);
 
+static inline unsigned wb_key_u64s(const struct bkey_i *k)
+{
+	return k->k.u64s + offsetof(struct btree_write_buffered_key, k) / sizeof(u64);
+}
+
+static inline struct btree_write_buffered_key *wb_keys_start(const struct btree_write_buffer_keys *keys)
+{
+	return (struct btree_write_buffered_key *) &darray_first(keys->keys);
+}
+
+static inline struct btree_write_buffered_key *wb_keys_end(const struct btree_write_buffer_keys *keys)
+{
+	return (struct btree_write_buffered_key *) &darray_top(keys->keys);
+}
+
+static inline struct btree_write_buffered_key *wb_keys_idx(const struct btree_write_buffer_keys *keys,
+							   unsigned idx)
+{
+	return (struct btree_write_buffered_key *) &keys->keys.data[idx];
+}
+
+static inline struct btree_write_buffered_key *wb_key_next(const struct btree_write_buffered_key *k)
+{
+	return (struct btree_write_buffered_key *) ((u64 *) k + wb_key_u64s(&k->k));
+}
+
+#define wb_keys_for_each(_keys, _k)							\
+	for (struct btree_write_buffered_key *_k = wb_keys_start(_keys);		\
+	     _k != wb_keys_end(_keys);							\
+	     _k = wb_key_next(_k))
+
+#define wb_keys_for_each_safe(_keys, _k)						\
+	for (struct btree_write_buffered_key *_next, *_k = wb_keys_start(_keys);	\
+	     _k != wb_keys_end(_keys) && (_next = wb_key_next(_k), true);		\
+	     _k = _next)
+
+static inline void bch2_journal_key_to_wb_reserved(struct bch_fs *c,
+			     struct journal_keys_to_wb *dst,
+			     enum btree_id btree, struct bkey_i *k)
+{
+	unsigned u64s = wb_key_u64s(k);
+	struct btree_write_buffered_key *wb_k = wb_keys_end(dst->wb);
+	wb_k->journal_seq	= dst->seq;
+	wb_k->btree		= btree;
+	bkey_copy(&wb_k->k, k);
+	dst->wb->keys.nr += u64s;
+	dst->room -= u64s;
+}
+
 static inline int __bch2_journal_key_to_wb(struct bch_fs *c,
 			     struct journal_keys_to_wb *dst,
 			     enum btree_id btree, struct bkey_i *k)
 {
-	if (unlikely(!dst->room))
+	if (unlikely(dst->room < wb_key_u64s(k)))
 		return bch2_journal_key_to_wb_slowpath(c, dst, btree, k);
 
-	struct btree_write_buffered_key *wb_k = &darray_top(dst->wb->keys);
-	wb_k->journal_seq	= dst->seq;
-	wb_k->btree		= btree;
-	bkey_copy(&wb_k->k, k);
-	dst->wb->keys.nr++;
-	dst->room--;
+	bch2_journal_key_to_wb_reserved(c, dst, btree, k);
 	return 0;
 }
 
@@ -128,6 +171,22 @@ void bch2_journal_keys_to_write_buffer_start(struct bch_fs *, struct journal_key
 int bch2_journal_keys_to_write_buffer_end(struct bch_fs *, struct journal_keys_to_wb *);
 
 int bch2_btree_write_buffer_resize(struct bch_fs *, size_t);
+
+void bch2_btree_write_buffer_to_text(struct printbuf *, struct bch_fs *);
+
+static inline void bch2_btree_write_buffer_wakeup(struct bch_fs *c)
+{
+	struct bch_fs_btree_write_buffer *wb = &c->btree.write_buffer;
+
+	guard(rcu)();
+	struct task_struct *p = rcu_dereference(wb->thread);
+	if (p)
+		wake_up_process(p);
+}
+
+void bch2_btree_write_buffer_stop(struct bch_fs *);
+int bch2_btree_write_buffer_start(struct bch_fs *);
+
 void bch2_fs_btree_write_buffer_exit(struct bch_fs *);
 void bch2_fs_btree_write_buffer_init_early(struct bch_fs *);
 int bch2_fs_btree_write_buffer_init(struct bch_fs *);

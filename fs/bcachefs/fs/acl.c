@@ -85,12 +85,20 @@ static inline int acl_to_xattr_type(int type)
 	}
 }
 
+static struct posix_acl *acl_entry_invalid(struct bkey_s_c_xattr xattr)
+{
+	pr_err("invalid acl entry");
+	return ERR_PTR(-EINVAL);
+}
+
 /*
  * Convert from filesystem to in-memory representation.
  */
 static struct posix_acl *bch2_acl_from_disk(struct btree_trans *trans,
-					    const void *value, size_t size)
+					    struct bkey_s_c_xattr xattr)
 {
+	const void *value = xattr_val(xattr.v);
+	size_t size = le16_to_cpu(xattr.v->x_val_len);
 	const void *p, *end = value + size;
 	struct posix_acl *acl;
 	struct posix_acl_entry *out;
@@ -100,17 +108,17 @@ static struct posix_acl *bch2_acl_from_disk(struct btree_trans *trans,
 	if (!value)
 		return NULL;
 	if (size < sizeof(bch_acl_header))
-		goto invalid;
+		return acl_entry_invalid(xattr);
 	if (((bch_acl_header *)value)->a_version !=
 	    cpu_to_le32(BCH_ACL_VERSION))
-		goto invalid;
+		return acl_entry_invalid(xattr);
 
 	p = value + sizeof(bch_acl_header);
 	while (p < end) {
 		const bch_acl_entry *entry = p;
 
 		if (p + sizeof(bch_acl_entry_short) > end)
-			goto invalid;
+			return acl_entry_invalid(xattr);
 
 		switch (le16_to_cpu(entry->e_tag)) {
 		case ACL_USER_OBJ:
@@ -124,14 +132,14 @@ static struct posix_acl *bch2_acl_from_disk(struct btree_trans *trans,
 			p += sizeof(bch_acl_entry);
 			break;
 		default:
-			goto invalid;
+			return acl_entry_invalid(xattr);
 		}
 
 		count++;
 	}
 
 	if (p > end)
-		goto invalid;
+		return acl_entry_invalid(xattr);
 
 	if (!count)
 		return NULL;
@@ -179,9 +187,6 @@ static struct posix_acl *bch2_acl_from_disk(struct btree_trans *trans,
 	BUG_ON(out != acl->a_entries + acl->a_count);
 
 	return acl;
-invalid:
-	pr_err("invalid acl entry");
-	return ERR_PTR(-EINVAL);
 }
 
 /*
@@ -271,24 +276,25 @@ struct posix_acl *bch2_get_acl(struct inode *vinode, int type, bool rcu)
 {
 	struct bch_inode_info *inode = to_bch_ei(vinode);
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
-	struct bch_hash_info hash = bch2_hash_info_init(c, &inode->ei_inode);
-	struct xattr_search_key search = X_SEARCH(acl_to_xattr_type(type), "", 0);
 
 	if (rcu)
 		return ERR_PTR(-ECHILD);
 
+	struct bch_hash_info hash;
+	struct xattr_search_key search = X_SEARCH(acl_to_xattr_type(type), "", 0);
+
 	CLASS(btree_trans, trans)(c);
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bkey_s_c k;
-	int ret = lockrestart_do(trans,
+	int ret = bch2_hash_info_init(c, &inode->ei_inode, &hash) ?:
+		lockrestart_do(trans,
 			bkey_err(k = bch2_hash_lookup(trans, &iter, bch2_xattr_hash_desc,
 					     &hash, inode_inum(inode), &search, 0)));
 	if (ret)
 		return bch2_err_matches(ret, ENOENT) ? NULL : ERR_PTR(ret);
 
 	struct bkey_s_c_xattr xattr = bkey_s_c_to_xattr(k);
-	struct posix_acl *acl = bch2_acl_from_disk(trans, xattr_val(xattr.v),
-						   le16_to_cpu(xattr.v->x_val_len));
+	struct posix_acl *acl = bch2_acl_from_disk(trans, xattr);
 	ret = PTR_ERR_OR_ZERO(acl);
 	if (ret)
 		return ERR_PTR(ret);
@@ -301,13 +307,14 @@ int bch2_set_acl_trans(struct btree_trans *trans, subvol_inum inum,
 		       struct bch_inode_unpacked *inode_u,
 		       struct posix_acl *acl, int type)
 {
-	struct bch_hash_info hash_info = bch2_hash_info_init(trans->c, inode_u);
-	int ret;
+	struct bch_hash_info hash_info;
+	try(bch2_hash_info_init(trans->c, inode_u, &hash_info));
 
 	if (type == ACL_TYPE_DEFAULT &&
 	    !S_ISDIR(inode_u->bi_mode))
 		return acl ? -EACCES : 0;
 
+	int ret;
 	if (acl) {
 		struct bkey_i_xattr *xattr =
 			bch2_acl_to_xattr(trans, acl, type);
@@ -373,7 +380,9 @@ int bch2_acl_chmod(struct btree_trans *trans, subvol_inum inum,
 		   umode_t mode,
 		   struct posix_acl **new_acl)
 {
-	struct bch_hash_info hash_info = bch2_hash_info_init(trans->c, inode);
+	struct bch_hash_info hash_info;
+	try(bch2_hash_info_init(trans->c, inode, &hash_info));
+
 	struct xattr_search_key search = X_SEARCH(KEY_TYPE_XATTR_INDEX_POSIX_ACL_ACCESS, "", 0);
 
 	CLASS(btree_iter_uninit, iter)(trans);
@@ -385,9 +394,7 @@ int bch2_acl_chmod(struct btree_trans *trans, subvol_inum inum,
 
 	struct bkey_s_c_xattr xattr = bkey_s_c_to_xattr(k);
 
-	struct posix_acl *acl __free(kfree) =
-		errptr_try(bch2_acl_from_disk(trans, xattr_val(xattr.v),
-					      le16_to_cpu(xattr.v->x_val_len)));
+	struct posix_acl *acl __free(kfree) = errptr_try(bch2_acl_from_disk(trans, xattr));
 
 	try(allocate_dropping_locks_errcode(trans, __posix_acl_chmod(&acl, _gfp, mode)));
 

@@ -3,9 +3,13 @@
 #define _BCACHEFS_BACKPOINTERS_H
 
 #include "alloc/buckets.h"
+
 #include "btree/cache.h"
 #include "btree/iter.h"
 #include "btree/update.h"
+
+#include "data/reconcile/trigger.h"
+
 #include "init/error.h"
 
 static inline u64 swab40(u64 x)
@@ -20,7 +24,7 @@ static inline u64 swab40(u64 x)
 int bch2_backpointer_validate(struct bch_fs *, struct bkey_s_c k,
 			      struct bkey_validate_context);
 void bch2_backpointer_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
-void bch2_backpointer_swab(struct bkey_s);
+void bch2_backpointer_swab(const struct bch_fs *, struct bkey_s);
 
 #define bch2_bkey_ops_backpointer ((struct bkey_ops) {	\
 	.key_validate	= bch2_backpointer_validate,	\
@@ -29,15 +33,13 @@ void bch2_backpointer_swab(struct bkey_s);
 	.min_val_size	= 32,				\
 })
 
-#define MAX_EXTENT_COMPRESS_RATIO_SHIFT		10
-
 /*
  * Convert from pos in backpointer btree to pos of corresponding bucket in alloc
  * btree:
  */
 static inline struct bpos bp_pos_to_bucket(const struct bch_dev *ca, struct bpos bp_pos)
 {
-	u64 bucket_sector = bp_pos.offset >> MAX_EXTENT_COMPRESS_RATIO_SHIFT;
+	u64 bucket_sector = bp_pos.offset >> ca->fs->sb.extent_bp_shift;
 
 	return POS(bp_pos.inode, sector_to_bucket(ca, bucket_sector));
 }
@@ -45,7 +47,7 @@ static inline struct bpos bp_pos_to_bucket(const struct bch_dev *ca, struct bpos
 static inline struct bpos bp_pos_to_bucket_and_offset(const struct bch_dev *ca, struct bpos bp_pos,
 						      u32 *bucket_offset)
 {
-	u64 bucket_sector = bp_pos.offset >> MAX_EXTENT_COMPRESS_RATIO_SHIFT;
+	u64 bucket_sector = bp_pos.offset >> ca->fs->sb.extent_bp_shift;
 
 	return POS(bp_pos.inode, sector_to_bucket_and_offset(ca, bucket_sector, bucket_offset));
 }
@@ -65,7 +67,7 @@ static inline struct bpos bucket_pos_to_bp_noerror(const struct bch_dev *ca,
 {
 	return POS(bucket.inode,
 		   (bucket_to_sector(ca, bucket.offset) <<
-		    MAX_EXTENT_COMPRESS_RATIO_SHIFT) + bucket_offset);
+		    ca->fs->sb.extent_bp_shift) + bucket_offset);
 }
 
 /*
@@ -100,6 +102,11 @@ static inline int bch2_bucket_backpointer_mod(struct btree_trans *trans,
 				struct bkey_i_backpointer *bp,
 				bool insert)
 {
+	if (BACKPOINTER_RECONCILE_PHYS(&bp->v))
+		try(bch2_btree_bit_mod_buffered(trans,
+				reconcile_work_phys_btree[BACKPOINTER_RECONCILE_PHYS(&bp->v)],
+				bp->k.p, insert));
+
 	if (static_branch_unlikely(&bch2_backpointers_no_use_write_buffer))
 		return bch2_bucket_backpointer_mod_nowritebuffer(trans, orig_k, bp, insert);
 
@@ -143,6 +150,24 @@ static inline enum bch_data_type bch2_bkey_ptr_data_type(struct bkey_s_c k,
 	}
 }
 
+static inline struct bpos bch2_extent_ptr_to_bp_pos(const struct bch_fs *c, struct bkey_s_c k,
+						    struct extent_ptr_decoded p)
+{
+	if (k.k->type != KEY_TYPE_stripe)
+		return POS(p.ptr.dev,
+			   ((u64) p.ptr.offset << c->sb.extent_bp_shift) + p.crc.offset);
+	else {
+		/*
+		 * Put stripe backpointers where they won't collide with the
+		 * extent backpointers within the stripe:
+		 */
+		struct bkey_s_c_stripe s = bkey_s_c_to_stripe(k);
+		return POS(p.ptr.dev,
+			   ((u64) (p.ptr.offset + le16_to_cpu(s.v->sectors)) <<
+			    c->sb.extent_bp_shift) - 1);
+	}
+}
+
 static inline void bch2_extent_ptr_to_bp(struct bch_fs *c,
 			   enum btree_id btree_id, unsigned level,
 			   struct bkey_s_c k, struct extent_ptr_decoded p,
@@ -150,20 +175,7 @@ static inline void bch2_extent_ptr_to_bp(struct bch_fs *c,
 			   struct bkey_i_backpointer *bp)
 {
 	bkey_backpointer_init(&bp->k_i);
-	bp->k.p.inode = p.ptr.dev;
-
-	if (k.k->type != KEY_TYPE_stripe)
-		bp->k.p.offset = ((u64) p.ptr.offset << MAX_EXTENT_COMPRESS_RATIO_SHIFT) + p.crc.offset;
-	else {
-		/*
-		 * Put stripe backpointers where they won't collide with the
-		 * extent backpointers within the stripe:
-		 */
-		struct bkey_s_c_stripe s = bkey_s_c_to_stripe(k);
-		bp->k.p.offset = ((u64) (p.ptr.offset + le16_to_cpu(s.v->sectors)) <<
-				  MAX_EXTENT_COMPRESS_RATIO_SHIFT) - 1;
-	}
-
+	bp->k.p = bch2_extent_ptr_to_bp_pos(c, k, p);
 	bp->v	= (struct bch_backpointer) {
 		.btree_id	= btree_id,
 		.level		= level,
@@ -172,6 +184,10 @@ static inline void bch2_extent_ptr_to_bp(struct bch_fs *c,
 		.bucket_len	= ptr_disk_sectors(level ? btree_sectors(c) : k.k->size, p),
 		.pos		= k.k->p,
 	};
+
+	if (!level && bch2_dev_rotational(c, p.ptr.dev))
+		SET_BACKPOINTER_RECONCILE_PHYS(&bp->v,
+				rb_work_id_phys(bch2_bkey_reconcile_work_id(c, k)));
 }
 
 struct wb_maybe_flush;
@@ -192,6 +208,53 @@ static inline bool bch2_bucket_bitmap_test(struct bucket_bitmap *b, u64 i)
 	unsigned long *bitmap = READ_ONCE(b->buckets);
 	return bitmap && test_bit(i, bitmap);
 }
+
+DEFINE_DARRAY_NAMED(darray_bkey_i_backpointer, struct bkey_i_backpointer);
+
+struct progress_indicator;
+struct bp_scan_iter {
+	struct bpos			pos;
+	u64				nr_flushes;
+	struct progress_indicator	*progress;
+	darray_bkey_i_backpointer	bps;
+};
+
+DEFINE_CLASS(backpointer_scan_iter, struct bp_scan_iter,
+	     darray_exit(&_T.bps),
+	     ((struct bp_scan_iter) { .pos = pos, .progress = progress }),
+	     struct bpos pos, struct progress_indicator *progress)
+
+struct bkey_s_c_backpointer bch2_bp_scan_iter_peek(struct btree_trans *, struct bp_scan_iter *,
+						   struct bpos, struct wb_maybe_flush *);
+
+static inline void bch2_bp_scan_iter_advance(struct bp_scan_iter *iter)
+{
+	BUG_ON(!iter->bps.nr);
+	--iter->bps.nr;
+}
+
+#define backpointer_scan_for_each(_trans, _bp_iter, _start, _end,				\
+				  _last_flushed, _progress, _bp, _do)				\
+({												\
+	CLASS(backpointer_scan_iter, _bp_iter)(_start, _progress);				\
+	int _ret3 = 0;										\
+												\
+	while (true) {										\
+		_ret3 = lockrestart_do(trans, ({						\
+			struct bkey_s_c_backpointer _bp =					\
+				bch2_bp_scan_iter_peek(_trans, &_bp_iter, _end, _last_flushed);	\
+			if (!_bp.k)								\
+				break;								\
+			bkey_err(_bp) ?: (_do);							\
+		}));										\
+		if (_ret3)									\
+			break;									\
+												\
+		bch2_bp_scan_iter_advance(&_bp_iter);						\
+	}											\
+												\
+	_ret3;											\
+})
 
 int bch2_bucket_bitmap_resize(struct bch_dev *, struct bucket_bitmap *, u64, u64);
 void bch2_bucket_bitmap_free(struct bucket_bitmap *);

@@ -9,37 +9,31 @@
 #include "journal/seq_blacklist.h"
 
 #include "alloc/foreground.h"
+#include "alloc/replicas.h"
 #include "btree/update.h"
+#include "init/error.h"
 
 /* allocate journal on a device: */
 
 static int bch2_set_nr_journal_buckets_iter(struct bch_dev *ca, unsigned nr,
-					    bool new_fs, struct closure *cl)
+					    bool new_fs, enum bch_watermark watermark,
+					    struct closure *cl)
 {
 	struct bch_fs *c = ca->fs;
 	struct journal_device *ja = &ca->journal;
-	u64 *new_bucket_seq = NULL, *new_buckets = NULL;
-	struct open_bucket **ob = NULL;
-	long *bu = NULL;
 	unsigned i, pos, nr_got = 0, nr_want = nr - ja->nr;
 	int ret = 0;
 
 	BUG_ON(nr <= ja->nr);
 
-	bu		= kcalloc(nr_want, sizeof(*bu), GFP_KERNEL);
-	ob		= kcalloc(nr_want, sizeof(*ob), GFP_KERNEL);
-	new_buckets	= kcalloc(nr, sizeof(u64), GFP_KERNEL);
-	new_bucket_seq	= kcalloc(nr, sizeof(u64), GFP_KERNEL);
-	if (!bu || !ob || !new_buckets || !new_bucket_seq) {
-		ret = bch_err_throw(c, ENOMEM_set_nr_journal_buckets);
-		goto err_free;
-	}
+	long *bu __free(kfree)			= kcalloc(nr_want, sizeof(*bu), GFP_KERNEL);
+	struct open_bucket **ob __free(kfree)	= kcalloc(nr_want, sizeof(*ob), GFP_KERNEL);
+	u64 *new_buckets __free(kfree)		= kcalloc(nr, sizeof(u64), GFP_KERNEL);
+	u64 *new_bucket_seq __free(kfree)	= kcalloc(nr, sizeof(u64), GFP_KERNEL);
+	if (!bu || !ob || !new_buckets || !new_bucket_seq)
+		return bch_err_throw(c, ENOMEM_set_nr_journal_buckets);
 
 	for (nr_got = 0; nr_got < nr_want; nr_got++) {
-		enum bch_watermark watermark = new_fs
-			? BCH_WATERMARK_btree
-			: BCH_WATERMARK_normal;
-
 		ob[nr_got] = bch2_bucket_alloc(c, ca, watermark,
 					       BCH_DATA_journal, cl);
 		ret = PTR_ERR_OR_ZERO(ob[nr_got]);
@@ -47,7 +41,7 @@ static int bch2_set_nr_journal_buckets_iter(struct bch_dev *ca, unsigned nr,
 		if (ret == -BCH_ERR_bucket_alloc_blocked)
 			ret = bch_err_throw(c, freelist_empty);
 		if (ret == -BCH_ERR_freelist_empty) /* don't if we're actually out of buckets */
-			closure_wake_up(&c->freelist_wait);
+			closure_wake_up(&c->allocator.freelist_wait);
 
 		if (ret)
 			break;
@@ -66,68 +60,59 @@ static int bch2_set_nr_journal_buckets_iter(struct bch_dev *ca, unsigned nr,
 	}
 
 	if (!nr_got)
-		goto err_free;
+		return ret;
 
 	/* Don't return an error if we successfully allocated some buckets: */
 	ret = 0;
 
-	if (c) {
-		bch2_journal_flush_all_pins(&c->journal);
-		bch2_journal_block(&c->journal);
-		mutex_lock(&c->sb_lock);
+	scoped_guard(journal_block, &c->journal) {
+		guard(memalloc_flags)(PF_MEMALLOC_NOFS);
+		guard(mutex)(&c->sb_lock);
+
+		memcpy(new_buckets,	ja->buckets,	ja->nr * sizeof(u64));
+		memcpy(new_bucket_seq,	ja->bucket_seq,	ja->nr * sizeof(u64));
+
+		BUG_ON(ja->discard_idx > ja->nr);
+
+		pos = ja->discard_idx ?: ja->nr;
+
+		memmove(new_buckets + pos + nr_got,
+			new_buckets + pos,
+			sizeof(new_buckets[0]) * (ja->nr - pos));
+		memmove(new_bucket_seq + pos + nr_got,
+			new_bucket_seq + pos,
+			sizeof(new_bucket_seq[0]) * (ja->nr - pos));
+
+		for (i = 0; i < nr_got; i++) {
+			new_buckets[pos + i] = bu[i];
+			new_bucket_seq[pos + i] = 0;
+		}
+
+		nr = ja->nr + nr_got;
+
+		ret = bch2_journal_buckets_to_sb(c, ca, new_buckets, nr);
+		if (ret)
+			goto err_unblock;
+
+		bch2_write_super(c);
+
+		/* Commit: */
+		scoped_guard(spinlock, &c->journal.lock) {
+			swap(new_buckets,	ja->buckets);
+			swap(new_bucket_seq,	ja->bucket_seq);
+			ja->nr = nr;
+
+			if (pos <= ja->discard_idx)
+				ja->discard_idx = (ja->discard_idx + nr_got) % ja->nr;
+			if (pos <= ja->dirty_idx_ondisk)
+				ja->dirty_idx_ondisk = (ja->dirty_idx_ondisk + nr_got) % ja->nr;
+			if (pos <= ja->dirty_idx)
+				ja->dirty_idx = (ja->dirty_idx + nr_got) % ja->nr;
+			if (pos <= ja->cur_idx)
+				ja->cur_idx = (ja->cur_idx + nr_got) % ja->nr;
+		}
 	}
-
-	memcpy(new_buckets,	ja->buckets,	ja->nr * sizeof(u64));
-	memcpy(new_bucket_seq,	ja->bucket_seq,	ja->nr * sizeof(u64));
-
-	BUG_ON(ja->discard_idx > ja->nr);
-
-	pos = ja->discard_idx ?: ja->nr;
-
-	memmove(new_buckets + pos + nr_got,
-		new_buckets + pos,
-		sizeof(new_buckets[0]) * (ja->nr - pos));
-	memmove(new_bucket_seq + pos + nr_got,
-		new_bucket_seq + pos,
-		sizeof(new_bucket_seq[0]) * (ja->nr - pos));
-
-	for (i = 0; i < nr_got; i++) {
-		new_buckets[pos + i] = bu[i];
-		new_bucket_seq[pos + i] = 0;
-	}
-
-	nr = ja->nr + nr_got;
-
-	ret = bch2_journal_buckets_to_sb(c, ca, new_buckets, nr);
-	if (ret)
-		goto err_unblock;
-
-	bch2_write_super(c);
-
-	/* Commit: */
-	if (c)
-		spin_lock(&c->journal.lock);
-
-	swap(new_buckets,	ja->buckets);
-	swap(new_bucket_seq,	ja->bucket_seq);
-	ja->nr = nr;
-
-	if (pos <= ja->discard_idx)
-		ja->discard_idx = (ja->discard_idx + nr_got) % ja->nr;
-	if (pos <= ja->dirty_idx_ondisk)
-		ja->dirty_idx_ondisk = (ja->dirty_idx_ondisk + nr_got) % ja->nr;
-	if (pos <= ja->dirty_idx)
-		ja->dirty_idx = (ja->dirty_idx + nr_got) % ja->nr;
-	if (pos <= ja->cur_idx)
-		ja->cur_idx = (ja->cur_idx + nr_got) % ja->nr;
-
-	if (c)
-		spin_unlock(&c->journal.lock);
 err_unblock:
-	if (c) {
-		bch2_journal_unblock(&c->journal);
-		mutex_unlock(&c->sb_lock);
-	}
 
 	if (ret) {
 		CLASS(btree_trans, trans)(c);
@@ -136,14 +121,10 @@ err_unblock:
 						bu[i], BCH_DATA_free, 0,
 						BTREE_TRIGGER_transactional);
 	}
-err_free:
+
 	for (i = 0; i < nr_got; i++)
 		bch2_open_bucket_put(c, ob[i]);
 
-	kfree(new_bucket_seq);
-	kfree(new_buckets);
-	kfree(ob);
-	kfree(bu);
 	return ret;
 }
 
@@ -151,10 +132,12 @@ static int bch2_set_nr_journal_buckets_loop(struct bch_fs *c, struct bch_dev *ca
 					    unsigned nr, bool new_fs)
 {
 	struct journal_device *ja = &ca->journal;
+	enum bch_watermark watermark = new_fs
+		? BCH_WATERMARK_btree
+		: BCH_WATERMARK_normal;
 	int ret = 0;
 
-	struct closure cl;
-	closure_init_stack(&cl);
+	CLASS(closure_stack, cl)();
 
 	/* don't handle reducing nr of buckets yet: */
 	if (nr < ja->nr)
@@ -176,11 +159,11 @@ static int bch2_set_nr_journal_buckets_loop(struct bch_fs *c, struct bch_dev *ca
 			try(bch2_disk_reservation_get(c, &res.r,
 						bucket_to_sector(ca, nr - ja->nr), 1, 0));
 
-		ret = bch2_set_nr_journal_buckets_iter(ca, nr, new_fs, &cl);
-		if (ret == -BCH_ERR_open_buckets_empty)
+		ret = bch2_set_nr_journal_buckets_iter(ca, nr, new_fs, watermark, &cl);
+		if (bch2_err_matches(ret, BCH_ERR_operation_blocked))
 			ret = 0; /* wait and retry */
 
-		bch2_wait_on_allocator(c, &cl);
+		bch2_wait_on_allocator(c, NULL, ret, &cl);
 	}
 
 	return ret;
@@ -205,6 +188,7 @@ int bch2_dev_journal_bucket_delete(struct bch_dev *ca, u64 b)
 	struct journal *j = &c->journal;
 	struct journal_device *ja = &ca->journal;
 
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
 	guard(mutex)(&c->sb_lock);
 	unsigned pos;
 	for (pos = 0; pos < ja->nr; pos++)
@@ -212,7 +196,7 @@ int bch2_dev_journal_bucket_delete(struct bch_dev *ca, u64 b)
 			break;
 
 	if (pos == ja->nr) {
-		bch_err(ca, "journal bucket %llu not found when deleting", b);
+		bch_err_dev(ca, "journal bucket %llu not found when deleting", b);
 		return -EINVAL;
 	}
 
@@ -293,7 +277,7 @@ int bch2_dev_journal_alloc(struct bch_dev *ca, bool new_fs)
 
 	ret = bch2_set_nr_journal_buckets_loop(c, ca, nr, new_fs);
 err:
-	bch_err_fn(ca, ret);
+	bch_err_fn_dev(ca, ret);
 	return ret;
 }
 
@@ -318,6 +302,8 @@ int bch2_fs_journal_alloc(struct bch_fs *c)
 
 static bool bch2_journal_writing_to_device(struct journal *j, unsigned dev_idx)
 {
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+
 	guard(spinlock)(&j->lock);
 
 	for (u64 seq = journal_last_unwritten_seq(j);
@@ -325,7 +311,7 @@ static bool bch2_journal_writing_to_device(struct journal *j, unsigned dev_idx)
 	     seq++) {
 		struct journal_buf *buf = journal_seq_to_buf(j, seq);
 
-		if (bch2_bkey_has_device_c(bkey_i_to_s_c(&buf->key), dev_idx))
+		if (bch2_bkey_has_device_c(c, bkey_i_to_s_c(&buf->key), dev_idx))
 			return true;
 	}
 
@@ -335,6 +321,7 @@ static bool bch2_journal_writing_to_device(struct journal *j, unsigned dev_idx)
 void bch2_dev_journal_stop(struct journal *j, struct bch_dev *ca)
 {
 	wait_event(j->wait, !bch2_journal_writing_to_device(j, ca->dev_idx));
+	cancel_work_sync(&ca->journal.discard);
 }
 
 void bch2_fs_journal_stop(struct journal *j)
@@ -366,29 +353,30 @@ void bch2_fs_journal_stop(struct journal *j)
 		clear_bit(JOURNAL_running, &j->flags);
 }
 
-int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
+int bch2_fs_journal_start(struct journal *j, struct journal_start_info info)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	struct journal_entry_pin_list *p;
 	struct journal_replay *i, **_i;
 	struct genradix_iter iter;
 	bool had_entries = false;
+	int ret = 0;
 
 	/*
 	 *
 	 * XXX pick most recent non blacklisted sequence number
 	 */
 
-	cur_seq = max(cur_seq, bch2_journal_last_blacklisted_seq(c));
+	info.start_seq = max(info.start_seq, bch2_journal_last_blacklisted_seq(c));
 
-	if (cur_seq >= JOURNAL_SEQ_MAX) {
+	if (info.start_seq >= JOURNAL_SEQ_MAX) {
 		bch_err(c, "cannot start: journal seq overflow");
 		return -EINVAL;
 	}
 
 	/* Clean filesystem? */
-	if (!last_seq)
-		last_seq = cur_seq;
+	u64 cur_seq	= info.start_seq;
+	u64 last_seq	= info.seq_read_start ?: info.start_seq;
 
 	u64 nr = cur_seq - last_seq;
 	if (nr * sizeof(struct journal_entry_pin_list) > 1U << 30) {
@@ -418,6 +406,7 @@ int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
 	j->seq_write_started	= cur_seq - 1;
 	j->seq_ondisk		= cur_seq - 1;
 	j->pin.front		= last_seq;
+	j->last_seq		= last_seq;
 	j->pin.back		= cur_seq;
 	atomic64_set(&j->seq, cur_seq - 1);
 
@@ -440,11 +429,26 @@ int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
 		if (journal_entry_empty(&i->j))
 			j->last_empty_seq = le64_to_cpu(i->j.seq);
 
-		p = journal_seq_pin(j, seq);
+		if (!info.clean) {
+			struct bch_devs_list seq_devs = {};
+			darray_for_each(i->ptrs, ptr)
+				seq_devs.data[seq_devs.nr++] = ptr->dev;
 
-		p->devs.nr = 0;
-		darray_for_each(i->ptrs, ptr)
-			bch2_dev_list_add_dev(&p->devs, ptr->dev);
+			p = journal_seq_pin(j, seq);
+			bch2_devlist_to_replicas(&p->devs.e, BCH_DATA_journal, seq_devs);
+
+			CLASS(printbuf, buf)();
+			bch2_replicas_entry_to_text(&buf, &p->devs.e);
+
+			fsck_err_on(!test_bit(JOURNAL_degraded, &j->flags) &&
+				    !bch2_replicas_marked(c, &p->devs.e),
+				    c, journal_entry_replicas_not_marked,
+				    "superblock not marked as containing replicas for journal entry %llu\n%s",
+				    le64_to_cpu(i->j.seq), buf.buf);
+
+			if (bch2_replicas_entry_get(c, &p->devs.e))
+				p->devs.e.nr_devs = 0;
+		}
 
 		had_entries = true;
 	}
@@ -455,10 +459,11 @@ int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
 	scoped_guard(spinlock, &j->lock) {
 		j->last_flush_write = jiffies;
 		j->reservations.idx = journal_cur_seq(j);
-		c->last_bucket_seq_cleanup = journal_cur_seq(j);
 	}
 
-	return 0;
+	try(bch2_replicas_gc_reffed(c));
+fsck_err:
+	return ret;
 }
 
 void bch2_journal_set_replay_done(struct journal *j)
@@ -490,6 +495,12 @@ void bch2_dev_journal_exit(struct bch_dev *ca)
 	kfree(ja->bucket_seq);
 	ja->buckets	= NULL;
 	ja->bucket_seq	= NULL;
+}
+
+void bch2_dev_journal_init_early(struct bch_dev *ca)
+{
+	mutex_init(&ca->journal.discard_lock);
+	INIT_WORK(&ca->journal.discard, bch2_journal_discard_work);
 }
 
 int bch2_dev_journal_init(struct bch_dev *ca, struct bch_sb *sb)
@@ -560,6 +571,9 @@ int bch2_dev_journal_init(struct bch_dev *ca, struct bch_sb *sb)
 
 void bch2_fs_journal_exit(struct journal *j)
 {
+	if (j->discard_wq)
+		destroy_workqueue(j->discard_wq);
+
 	if (j->wq)
 		destroy_workqueue(j->wq);
 
@@ -583,7 +597,6 @@ void bch2_fs_journal_init_early(struct journal *j)
 	init_waitqueue_head(&j->reclaim_wait);
 	init_waitqueue_head(&j->pin_flush_wait);
 	mutex_init(&j->reclaim_lock);
-	mutex_init(&j->discard_lock);
 
 	lockdep_init_map(&j->res_map, "journal res", &res_key, 0);
 
@@ -607,6 +620,11 @@ int bch2_fs_journal_init(struct journal *j)
 	j->wq = alloc_workqueue("bcachefs_journal",
 				WQ_HIGHPRI|WQ_FREEZABLE|WQ_UNBOUND|WQ_MEM_RECLAIM, 512);
 	if (!j->wq)
+		return bch_err_throw(c, ENOMEM_fs_other_alloc);
+
+	j->discard_wq = alloc_workqueue("bcachefs_journal_discard",
+				WQ_HIGHPRI|WQ_FREEZABLE|WQ_UNBOUND|WQ_MEM_RECLAIM, 512);
+	if (!j->discard_wq)
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 	return 0;
 }

@@ -39,6 +39,10 @@ void __bch2_btree_node_wait_on_write(struct btree *);
 void bch2_btree_node_wait_on_read(struct btree *);
 void bch2_btree_node_wait_on_write(struct btree *);
 
+DEFINE_GUARD(btree_node_io_lock, struct btree *,
+	     bch2_btree_node_io_lock(_T),
+	     bch2_btree_node_io_unlock(_T));
+
 static inline struct nonce btree_nonce(struct bset *i, unsigned offset)
 {
 	return (struct nonce) {{
@@ -72,8 +76,8 @@ static inline int bset_encrypt(struct bch_fs *c, struct bset *i, unsigned offset
 
 void bch2_btree_node_drop_keys_outside_node(struct btree *);
 
-int bch2_validate_bset_keys(struct bch_fs *, struct btree *,
-			    struct bset *, int,
+int bch2_validate_bset_keys(struct bch_fs *, struct bch_dev *,
+			    struct btree *, struct bset *, int,
 			    struct bch_io_failures *,
 			    struct printbuf *);
 int bch2_validate_bset(struct bch_fs *, struct bch_dev *,
@@ -96,7 +100,6 @@ int bch2_btree_node_scrub(struct btree_trans *, enum btree_id, unsigned,
 			  struct bkey_s_c, unsigned);
 
 bool bch2_btree_flush_all_reads(struct bch_fs *);
-bool bch2_btree_flush_all_writes(struct bch_fs *);
 
 static inline void compat_bformat(unsigned level, enum btree_id btree_id,
 				  unsigned version, unsigned big_endian,

@@ -62,7 +62,7 @@ static inline struct bch_devs_mask target_rw_devs(struct bch_fs *c,
 						  enum bch_data_type data_type,
 						  u16 target)
 {
-	struct bch_devs_mask devs = c->rw_devs[data_type];
+	struct bch_devs_mask devs = c->allocator.rw_devs[data_type];
 	const struct bch_devs_mask *t = bch2_target_to_mask(c, target);
 
 	if (t)
@@ -78,7 +78,13 @@ static inline bool bch2_target_accepts_data(struct bch_fs *c,
 	return !bitmap_empty(rw_devs.d, BCH_SB_MEMBERS_MAX);
 }
 
-bool bch2_dev_in_target(struct bch_fs *, unsigned, unsigned);
+bool bch2_dev_in_target_rcu(struct bch_fs *, unsigned, unsigned);
+
+static inline bool bch2_dev_in_target(struct bch_fs *c, unsigned dev, unsigned target)
+{
+	guard(rcu)();
+	return bch2_dev_in_target_rcu(c, dev, target);
+}
 
 int bch2_disk_path_find(struct bch_sb_handle *, const char *);
 

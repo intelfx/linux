@@ -202,15 +202,14 @@ static struct bch_csum __bch2_checksum_bio(struct bch_fs *c, unsigned type,
 
 #ifdef CONFIG_HIGHMEM
 		__bio_for_each_segment(bv, bio, *iter, *iter) {
-			void *p = kmap_local_page(bv.bv_page) + bv.bv_offset;
+			void *p = bvec_kmap_local(&bv);
 
 			bch2_checksum_update(&state, p, bv.bv_len);
 			kunmap_local(p);
 		}
 #else
 		__bio_for_each_bvec(bv, bio, *iter, *iter)
-			bch2_checksum_update(&state, page_address(bv.bv_page) + bv.bv_offset,
-				bv.bv_len);
+			bch2_checksum_update(&state, bvec_virt(&bv), bv.bv_len);
 #endif
 		return (struct bch_csum) { .lo = cpu_to_le64(bch2_checksum_final(&state)) };
 	}
@@ -225,16 +224,14 @@ static struct bch_csum __bch2_checksum_bio(struct bch_fs *c, unsigned type,
 
 #ifdef CONFIG_HIGHMEM
 		__bio_for_each_segment(bv, bio, *iter, *iter) {
-			void *p = kmap_local_page(bv.bv_page) + bv.bv_offset;
+			void *p = bvec_kmap_local(&bv);
 
 			poly1305_update(&dctx, p, bv.bv_len);
 			kunmap_local(p);
 		}
 #else
 		__bio_for_each_bvec(bv, bio, *iter, *iter)
-			poly1305_update(&dctx,
-				page_address(bv.bv_page) + bv.bv_offset,
-				bv.bv_len);
+			poly1305_update(&dctx, bvec_virt(&bv), bv.bv_len);
 #endif
 		poly1305_final(&dctx, digest);
 
@@ -420,7 +417,9 @@ static int bch2_sb_crypt_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_crypt_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_crypt_to_text(struct printbuf *out,
+				  struct bch_fs *c,
+				  struct bch_sb *sb,
 				  struct bch_sb_field *f)
 {
 	struct bch_sb_field_crypt *crypt = field_to_type(f, crypt);
@@ -581,6 +580,7 @@ err:
  */
 int bch2_disable_encryption(struct bch_fs *c)
 {
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
 	guard(mutex)(&c->sb_lock);
 
 	struct bch_sb_field_crypt *crypt = bch2_sb_field_get(c->disk_sb.sb, crypt);
@@ -614,6 +614,7 @@ int bch2_enable_encryption(struct bch_fs *c, bool keyed)
 	struct bch_sb_field_crypt *crypt;
 	int ret = -EINVAL;
 
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
 	guard(mutex)(&c->sb_lock);
 
 	/* Do we already have an encryption key? */

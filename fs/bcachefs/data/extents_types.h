@@ -32,11 +32,33 @@ struct bch_io_failures {
 	u8			nr;
 	struct bch_dev_io_failures {
 		u8		dev;
-		unsigned	failed_csum_nr:6,
-				failed_io:1,
-				failed_btree_validate:1,
-				failed_ec:1;
-	}			devs[BCH_REPLICAS_MAX + 1];
+		unsigned	csum_nr:7;
+		s16		ec_errcode;
+		s16		errcode;
+	}			data[BCH_REPLICAS_MAX + 1];
+};
+
+#define BCH_READ_FLAGS()		\
+	x(retry_if_stale)		\
+	x(may_promote)			\
+	x(user_mapped)			\
+	x(soft_require_read_device)	\
+	x(hard_require_read_device)	\
+	x(last_fragment)		\
+	x(must_bounce)			\
+	x(must_clone)			\
+	x(in_retry)
+
+enum __bch_read_flags {
+#define x(n)	__BCH_READ_##n,
+	BCH_READ_FLAGS()
+#undef x
+};
+
+enum bch_read_flags {
+#define x(n)	BCH_READ_##n = BIT(__BCH_READ_##n),
+	BCH_READ_FLAGS()
+#undef x
 };
 
 #endif /* _BCACHEFS_EXTENTS_TYPES_H */

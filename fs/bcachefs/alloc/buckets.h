@@ -212,14 +212,20 @@ static inline u64 bch2_dev_buckets_reserved(struct bch_dev *ca, enum bch_waterma
 	return reserved;
 }
 
-static inline u64 dev_buckets_free(struct bch_dev *ca,
-				   struct bch_dev_usage usage,
-				   enum bch_watermark watermark)
+static inline u64 __dev_buckets_free(struct bch_dev *ca,
+				     struct bch_dev_usage usage,
+				     enum bch_watermark watermark)
 {
 	return max_t(s64, 0,
 		     usage.buckets[BCH_DATA_free]-
 		     ca->nr_open_buckets -
 		     bch2_dev_buckets_reserved(ca, watermark));
+}
+
+static inline u64 dev_buckets_free(struct bch_dev *ca,
+				   enum bch_watermark watermark)
+{
+	return __dev_buckets_free(ca, bch2_dev_usage_read(ca), watermark);
 }
 
 static inline u64 __dev_buckets_available(struct bch_dev *ca,
@@ -298,7 +304,7 @@ static inline void bch2_disk_reservation_put(struct bch_fs *c,
 					     struct disk_reservation *res)
 {
 	if (res->sectors) {
-		this_cpu_sub(*c->online_reserved, res->sectors);
+		this_cpu_sub(c->capacity.pcpu->online_reserved, res->sectors);
 		res->sectors = 0;
 	}
 }
@@ -317,15 +323,15 @@ static inline int bch2_disk_reservation_add(struct bch_fs *c, struct disk_reserv
 #ifdef __KERNEL__
 	u64 old, new;
 
-	old = this_cpu_read(c->pcpu->sectors_available);
+	old = this_cpu_read(c->capacity.pcpu->sectors_available);
 	do {
 		if (sectors > old)
 			return __bch2_disk_reservation_add(c, res, sectors, flags);
 
 		new = old - sectors;
-	} while (!this_cpu_try_cmpxchg(c->pcpu->sectors_available, &old, new));
+	} while (!this_cpu_try_cmpxchg(c->capacity.pcpu->sectors_available, &old, new));
 
-	this_cpu_add(*c->online_reserved, sectors);
+	this_cpu_add(c->capacity.pcpu->online_reserved, sectors);
 	res->sectors			+= sectors;
 	return 0;
 #else

@@ -329,8 +329,8 @@ bch2_bkey_prev(struct btree *b, struct bset_tree *t, struct bkey_packed *k)
 void bch2_btree_node_iter_push(struct btree_node_iter *, struct btree *,
 			      const struct bkey_packed *,
 			      const struct bkey_packed *);
-void bch2_btree_node_iter_init(struct btree_node_iter *, struct btree *,
-			       struct bpos *);
+void bch2_btree_node_iter_init(struct bch_fs *, struct btree *,
+			       struct btree_node_iter *, struct bpos *);
 void bch2_btree_node_iter_init_from_start(struct btree_node_iter *,
 					  struct btree *);
 struct bkey_packed *bch2_btree_node_iter_bset_pos(struct btree_node_iter *,
@@ -343,10 +343,19 @@ void bch2_btree_node_iter_set_drop(struct btree_node_iter *,
 void bch2_btree_node_iter_advance(struct btree_node_iter *, struct btree *);
 
 #define btree_node_iter_for_each(_iter, _set)				\
-	for (_set = (_iter)->data;					\
+	for (struct btree_node_iter_set *_set = (_iter)->data;		\
 	     _set < (_iter)->data + ARRAY_SIZE((_iter)->data) &&	\
 	     (_set)->k != (_set)->end;					\
 	     _set++)
+
+static inline struct btree_node_iter_set *
+btree_node_iter_set_find(struct btree_node_iter *iter, unsigned end_offset)
+{
+	btree_node_iter_for_each(iter, set)
+		if (set->end == end_offset)
+			return set;
+	return NULL;
+}
 
 static inline bool __btree_node_iter_set_end(struct btree_node_iter *iter,
 					     unsigned i)
@@ -513,8 +522,11 @@ void bch2_bfloat_to_text(struct printbuf *, struct btree *,
 
 /* Debug stuff */
 
-void bch2_dump_bset(struct bch_fs *, struct btree *, struct bset *, unsigned);
-void bch2_dump_btree_node(struct bch_fs *, struct btree *);
+void bch2_btree_node_keys_to_text(struct printbuf *, struct bch_fs *, struct btree *);
+
+void bch2_bset_to_text(struct printbuf *,
+		       struct bch_fs *, struct btree *,
+		       struct bset *, unsigned);
 void bch2_dump_btree_node_iter(struct btree *, struct btree_node_iter *);
 
 void __bch2_verify_btree_nr_keys(struct btree *);

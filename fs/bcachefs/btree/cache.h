@@ -14,11 +14,11 @@ void bch2_recalc_btree_reserve(struct bch_fs *);
 
 void bch2_btree_node_to_freelist(struct bch_fs *, struct btree *);
 
-void __bch2_btree_node_hash_remove(struct btree_cache *, struct btree *);
-void bch2_btree_node_hash_remove(struct btree_cache *, struct btree *);
+void __bch2_btree_node_hash_remove(struct bch_fs_btree_cache *, struct btree *);
+void bch2_btree_node_hash_remove(struct bch_fs_btree_cache *, struct btree *);
 
-int __bch2_btree_node_hash_insert(struct btree_cache *, struct btree *);
-int bch2_btree_node_hash_insert(struct btree_cache *, struct btree *,
+int __bch2_btree_node_hash_insert(struct bch_fs_btree_cache *, struct btree *);
+int bch2_btree_node_hash_insert(struct bch_fs_btree_cache *, struct btree *,
 				unsigned, enum btree_id);
 
 void bch2_node_pin(struct bch_fs *, struct btree *);
@@ -30,7 +30,7 @@ void bch2_btree_node_update_key_early(struct btree_trans *, enum btree_id, unsig
 void bch2_btree_cache_cannibalize_unlock(struct btree_trans *);
 int bch2_btree_cache_cannibalize_lock(struct btree_trans *, struct closure *);
 
-void __btree_node_data_free(struct btree *);
+void bch2_btree_node_data_free_locked(struct btree *);
 struct btree *__bch2_btree_node_mem_alloc(struct bch_fs *);
 struct btree *bch2_btree_node_mem_alloc(struct btree_trans *, bool);
 
@@ -48,7 +48,7 @@ void bch2_btree_node_evict(struct btree_trans *, const struct bkey_i *);
 
 void bch2_fs_btree_cache_exit(struct bch_fs *);
 int bch2_fs_btree_cache_init(struct bch_fs *);
-void bch2_fs_btree_cache_init_early(struct btree_cache *);
+void bch2_fs_btree_cache_init_early(struct bch_fs_btree_cache *);
 
 static inline u64 btree_ptr_hash_val(const struct bkey_i *k)
 {
@@ -80,8 +80,8 @@ static inline bool btree_node_hashed(struct btree *b)
 }
 
 #define for_each_cached_btree(_b, _c, _tbl, _iter, _pos)		\
-	for ((_tbl) = rht_dereference_rcu((_c)->btree_cache.table.tbl,	\
-					  &(_c)->btree_cache.table),	\
+	for ((_tbl) = rht_dereference_rcu((_c)->btree.cache.table.tbl,	\
+					  &(_c)->btree.cache.table),	\
 	     _iter = 0;	_iter < (_tbl)->size; _iter++)			\
 		rht_for_each_entry_rcu((_b), (_pos), _tbl, _iter, hash)
 
@@ -119,21 +119,21 @@ static inline unsigned btree_blocks(const struct bch_fs *c)
 
 static inline unsigned btree_id_nr_alive(struct bch_fs *c)
 {
-	return BTREE_ID_NR + c->btree_roots_extra.nr;
+	return BTREE_ID_NR + c->btree.cache.roots_extra.nr;
 }
 
 static inline struct btree_root *bch2_btree_id_root(struct bch_fs *c, unsigned id)
 {
 	if (likely(id < BTREE_ID_NR)) {
-		return &c->btree_roots_known[id];
+		return &c->btree.cache.roots_known[id];
 	} else {
 		unsigned idx = id - BTREE_ID_NR;
 
 		/* This can happen when we're called from btree_node_scan */
-		if (idx >= c->btree_roots_extra.nr)
+		if (idx >= c->btree.cache.roots_extra.nr)
 			return NULL;
 
-		return &c->btree_roots_extra.data[idx];
+		return &c->btree.cache.roots_extra.data[idx];
 	}
 }
 
@@ -152,6 +152,18 @@ static inline bool btree_node_is_root(struct bch_fs *c, struct btree *b)
 	return b == root;
 }
 
+static inline void btree_node_buf_swap_account(struct bch_fs *c, void *old, void *new)
+{
+	int vmalloc_delta =
+		(int) is_vmalloc_addr(new) -
+		(int) is_vmalloc_addr(old);
+
+	if (vmalloc_delta) {
+		guard(mutex)(&c->btree.cache.lock);
+		c->btree.cache.nr_vmalloc += vmalloc_delta;
+	}
+}
+
 const char *bch2_btree_id_str(enum btree_id);	/* avoid */
 void bch2_btree_id_to_text(struct printbuf *, enum btree_id);
 void bch2_btree_id_level_to_text(struct printbuf *, enum btree_id, unsigned);
@@ -160,17 +172,9 @@ void __bch2_btree_pos_to_text(struct printbuf *, struct bch_fs *,
 			      enum btree_id, unsigned, struct bkey_s_c);
 void bch2_btree_pos_to_text(struct printbuf *, struct bch_fs *, const struct btree *);
 void bch2_btree_node_to_text(struct printbuf *, struct bch_fs *, const struct btree *);
-void bch2_btree_cache_to_text(struct printbuf *, const struct btree_cache *);
+void bch2_btree_cache_to_text(struct printbuf *, const struct bch_fs_btree_cache *);
 
 #define trace_btree_node(_c, _b, event)				\
-do {								\
-	if (trace_##event##_enabled()) {			\
-		CLASS(printbuf, buf)();				\
-		guard(printbuf_indent)(&buf);			\
-		bch2_btree_pos_to_text(&buf, c, b);		\
-		trace_##event(c, buf.buf);			\
-	}							\
-	count_event(c, event);					\
-} while (0);
+	event_inc_trace(c, event, buf, bch2_btree_pos_to_text(&buf, c, b))
 
 #endif /* _BCACHEFS_BTREE_CACHE_H */

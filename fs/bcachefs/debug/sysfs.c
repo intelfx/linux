@@ -6,13 +6,12 @@
  * Copyright 2012 Google, Inc.
  */
 
-#ifndef NO_BCACHEFS_SYSFS
-
 #include "bcachefs.h"
 
 #include "alloc/accounting.h"
 #include "alloc/background.h"
 #include "alloc/buckets.h"
+#include "alloc/discard.h"
 #include "alloc/disk_groups.h"
 #include "alloc/foreground.h"
 #include "alloc/replicas.h"
@@ -29,10 +28,10 @@
 
 #include "data/compress.h"
 #include "data/copygc.h"
-#include "data/ec.h"
+#include "data/ec/create.h"
 #include "data/move.h"
 #include "data/nocow_locking.h"
-#include "data/rebalance.h"
+#include "data/reconcile/work.h"
 
 #include "debug/sysfs.h"
 #include "debug/tests.h"
@@ -46,6 +45,7 @@
 #include "journal/journal.h"
 #include "journal/reclaim.h"
 
+#include "sb/counters.h"
 #include "sb/errors.h"
 #include "sb/io.h"
 
@@ -56,6 +56,7 @@
 #include <linux/blkdev.h>
 #include <linux/sort.h>
 #include <linux/sched/clock.h>
+#include <linux/sysfs.h>
 
 
 #define SYSFS_OPS(type)							\
@@ -163,6 +164,8 @@ write_attribute(trigger_btree_write_buffer_flush);
 write_attribute(trigger_btree_updates);
 write_attribute(trigger_freelist_wakeup);
 write_attribute(trigger_recalc_capacity);
+write_attribute(trigger_reconcile_wakeup);
+write_attribute(trigger_reconcile_pending_wakeup);
 write_attribute(trigger_delete_dead_snapshots);
 write_attribute(trigger_emergency_read_only);
 read_attribute(gc_gens_pos);
@@ -180,6 +183,8 @@ read_attribute(io_latency_read);
 read_attribute(io_latency_write);
 read_attribute(io_latency_stats_read);
 read_attribute(io_latency_stats_write);
+read_attribute(io_latency_stats_read_json);
+read_attribute(io_latency_stats_write_json);
 #ifndef CONFIG_BCACHEFS_NO_LATENCY_ACCT
 read_attribute(congested);
 #endif
@@ -193,9 +198,11 @@ read_attribute(journal_debug);
 read_attribute(btree_cache);
 read_attribute(btree_key_cache);
 read_attribute(btree_reserve_cache);
+read_attribute(btree_write_buffer);
 read_attribute(open_buckets);
 read_attribute(open_buckets_partial);
 read_attribute(nocow_lock_table);
+read_attribute(replicas);
 
 read_attribute(read_refs);
 read_attribute(write_refs);
@@ -207,7 +214,8 @@ read_attribute(has_data);
 read_attribute(alloc_debug);
 read_attribute(usage_base);
 
-#define x(t, n, ...) read_attribute(t);
+#define x(t, n, ...)							\
+	static struct attribute sysfs_counter_##t = { .name = #t, .mode = 0644 };
 BCH_PERSISTENT_COUNTERS()
 #undef x
 
@@ -215,8 +223,8 @@ rw_attribute(label);
 
 read_attribute(copy_gc_wait);
 
-sysfs_pd_controller_attribute(rebalance);
-read_attribute(rebalance_status);
+read_attribute(reconcile_status);
+read_attribute(reconcile_scan_pending);
 read_attribute(snapshot_delete_status);
 read_attribute(recovery_status);
 
@@ -226,6 +234,8 @@ read_attribute(io_timers_read);
 read_attribute(io_timers_write);
 
 read_attribute(moving_ctxts);
+
+read_attribute(recent_counters);
 
 #ifdef CONFIG_BCACHEFS_TESTS
 write_attribute(perf_test);
@@ -239,7 +249,7 @@ write_attribute(perf_test);
 
 static size_t bch2_btree_cache_size(struct bch_fs *c)
 {
-	struct btree_cache *bc = &c->btree_cache;
+	struct bch_fs_btree_cache *bc = &c->btree.cache;
 	size_t ret = 0;
 	struct btree *b;
 
@@ -294,9 +304,7 @@ static int bch2_compression_stats_to_text(struct printbuf *out, struct bch_fs *c
 
 static void bch2_gc_gens_pos_to_text(struct printbuf *out, struct bch_fs *c)
 {
-	bch2_btree_id_to_text(out, c->gc_gens_btree);
-	prt_printf(out, ": ");
-	bch2_bpos_to_text(out, c->gc_gens_pos);
+	bch2_bbpos_to_text(out, c->gc_gens.pos);
 	prt_printf(out, "\n");
 }
 
@@ -304,7 +312,7 @@ static void bch2_fs_usage_base_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct bch_fs_usage_base b = {};
 
-	acc_u64s_percpu(&b.hidden, &c->usage->hidden, sizeof(b) / sizeof(u64));
+	acc_u64s_percpu(&b.hidden, &c->capacity.usage->hidden, sizeof(b) / sizeof(u64));
 
 	prt_printf(out, "hidden:\t\t%llu\n",	b.hidden);
 	prt_printf(out, "btree:\t\t%llu\n",	b.btree);
@@ -331,13 +339,14 @@ SHOW(bch2_fs)
 	if (attr == &sysfs_gc_gens_pos)
 		bch2_gc_gens_pos_to_text(out, c);
 
-	sysfs_pd_controller_show(rebalance,	&c->rebalance.pd); /* XXX */
-
 	if (attr == &sysfs_copy_gc_wait)
 		bch2_copygc_wait_to_text(out, c);
 
-	if (attr == &sysfs_rebalance_status)
-		bch2_rebalance_status_to_text(out, c);
+	if (attr == &sysfs_reconcile_status)
+		bch2_reconcile_status_to_text(out, c);
+
+	if (attr == &sysfs_reconcile_scan_pending)
+		bch2_reconcile_scan_pending_to_text(out, c);
 
 	if (attr == &sysfs_snapshot_delete_status)
 		bch2_snapshot_delete_status_to_text(out, c);
@@ -351,13 +360,16 @@ SHOW(bch2_fs)
 		bch2_journal_debug_to_text(out, &c->journal);
 
 	if (attr == &sysfs_btree_cache)
-		bch2_btree_cache_to_text(out, &c->btree_cache);
+		bch2_btree_cache_to_text(out, &c->btree.cache);
 
 	if (attr == &sysfs_btree_key_cache)
-		bch2_btree_key_cache_to_text(out, &c->btree_key_cache);
+		bch2_btree_key_cache_to_text(out, &c->btree.key_cache);
 
 	if (attr == &sysfs_btree_reserve_cache)
 		bch2_btree_reserve_cache_to_text(out, c);
+
+	if (attr == &sysfs_btree_write_buffer)
+		bch2_btree_write_buffer_to_text(out, c);
 
 	if (attr == &sysfs_open_buckets)
 		bch2_open_buckets_to_text(out, c, NULL);
@@ -383,17 +395,25 @@ SHOW(bch2_fs)
 	if (attr == &sysfs_moving_ctxts)
 		bch2_fs_moving_ctxts_to_text(out, c);
 
+	if (attr == &sysfs_recent_counters)
+		bch2_sb_recent_counters_to_text(out, &c->counters);
+
 	if (attr == &sysfs_write_refs)
 		enumerated_ref_to_text(out, &c->writes, bch2_write_refs);
 
 	if (attr == &sysfs_nocow_lock_table)
 		bch2_nocow_locks_to_text(out, &c->nocow_locks);
 
+	if (attr == &sysfs_replicas)
+		bch2_cpu_replicas_to_text(out, &c->replicas);
+
 	if (attr == &sysfs_disk_groups)
 		bch2_disk_groups_to_text(out, c);
 
-	if (attr == &sysfs_alloc_debug)
+	if (attr == &sysfs_alloc_debug) {
 		bch2_fs_alloc_debug_to_text(out, c);
+		bch2_fs_open_buckets_to_text(out, c);
+	}
 
 	if (attr == &sysfs_usage_base)
 		bch2_fs_usage_base_to_text(out, c);
@@ -405,8 +425,6 @@ STORE(bch2_fs)
 {
 	struct bch_fs *c = container_of(kobj, struct bch_fs, kobj);
 
-	sysfs_pd_controller_store(rebalance,	&c->rebalance.pd);
-
 	/* Debugging: */
 
 	if (!test_bit(BCH_FS_started, &c->flags))
@@ -415,13 +433,13 @@ STORE(bch2_fs)
 	/* Debugging: */
 
 	if (attr == &sysfs_trigger_btree_updates)
-		queue_work(c->btree_interior_update_worker, &c->btree_interior_update_work);
+		queue_work(c->btree.interior_updates.worker, &c->btree.interior_updates.work);
 
 	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_sysfs))
 		return -EROFS;
 
 	if (attr == &sysfs_trigger_btree_cache_shrink) {
-		struct btree_cache *bc = &c->btree_cache;
+		struct bch_fs_btree_cache *bc = &c->btree.cache;
 		struct shrink_control sc;
 
 		sc.gfp_mask = GFP_KERNEL;
@@ -434,7 +452,7 @@ STORE(bch2_fs)
 
 		sc.gfp_mask = GFP_KERNEL;
 		sc.nr_to_scan = strtoul_or_return(buf);
-		c->btree_key_cache.shrink->scan_objects(c->btree_key_cache.shrink, &sc);
+		c->btree.key_cache.shrink->scan_objects(c->btree.key_cache.shrink, &sc);
 	}
 
 	if (attr == &sysfs_trigger_btree_write_buffer_flush)
@@ -463,24 +481,27 @@ STORE(bch2_fs)
 		bch2_journal_do_writes(&c->journal);
 
 	if (attr == &sysfs_trigger_freelist_wakeup)
-		closure_wake_up(&c->freelist_wait);
+		closure_wake_up(&c->allocator.freelist_wait);
 
 	if (attr == &sysfs_trigger_recalc_capacity) {
 		guard(rwsem_read)(&c->state_lock);
 		bch2_recalc_capacity(c);
 	}
 
+	if (attr == &sysfs_trigger_reconcile_wakeup)
+		bch2_reconcile_wakeup(c);
+
+	if (attr == &sysfs_trigger_reconcile_pending_wakeup)
+		bch2_reconcile_pending_wakeup(c);
+
 	if (attr == &sysfs_trigger_delete_dead_snapshots)
 		__bch2_delete_dead_snapshots(c);
 
 	if (attr == &sysfs_trigger_emergency_read_only) {
-		struct printbuf buf = PRINTBUF;
-		bch2_log_msg_start(c, &buf);
+		CLASS(bch_log_msg, msg)(c);
 
-		prt_printf(&buf, "shutdown by sysfs\n");
-		bch2_fs_emergency_read_only2(c, &buf);
-		bch2_print_str(c, KERN_ERR, buf.buf);
-		printbuf_exit(&buf);
+		prt_printf(&msg.m, "shutdown by sysfs\n");
+		bch2_fs_emergency_read_only(c, &msg.m);
 	}
 
 #ifdef CONFIG_BCACHEFS_TESTS
@@ -512,7 +533,8 @@ struct attribute *bch2_fs_files[] = {
 	&sysfs_btree_cache_size,
 	&sysfs_btree_write_stats,
 
-	&sysfs_rebalance_status,
+	&sysfs_reconcile_status,
+	&sysfs_reconcile_scan_pending,
 	&sysfs_snapshot_delete_status,
 	&sysfs_recovery_status,
 
@@ -536,9 +558,9 @@ SHOW(bch2_fs_counters)
 	printbuf_tabstop_push(out, 32);
 
 	#define x(t, n, f, ...) \
-		if (attr == &sysfs_##t) {					\
-			counter             = percpu_u64_get(&c->counters[BCH_COUNTER_##t]);\
-			counter_since_mount = counter - c->counters_on_mount[BCH_COUNTER_##t];\
+		if (attr == &sysfs_counter_##t) {					\
+			counter             = percpu_u64_get(&c->counters.now[BCH_COUNTER_##t]);\
+			counter_since_mount = counter - c->counters.mount[BCH_COUNTER_##t];\
 			if (f & TYPE_SECTORS) {					\
 				counter <<= 9;					\
 				counter_since_mount <<= 9;			\
@@ -567,7 +589,7 @@ SYSFS_OPS(bch2_fs_counters);
 
 struct attribute *bch2_fs_counters_files[] = {
 #define x(t, ...) \
-	&sysfs_##t,
+	&sysfs_counter_##t,
 	BCH_PERSISTENT_COUNTERS()
 #undef x
 	NULL
@@ -595,11 +617,13 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_btree_cache,
 	&sysfs_btree_key_cache,
 	&sysfs_btree_reserve_cache,
+	&sysfs_btree_write_buffer,
 	&sysfs_new_stripes,
 	&sysfs_open_buckets,
 	&sysfs_open_buckets_partial,
 	&sysfs_write_refs,
 	&sysfs_nocow_lock_table,
+	&sysfs_replicas,
 	&sysfs_io_timers_read,
 	&sysfs_io_timers_write,
 
@@ -615,6 +639,8 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_trigger_btree_updates,
 	&sysfs_trigger_freelist_wakeup,
 	&sysfs_trigger_recalc_capacity,
+	&sysfs_trigger_reconcile_wakeup,
+	&sysfs_trigger_reconcile_pending_wakeup,
 	&sysfs_trigger_delete_dead_snapshots,
 	&sysfs_trigger_emergency_read_only,
 
@@ -622,9 +648,8 @@ struct attribute *bch2_fs_internal_files[] = {
 
 	&sysfs_copy_gc_wait,
 
-	sysfs_pd_controller_files(rebalance),
-
 	&sysfs_moving_ctxts,
+	&sysfs_recent_counters,
 
 	&sysfs_internal_uuid,
 
@@ -632,6 +657,96 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_alloc_debug,
 	&sysfs_usage_base,
 	NULL
+};
+
+/* btree transaction stats - JSON via bin_attribute */
+
+static ssize_t bch2_btree_trans_stats_json_read(struct file *file,
+		struct kobject *kobj, const struct bin_attribute *attr,
+		char *buf, loff_t off, size_t count)
+{
+	struct bch_fs *c = container_of(kobj, struct bch_fs, internal);
+	struct printbuf *out = &c->btree.trans.stats_json_buf;
+
+	guard(mutex)(&c->btree.trans.stats_json_lock);
+
+	/*
+	 * kernfs caps bin_attribute reads at PAGE_SIZE per callback, so
+	 * multi-page output triggers multiple calls with increasing offsets.
+	 * Regenerating each time would produce inconsistent JSON if stats
+	 * change between calls. Cache the buffer and only regenerate when
+	 * off == 0 (start of a new read sequence).
+	 */
+	if (off == 0) {
+		printbuf_reset(out);
+
+		bool first = true;
+
+		prt_char(out, '{');
+
+		for (unsigned i = 0; i < ARRAY_SIZE(bch2_btree_transaction_fns); i++) {
+			if (!bch2_btree_transaction_fns[i])
+				break;
+
+			struct btree_transaction_stats *s = &c->btree.trans.stats[i];
+
+			if (!first)
+				prt_char(out, ',');
+			first = false;
+
+			prt_printf(out, "\"%s\":{", bch2_btree_transaction_fns[i]);
+
+			prt_printf(out, "\"max_mem\":%u,", s->max_mem);
+
+			prt_str(out, "\"duration\":");
+			bch2_time_stats_json_to_text(out, &s->duration, NULL, 0);
+
+			if (IS_ENABLED(CONFIG_BCACHEFS_LOCK_TIME_STATS)) {
+				prt_str(out, ",\"lock_hold_times\":");
+				bch2_time_stats_json_to_text(out, &s->lock_hold_times, NULL, 0);
+			}
+
+			prt_char(out, '}');
+		}
+
+		prt_str(out, "}\n");
+
+		if (out->allocation_failure)
+			return -ENOMEM;
+	}
+
+	if (off >= out->pos)
+		return 0;
+
+	size_t n = min_t(size_t, count, out->pos - off);
+	memcpy(buf, out->buf + off, n);
+	return n;
+}
+
+static ssize_t bch2_btree_trans_stats_json_write(struct file *file,
+		struct kobject *kobj, const struct bin_attribute *attr,
+		char *buf, loff_t off, size_t count)
+{
+	struct bch_fs *c = container_of(kobj, struct bch_fs, internal);
+
+	for (unsigned i = 0; i < ARRAY_SIZE(bch2_btree_transaction_fns); i++) {
+		if (!bch2_btree_transaction_fns[i])
+			break;
+
+		struct btree_transaction_stats *s = &c->btree.trans.stats[i];
+
+		guard(mutex)(&s->lock);
+		bch2_time_stats_reset(&s->duration);
+		bch2_time_stats_reset(&s->lock_hold_times);
+	}
+
+	return count;
+}
+
+struct bin_attribute bin_attr_btree_trans_stats_json = {
+	.attr	= { .name = "btree_trans_stats_json", .mode = 0644 },
+	.read	= bch2_btree_trans_stats_json_read,
+	.write	= bch2_btree_trans_stats_json_write,
 };
 
 /* options */
@@ -665,6 +780,10 @@ static ssize_t sysfs_opt_store(struct bch_fs *c,
 	const struct bch_option *opt = bch2_opt_table + id;
 	int ret = 0;
 
+	char *tmp __free(kfree) = kstrdup(buf, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+
 	/*
 	 * We don't need to take c->writes for correctness, but it eliminates an
 	 * unsightly error message in the dmesg log when we're RO:
@@ -672,40 +791,39 @@ static ssize_t sysfs_opt_store(struct bch_fs *c,
 	if (unlikely(!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_sysfs)))
 		return -EROFS;
 
-	char *tmp __free(kfree) = kstrdup(buf, GFP_KERNEL);
-	if (!tmp) {
-		ret = -ENOMEM;
-		goto err;
-	}
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
+	guard(opt_change_lock)(c);
 
 	u64 v;
 	ret =   bch2_opt_parse(c, opt, strim(tmp), &v, NULL) ?:
 		bch2_opt_hook_pre_set(c, ca, 0, id, v, true);
 
-	if (ret < 0)
-		goto err;
+	if (!ret) {
+		bool is_sb = opt->get_sb || opt->get_member;
+		bool changed = false;
 
-	bool is_sb = opt->get_sb || opt->get_member;
-	bool changed = false;
+		if (is_sb) {
+			changed = bch2_opt_set_sb(c, ca, opt, v);
+		} else if (!ca) {
+			changed = bch2_opt_get_by_id(&c->opts, id) != v;
+		} else {
+			/* device options that aren't superblock options aren't
+			 * supported */
+			BUG();
+		}
 
-	if (is_sb) {
-		changed = bch2_opt_set_sb(c, ca, opt, v);
-	} else if (!ca) {
-		changed = bch2_opt_get_by_id(&c->opts, id) != v;
-	} else {
-		/* device options that aren't superblock options aren't
-		 * supported */
-		BUG();
+		if (changed) {
+			if (!ca) {
+				bch2_opt_set_by_id(&c->opts, id, v);
+				clear_bit(id, c->mount_opts.d);
+			}
+
+			bch2_opt_hook_post_set(c, ca, 0, id, v);
+		}
+
+		ret = size;
 	}
 
-	if (!ca)
-		bch2_opt_set_by_id(&c->opts, id, v);
-
-	if (changed)
-		bch2_opt_hook_post_set(c, ca, 0, id, v);
-
-	ret = size;
-err:
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_sysfs);
 	return ret;
 }
@@ -785,6 +903,42 @@ struct attribute *bch2_fs_time_stats_files[] = {
 	NULL
 };
 
+/* time stats - JSON */
+
+SHOW(bch2_fs_time_stats_json)
+{
+	struct bch_fs *c = container_of(kobj, struct bch_fs, time_stats_json);
+
+#define x(name)								\
+	if (attr == &sysfs_time_stat_##name)				\
+		bch2_time_stats_json_to_text(out, &c->times[BCH_TIME_##name], NULL, 0);
+	BCH_TIME_STATS()
+#undef x
+
+	return 0;
+}
+
+STORE(bch2_fs_time_stats_json)
+{
+	struct bch_fs *c = container_of(kobj, struct bch_fs, time_stats_json);
+
+#define x(name)								\
+	if (attr == &sysfs_time_stat_##name)				\
+		bch2_time_stats_reset(&c->times[BCH_TIME_##name]);
+	BCH_TIME_STATS()
+#undef x
+	return size;
+}
+SYSFS_OPS(bch2_fs_time_stats_json);
+
+struct attribute *bch2_fs_time_stats_json_files[] = {
+#define x(name)						\
+	&sysfs_time_stat_##name,
+	BCH_TIME_STATS()
+#undef x
+	NULL
+};
+
 static const char * const bch2_rw[] = {
 	"read",
 	"write",
@@ -840,6 +994,12 @@ SHOW(bch2_dev)
 
 	if (attr == &sysfs_io_latency_stats_write)
 		bch2_time_stats_to_text(out, &ca->io_latency[WRITE].stats);
+
+	if (attr == &sysfs_io_latency_stats_read_json)
+		bch2_time_stats_json_to_text(out, &ca->io_latency[READ].stats, NULL, 0);
+
+	if (attr == &sysfs_io_latency_stats_write_json)
+		bch2_time_stats_json_to_text(out, &ca->io_latency[WRITE].stats, NULL, 0);
 
 #ifndef CONFIG_BCACHEFS_NO_LATENCY_ACCT
 	if (attr == &sysfs_congested)
@@ -906,6 +1066,8 @@ struct attribute *bch2_dev_files[] = {
 	&sysfs_io_latency_write,
 	&sysfs_io_latency_stats_read,
 	&sysfs_io_latency_stats_write,
+	&sysfs_io_latency_stats_read_json,
+	&sysfs_io_latency_stats_write_json,
 #ifndef CONFIG_BCACHEFS_NO_LATENCY_ACCT
 	&sysfs_congested,
 #endif
@@ -918,5 +1080,3 @@ struct attribute *bch2_dev_files[] = {
 	&sysfs_write_refs,
 	NULL
 };
-
-#endif  /* _BCACHEFS_SYSFS_H_ */

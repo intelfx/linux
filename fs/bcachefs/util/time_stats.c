@@ -306,11 +306,12 @@ void bch2_time_stats_to_json(struct seq_buf *out, struct bch2_time_stats *stats,
 	}
 
 	seq_buf_printf(out, "{\n");
-	seq_buf_printf(out, "  \"epoch\":       \"%s\",\n", epoch_name);
+	if (epoch_name)
+		seq_buf_printf(out, "  \"epoch\":       \"%s\",\n", epoch_name);
 	seq_buf_printf(out, "  \"count\":       %llu,\n", stats->duration_stats.n);
 
 	seq_buf_printf(out, "  \"duration_ns\": {\n");
-	seq_buf_printf(out, "    \"min\":       %llu,\n", stats->min_duration);
+	seq_buf_printf(out, "    \"min\":       %llu,\n", stats->min_duration != U64_MAX ? stats->min_duration : 0);
 	seq_buf_printf(out, "    \"max\":       %llu,\n", stats->max_duration);
 	seq_buf_printf(out, "    \"total\":     %llu,\n", stats->total_duration);
 	seq_buf_printf(out, "    \"mean\":      %llu,\n", d_mean);
@@ -326,7 +327,7 @@ void bch2_time_stats_to_json(struct seq_buf *out, struct bch2_time_stats *stats,
 	seq_buf_printf(out, "  },\n");
 
 	seq_buf_printf(out, "  \"between_ns\": {\n");
-	seq_buf_printf(out, "    \"min\":       %llu,\n", stats->min_freq);
+	seq_buf_printf(out, "    \"min\":       %llu,\n", stats->min_freq != U64_MAX ? stats->min_freq : 0);
 	seq_buf_printf(out, "    \"max\":       %llu,\n", stats->max_freq);
 	seq_buf_printf(out, "    \"mean\":      %llu,\n", f_mean);
 	seq_buf_printf(out, "    \"stddev\":    %llu\n", f_stddev);

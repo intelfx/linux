@@ -240,25 +240,23 @@ static void verify_no_dups(struct btree *b,
 void bch2_btree_bounce_free(struct bch_fs *c, size_t size, bool used_mempool, void *p)
 {
 	if (used_mempool)
-		mempool_free(p, &c->btree_bounce_pool);
+		mempool_free(p, &c->btree.bounce_pool);
 	else
 		kvfree(p);
 }
 
 void *bch2_btree_bounce_alloc(struct bch_fs *c, size_t size, bool *used_mempool)
 {
-	unsigned flags = memalloc_nofs_save();
-	void *p;
-
 	BUG_ON(size > c->opts.btree_node_size);
 
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
+
 	*used_mempool = false;
-	p = kvmalloc(size, GFP_NOWAIT|__GFP_ACCOUNT|__GFP_RECLAIMABLE);
+	void *p = kvmalloc(size, GFP_NOWAIT|__GFP_ACCOUNT|__GFP_RECLAIMABLE);
 	if (!p) {
 		*used_mempool = true;
-		p = mempool_alloc(&c->btree_bounce_pool, GFP_NOFS|__GFP_ACCOUNT|__GFP_RECLAIMABLE);
+		p = mempool_alloc(&c->btree.bounce_pool, GFP_NOFS|__GFP_ACCOUNT|__GFP_RECLAIMABLE);
 	}
-	memalloc_nofs_restore(flags);
 	return p;
 }
 
@@ -492,6 +490,8 @@ void bch2_btree_node_sort(struct bch_fs *c, struct btree *b,
 		out->keys.u64s = cpu_to_le16(u64s);
 		swap(out, b->data);
 		set_btree_bset(b, b->set, &b->data->keys);
+
+		btree_node_buf_swap_account(c, out, b->data);
 	} else {
 		start_bset->u64s = out->keys.u64s;
 		memcpy_u64s(start_bset->start,

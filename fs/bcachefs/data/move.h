@@ -86,11 +86,10 @@ void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
 int bch2_move_ratelimit(struct moving_context *);
 
-int bch2_scan_old_btree_nodes(struct bch_fs *, struct bch_move_stats *);
-
-struct per_snapshot_io_opts;
-int bch2_move_extent(struct moving_context *, struct move_bucket *,
-		     struct per_snapshot_io_opts *, move_pred_fn, void *,
+int bch2_move_extent(struct moving_context *,
+		     struct move_bucket *,
+		     struct bch_inode_opts *,
+		     struct data_update_opts *,
 		     struct btree_iter *, unsigned, struct bkey_s_c);
 
 int bch2_move_data_btree(struct moving_context *, struct bpos, struct bpos,
@@ -100,6 +99,8 @@ int bch2_move_data_phys(struct bch_fs *, unsigned, u64, u64, unsigned,
 			struct bch_ratelimit *, struct bch_move_stats *,
 			struct write_point_specifier, bool,
 			move_pred_fn, void *);
+
+int bch2_evacuate_data(struct moving_context *, unsigned, u64, u64);
 
 int bch2_evacuate_bucket(struct moving_context *,
 			   struct move_bucket *,

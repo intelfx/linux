@@ -7,6 +7,8 @@
 #include "extents_types.h"
 #include "data/reflink.h"
 
+#define BIO_BOUNCE_BUF_POOL_LEN	(PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER)
+
 #ifndef CONFIG_BCACHEFS_NO_LATENCY_ACCT
 void bch2_dev_congested_to_text(struct printbuf *, struct bch_dev *);
 #endif
@@ -42,6 +44,7 @@ struct bch_read_bio {
 	union {
 	struct {
 	u16			data_update:1,
+				data_update_verify_decompress:1,
 				promote:1,
 				bounce:1,
 				split:1,
@@ -111,39 +114,18 @@ static inline int bch2_read_indirect_extent(struct btree_trans *trans,
 	return 0;
 }
 
-#define BCH_READ_FLAGS()		\
-	x(retry_if_stale)		\
-	x(may_promote)			\
-	x(user_mapped)			\
-	x(last_fragment)		\
-	x(must_bounce)			\
-	x(must_clone)			\
-	x(in_retry)
-
-enum __bch_read_flags {
-#define x(n)	__BCH_READ_##n,
-	BCH_READ_FLAGS()
-#undef x
-};
-
-enum bch_read_flags {
-#define x(n)	BCH_READ_##n = BIT(__BCH_READ_##n),
-	BCH_READ_FLAGS()
-#undef x
-};
-
 void bch2_read_err_msg_trans(struct btree_trans *, struct printbuf *,
 			     struct bch_read_bio *, struct bpos);
 
 int __bch2_read_extent(struct btree_trans *, struct bch_read_bio *,
 		       struct bvec_iter, struct bpos, enum btree_id,
 		       struct bkey_s_c, unsigned,
-		       struct bch_io_failures *, unsigned, int);
+		       struct bch_io_failures *, enum bch_read_flags, int);
 
 static inline void bch2_read_extent(struct btree_trans *trans,
 			struct bch_read_bio *rbio, struct bpos read_pos,
 			enum btree_id data_btree, struct bkey_s_c k,
-			unsigned offset_into_extent, unsigned flags)
+			unsigned offset_into_extent, enum bch_read_flags flags)
 {
 	int ret = __bch2_read_extent(trans, rbio, rbio->bio.bi_iter, read_pos,
 				     data_btree, k, offset_into_extent, NULL, flags, -1);
@@ -153,7 +135,7 @@ static inline void bch2_read_extent(struct btree_trans *trans,
 
 int __bch2_read(struct btree_trans *, struct bch_read_bio *, struct bvec_iter,
 		subvol_inum,
-		struct bch_io_failures *, struct bkey_buf *, unsigned flags);
+		struct bch_io_failures *, struct bkey_buf *, enum bch_read_flags);
 
 static inline void bch2_read(struct bch_fs *c, struct bch_read_bio *rbio,
 			     subvol_inum inum)

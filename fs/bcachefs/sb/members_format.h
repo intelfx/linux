@@ -44,6 +44,10 @@ enum bch_member_error_type {
 	BCH_MEMBER_ERROR_NR
 };
 
+#ifndef __nonstring
+#define __nonstring
+#endif
+
 struct bch_member {
 	__uuid_t		uuid;
 	__le64			nbuckets;	/* device size */
@@ -67,6 +71,9 @@ struct bch_member {
 	 */
 	__le32			last_journal_bucket;
 	__le32			last_journal_bucket_offset;
+
+	__u8			device_name[16] __nonstring;
+	__u8			device_model[64] __nonstring;
 };
 
 /*
@@ -92,8 +99,9 @@ LE64_BITMASK(BCH_MEMBER_GROUP,		struct bch_member, flags, 20, 28)
 LE64_BITMASK(BCH_MEMBER_DURABILITY,	struct bch_member, flags, 28, 30)
 LE64_BITMASK(BCH_MEMBER_FREESPACE_INITIALIZED,
 					struct bch_member, flags, 30, 31)
-LE64_BITMASK(BCH_MEMBER_RESIZE_ON_MOUNT,
-					struct bch_member, flags, 31, 32)
+LE64_BITMASK(BCH_MEMBER_RESIZE_ON_MOUNT,struct bch_member, flags, 31, 32)
+LE64_BITMASK(BCH_MEMBER_ROTATIONAL,	struct bch_member, flags, 32, 33)
+LE64_BITMASK(BCH_MEMBER_ROTATIONAL_SET,	struct bch_member, flags, 33, 34)
 
 #if 0
 LE64_BITMASK(BCH_MEMBER_NR_READ_ERRORS,	struct bch_member, flags[1], 0,  20);
@@ -103,7 +111,7 @@ LE64_BITMASK(BCH_MEMBER_NR_WRITE_ERRORS,struct bch_member, flags[1], 20, 40);
 #define BCH_MEMBER_STATES()			\
 	x(rw,		0)			\
 	x(ro,		1)			\
-	x(failed,	2)			\
+	x(evacuating,	2)			\
 	x(spare,	3)
 
 enum bch_member_state {

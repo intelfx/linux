@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _BCACHEFS_COMPRESS_H
-#define _BCACHEFS_COMPRESS_H
+#ifndef _BCACHEFS_DATA_COMPRESS_H
+#define _BCACHEFS_DATA_COMPRESS_H
 
 #include "extents_types.h"
 
@@ -37,8 +37,10 @@ struct bch_write_op;
 int bch2_bio_uncompress_inplace(struct bch_write_op *, struct bio *);
 int bch2_bio_uncompress(struct bch_fs *, struct bio *, struct bio *,
 		       struct bvec_iter, struct bch_extent_crc_unpacked);
+
 unsigned bch2_bio_compress(struct bch_fs *, struct bio *, size_t *,
-			   struct bio *, size_t *, unsigned);
+			   struct bio *, size_t *, unsigned,
+			   struct bpos, bool);
 
 int bch2_check_set_has_compressed_data(struct bch_fs *, unsigned);
 void bch2_fs_compress_exit(struct bch_fs *);
@@ -56,4 +58,4 @@ int bch2_opt_compression_validate(u64, struct printbuf *);
 	.validate	= bch2_opt_compression_validate,	\
 }
 
-#endif /* _BCACHEFS_COMPRESS_H */
+#endif /* _BCACHEFS_DATA_COMPRESS_H */

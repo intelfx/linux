@@ -18,7 +18,7 @@ static inline bool bch2_dev_bucket_exists(struct bch_fs *c, struct bpos pos)
 
 static inline u64 bucket_to_u64(struct bpos bucket)
 {
-	return (bucket.inode << 48) | bucket.offset;
+	return (bucket.inode << 48) | (bucket.offset & ~(~0ULL << 48));
 }
 
 static inline struct bpos u64_to_bucket(u64 bucket)
@@ -38,7 +38,6 @@ static inline void alloc_to_bucket(struct bucket *dst, struct bch_alloc_v4 src)
 	dst->stripe_sectors	= src.stripe_sectors;
 	dst->dirty_sectors	= src.dirty_sectors;
 	dst->cached_sectors	= src.cached_sectors;
-	dst->stripe		= src.stripe;
 }
 
 static inline void __bucket_m_to_alloc(struct bch_alloc_v4 *dst, struct bucket src)
@@ -48,7 +47,6 @@ static inline void __bucket_m_to_alloc(struct bch_alloc_v4 *dst, struct bucket s
 	dst->stripe_sectors	= src.stripe_sectors;
 	dst->dirty_sectors	= src.dirty_sectors;
 	dst->cached_sectors	= src.cached_sectors;
-	dst->stripe		= src.stripe;
 }
 
 static inline struct bch_alloc_v4 bucket_m_to_alloc(struct bucket b)
@@ -124,7 +122,7 @@ static inline s64 bch2_bucket_sectors_unstriped(struct bch_alloc_v4 a)
 static inline enum bch_data_type alloc_data_type(struct bch_alloc_v4 a,
 						 enum bch_data_type data_type)
 {
-	if (a.stripe)
+	if (a.stripe_refcount)
 		return data_type == BCH_DATA_parity ? data_type : BCH_DATA_stripe;
 	if (bch2_bucket_sectors_dirty(a))
 		return bucket_data_type(data_type);
@@ -242,17 +240,12 @@ void __bch2_alloc_to_v4(struct bkey_s_c, struct bch_alloc_v4 *);
 
 static inline const struct bch_alloc_v4 *bch2_alloc_to_v4(struct bkey_s_c k, struct bch_alloc_v4 *convert)
 {
-	const struct bch_alloc_v4 *ret;
+	if (likely(k.k->type == KEY_TYPE_alloc_v4)) {
+		const struct bch_alloc_v4 *ret = bkey_s_c_to_alloc_v4(k).v;
+		if (BCH_ALLOC_V4_BACKPOINTERS_START(ret) == BCH_ALLOC_V4_U64s)
+			return ret;
+	}
 
-	if (unlikely(k.k->type != KEY_TYPE_alloc_v4))
-		goto slowpath;
-
-	ret = bkey_s_c_to_alloc_v4(k).v;
-	if (BCH_ALLOC_V4_BACKPOINTERS_START(ret) != BCH_ALLOC_V4_U64s)
-		goto slowpath;
-
-	return ret;
-slowpath:
 	__bch2_alloc_to_v4(k, convert);
 	return convert;
 }
@@ -269,7 +262,7 @@ int bch2_alloc_v3_validate(struct bch_fs *, struct bkey_s_c,
 			   struct bkey_validate_context);
 int bch2_alloc_v4_validate(struct bch_fs *, struct bkey_s_c,
 			   struct bkey_validate_context);
-void bch2_alloc_v4_swab(struct bkey_s);
+void bch2_alloc_v4_swab(const struct bch_fs *, struct bkey_s);
 void bch2_alloc_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 void bch2_alloc_v4_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 
@@ -332,25 +325,6 @@ int bch2_trigger_alloc(struct btree_trans *, enum btree_id, unsigned,
 		       struct bkey_s_c, struct bkey_s,
 		       enum btree_iter_update_trigger_flags);
 
-void bch2_dev_do_discards(struct bch_dev *);
-void bch2_do_discards_going_ro(struct bch_fs *);
-void bch2_do_discards(struct bch_fs *);
-
-static inline u64 should_invalidate_buckets(struct bch_dev *ca,
-					    struct bch_dev_usage u)
-{
-	u64 want_free = ca->mi.nbuckets >> 7;
-	u64 free = max_t(s64, 0,
-			   u.buckets[BCH_DATA_free]
-			 + u.buckets[BCH_DATA_need_discard]
-			 - bch2_dev_buckets_reserved(ca, BCH_WATERMARK_stripe));
-
-	return clamp_t(s64, want_free - free, 0, u.buckets[BCH_DATA_cached]);
-}
-
-void bch2_dev_do_invalidates(struct bch_dev *);
-void bch2_do_invalidates(struct bch_fs *);
-
 static inline struct bch_backpointer *alloc_v4_backpointers(struct bch_alloc_v4 *a)
 {
 	return (void *) ((u64 *) &a->v +
@@ -376,5 +350,8 @@ void bch2_dev_allocator_background_exit(struct bch_dev *);
 void bch2_dev_allocator_background_init(struct bch_dev *);
 
 void bch2_fs_allocator_background_init(struct bch_fs *);
+
+void bch2_fs_capacity_exit(struct bch_fs *);
+int bch2_fs_capacity_init(struct bch_fs *);
 
 #endif /* _BCACHEFS_ALLOC_BACKGROUND_H */

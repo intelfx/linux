@@ -37,7 +37,9 @@ static int bch2_sb_quota_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_quota_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_quota_to_text(struct printbuf *out,
+				  struct bch_fs *c,
+				  struct bch_sb *sb,
 				  struct bch_sb_field *f)
 {
 	struct bch_sb_field_quota *q = field_to_type(f, quota);
@@ -118,7 +120,7 @@ static void qc_dqblk_to_text(struct printbuf *out, struct qc_dqblk *q)
 	prt_printf(out, "d_fieldmask\t%x\n",		q->d_fieldmask);
 	prt_printf(out, "d_spc_hardlimit\t%llu\n",	q->d_spc_hardlimit);
 	prt_printf(out, "d_spc_softlimit\t%llu\n",	q->d_spc_softlimit);
-	prt_printf(out, "d_ino_hardlimit\%llu\n",	q->d_ino_hardlimit);
+	prt_printf(out, "d_ino_hardlimit\t%llu\n",	q->d_ino_hardlimit);
 	prt_printf(out, "d_ino_softlimit\t%llu\n",	q->d_ino_softlimit);
 	prt_printf(out, "d_space\t%llu\n",		q->d_space);
 	prt_printf(out, "d_ino_count\t%llu\n",		q->d_ino_count);
@@ -522,7 +524,8 @@ advance:
 
 int bch2_fs_quota_read(struct bch_fs *c)
 {
-	scoped_guard(mutex, &c->sb_lock) {
+	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
+		guard(mutex)(&c->sb_lock);
 		struct bch_sb_field_quota *sb_quota = bch2_sb_get_or_create_quota(&c->disk_sb);
 		if (!sb_quota)
 			return bch_err_throw(c, ENOSPC_sb_quota);
@@ -565,6 +568,7 @@ static int bch2_quota_enable(struct super_block	*sb, unsigned uflags)
 	if (uflags & FS_QUOTA_PDQ_ENFD && !c->opts.prjquota)
 		return -EINVAL;
 
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
 	guard(mutex)(&c->sb_lock);
 	sb_quota = bch2_sb_get_or_create_quota(&c->disk_sb);
 	if (!sb_quota) {
@@ -593,6 +597,7 @@ static int bch2_quota_disable(struct super_block *sb, unsigned uflags)
 	if (sb->s_flags & SB_RDONLY)
 		return -EROFS;
 
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
 	guard(mutex)(&c->sb_lock);
 	if (uflags & FS_QUOTA_UDQ_ENFD)
 		SET_BCH_SB_USRQUOTA(c->disk_sb.sb, false);
@@ -703,6 +708,7 @@ static int bch2_quota_set_info(struct super_block *sb, int type,
 	    ~(QC_SPC_TIMER|QC_INO_TIMER|QC_SPC_WARNS|QC_INO_WARNS))
 		return -EINVAL;
 
+	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
 	guard(mutex)(&c->sb_lock);
 	sb_quota = bch2_sb_get_or_create_quota(&c->disk_sb);
 	if (!sb_quota) {

@@ -110,7 +110,9 @@ static inline bool data_type_is_hidden(enum bch_data_type type)
 	x(snapshot,		5,	1)	\
 	x(btree,		6,	3)	\
 	x(rebalance_work,	7,	1)	\
-	x(inum,			8,	3)
+	x(inum,			8,	3)	\
+	x(reconcile_work,	9,	2)	\
+	x(dev_leaving,		10,	1)
 
 enum disk_accounting_type {
 #define x(f, nr, ...)	BCH_DISK_ACCOUNTING_##f	= nr,
@@ -146,6 +148,13 @@ struct bch_acct_persistent_reserved {
  * XXX: live sectors should've been done differently, you can have multiple data
  * types in the same bucket (user, stripe, cached) and this collapses them to
  * the bucket data type, and makes the internal fragmentation counter redundant
+ *
+ * It is possible for live_sectors to be greater than nr_buckets * bucket_size,
+ * due to the way compressed disk space accounting works with partially
+ * overwritten (and especially split) extents.
+ *
+ * The fragmentation counter handles this by first clamping bucket sector counts
+ * to the bucket size.
  */
 struct bch_acct_dev_data_type {
 	__u8			dev;
@@ -210,6 +219,14 @@ struct bch_acct_inum {
 struct bch_acct_rebalance_work {
 };
 
+struct bch_acct_reconcile_work {
+	__u8			type;
+};
+
+struct bch_acct_dev_leaving {
+	__u32			dev;
+};
+
 struct disk_accounting_pos {
 	union {
 	struct {
@@ -224,6 +241,8 @@ struct disk_accounting_pos {
 		struct bch_acct_btree		btree;
 		struct bch_acct_rebalance_work	rebalance_work;
 		struct bch_acct_inum		inum;
+		struct bch_acct_reconcile_work	reconcile_work;
+		struct bch_acct_dev_leaving	dev_leaving;
 		} __packed;
 	} __packed;
 		struct bpos			_pad;

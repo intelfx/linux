@@ -194,7 +194,7 @@ static inline unsigned closure_nr_remaining(struct closure *cl)
  */
 static inline void closure_sync(struct closure *cl)
 {
-	if (closure_nr_remaining(cl) > 1)
+	//if (closure_nr_remaining(cl) > 1)
 		__bch2_closure_sync(cl);
 }
 
@@ -206,6 +206,8 @@ static inline int closure_sync_timeout(struct closure *cl, unsigned long timeout
 		? __bch2_closure_sync_timeout(cl, timeout)
 		: 0;
 }
+
+void bch2_closure_sync_unbounded(struct closure *);
 
 //#ifdef CONFIG_DEBUG_CLOSURES
 #if 0
@@ -336,6 +338,29 @@ static inline void closure_init_stack_release(struct closure *cl)
 #endif
 }
 
+/*
+ * Open coded DEFINE_CLASS(closure_stack, ...)
+ *
+ * We can't use DEFINE_CLASS() because that defines a destructor that destructs
+ * a copy...
+ */
+typedef struct closure class_closure_stack_t;
+
+static inline void class_closure_stack_destructor(struct closure *cl)
+{
+	closure_sync(cl);
+}
+
+static inline struct closure class_closure_stack_constructor(void)
+{
+	return (struct closure) {
+	      .remaining.counter = CLOSURE_REMAINING_INITIALIZER,
+#ifdef CONFIG_DEBUG_CLOSURES
+	      .magic = CLOSURE_MAGIC_STACK,
+#endif
+	};
+}
+
 /**
  * closure_wake_up - wake up all closures on a wait list,
  *		     with memory barrier
@@ -432,9 +457,7 @@ static inline void closure_call(struct closure *cl, closure_fn fn,
 
 #define __closure_wait_event(waitlist, _cond)				\
 do {									\
-	struct closure cl;						\
-									\
-	closure_init_stack(&cl);					\
+	CLASS(closure_stack, cl)();					\
 									\
 	while (1) {							\
 		bch2_closure_wait(waitlist, &cl);			\
@@ -443,7 +466,6 @@ do {									\
 		closure_sync(&cl);					\
 	}								\
 	closure_wake_up(waitlist);					\
-	closure_sync(&cl);						\
 } while (0)
 
 #define closure_wait_event(waitlist, _cond)				\
@@ -454,10 +476,8 @@ do {									\
 
 #define __closure_wait_event_timeout(waitlist, _cond, _until)		\
 ({									\
-	struct closure cl;						\
+	CLASS(closure_stack, cl)();					\
 	long _t;							\
-									\
-	closure_init_stack(&cl);					\
 									\
 	while (1) {							\
 		bch2_closure_wait(waitlist, &cl);			\
@@ -471,7 +491,6 @@ do {									\
 		closure_sync_timeout(&cl, _t);				\
 	}								\
 	closure_wake_up(waitlist);					\
-	closure_sync(&cl);						\
 	_t;								\
 })
 

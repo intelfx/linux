@@ -63,11 +63,11 @@ struct bch_alloc_v4 {
 	__u8			gen;
 	__u8			oldest_gen;
 	__u8			data_type;
-	__u8			stripe_redundancy;
+	__u8			stripe_redundancy_obsolete;
 	__u32			dirty_sectors;
 	__u32			cached_sectors;
 	__u64			io_time[2];
-	__u32			stripe;
+	__u32			stripe_refcount;
 	__u32			nr_external_backpointers;
 	/* end of fields in original version of alloc_v4 */
 	__u64			journal_seq_empty;

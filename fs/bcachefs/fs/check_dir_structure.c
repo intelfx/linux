@@ -46,7 +46,7 @@ static int reattach_subvol(struct btree_trans *trans, struct bkey_s_c_subvolume 
 
 	struct bch_inode_unpacked inode;
 	try(bch2_inode_find_by_inum_trans(trans,
-				(subvol_inum) { s.k->p.offset, le64_to_cpu(s.v->inode) },
+				((subvol_inum) { s.k->p.offset, le64_to_cpu(s.v->inode) }),
 				&inode));
 
 	int ret = remove_backpointer(trans, &inode);
@@ -84,7 +84,7 @@ static int check_subvol_path(struct btree_trans *trans, struct btree_iter *iter,
 
 		struct bch_inode_unpacked subvol_root;
 		ret = bch2_inode_find_by_inum_trans(trans,
-					(subvol_inum) { s.k->p.offset, le64_to_cpu(s.v->inode) },
+					((subvol_inum) { s.k->p.offset, le64_to_cpu(s.v->inode) }),
 					&subvol_root);
 		if (ret)
 			break;
@@ -122,13 +122,13 @@ int bch2_check_subvolume_structure(struct bch_fs *c)
 {
 	CLASS(btree_trans, trans)(c);
 
-	struct progress_indicator_state progress;
-	bch2_progress_init(&progress, c, BIT_ULL(BTREE_ID_subvolumes));
+	struct progress_indicator progress;
+	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_subvolumes), 0);
 
 	return for_each_btree_key_commit(trans, iter,
 				BTREE_ID_subvolumes, POS_MIN, BTREE_ITER_prefetch, k,
 				NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
-			progress_update_iter(trans, &progress, &iter) ?:
+			bch2_progress_update_iter(trans, &progress, &iter) ?:
 			check_subvol_path(trans, &iter, k);
 	}));
 }
@@ -284,12 +284,12 @@ int bch2_check_directory_structure(struct bch_fs *c)
 					  BTREE_ITER_prefetch|
 					  BTREE_ITER_all_snapshots, k,
 					  NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
-			if (!S_ISDIR(bkey_inode_mode(k)))
-				continue;
+		if (!S_ISDIR(bkey_inode_mode(k)))
+			continue;
 
-			if (bch2_inode_flags(k) & BCH_INODE_unlinked)
-				continue;
+		if (bch2_inode_flags(k) & BCH_INODE_unlinked)
+			continue;
 
-			check_path_loop(trans, k);
-		}));
+		check_path_loop(trans, k);
+	}));
 }

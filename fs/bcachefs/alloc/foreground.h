@@ -5,6 +5,7 @@
 #include "bcachefs.h"
 #include "alloc/buckets.h"
 #include "alloc/types.h"
+#include "btree/iter.h"
 #include "data/extents.h"
 #include "data/write_types.h"
 #include "sb/members.h"
@@ -26,9 +27,13 @@ struct dev_alloc_list {
 };
 
 struct alloc_request {
-	unsigned		nr_replicas;
+	struct closure		*cl;
+	u8			nr_replicas;
+	u8			ec_replicas;
 	unsigned		target;
-	bool			ec;
+	bool			ec:1;
+	bool			will_retry_all_devices:1;
+	bool			will_retry_target_devices:1;
 	enum bch_watermark	watermark;
 	enum bch_write_flags	flags;
 	enum bch_data_type	data_type;
@@ -109,13 +114,13 @@ static inline void ob_push(struct bch_fs *c, struct open_buckets *obs,
 {
 	BUG_ON(obs->nr >= ARRAY_SIZE(obs->v));
 
-	obs->v[obs->nr++] = ob - c->open_buckets;
+	obs->v[obs->nr++] = ob - c->allocator.open_buckets;
 }
 
-#define open_bucket_for_each(_c, _obs, _ob, _i)				\
-	for ((_i) = 0;							\
-	     (_i) < (_obs)->nr &&					\
-	     ((_ob) = (_c)->open_buckets + (_obs)->v[_i], true);	\
+#define open_bucket_for_each(_c, _obs, _ob, _i)					\
+	for ((_i) = 0;								\
+	     (_i) < (_obs)->nr &&						\
+	     ((_ob) = (_c)->allocator.open_buckets + (_obs)->v[_i], true);	\
 	     (_i)++)
 
 static inline struct open_bucket *ec_open_bucket(struct bch_fs *c,
@@ -165,6 +170,11 @@ static inline void bch2_alloc_sectors_done_inlined(struct bch_fs *c, struct writ
 			: &keep, ob);
 	wp->ptrs = keep;
 
+	unsigned sectors = wp->prev_sectors_free - wp->sectors_free;
+	event_add_trace(c, sectors_alloc, sectors, buf, ({
+		prt_str(&buf, __bch2_data_types[wp->data_type]);
+	}));
+
 	mutex_unlock(&wp->lock);
 
 	bch2_open_buckets_put(c, &ptrs);
@@ -187,7 +197,7 @@ static inline void bch2_open_bucket_get(struct bch_fs *c,
 static inline open_bucket_idx_t *open_bucket_hashslot(struct bch_fs *c,
 						  unsigned dev, u64 bucket)
 {
-	return c->open_buckets_hash +
+	return c->allocator.open_buckets_hash +
 		(jhash_3words(dev, bucket, bucket >> 32, 0) &
 		 (OPEN_BUCKETS_COUNT - 1));
 }
@@ -197,7 +207,7 @@ static inline bool bch2_bucket_is_open(struct bch_fs *c, unsigned dev, u64 bucke
 	open_bucket_idx_t slot = *open_bucket_hashslot(c, dev, bucket);
 
 	while (slot) {
-		struct open_bucket *ob = &c->open_buckets[slot];
+		struct open_bucket *ob = &c->allocator.open_buckets[slot];
 
 		if (ob->dev == dev && ob->bucket == bucket)
 			return true;
@@ -213,23 +223,68 @@ static inline bool bch2_bucket_is_open_safe(struct bch_fs *c, unsigned dev, u64 
 	if (bch2_bucket_is_open(c, dev, bucket))
 		return true;
 
-	guard(spinlock)(&c->freelist_lock);
+	guard(spinlock)(&c->allocator.freelist_lock);
 	return bch2_bucket_is_open(c, dev, bucket);
 }
 
 enum bch_write_flags;
 int bch2_bucket_alloc_set_trans(struct btree_trans *, struct alloc_request *,
-				struct dev_stripe_state *, struct closure *);
+				struct dev_stripe_state *);
 
-int bch2_alloc_sectors_start_trans(struct btree_trans *,
-				   unsigned, unsigned,
-				   struct write_point_specifier,
-				   struct bch_devs_list *,
-				   unsigned, unsigned,
-				   enum bch_watermark,
-				   enum bch_write_flags,
-				   struct closure *,
-				   struct write_point **);
+int bch2_alloc_sectors_req(struct btree_trans *, struct alloc_request *,
+			   struct write_point_specifier,
+			   struct write_point **);
+
+static inline struct alloc_request *alloc_request_get(struct btree_trans *trans,
+						      unsigned target,
+						      unsigned erasure_code,
+						      struct bch_devs_list *devs_have,
+						      unsigned nr_replicas,
+						      unsigned ec_replicas,
+						      enum bch_watermark watermark,
+						      enum bch_write_flags flags,
+						      struct closure *cl)
+{
+	struct alloc_request *req = bch2_trans_kmalloc_nomemzero(trans, sizeof(*req));
+	if (IS_ERR(req))
+		return req;
+
+	if (!IS_ENABLED(CONFIG_BCACHEFS_ERASURE_CODING))
+		erasure_code = false;
+
+	if (ec_replicas < 2)
+		erasure_code = false;
+
+	req->cl			= cl;
+	req->nr_replicas	= nr_replicas;
+	req->ec_replicas	= ec_replicas;
+	req->ec			= erasure_code;
+	req->target		= target;
+	req->watermark		= watermark;
+	req->flags		= flags;
+	req->devs_have		= devs_have;
+	return req;
+}
+
+static inline int bch2_alloc_sectors_start_trans(struct btree_trans *trans,
+			     unsigned target,
+			     unsigned erasure_code,
+			     struct write_point_specifier write_point,
+			     struct bch_devs_list *devs_have,
+			     unsigned nr_replicas,
+			     unsigned ec_replicas,
+			     enum bch_watermark watermark,
+			     enum bch_write_flags flags,
+			     struct closure *cl,
+			     struct write_point **wp_ret)
+{
+	struct alloc_request *req = errptr_try(alloc_request_get(trans, target, erasure_code,
+								 devs_have,
+								 nr_replicas,
+								 ec_replicas,
+								 watermark, flags, cl));
+	return bch2_alloc_sectors_req(trans, req, write_point, wp_ret);
+}
 
 static inline struct bch_extent_ptr bch2_ob_ptr(struct bch_fs *c, struct open_bucket *ob)
 {
@@ -269,7 +324,7 @@ bch2_alloc_sectors_append_ptrs_inlined(struct bch_fs *c, struct write_point *wp,
 			(!ca->mi.durability &&
 			 wp->data_type == BCH_DATA_user);
 
-		bch2_bkey_append_ptr(k, ptr);
+		bch2_bkey_append_ptr(c, k, ptr);
 
 		BUG_ON(sectors > ob->sectors_free);
 		ob->sectors_free -= sectors;
@@ -300,14 +355,19 @@ void bch2_open_buckets_partial_to_text(struct printbuf *, struct bch_fs *);
 
 void bch2_write_points_to_text(struct printbuf *, struct bch_fs *);
 
+void bch2_fs_open_buckets_to_text(struct printbuf *, struct bch_fs *);
 void bch2_fs_alloc_debug_to_text(struct printbuf *, struct bch_fs *);
 void bch2_dev_alloc_debug_to_text(struct printbuf *, struct bch_dev *);
 
-void __bch2_wait_on_allocator(struct bch_fs *, struct closure *);
-static inline void bch2_wait_on_allocator(struct bch_fs *c, struct closure *cl)
+void __bch2_wait_on_allocator(struct bch_fs *, struct alloc_request *, int, struct closure *);
+
+static inline void bch2_wait_on_allocator(struct bch_fs *c,
+					  struct alloc_request *req,
+					  int err,
+					  struct closure *cl)
 {
 	if (closure_nr_remaining(cl) > 1)
-		__bch2_wait_on_allocator(c, cl);
+		__bch2_wait_on_allocator(c, req, err, cl);
 }
 
 #endif /* _BCACHEFS_ALLOC_FOREGROUND_H */

@@ -13,6 +13,7 @@ bcachefs-y		:=			\
 	alloc/buckets.o				\
 	alloc/buckets_waiting_for_journal.o	\
 	alloc/check.o				\
+	alloc/discard.o				\
 	alloc/disk_groups.o			\
 	alloc/foreground.o			\
 	alloc/lru.o				\
@@ -23,6 +24,7 @@ bcachefs-y		:=			\
 	btree/cache.o				\
 	btree/check.o				\
 	btree/commit.o				\
+	btree/init.o				\
 	btree/interior.o			\
 	btree/iter.o				\
 	btree/journal_overlay.o			\
@@ -37,8 +39,12 @@ bcachefs-y		:=			\
 	data/checksum.o				\
 	data/compress.o				\
 	data/copygc.o				\
-	data/ec.o				\
+	data/ec/create.o			\
+	data/ec/init.o				\
+	data/ec/io.o				\
+	data/ec/trigger.o			\
 	data/extents.o				\
+	data/extents_sb.o			\
 	data/extent_update.o			\
 	data/io_misc.o				\
 	data/keylist.o				\
@@ -46,11 +52,12 @@ bcachefs-y		:=			\
 	data/move.o				\
 	data/nocow_locking.o			\
 	data/read.o				\
-	data/rebalance.o			\
+	data/reconcile/check.o			\
+	data/reconcile/trigger.o		\
+	data/reconcile/work.o			\
 	data/reflink.o				\
 	data/update.o				\
 	data/write.o				\
-	debug/async_objs.o			\
 	debug/debug.o				\
 	debug/sysfs.o				\
 	debug/tests.o				\
@@ -90,6 +97,7 @@ bcachefs-y		:=			\
 	sb/io.o					\
 	sb/members.o				\
 	snapshots/check_snapshots.o		\
+	snapshots/delete.o			\
 	snapshots/snapshot.o			\
 	snapshots/subvolume.o			\
 	util/clock.o				\
@@ -107,6 +115,7 @@ bcachefs-y		:=			\
 	util/two_state_shared_lock.o		\
 	util/util.o				\
 	util/varint.o				\
+	vendor/bio_iov_iter.o			\
 	vendor/closure.o			\
 	vendor/min_heap.o			\
 	vfs/fiemap.o				\
@@ -115,10 +124,18 @@ bcachefs-y		:=			\
 	vfs/io.o				\
 	vfs/buffered.o				\
 	vfs/direct.o				\
-	vfs/pagecache.o	
+	vfs/pagecache.o
+
+ifdef CONFIG_DEBUG_FS
+	bcachefs-y += debug/async_objs.o
+endif
 
 ifndef BCACHEFS_DKMS
 	obj-$(CONFIG_MEAN_AND_VARIANCE_UNIT_TEST)   += util/mean_and_variance_test.o
+endif
+
+ifdef BCACHEFS_DKMS
+	bcachefs-y += module-version.o
 endif
 
 # Silence "note: xyz changed in GCC X.X" messages

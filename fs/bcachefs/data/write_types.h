@@ -20,6 +20,7 @@
 	x(pages_stable)			\
 	x(pages_owned)			\
 	x(only_specified_devs)		\
+	x(must_ec)			\
 	x(wrote_data_inline)		\
 	x(check_enospc)			\
 	x(sync)				\
@@ -49,7 +50,7 @@ struct bch_write_bio {
 	u64			inode_offset;
 	u64			nocow_bucket;
 
-	struct bch_devs_list	failed;
+	struct bch_io_failures	failed;
 	u8			dev;
 
 	unsigned		split:1,
@@ -82,7 +83,6 @@ struct bch_write_op {
 	unsigned		compression_opt:8;
 	unsigned		csum_type:4;
 	unsigned		nr_replicas:4;
-	unsigned		nr_replicas_required:4;
 	unsigned		watermark:3;
 	unsigned		incompressible:1;
 	unsigned		stripe_waited:1;
@@ -110,8 +110,6 @@ struct bch_write_op {
 
 	u64			new_i_size;
 	s64			i_sectors_delta;
-
-	struct bch_devs_mask	failed;
 
 	struct keylist		insert_keys;
 	u64			inline_keys[BKEY_EXTENT_U64s_MAX * 2];

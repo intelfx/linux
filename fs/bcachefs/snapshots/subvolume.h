@@ -3,7 +3,7 @@
 #define _BCACHEFS_SUBVOLUME_H
 
 #include "util/darray.h"
-#include "subvolume_types.h"
+#include "snapshots/types.h"
 
 int bch2_check_subvols(struct bch_fs *);
 int bch2_check_subvol_children(struct bch_fs *);
@@ -80,5 +80,7 @@ int bch2_initialize_subvolumes(struct bch_fs *);
 int bch2_fs_upgrade_for_subvolumes(struct bch_fs *);
 
 void bch2_fs_subvolumes_init_early(struct bch_fs *);
+
+void bch2_subvolumes_list_to_text(struct printbuf *, struct bch_fs *);
 
 #endif /* _BCACHEFS_SUBVOLUME_H */
