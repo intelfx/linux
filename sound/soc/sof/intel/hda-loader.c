@@ -549,6 +549,12 @@ int hda_dsp_ipc4_load_library(struct snd_sof_dev *sdev,
 	msg.primary |= SOF_IPC4_MSG_TYPE_SET(SOF_IPC4_GLB_LOAD_LIBRARY);
 	msg.primary |= SOF_IPC4_MSG_DIR(SOF_IPC4_MSG_REQUEST);
 	msg.primary |= SOF_IPC4_MSG_TARGET(SOF_IPC4_FW_GEN_MSG);
+
+	/* send LOAD_LIBRARY IPC with lib_id = 0 to allow the FW to configure the DMA */
+	ret = sof_ipc_tx_message_no_reply(sdev->ipc, &msg, 0);
+	if (ret < 0)
+		return ret;
+
 	msg.primary |= SOF_IPC4_GLB_LOAD_LIBRARY_LIB_ID(fw_lib->id);
 
 	ret = cl_trigger(sdev, hext_stream, SNDRV_PCM_TRIGGER_START);

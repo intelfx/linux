@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (C) 2014 Intel Corporation
- *
- * Authors:
- * Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
- *
- * Maintained by: <tpmdd-devel@lists.sourceforge.net>
- *
- * This device driver implements the TPM interface as defined in
- * the TCG CRB 2.0 TPM specification.
- */
+* Copyright (C) 2014 Intel Corporation
+*
+* Authors:
+* Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+*
+* Maintained by: <tpmdd-devel@lists.sourceforge.net>
+*
+* This device driver implements the TPM interface as defined in
+* the TCG CRB 2.0 TPM specification.
+*/
 
 #include <linux/acpi.h>
 #include <linux/highmem.h>
@@ -25,12 +25,12 @@
 #define TPM_CRB_MAX_RESOURCES 3
 
 static const guid_t crb_acpi_start_guid =
-	GUID_INIT(0x6BBF6CAB, 0x5463, 0x4714,
-		  0xB7, 0xCD, 0xF0, 0x20, 0x3C, 0x03, 0x68, 0xD4);
+GUID_INIT(0x6BBF6CAB, 0x5463, 0x4714,
+	  0xB7, 0xCD, 0xF0, 0x20, 0x3C, 0x03, 0x68, 0xD4);
 
 enum crb_defaults {
-	CRB_ACPI_START_REVISION_ID = 1,
-	CRB_ACPI_START_INDEX = 1,
+CRB_ACPI_START_REVISION_ID = 1,
+CRB_ACPI_START_INDEX = 1,
 };
 
 enum crb_loc_ctrl {
