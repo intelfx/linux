@@ -3846,7 +3846,6 @@ static void skl_dbuf_sanitize(struct drm_i915_private *i915)
 static void skl_wm_sanitize(struct drm_i915_private *i915)
 {
 	skl_mbus_sanitize(i915);
-	skl_dbuf_sanitize(i915);
 }
 
 void skl_wm_crtc_disable_noatomic(struct intel_crtc *crtc)
