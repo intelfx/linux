@@ -668,7 +668,8 @@ static void rate_fixup_ratelist(struct ieee80211_vif *vif,
 		 * needs to be fixed.
 		 */
 		if (rates[i].flags & IEEE80211_TX_RC_MCS) {
-			WARN_ON(rates[i].idx > 76);
+			if (unlikely(rates[i].idx > 76))
+				pr_warn("rates[%d].idx == %d > 76\n", i, rates[i].idx);
 
 			if (!(rates[i].flags & IEEE80211_TX_RC_USE_RTS_CTS) &&
 			    info->control.use_cts_prot)
