@@ -2733,6 +2733,92 @@ static struct ctl_table kern_table[] = {
 	{ }
 };
 
+#if defined(CONFIG_UNEVICTABLE_FILE)
+extern unsigned long vm_unevictable_file_kbytes_low;
+extern unsigned long vm_unevictable_file_kbytes_min;
+
+static int vm_unevictable_file_kbytes_low_handler(struct ctl_table *table, int write,
+						  void *buffer, size_t *length, loff_t *ppos)
+{
+	int rc;
+
+	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
+	if (rc)
+		return rc;
+
+	if (write) {
+		if (vm_unevictable_file_kbytes_low <
+		    vm_unevictable_file_kbytes_min)
+		    vm_unevictable_file_kbytes_min =
+		    vm_unevictable_file_kbytes_low;
+	}
+
+	return 0;
+}
+
+static int vm_unevictable_file_kbytes_min_handler(struct ctl_table *table, int write,
+						  void *buffer, size_t *length, loff_t *ppos)
+{
+	int rc;
+
+	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
+	if (rc)
+		return rc;
+
+	if (write) {
+		if (vm_unevictable_file_kbytes_min >
+		    vm_unevictable_file_kbytes_low)
+		    vm_unevictable_file_kbytes_low =
+		    vm_unevictable_file_kbytes_min;
+	}
+
+	return 0;
+}
+#endif /* CONFIG_UNEVICTABLE_FILE */
+
+#if defined(CONFIG_UNEVICTABLE_ANON)
+extern unsigned long vm_unevictable_anon_kbytes_low;
+extern unsigned long vm_unevictable_anon_kbytes_min;
+
+static int vm_unevictable_anon_kbytes_low_handler(struct ctl_table *table, int write,
+						  void *buffer, size_t *length, loff_t *ppos)
+{
+	int rc;
+
+	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
+	if (rc)
+		return rc;
+
+	if (write) {
+		if (vm_unevictable_anon_kbytes_low <
+		    vm_unevictable_anon_kbytes_min)
+		    vm_unevictable_anon_kbytes_min =
+		    vm_unevictable_anon_kbytes_low;
+	}
+
+	return 0;
+}
+
+static int vm_unevictable_anon_kbytes_min_handler(struct ctl_table *table, int write,
+						  void *buffer, size_t *length, loff_t *ppos)
+{
+	int rc;
+
+	rc = proc_doulongvec_minmax(table, write, buffer, length, ppos);
+	if (rc)
+		return rc;
+
+	if (write) {
+		if (vm_unevictable_anon_kbytes_min >
+		    vm_unevictable_anon_kbytes_low)
+		    vm_unevictable_anon_kbytes_low =
+		    vm_unevictable_anon_kbytes_min;
+	}
+
+	return 0;
+}
+#endif /* CONFIG_UNEVICTABLE_ANON */
+
 static struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
@@ -3190,6 +3276,42 @@ static struct ctl_table vm_table[] = {
 		.extra2		= SYSCTL_ONE,
 	},
 #endif
+#if defined(CONFIG_UNEVICTABLE_FILE)
+	{
+		.procname	= "unevictable_file_kbytes_low",
+		.data		= &vm_unevictable_file_kbytes_low,
+		.maxlen		= sizeof(vm_unevictable_file_kbytes_low),
+		.mode		= 0644,
+		.proc_handler	= vm_unevictable_file_kbytes_low_handler,
+		.extra1		= &zero_ul,
+	},
+	{
+		.procname	= "unevictable_file_kbytes_min",
+		.data		= &vm_unevictable_file_kbytes_min,
+		.maxlen		= sizeof(vm_unevictable_file_kbytes_min),
+		.mode		= 0644,
+		.proc_handler	= vm_unevictable_file_kbytes_min_handler,
+		.extra1		= &zero_ul,
+	},
+#endif /* CONFIG_UNEVICTABLE_FILE */
+#if defined(CONFIG_UNEVICTABLE_ANON)
+	{
+		.procname	= "unevictable_anon_kbytes_low",
+		.data		= &vm_unevictable_anon_kbytes_low,
+		.maxlen		= sizeof(vm_unevictable_anon_kbytes_low),
+		.mode		= 0644,
+		.proc_handler	= vm_unevictable_anon_kbytes_low_handler,
+		.extra1		= &zero_ul,
+	},
+	{
+		.procname	= "unevictable_anon_kbytes_min",
+		.data		= &vm_unevictable_anon_kbytes_min,
+		.maxlen		= sizeof(vm_unevictable_anon_kbytes_min),
+		.mode		= 0644,
+		.proc_handler	= vm_unevictable_anon_kbytes_min_handler,
+		.extra1		= &zero_ul,
+	},
+#endif /* CONFIG_UNEVICTABLE_ANON */
 	{ }
 };
 
