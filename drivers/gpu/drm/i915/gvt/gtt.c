@@ -313,8 +313,19 @@ static inline int gtt_get_entry64(void *pt,
 		ret = intel_gvt_read_gpa(vgpu, gpa +
 				(index << info->gtt_entry_size_shift),
 				&e->val64, 8);
-		if (WARN_ON(ret))
+		/*
+		 * We end up in this error case, if we tried to read memory that
+		 * the hypervisor doesn't know about. Trying to continue usually
+		 * results in getting these errors over and over again and
+		 * results in follow-up weirdness in the GVT code. So instead
+		 * just nuke the guest and don't go down this rabbit hole.
+		 */
+		if (WARN_ONCE(ret,
+			      "failed to read from guest %#lx %#lx %#x, entering failsafe mode",
+			      gpa, index, info->gtt_entry_size_shift)) {
+			enter_failsafe_mode(vgpu, GVT_FAILSAFE_GUEST_ERR);
 			return ret;
+		}
 	} else if (!pt) {
 		e->val64 = read_pte64(vgpu->gvt->gt->ggtt, index);
 	} else {
@@ -939,7 +950,7 @@ static inline int ppgtt_put_spt(struct intel_vgpu_ppgtt_spt *spt)
 	return atomic_dec_return(&spt->refcount);
 }
 
-static int ppgtt_invalidate_spt(struct intel_vgpu_ppgtt_spt *spt);
+int ppgtt_invalidate_spt(struct intel_vgpu_ppgtt_spt *spt);
 
 static int ppgtt_invalidate_spt_by_shadow_entry(struct intel_vgpu *vgpu,
 		struct intel_gvt_gtt_entry *e)
@@ -996,7 +1007,7 @@ static inline void ppgtt_invalidate_pte(struct intel_vgpu_ppgtt_spt *spt,
 	intel_gvt_dma_unmap_guest_page(vgpu, pfn << PAGE_SHIFT);
 }
 
-static int ppgtt_invalidate_spt(struct intel_vgpu_ppgtt_spt *spt)
+int ppgtt_invalidate_spt(struct intel_vgpu_ppgtt_spt *spt)
 {
 	struct intel_vgpu *vgpu = spt->vgpu;
 	struct intel_gvt_gtt_entry e;

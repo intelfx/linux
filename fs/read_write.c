@@ -1464,6 +1464,27 @@ COMPAT_SYSCALL_DEFINE4(sendfile64, int, out_fd, int, in_fd,
 }
 #endif
 
+static int file_copy_checks(struct file *file_in,
+			    struct file *file_out)
+{
+	if (file_in->f_op->copy_file_range != file_out->f_op->copy_file_range)
+		return -EXDEV;
+	return 0;
+}
+
+static int file_remap_checks(struct file *file_in,
+			     struct file *file_out)
+{
+	if (file_in->f_op->fop_flags & FOP_REMAP_CROSS_SB) {
+		if (file_in->f_op != file_out->f_op)
+			return -EXDEV;
+	} else {
+		if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
+			return -EXDEV;
+	}
+	return 0;
+}
+
 /*
  * Performs necessary checks before doing a file copy
  *
@@ -1498,11 +1519,13 @@ static int generic_copy_file_checks(struct file *file_in, loff_t pos_in,
 	if (flags & COPY_FILE_SPLICE) {
 		/* cross sb splice is allowed */
 	} else if (file_out->f_op->copy_file_range) {
-		if (file_in->f_op->copy_file_range !=
-		    file_out->f_op->copy_file_range)
-			return -EXDEV;
-	} else if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb) {
-		return -EXDEV;
+		ret = file_copy_checks(file_in, file_out);
+		if (ret)
+			return ret;
+	} else if (file_in->f_op->remap_file_range) {
+		ret = file_remap_checks(file_in, file_out);
+		if (ret)
+			return ret;
 	}
 
 	/* Don't touch certain kinds of inodes */
@@ -1534,6 +1557,35 @@ static int generic_copy_file_checks(struct file *file_in, loff_t pos_in,
 		return -EINVAL;
 
 	*req_count = count;
+	return 0;
+}
+
+/*
+ * Perform necessary checks before doing a file clone/remap.
+ *
+ * Unlike generic_copy_file_checks(), this is split into three steps:
+ * - generic_file_rw_checks()
+ * - generic_file_remap_checks()
+ * - generic_remap_checks() in remap_range.c
+ *
+ * This checks whether a remap operation is supported/allowed.
+ *
+ * Returns appropriate error code that caller should return or
+ * zero in case the copy should be allowed.
+ */
+int generic_file_remap_checks(struct file *file_in,
+			      struct file *file_out)
+{
+	int ret;
+
+	if (file_in->f_op->remap_file_range) {
+		ret = file_remap_checks(file_in, file_out);
+		if (ret)
+			return ret;
+	} else {
+		return -EOPNOTSUPP;
+	}
+
 	return 0;
 }
 
@@ -1576,11 +1628,15 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	 * same sb using clone, but for filesystems where both clone and copy
 	 * are supported (e.g. nfs,cifs), we only call the copy method.
 	 */
-	if (!splice && file_out->f_op->copy_file_range) {
+	if (splice) {
+		/* fall through */
+	} if (file_out->f_op->copy_file_range &&
+	      file_copy_checks(file_in, file_out) == 0) {
 		ret = file_out->f_op->copy_file_range(file_in, pos_in,
 						      file_out, pos_out,
 						      len, flags);
-	} else if (!splice && file_in->f_op->remap_file_range && samesb) {
+	} else if (file_in->f_op->remap_file_range &&
+	           file_remap_checks(file_in, file_out) == 0) {
 		ret = file_in->f_op->remap_file_range(file_in, pos_in,
 				file_out, pos_out,
 				min_t(loff_t, MAX_RW_COUNT, len),
