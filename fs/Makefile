@@ -60,6 +60,7 @@ obj-y				+= devpts/
 obj-$(CONFIG_DLM)		+= dlm/
  
 # Do not add any filesystems before this line
+obj-$(CONFIG_ZFS) 		+= zfs/
 obj-$(CONFIG_NETFS_SUPPORT)	+= netfs/
 obj-$(CONFIG_REISERFS_FS)	+= reiserfs/
 obj-$(CONFIG_EXT4_FS)		+= ext4/
