@@ -306,8 +306,8 @@ class SphinxBuilder:
         be freed once subprocess finishes
         """
 
-        with JobserverExec() as jobserver:
-            if jobserver.claim:
+        if True:
+            if False:
                 #
                 # when GNU make is used, claim available jobs from jobserver
                 #
@@ -508,7 +508,7 @@ class SphinxBuilder:
         # When using make, jobserver.claim is the number of jobs that were
         # used with "-j" and that aren't used by other make targets
         #
-        with JobserverExec() as jobserver:
+        if True:
             n_jobs = 1
 
             #
@@ -520,9 +520,6 @@ class SphinxBuilder:
                     n_jobs = int(self.n_jobs)
                 except ValueError:
                     pass
-
-            if jobserver.claim:
-                n_jobs = jobserver.claim
 
             builds, build_failed, max_len = self.pdf_parallel_build(tex_suffix,
                                                                     latex_cmd,
