@@ -278,6 +278,9 @@ static const struct {
 #ifdef HAVE_LZMA_SUPPORT
 	{ "xz", lzma_decompress_to_file, lzma_is_compressed },
 #endif
+#ifdef HAVE_ZSTD_SUPPORT
+	{ "zst", zstd_decompress_to_fd, zstd_is_compressed },
+#endif
 	{ NULL, NULL, NULL },
 };
 
@@ -452,7 +455,7 @@ int __kmod_path__parse(struct kmod_path *m, const char *path,
 
 	m->comp = is_supported_compression(ext + 1);
 	if (m->comp > COMP_ID__NONE)
-		ext -= 3;
+		ext -= strlen(compressions[m->comp].fmt);
 
 	/* Check .ko extension only if there's enough name left. */
 	if (ext > name)

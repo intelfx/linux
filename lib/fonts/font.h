@@ -31,8 +31,11 @@ struct font_data {
 #define ACORN8x8_IDX	8
 #define	MINI4x6_IDX	9
 #define FONT6x10_IDX	10
-#define TER16x32_IDX	11
-#define FONT6x8_IDX	12
+#define TER6x12_IDX     11
+#define TER8x16_IDX     12
 #define TER10x18_IDX	13
+#define TER12x24_IDX    14
+#define TER16x32_IDX	15
+#define FONT6x8_IDX	16
 
 #endif
