@@ -1,0 +1,1108 @@
+// SPDX-License-Identifier: CDDL-1.0
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "License").
+ * You may not use this file except in compliance with the License.
+ *
+ * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
+ * or https://opensource.org/licenses/CDDL-1.0.
+ * See the License for the specific language governing permissions
+ * and limitations under the License.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the License file at usr/src/OPENSOLARIS.LICENSE.
+ * If applicable, add the following below this CDDL HEADER, with the
+ * fields enclosed by brackets "[]" replaced with your own identifying
+ * information: Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright (c) 2011, Lawrence Livermore National Security, LLC.
+ * Copyright (c) 2023, Datto Inc. All rights reserved.
+ * Copyright (c) 2025, Klara, Inc.
+ * Copyright (c) 2025, Rob Norris <robn@despairlabs.com>
+ * Copyright (c) 2026, TrueNAS.
+ */
+
+
+#include <sys/zfs_znode.h>
+#include <sys/zfs_vfsops.h>
+#include <sys/zfs_vnops.h>
+#include <sys/zfs_ctldir.h>
+#include <sys/zpl.h>
+#include <linux/iversion.h>
+#include <linux/version.h>
+#include <linux/vfs_compat.h>
+#include <linux/fs_context.h>
+#include <linux/fs_parser.h>
+
+/*
+ * What to do when the last reference to an inode is released. If 0, the kernel
+ * will cache it on the superblock. If 1, the inode will be freed immediately.
+ * See zpl_drop_inode().
+ */
+int zfs_delete_inode = 0;
+
+/*
+ * What to do when the last reference to a dentry is released. If 0, the kernel
+ * will cache it until the entry (file) is destroyed. If 1, the dentry will be
+ * marked for cleanup, at which time its inode reference will be released. See
+ * zpl_dentry_delete().
+ */
+int zfs_delete_dentry = 0;
+
+static struct inode *
+zpl_inode_alloc(struct super_block *sb)
+{
+	struct inode *ip;
+
+	VERIFY3S(zfs_inode_alloc(sb, &ip), ==, 0);
+	inode_set_iversion(ip, 1);
+
+	return (ip);
+}
+
+#ifdef HAVE_SOPS_FREE_INODE
+static void
+zpl_inode_free(struct inode *ip)
+{
+	ASSERT0(atomic_read(&ip->i_count));
+	zfs_inode_free(ip);
+}
+#endif
+
+static void
+zpl_inode_destroy(struct inode *ip)
+{
+	ASSERT0(atomic_read(&ip->i_count));
+	zfs_inode_destroy(ip);
+}
+
+/*
+ * Called from __mark_inode_dirty() to reflect that something in the
+ * inode has changed.  We use it to ensure the znode system attributes
+ * are always strictly update to date with respect to the inode.
+ */
+static void
+zpl_dirty_inode(struct inode *ip, int flags)
+{
+	fstrans_cookie_t cookie;
+
+	cookie = spl_fstrans_mark();
+	zfs_dirty_inode(ip, flags);
+	spl_fstrans_unmark(cookie);
+}
+
+/*
+ * ->drop_inode() is called when the last reference to an inode is released.
+ * Its return value indicates if the inode should be destroyed immediately, or
+ * cached on the superblock structure.
+ *
+ * By default (zfs_delete_inode=0), we call generic_drop_inode(), which returns
+ * "destroy immediately" if the inode is unhashed and has no links (roughly: no
+ * longer exists on disk). On datasets with millions of rarely-accessed files,
+ * this can cause a large amount of memory to be "pinned" by cached inodes,
+ * which in turn pin their associated dnodes and dbufs, until the kernel starts
+ * reporting memory pressure and requests OpenZFS release some memory (see
+ * zfs_prune()).
+ *
+ * When set to 1, we call generic_delete_inode(), which always returns "destroy
+ * immediately", resulting in inodes being destroyed immediately, releasing
+ * their associated dnodes and dbufs to the dbuf cached and the ARC to be
+ * evicted as normal.
+ *
+ * Note that the "last reference" doesn't always mean the last _userspace_
+ * reference; the dentry cache also holds a reference, so "busy" inodes will
+ * still be kept alive that way (subject to dcache tuning).
+ */
+static int
+zpl_drop_inode(struct inode *ip)
+{
+	if (zfs_delete_inode)
+		return (generic_delete_inode(ip));
+	return (generic_drop_inode(ip));
+}
+
+/*
+ * The ->evict_inode() callback must minimally truncate the inode pages,
+ * and call clear_inode().  For 2.6.35 and later kernels this will
+ * simply update the inode state, with the sync occurring before the
+ * truncate in evict().  For earlier kernels clear_inode() maps to
+ * end_writeback() which is responsible for completing all outstanding
+ * write back.  In either case, once this is done it is safe to cleanup
+ * any remaining inode specific data via zfs_inactive().
+ * remaining filesystem specific data.
+ */
+static void
+zpl_evict_inode(struct inode *ip)
+{
+	fstrans_cookie_t cookie;
+
+	cookie = spl_fstrans_mark();
+	truncate_setsize(ip, 0);
+	clear_inode(ip);
+	zfs_inactive(ip);
+	spl_fstrans_unmark(cookie);
+}
+
+static void
+zpl_put_super(struct super_block *sb)
+{
+	fstrans_cookie_t cookie;
+	int error;
+
+	cookie = spl_fstrans_mark();
+	error = -zfs_umount(sb);
+	spl_fstrans_unmark(cookie);
+	ASSERT3S(error, <=, 0);
+}
+
+/*
+ * zfs_sync() is the underlying implementation for the sync(2) and syncfs(2)
+ * syscalls, via sb->s_op->sync_fs().
+ *
+ * Before kernel 5.17 (torvalds/linux@5679897eb104), syncfs() ->
+ * sync_filesystem() would ignore the return from sync_fs(), instead only
+ * considing the error from syncing the underlying block device (sb->s_dev).
+ * Since OpenZFS doesn't _have_ an underlying block device, there's no way for
+ * us to report a sync directly.
+ *
+ * However, in 5.8 (torvalds/linux@735e4ae5ba28) the superblock gained an extra
+ * error store `s_wb_err`, to carry errors seen on page writeback since the
+ * last call to syncfs(). If sync_filesystem() does not return an error, any
+ * existing writeback error on the superblock will be used instead (and cleared
+ * either way). We don't use this (page writeback is a different thing for us),
+ * so for 5.8-5.17 we can use that instead to get syncfs() to return the error.
+ *
+ * Before 5.8, we have no other good options - no matter what happens, the
+ * userspace program will be told the call has succeeded, and so we must make
+ * it so, Therefore, when we are asked to wait for sync to complete (wait ==
+ * 1), if zfs_sync() has returned an error we have no choice but to block,
+ * regardless of the reason.
+ *
+ * The 5.17 change was backported to the 5.10, 5.15 and 5.16 series, and likely
+ * to some vendor kernels. Meanwhile, s_wb_err is still in use in 6.15 (the
+ * mainline Linux series at time of writing), and has likely been backported to
+ * vendor kernels before 5.8. We don't really want to use a workaround when we
+ * don't have to, but we can't really detect whether or not sync_filesystem()
+ * will return our errors (without a difficult runtime test anyway). So, we use
+ * a static version check: any kernel reporting its version as 5.17+ will use a
+ * direct error return, otherwise, we'll either use s_wb_err if it was detected
+ * at configure (5.8-5.16 + vendor backports). If it's unavailable, we will
+ * block to ensure the correct semantics.
+ *
+ * See https://github.com/openzfs/zfs/issues/17416 for further discussion.
+ */
+static int
+zpl_sync_fs(struct super_block *sb, int wait)
+{
+	fstrans_cookie_t cookie;
+	cred_t *cr = CRED();
+	int error;
+
+	crhold(cr);
+	cookie = spl_fstrans_mark();
+	error = -zfs_sync(sb, wait, cr);
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#ifdef HAVE_SUPER_BLOCK_S_WB_ERR
+	if (error && wait)
+		errseq_set(&sb->s_wb_err, error);
+#else
+	if (error && wait) {
+		zfsvfs_t *zfsvfs = sb->s_fs_info;
+		ASSERT3P(zfsvfs, !=, NULL);
+		if (zfs_enter(zfsvfs, FTAG) == 0) {
+			txg_wait_synced(dmu_objset_pool(zfsvfs->z_os), 0);
+			zfs_exit(zfsvfs, FTAG);
+			error = 0;
+		}
+	}
+#endif
+#endif /* < 5.17.0 */
+
+	spl_fstrans_unmark(cookie);
+	crfree(cr);
+
+	ASSERT3S(error, <=, 0);
+	return (error);
+}
+
+static int
+zpl_statfs(struct dentry *dentry, struct kstatfs *statp)
+{
+	fstrans_cookie_t cookie;
+	int error;
+
+	cookie = spl_fstrans_mark();
+	error = -zfs_statvfs(dentry->d_inode, statp);
+	spl_fstrans_unmark(cookie);
+	ASSERT3S(error, <=, 0);
+
+	/*
+	 * If required by a 32-bit system call, dynamically scale the
+	 * block size up to 16MiB and decrease the block counts.  This
+	 * allows for a maximum size of 64EiB to be reported.  The file
+	 * counts must be artificially capped at 2^32-1.
+	 */
+	if (unlikely(zpl_is_32bit_api())) {
+		while (statp->f_blocks > UINT32_MAX &&
+		    statp->f_bsize < SPA_MAXBLOCKSIZE) {
+			statp->f_frsize <<= 1;
+			statp->f_bsize <<= 1;
+
+			statp->f_blocks >>= 1;
+			statp->f_bfree >>= 1;
+			statp->f_bavail >>= 1;
+		}
+
+		uint64_t usedobjs = statp->f_files - statp->f_ffree;
+		statp->f_ffree = MIN(statp->f_ffree, UINT32_MAX - usedobjs);
+		statp->f_files = statp->f_ffree + usedobjs;
+	}
+
+	return (error);
+}
+
+static int
+__zpl_show_devname(struct seq_file *seq, zfsvfs_t *zfsvfs)
+{
+	int error;
+	if ((error = zpl_enter(zfsvfs, FTAG)) != 0)
+		return (error);
+
+	char *fsname = kmem_alloc(ZFS_MAX_DATASET_NAME_LEN, KM_SLEEP);
+	dmu_objset_name(zfsvfs->z_os, fsname);
+
+	for (int i = 0; fsname[i] != 0; i++) {
+		/*
+		 * Spaces in the dataset name must be converted to their
+		 * octal escape sequence for getmntent(3) to correctly
+		 * parse then fsname portion of /proc/self/mounts.
+		 */
+		if (fsname[i] == ' ') {
+			seq_puts(seq, "\\040");
+		} else {
+			seq_putc(seq, fsname[i]);
+		}
+	}
+
+	kmem_free(fsname, ZFS_MAX_DATASET_NAME_LEN);
+
+	zpl_exit(zfsvfs, FTAG);
+
+	return (0);
+}
+
+static int
+zpl_show_devname(struct seq_file *seq, struct dentry *root)
+{
+	return (__zpl_show_devname(seq, root->d_sb->s_fs_info));
+}
+
+static int
+__zpl_show_options(struct seq_file *seq, zfsvfs_t *zfsvfs)
+{
+	seq_printf(seq, ",%s",
+	    zfsvfs->z_flags & ZSB_XATTR ? "xattr" : "noxattr");
+
+#ifdef CONFIG_FS_POSIX_ACL
+	switch (zfsvfs->z_acl_type) {
+	case ZFS_ACLTYPE_POSIX:
+		seq_puts(seq, ",posixacl");
+		break;
+	default:
+		seq_puts(seq, ",noacl");
+		break;
+	}
+#endif /* CONFIG_FS_POSIX_ACL */
+
+	switch (zfsvfs->z_case) {
+	case ZFS_CASE_SENSITIVE:
+		seq_puts(seq, ",casesensitive");
+		break;
+	case ZFS_CASE_INSENSITIVE:
+		seq_puts(seq, ",caseinsensitive");
+		break;
+	default:
+		seq_puts(seq, ",casemixed");
+		break;
+	}
+
+	return (0);
+}
+
+static int
+zpl_show_options(struct seq_file *seq, struct dentry *root)
+{
+	return (__zpl_show_options(seq, root->d_sb->s_fs_info));
+}
+
+static int
+zpl_test_super(struct super_block *s, void *data)
+{
+	zfsvfs_t *zfsvfs = s->s_fs_info;
+	objset_t *os = data;
+	/*
+	 * If the os doesn't match the z_os in the super_block, assume it is
+	 * not a match. Matching would imply a multimount of a dataset. It is
+	 * possible that during a multimount, there is a simultaneous operation
+	 * that changes the z_os, e.g., rollback, where the match will be
+	 * missed, but in that case the user will get an EBUSY.
+	 */
+	return (zfsvfs != NULL && os == zfsvfs->z_os);
+}
+
+static void
+zpl_kill_sb(struct super_block *sb)
+{
+	zfs_preumount(sb);
+	kill_anon_super(sb);
+}
+
+void
+zpl_prune_sb(uint64_t nr_to_scan, void *arg)
+{
+	struct super_block *sb = (struct super_block *)arg;
+	int objects = 0;
+
+	/*
+	 * Ensure the superblock is not in the process of being torn down.
+	 */
+#ifdef HAVE_SB_DYING
+	if (down_read_trylock(&sb->s_umount)) {
+		if (!(sb->s_flags & SB_DYING) && sb->s_root &&
+		    (sb->s_flags & SB_BORN)) {
+			(void) zfs_prune(sb, nr_to_scan, &objects);
+		}
+		up_read(&sb->s_umount);
+	}
+#else
+	if (down_read_trylock(&sb->s_umount)) {
+		if (!hlist_unhashed(&sb->s_instances) &&
+		    sb->s_root && (sb->s_flags & SB_BORN)) {
+			(void) zfs_prune(sb, nr_to_scan, &objects);
+		}
+		up_read(&sb->s_umount);
+	}
+#endif
+}
+
+/*
+ * Mount option parsing.
+ *
+ * The kernel receives a set of "stringy" mount options, typically a
+ * comma-separated list through mount(2) or fsconfig(2). These are split into a
+ * set of struct fs_parameter, and then vfs_parse_fs_param() is called for
+ * each. That function will handle (and consume) some options directly, and
+ * other subsystems (mainly security modules) are given the opportunity to
+ * consume them too. Any left over are passed to zpl_parse_param(). Our job is
+ * to use them to fill in the vfs_t we've attached previously to
+ * fc->fs_private, ready for the mount or remount call when it comes.
+ *
+ * Historically, mount options have been generated, removed, modified and
+ * otherwise complicated by multiple different actors over a long time: the
+ * kernel itself, the original mount(8) utility and later libmount,
+ * mount.zfs(8), libzfs and the ZFS tools that use it, and any program using
+ * the various mount APIs that have come and gone over the years. This is
+ * further complicated by cross-pollination between OpenSolaris/illumos, Linux
+ * and FreeBSD. Long story short: we could see all sorts of things, and we need
+ * to at least try not to break old userspace programs.
+ *
+ * At time of writing, this is my best understanding of all the options we
+ * might reasonably see, and where and how they're handled.
+ *
+ *
+ * These are common options for all filesystems that are processed by the
+ * kernel directly, without zpl_parse_param() being called. They're a bit of a
+ * mixed bag, but are ultimately all available to us via either sb->s_flags or
+ * fc->sb_flags:
+ *
+ *	dirsync:	set SB_DIRSYNC
+ *	lazytime:	set SB_LAZYTIME
+ *	mand:		set SB_MANDLOCK
+ *	ro:		set SB_RDONLY
+ *	sync:		set SB_SYNCHRONOUS
+ *
+ *	async:		clear SB_SYNCHRONOUS
+ *	nolazytime:	clear SB_LAZYTIME
+ *	nomand:		clear SB_MANDLOCK
+ *	rw:		clear SB_RDONLY
+ *
+ * Fortunately, almost all of these are handled directly by the kernel. 'mand'
+ * and 'nomand' are swallowed by the kernel ('mand' emits a warning in the
+ * kernel log), but it and the corresponding dataset property have been a no-op
+ * in OpenZFS for years, so there's nothing for us to do there.
+ *
+ * The only tricky one is SB_RDONLY ('ro'/'rw'), which can be both a mount and
+ * a superblock option. While we won't receive the "stringy" options, the
+ * kernel will set it for us in fc->sb_flags, and we've always had special
+ * handling for it at mount and remount time (eg handling snapshot mounts), so
+ * it's not a problem to do nothing here because we will sort it out later.
+ *
+ *
+ * These are options that we may receive as "stringy" options but also as mount
+ * flags.
+ *
+ *	exec:		clear MS_NOEXEC
+ *	noexec:		set MS_NOEXEC
+ *	suid:		clear MS_NOSUID
+ *	nosuid:		set MS_NOSUID
+ *	dev:		clear MS_NODEV
+ *	nodev:		set MS_NODEV
+ *	atime:		clear MS_NOATIME
+ *	noatime:	set MS_NOATIME
+ *	relatime:	set MS_RELATIME
+ *	norelatime:	clear MS_RELATIME
+ *
+ * In testing, it appears that recent libmount will convert them, but our own
+ * mount code (libzfs_mount) may not. We will be called for the stringy
+ * versions, but not for the flags. The flags will later be available on
+ * vfsmount->mnt_flags, not set on the vfs_t. This tends not to matter in
+ * practice, as almost all mounts come through libzfs (via zfs-mount(8) or
+ * mount.zfs(8)) and so as strings, and when they do come through flags, they
+ * will still be reported correctly via mountinfo and by zfs-get(8), which has
+ * special handling for "temporary" properties. Also, we never use these
+ * internally for any decisions; 'exec', 'suid' and 'dev' are handled in the
+ * kernel, and the kernel provides helpers for 'atime' and 'relatime'. The
+ * only place the difference is observable is through zfs_get_temporary_prop(),
+ * which is only used by the zfs.get_prop() Lua call.
+ *
+ * This is fixable by getting at vfsmount->mnt_flags, but this is not readily
+ * available until after the mount operation is completed, and with some
+ * effort. This is all very low impact, so it's left for future improvement.
+ *
+ *
+ * These are true OpenZFS-specific mount options. They give the equivalent
+ * of temporarily setting the pool properties as follows:
+ *
+ *	strictatime	atime=on, relatime=off
+ *
+ *	xattr:		xattr=sa
+ *	saxattr:	xattr=sa
+ *	dirxattr:	xattr=dir
+ *	noxattr:	xattr=off
+ *
+ *
+ * mntpoint= provides the canonical mount point for a snapshot mount. This
+ * is an assist for the snapshot automounter call out to userspace, to
+ * understand where the snapshot is mounted even when triggered from an
+ * alternate mount namespace (eg inside a chroot).
+ *
+ *	mntpoint=	vfs->vfs_mntpoint=...
+ *
+ *
+ * These are used for coordination inside libzfs, and should not make it
+ * to the kernel, but it does not strip them, so we handle them and ignore
+ * them.
+ *
+ *	defaults
+ *	zfsutil
+ *	remount
+ *
+ *
+ * These are specific to SELinux. When that security module is running, it
+ * will consume them, but if not, they will be passed through to us. libzfs
+ * adds them unconditionally, so we will always see them when SELinux is not
+ * running, and ignore them.
+ *
+ *	fscontext
+ *	defcontext
+ *	rootcontext
+ *	context
+ *
+ *
+ * When preparing a remount, libmount will read /proc/self/mountinfo and add
+ * any unrecognised flags it finds there to the options. So, we have to accept
+ * anything that __zpl_show_options() can produce.
+ *
+ *	posixacl
+ *	noacl
+ *	casesensitive
+ *	caseinsensitive
+ *	casemixed
+ *
+ *
+ * mount(8) has a notion of "sloppy" options. According to the documentation,
+ * when the -s switch is provided, unrecognised mount options will be ignored.
+ * Only the Linux NFS and SMB filesystems support it, and traditionally
+ * OpenZFS has too. however, it appears massively underspecified and
+ * inconsistent. Depending on the interplay between mount(8), the mount helper
+ * (eg mount.zfs(8)) and libmount, -s may cause unknown options to be filtered
+ * in userspace, _or_ an additional option 'sloppy' to be passed to the kernel
+ * either before or after the "unknown" option, _or_ nothing at all happens
+ * and the unknown option to be passed through to the kernel as-is. The
+ * kernel NFS and SMB filesystems both expect to see an explicit option
+ * 'sloppy' and use this to either ignore or reject unknown options, but as
+ * described, it's very easy for that option to not appear, or appear too late.
+ *
+ * OpenZFS has a test for this in the test suite, and it's documented in
+ * mount.zfs(8), so to support it we accept 'sloppy' and ignore it, and all
+ * other unknown options produce a notice in the kernel log, and are also
+ * ignored. This allows the "feature" to continue to work, while avoiding
+ * the additional housekeeping for the 'sloppy' option.
+ *
+ *	sloppy
+ *
+ *
+ * Finally, all filesystems get automatic handling for the 'source' option,
+ * that is, the "name" of the filesystem (the first column of df(1)'s output).
+ * However, this only happens if the handler does not otherwise handle the
+ * 'source' option. Since we handle _all_ options because of 'sloppy', we have
+ * ot handle it ourselves. Normally we would call vfs_parse_fs_param_source()
+ * to deal with this, but that didn't appear until 5.14, and it's small enough
+ * that we can just handle it ourselves.
+ *
+ *	source
+ *
+ *
+ * Thank you for reading this far. I hope you find what you are looking for,
+ * in this life or the next.
+ *
+ *   -- robn, 2026-03-26
+ */
+
+enum {
+	Opt_source,
+	Opt_exec, Opt_suid, Opt_dev,
+	Opt_atime, Opt_relatime, Opt_strictatime,
+	Opt_saxattr, Opt_dirxattr, Opt_noxattr,
+	Opt_mntpoint,
+
+	Opt_ignore, Opt_warn,
+};
+
+static const struct fs_parameter_spec zpl_param_spec[] = {
+	fsparam_string("source",	Opt_source),
+
+	fsparam_flag_no("exec",		Opt_exec),
+	fsparam_flag_no("suid",		Opt_suid),
+	fsparam_flag_no("dev",		Opt_dev),
+
+	fsparam_flag_no("atime",	Opt_atime),
+	fsparam_flag_no("relatime",	Opt_relatime),
+	fsparam_flag("strictatime",	Opt_strictatime),
+
+	fsparam_flag("xattr",		Opt_saxattr),
+	fsparam_flag("saxattr",		Opt_saxattr),
+	fsparam_flag("dirxattr",	Opt_dirxattr),
+	fsparam_flag("noxattr",		Opt_noxattr),
+
+	fsparam_string("mntpoint",	Opt_mntpoint),
+
+	fsparam_flag("defaults",	Opt_ignore),
+	fsparam_flag("zfsutil",		Opt_ignore),
+	fsparam_flag("remount",		Opt_ignore),
+
+	fsparam_string("fscontext",	Opt_ignore),
+	fsparam_string("defcontext",	Opt_ignore),
+	fsparam_string("rootcontext",	Opt_ignore),
+	fsparam_string("context",	Opt_ignore),
+
+	fsparam_flag("posixacl",	Opt_ignore),
+	fsparam_flag("noacl",		Opt_ignore),
+	fsparam_flag("casesensitive",	Opt_ignore),
+	fsparam_flag("caseinsensitive",	Opt_ignore),
+	fsparam_flag("casemixed",	Opt_ignore),
+
+	fsparam_flag("sloppy",		Opt_ignore),
+
+	{}
+};
+
+/*
+ * Before 5.6, fs_parse() took a struct fs_parameter_description
+ * which wraps the parameter specs with name and enum pointers. From 5.6,
+ * the description struct was removed and fs_parse() accepts the
+ * fs_parameter_spec directly.
+ */
+static int
+zpl_fs_parse(struct fs_context *fc, struct fs_parameter *param,
+	struct fs_parse_result *result)
+{
+#ifdef HAVE_FS_PARSE_TAKES_SPEC
+	return (fs_parse(fc, zpl_param_spec, param, result));
+#else
+	static const struct fs_parameter_description zpl_param_desc = {
+		.name = "zfs",
+		.specs = zpl_param_spec,
+	};
+	return (fs_parse(fc, &zpl_param_desc, param, result));
+#endif
+}
+
+static int
+zpl_parse_param(struct fs_context *fc, struct fs_parameter *param)
+{
+	vfs_t *vfs = fc->fs_private;
+
+	struct fs_parse_result result;
+	int opt = zpl_fs_parse(fc, param, &result);
+	if (opt == -ENOPARAM) {
+		/*
+		 * Convert unknowns to warnings, to work around the whole
+		 * "sloppy option" mess.
+		 */
+		opt = Opt_warn;
+	}
+	if (opt < 0)
+		return (opt);
+
+	switch (opt) {
+	case Opt_source:
+		if (fc->source != NULL) {
+			cmn_err(CE_NOTE,
+			    "ZFS: multiple 'source' options not supported");
+			return (-SET_ERROR(EINVAL));
+		}
+		fc->source = param->string;
+		param->string = NULL;
+		break;
+
+	case Opt_exec:
+		vfs->vfs_exec = !result.negated;
+		vfs->vfs_do_exec = B_TRUE;
+		break;
+	case Opt_suid:
+		vfs->vfs_setuid = !result.negated;
+		vfs->vfs_do_setuid = B_TRUE;
+		break;
+	case Opt_dev:
+		vfs->vfs_devices = !result.negated;
+		vfs->vfs_do_devices = B_TRUE;
+		break;
+
+	case Opt_atime:
+		vfs->vfs_atime = !result.negated;
+		vfs->vfs_do_atime = B_TRUE;
+		break;
+	case Opt_relatime:
+		vfs->vfs_relatime = !result.negated;
+		vfs->vfs_do_relatime = B_TRUE;
+		break;
+	case Opt_strictatime:
+		vfs->vfs_atime = B_TRUE;
+		vfs->vfs_do_atime = B_TRUE;
+		vfs->vfs_relatime = B_FALSE;
+		vfs->vfs_do_relatime = B_TRUE;
+		break;
+
+	case Opt_saxattr:
+		vfs->vfs_xattr = ZFS_XATTR_SA;
+		vfs->vfs_do_xattr = B_TRUE;
+		break;
+	case Opt_dirxattr:
+		vfs->vfs_xattr = ZFS_XATTR_DIR;
+		vfs->vfs_do_xattr = B_TRUE;
+		break;
+	case Opt_noxattr:
+		vfs->vfs_xattr = ZFS_XATTR_OFF;
+		vfs->vfs_do_xattr = B_TRUE;
+		break;
+
+	case Opt_mntpoint:
+		if (vfs->vfs_mntpoint != NULL)
+			kmem_strfree(vfs->vfs_mntpoint);
+		vfs->vfs_mntpoint = kmem_strdup(param->string);
+		break;
+
+	case Opt_ignore:
+		break;
+
+	case Opt_warn:
+		cmn_err(CE_NOTE,
+		    "ZFS: ignoring unknown mount option: %s", param->key);
+		break;
+
+	default:
+		return (-SET_ERROR(EINVAL));
+	}
+
+	return (0);
+}
+
+/*
+ * Before Linux 5.8, the kernel's individual parameter parsing had a list of
+ * "forbidden" options that would always be rejected early. These were options
+ * that should be specified by MS_* flags, to be set on the superblock
+ * directly. However, it was inconsistently applied (eg it had various "*atime"
+ * options but not "atime", and also caused problems when it was not in sync
+ * with the version of libmount in use. It was deemed needlessly restrictive
+ * and was dropped in torvalds/linux@9193ae87a8af.
+ *
+ * Unfortunately, some of the options on this list are used by OpenZFS, so
+ * we need to see them. These include the aforementioned "*atime", "dev",
+ * "exec" and "suid".
+ *
+ * There is no easy compile-time check available to detect this, so we use
+ * a simple version check that should make it available everywhere needed,
+ * most notably RHEL8's 4.18+extras, which has backported fs_context support
+ * but does not include the 5.8 commit.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+#define	HAVE_FORBIDDEN_SB_FLAGS	1
+#endif
+
+#ifdef HAVE_FORBIDDEN_SB_FLAGS
+/*
+ * The typical path for options parsing through mount(2) is:
+ *
+ *     ksys_mount
+ *     do_mount
+ *     generic_parse_monolithic
+ *     vfs_parse_fs_string
+ *     vfs_parse_fs_param
+ *     zpl_parse_param
+ *
+ * vfs_parse_fs_param() calls the internal vfs_parse_sb_flag(), which is
+ * where the "forbidden" flags are applied. If it makes it through there,
+ * it will later call fc->parse_param() ie zpl_parse_param(). We can't
+ * intercept this chain in the middle anywhere; the earliest thing we can
+ * override is generic_parse_monolithic(), substituting our own by setting
+ * fc->parse_monolithic and doing the parsing work ourselves.
+ *
+ * Fortunately, generic_parse_monolithic() is almost entirely splitting the
+ * incoming parameter string on comma and handing off to the rest of the
+ * pipeline. This is easily replaced (almost entirely by reviving a few bits
+ * of our old options parser).
+ *
+ * To keep the change as narrow as possible, we reuse zpl_param_spec and
+ * zpl_parse_param() as much as possible. Once we've parsed the option, we call
+ * fs_parse(zpl_param_spec) to find out if the option is actually one we
+ * explicitly care about. If it is, we call zpl_parse_param() directly,
+ * avoiding vfs_parse_fs_param() and so the risk of being rejected. If it is
+ * not one we explicitly care about, we call zpl_parse_param() as normal,
+ * letting the kernel reject it if it wishes. If it doesn't, it will end up
+ * back in zpl_parse_param() via fc->parse_param, and we can ignore or warn
+ * about it we normally would.
+ */
+static int
+zpl_parse_monolithic(struct fs_context *fc, void *data)
+{
+	char *mntopts = data;
+
+	if (mntopts == NULL)
+		return (0);
+
+	/*
+	 * Because we supply a .parse_monolithic callback, the kernel does
+	 * no consideration of the options blob at all. Because of this, we
+	 * have to give LSMs a first look at it. They will remove any options
+	 * of interest to them (eg the SELinux *context= options).
+	 */
+	int err = security_sb_eat_lsm_opts(mntopts, &fc->security);
+	if (err)
+		return (err);
+
+	char *key;
+	while ((key = strsep(&mntopts, ",")) != NULL) {
+		if (!*key)
+			continue;
+
+		struct fs_parameter param = {
+		    .key = key,
+		};
+
+		char *value = strchr(key, '=');
+		if (value != NULL) {
+			/* Key starts with '='. Kernel ignores, we will too. */
+			if (value == key)
+				continue;
+			*value++ = '\0';
+
+			/* key=value is a "string" type, set up for that */
+			param.string = value;
+			param.type = fs_value_is_string;
+			param.size = strlen(value);
+		} else {
+			/* unadorned key is a "flag" type */
+			param.type = fs_value_is_flag;
+		}
+
+		/* Check if this is one of our options. */
+		struct fs_parse_result result;
+		int opt = zpl_fs_parse(fc, &param, &result);
+		if (opt >= 0) {
+			/*
+			 * We already know this one of our options, so a
+			 * failure here would be nonsensical.
+			 */
+			VERIFY0(zpl_parse_param(fc, &param));
+		} else {
+			/*
+			 * Not one of our option, send it through the kernel's
+			 * standard parameter handling.
+			 */
+			err = vfs_parse_fs_param(fc, &param);
+			if (err < 0)
+				return (err);
+		}
+	}
+
+	return (0);
+}
+#endif /* HAVE_FORBIDDEN_SB_FLAGS */
+
+static int
+zpl_get_tree(struct fs_context *fc)
+{
+	struct super_block *sb;
+	objset_t *os;
+	boolean_t issnap = B_FALSE;
+	int err;
+
+	err = dmu_objset_hold(fc->source, FTAG, &os);
+	if (err)
+		return (-err);
+
+	/*
+	 * The dsl pool lock must be released prior to calling sget().
+	 * It is possible sget() may block on the lock in grab_super()
+	 * while deactivate_super() holds that same lock and waits for
+	 * a txg sync.  If the dsl_pool lock is held over sget()
+	 * this can prevent the pool sync and cause a deadlock.
+	 */
+	dsl_dataset_long_hold(dmu_objset_ds(os), FTAG);
+	dsl_pool_rele(dmu_objset_pool(os), FTAG);
+
+	sb = sget(fc->fs_type, zpl_test_super, set_anon_super,
+	    fc->sb_flags, os);
+
+	/*
+	 * Recheck with the lock held to prevent mounting the wrong dataset
+	 * since z_os can be stale when the teardown lock is held.
+	 *
+	 * We can't do this in zpl_test_super in since it's under spinlock and
+	 * also s_umount lock is not held there so it would race with
+	 * zfs_umount and zfsvfs can be freed.
+	 */
+	if (!IS_ERR(sb) && sb->s_fs_info != NULL) {
+		zfsvfs_t *zfsvfs = sb->s_fs_info;
+		if (zpl_enter(zfsvfs, FTAG) == 0) {
+			if (os != zfsvfs->z_os)
+				err = SET_ERROR(EBUSY);
+			issnap = zfsvfs->z_issnap;
+			zpl_exit(zfsvfs, FTAG);
+		} else {
+			err = SET_ERROR(EBUSY);
+		}
+	}
+	dsl_dataset_long_rele(dmu_objset_ds(os), FTAG);
+	dsl_dataset_rele(dmu_objset_ds(os), FTAG);
+
+	if (IS_ERR(sb))
+		return (PTR_ERR(sb));
+
+	if (err) {
+		deactivate_locked_super(sb);
+		return (-err);
+	}
+
+	if (sb->s_root == NULL) {
+		vfs_t *vfs = fc->fs_private;
+
+		/*
+		 * If SB_RDONLY was set/cleared from mount options, update
+		 * them in the options struct so we set up the filesystem
+		 * in the proper state.
+		 */
+		if (fc->sb_flags_mask & SB_RDONLY) {
+			vfs->vfs_readonly =
+			    (fc->sb_flags & SB_RDONLY) ? B_TRUE : B_FALSE;
+			vfs->vfs_do_readonly = B_TRUE;
+		}
+
+		fstrans_cookie_t cookie = spl_fstrans_mark();
+		err = zfs_domount(sb, fc->source, vfs,
+		    fc->sb_flags & SB_SILENT ? 1 : 0);
+		spl_fstrans_unmark(cookie);
+
+		if (err) {
+			deactivate_locked_super(sb);
+			return (-err);
+		}
+
+		/*
+		 * zfsvfs has taken ownership of the mount options, so we
+		 * need to ensure we don't free them.
+		 */
+		fc->fs_private = NULL;
+
+		sb->s_flags |= SB_ACTIVE;
+	} else if (!issnap && ((fc->sb_flags ^ sb->s_flags) & SB_RDONLY)) {
+		/*
+		 * Skip ro check for snap since snap is always ro regardless
+		 * ro flag is passed by mount or not.
+		 */
+		deactivate_locked_super(sb);
+		return (-SET_ERROR(EBUSY));
+	}
+
+	struct dentry *root = dget(sb->s_root);
+	if (IS_ERR(root))
+		return (PTR_ERR(root));
+
+	fc->root = root;
+	return (0);
+}
+
+static int
+zpl_reconfigure(struct fs_context *fc)
+{
+	fstrans_cookie_t cookie;
+	int error;
+
+	cookie = spl_fstrans_mark();
+	error = -zfs_remount(fc->root->d_sb, fc->fs_private, fc->sb_flags);
+	spl_fstrans_unmark(cookie);
+	ASSERT3S(error, <=, 0);
+
+	if (error == 0) {
+		/*
+		 * zfsvfs has taken ownership of the mount options, so we
+		 * need to ensure we don't free them.
+		 */
+		fc->fs_private = NULL;
+	}
+
+	return (error);
+}
+
+static int
+zpl_dup_fc(struct fs_context *fc, struct fs_context *src_fc)
+{
+	vfs_t *src_vfs = src_fc->fs_private;
+	if (src_vfs == NULL)
+		return (0);
+
+	vfs_t *vfs = zfsvfs_vfs_alloc();
+	if (vfs == NULL)
+		return (-SET_ERROR(ENOMEM));
+
+	/*
+	 * This is annoying, but a straight memcpy() would require us to
+	 * reinitialise the lock.
+	 */
+	vfs->vfs_xattr = src_vfs->vfs_xattr;
+	vfs->vfs_readonly = src_vfs->vfs_readonly;
+	vfs->vfs_do_readonly = src_vfs->vfs_do_readonly;
+	vfs->vfs_setuid = src_vfs->vfs_setuid;
+	vfs->vfs_do_setuid = src_vfs->vfs_do_setuid;
+	vfs->vfs_exec = src_vfs->vfs_exec;
+	vfs->vfs_do_exec = src_vfs->vfs_do_exec;
+	vfs->vfs_devices = src_vfs->vfs_devices;
+	vfs->vfs_do_devices = src_vfs->vfs_do_devices;
+	vfs->vfs_do_xattr = src_vfs->vfs_do_xattr;
+	vfs->vfs_atime = src_vfs->vfs_atime;
+	vfs->vfs_do_atime = src_vfs->vfs_do_atime;
+	vfs->vfs_relatime = src_vfs->vfs_relatime;
+	vfs->vfs_do_relatime = src_vfs->vfs_do_relatime;
+	vfs->vfs_nbmand = src_vfs->vfs_nbmand;
+	vfs->vfs_do_nbmand = src_vfs->vfs_do_nbmand;
+
+	mutex_enter(&src_vfs->vfs_mntpt_lock);
+	if (src_vfs->vfs_mntpoint != NULL)
+		vfs->vfs_mntpoint = kmem_strdup(src_vfs->vfs_mntpoint);
+	mutex_exit(&src_vfs->vfs_mntpt_lock);
+
+	fc->fs_private = vfs;
+	return (0);
+}
+
+static void
+zpl_free_fc(struct fs_context *fc)
+{
+	zfsvfs_vfs_free(fc->fs_private);
+}
+
+const struct fs_context_operations zpl_fs_context_operations = {
+#ifdef	HAVE_FORBIDDEN_SB_FLAGS
+	.parse_monolithic	= zpl_parse_monolithic,
+#endif
+	.parse_param		= zpl_parse_param,
+	.get_tree		= zpl_get_tree,
+	.reconfigure		= zpl_reconfigure,
+	.dup			= zpl_dup_fc,
+	.free			= zpl_free_fc,
+};
+
+static int
+zpl_init_fs_context(struct fs_context *fc)
+{
+	fc->fs_private = zfsvfs_vfs_alloc();
+	if (fc->fs_private == NULL)
+		return (-SET_ERROR(ENOMEM));
+
+	fc->ops = &zpl_fs_context_operations;
+
+	return (0);
+}
+
+const struct super_operations zpl_super_operations = {
+	.alloc_inode		= zpl_inode_alloc,
+#ifdef HAVE_SOPS_FREE_INODE
+	.free_inode		= zpl_inode_free,
+#endif
+	.destroy_inode		= zpl_inode_destroy,
+	.dirty_inode		= zpl_dirty_inode,
+	.write_inode		= NULL,
+	.drop_inode		= zpl_drop_inode,
+	.evict_inode		= zpl_evict_inode,
+	.put_super		= zpl_put_super,
+	.sync_fs		= zpl_sync_fs,
+	.statfs			= zpl_statfs,
+	.show_devname		= zpl_show_devname,
+	.show_options		= zpl_show_options,
+	.show_stats		= NULL,
+};
+
+/*
+ * ->d_delete() is called when the last reference to a dentry is released. Its
+ *  return value indicates if the dentry should be destroyed immediately, or
+ *  retained in the dentry cache.
+ *
+ * By default (zfs_delete_dentry=0) the kernel will always cache unused
+ * entries.  Each dentry holds an inode reference, so cached dentries can hold
+ * the final inode reference indefinitely, leading to the inode and its related
+ * data being pinned (see zpl_drop_inode()).
+ *
+ * When set to 1, we signal that the dentry should be destroyed immediately and
+ * never cached. This reduces memory usage, at the cost of higher overheads to
+ * lookup a file, as the inode and its underlying data (dnode/dbuf) need to be
+ * reloaded and reinflated.
+ *
+ * Note that userspace does not have direct control over dentry references and
+ * reclaim; rather, this is part of the kernel's caching and reclaim subsystems
+ * (eg vm.vfs_cache_pressure).
+ */
+static int
+zpl_dentry_delete(const struct dentry *dentry)
+{
+	return (zfs_delete_dentry ? 1 : 0);
+}
+
+const struct dentry_operations zpl_dentry_operations = {
+	.d_delete = zpl_dentry_delete,
+};
+
+struct file_system_type zpl_fs_type = {
+	.owner			= THIS_MODULE,
+	.name			= ZFS_DRIVER,
+#if defined(HAVE_IDMAP_MNT_API)
+	.fs_flags		= FS_USERNS_MOUNT | FS_ALLOW_IDMAP,
+#else
+	.fs_flags		= FS_USERNS_MOUNT,
+#endif
+	.init_fs_context	= zpl_init_fs_context,
+	.kill_sb		= zpl_kill_sb,
+};
+
+ZFS_MODULE_PARAM(zfs, zfs_, delete_inode, INT, ZMOD_RW,
+	"Delete inodes as soon as the last reference is released.");
+
+ZFS_MODULE_PARAM(zfs, zfs_, delete_dentry, INT, ZMOD_RW,
+	"Delete dentries from dentry cache as soon as the last reference is "
+	"released.");
