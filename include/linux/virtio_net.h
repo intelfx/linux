@@ -403,8 +403,8 @@ virtio_net_hdr_tnl_from_skb(const struct sk_buff *skb,
 
 	vhdr->hash_hdr.hash_value_lo = 0;
 	vhdr->hash_hdr.hash_value_hi = 0;
-        vhdr->hash_hdr.hash_report = 0;
-        vhdr->hash_hdr.padding = 0;
+	vhdr->hash_hdr.hash_report = 0;
+	vhdr->hash_hdr.padding = 0;
 
 	/* Let the basic parsing deal with plain GSO features. */
 	skb_shinfo(skb)->gso_type &= ~tnl_gso_type;
