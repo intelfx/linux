@@ -1,0 +1,19 @@
+config LANYFS_FS
+	tristate "Lanyard file system (LanyFS) (EXPERIMENTAL)"
+	help
+	  The lanyard file system (LanyFS) is designed for removable storage
+	  devices, particularly those small gadgets one would carry around
+	  using a lanyard.
+
+	  LanyFS is highly experimental.
+
+	  If unsure, say N.
+
+config LANYFS_DEBUG
+	bool "LanyFS debugging support"
+	depends on LANYFS_FS
+	help
+	  Enables debugging for the lanyard file system (LanyFS).
+
+	  Selecting Y will produce a lot of kernel messages and it will slow
+	  down the system while accessing LanyFS-formatted devices.
