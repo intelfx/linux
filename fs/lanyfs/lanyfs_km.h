@@ -28,8 +28,6 @@
 
 #include "lanyfs_lnx.h"		/* kernel space data structures */
 
-#define	LANYFS_DEBUG		CONFIG_LANYFS_DEBUG	/* 0: fast 1: verbose */
-
 /* lanyfs uses standard error codes whenever possible */
 #define LANYFS_ERRNO_BASE	2050
 #define LANYFS_EPROTECTED	(LANYFS_ERRNO_BASE + 0)

@@ -227,7 +227,7 @@ static int lanyfs_unlink(struct inode *dir, struct dentry *dentry)
 	addr = inode->i_ino;
 
 	/* free space used by inode */
-	err = err = vmtruncate(inode, 0);
+	err = vmtruncate(inode, 0);
 	if (err)
 		return err;
 
