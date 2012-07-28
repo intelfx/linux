@@ -23,6 +23,8 @@
  */
 void lanyfs_time_lts_to_kts(struct lanyfs_ts *lts, struct timespec *kts)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	kts->tv_sec = mktime(le16_to_cpu(lts->year), lts->mon, lts->day,
 			     lts->hour, lts->min, lts->sec);
 	kts->tv_sec += le16_to_cpu(lts->offset) * 60;
@@ -96,6 +98,7 @@ void lanyfs_time_sync_inode(struct inode *inode)
 umode_t lanyfs_attr_to_mode(struct super_block *sb, u16 attr, umode_t t)
 {
 	umode_t mode;
+	lanyfs_debug_function(__FILE__, __func__);
 
 	mode = S_IRWXUGO;
 	if (attr & LANYFS_ATTR_NOWRITE)
@@ -116,6 +119,8 @@ umode_t lanyfs_attr_to_mode(struct super_block *sb, u16 attr, umode_t t)
  */
 inline u16 lanyfs_mode_to_attr(mode_t mode, u16 base)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	if (!(mode & S_IWUGO))
 		base |= LANYFS_ATTR_NOWRITE;
 	if (!(mode & S_IXUGO))

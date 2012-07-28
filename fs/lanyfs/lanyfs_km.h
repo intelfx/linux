@@ -28,11 +28,43 @@
 
 #include "lanyfs_lnx.h"		/* kernel space data structures */
 
-/* lanyfs uses standard error codes whenever possible */
+/*
+ * error codes
+ * lanyfs uses standard error codes whenever possible
+ */
 #define LANYFS_ERRNO_BASE	2050
 #define LANYFS_EPROTECTED	(LANYFS_ERRNO_BASE + 0)
 #define LANYFS_ENOEMPTY		(LANYFS_ERRNO_BASE + 1)
 #define LANYFS_ENOTAKEN		(LANYFS_ERRNO_BASE + 2)
+
+/* messaging */
+#define lanyfs_info(sb, fmt, ...)					\
+	do {								\
+		if (sb)							\
+			pr_info("LANYFS (%s): " pr_fmt(fmt) "\n",	\
+				sb->s_id, ##__VA_ARGS__);		\
+	} while (0)
+#define lanyfs_err(sb, fmt, ...)					\
+	do {								\
+		if (sb)							\
+			pr_err("LANYFS (%s): " pr_fmt(fmt) "\n",	\
+			       sb->s_id, ##__VA_ARGS__);		\
+	} while (0)
+#define lanyfs_warn(sb, fmt, ...)					\
+	do {								\
+		if (sb)							\
+			pr_warning("LANYFS (%s): " pr_fmt(fmt) "\n",	\
+				   sb->s_id, ##__VA_ARGS__);		\
+	} while (0)
+
+/* debug messaging */
+#ifdef LANYFS_DEBUG
+#define lanyfs_debug(fmt, ...) \
+	pr_devel("LANYFS: " (fmt) "\n", ##__VA_ARGS__)
+#else
+#define lanyfs_debug(fmt, ...) \
+	no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
+#endif /* LANYFS_DEBUG */
 
 /**
  * typedef lanyfs_blk_t - the address of a logical block
@@ -131,8 +163,6 @@ struct lanyfs_lii {
 };
 
 /* msg.c */
-extern void lanyfs_msg(struct super_block *, const char *, const char *, ...);
-extern void lanyfs_debug(const char *, ...);
 extern void lanyfs_debug_function(const char *, const char *);
 extern void lanyfs_debug_ts(const char *, struct lanyfs_ts *);
 extern void lanyfs_debug_block(union lanyfs_b *);

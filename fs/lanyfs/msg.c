@@ -12,75 +12,29 @@
 #include "lanyfs_km.h"
 
 /**
- * lanyfs_msg() - Throws messages out via printk.
- * @sb:				superblock
- * @prefix:			kernel message prefix (e.g. KERN_INFO)
- * @fmt:			format string of message
- */
-void lanyfs_msg(struct super_block *sb, const char *prefix,
-		const char *fmt, ...)
-{
-	struct va_format vaf;
-	va_list args;
-
-	va_start(args, fmt);
-	vaf.fmt = fmt;
-	vaf.va = &args;
-	pr_info("%sLANYFS (%s): %pV\n", prefix, sb->s_id, &vaf);
-	va_end(args);
-}
-
-/**
- * lanyfs_debug() - Throws debug messages out via printk.
- * @fmt:			format string of message
- */
-#ifdef LANYFS_DEBUG
-void lanyfs_debug(const char *fmt, ...)
-{
-	struct va_format vaf;
-	va_list args;
-
-	va_start(args, fmt);
-	vaf.fmt = fmt;
-	vaf.va = &args;
-	pr_debug("LANYFS: %pV\n", &vaf);
-	va_end(args);
-}
-#else
-void lanyfs_debug(const char *fmt, ...) { }
-#endif /* LANYFS_DEBUG */
-
-/**
- * lanyfs_debug_function() - Prints current function's name and file.
+ * lanyfs_debug_function() - Prints the currents function name and file.
  * @file:			file name
  * @func:			function name
+ *
+ * Produces call traces that help debugging a lot.
  */
-#ifdef LANYFS_DEBUG
 void lanyfs_debug_function(const char *file, const char *func)
 {
-	/* yes, the order is not consistent */
-	lanyfs_debug("function %s (%s)", func, file);
+	lanyfs_debug("%s: %s", file, func);
 }
-#else
-void lanyfs_debug_function(const char *file, const char *func) { }
-#endif /* LANYFS_DEBUG */
 
 /**
  * lanyfs_debug_ts() - Prints human readable LanyFS timestamp.
  * @lts:			timestamp
  * @desc:			description
  */
-#ifdef LANYFS_DEBUG
 void lanyfs_debug_ts(const char *desc, struct lanyfs_ts *lts)
 {
-	lanyfs_debug("%s=%04u-%02u-%02uT%02u:%02u:%02u.%u%+03d:%02d",
+	lanyfs_debug("%s=%04u-%02u-%02uT%02u:%02u:%02u.%u%+03d:%02ld",
 		     desc, le16_to_cpu(lts->year), lts->mon, lts->day,
 		     lts->hour, lts->min, lts->sec, lts->nsec,
 		     lts->offset / 60, abs(lts->offset % 60));
 }
-#else
-void lanyfs_debug_ts(const char *desc, struct lanyfs_ts *lts) { }
-#endif /* LANYFS_DEBUG */
 
 /**
  * lanyfs_debug_block() - Prints block's type and content.
@@ -90,7 +44,6 @@ void lanyfs_debug_ts(const char *desc, struct lanyfs_ts *lts) { }
  * whenever you are unsure of its contents. It will slow down the
  * filesystem, though.
  */
-#ifdef LANYFS_DEBUG
 void lanyfs_debug_block(union lanyfs_b *b)
 {
 	lanyfs_debug("dumping block at %p", b);
@@ -143,6 +96,3 @@ void lanyfs_debug_block(union lanyfs_b *b)
 		lanyfs_debug("meta_name=%s", b->vi_meta.name);
 	}
 }
-#else
-void lanyfs_debug_block(union lanyfs_b *b) { }
-#endif /* LANYFS_DEBUG */

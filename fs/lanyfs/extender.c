@@ -39,6 +39,8 @@ static inline lanyfs_blk_t lanyfs_ext_get_slot(struct lanyfs_ext *ext,
 					       unsigned int slot)
 {
 	lanyfs_blk_t addr;
+	lanyfs_debug_function(__FILE__, __func__);
+
 	addr = 0;
 	memcpy(&addr, &ext->stream + (slot * addrlen), addrlen);
 	return le64_to_cpu(addr);
@@ -55,6 +57,8 @@ static inline void lanyfs_ext_set_slot(struct lanyfs_ext *ext,
 				       unsigned int addrlen,
 				       unsigned int slot, lanyfs_blk_t addr)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	addr = cpu_to_le64(addr);
 	memcpy(&ext->stream + (slot * addrlen), &addr, addrlen);
 }
@@ -69,6 +73,8 @@ static inline void lanyfs_ext_kill_slot(struct lanyfs_ext *ext,
 					unsigned int addrlen,
 					unsigned int slot)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	memset(&ext->stream + (slot * addrlen), 0x00, addrlen);
 }
 
@@ -101,7 +107,7 @@ int lanyfs_ext_iblock(struct super_block *sb, lanyfs_blk_t addr,
 	fsi = LANYFS_SB(sb);
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return -EIO;
 	}
 	ext = (struct lanyfs_ext *) bh->b_data;
@@ -144,7 +150,7 @@ int lanyfs_ext_truncate(struct super_block *sb, lanyfs_blk_t addr,
 	fsi = LANYFS_SB(sb);
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return -EIO;
 	}
 	ext = (struct lanyfs_ext *) bh->b_data;
@@ -193,7 +199,7 @@ lanyfs_blk_t lanyfs_ext_create(struct super_block *sb, unsigned short level)
 		return 0;
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return 0;
 	}
 	ext = (struct lanyfs_ext *) bh->b_data;
@@ -235,7 +241,7 @@ static int __lanyfs_ext_grow(struct super_block *sb, lanyfs_blk_t addr)
 	ret = -LANYFS_ENOTAKEN;
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return -EIO;
 	}
 	ext = (struct lanyfs_ext *) bh->b_data;
@@ -318,8 +324,7 @@ int lanyfs_ext_grow(struct super_block *sb, lanyfs_blk_t *addr)
 		/* all extender blocks are occupied, go one level up */
 		bh = sb_bread(sb, *addr);
 		if (unlikely(!bh)) {
-			lanyfs_msg(sb, KERN_ERR, "block #%llu read error",
-				   (u64) *addr);
+			lanyfs_err(sb, "block #%llu read error", (u64) *addr);
 			return -EIO;
 		}
 		ext = (struct lanyfs_ext *) bh->b_data;
@@ -330,8 +335,7 @@ int lanyfs_ext_grow(struct super_block *sb, lanyfs_blk_t *addr)
 			return -ENOSPC;
 		bh = sb_bread(sb, new);
 		if (unlikely(!bh)) {
-			lanyfs_msg(sb, KERN_ERR, "block #%llu read error",
-				   (u64) new);
+			lanyfs_err(sb, "block #%llu read error", (u64) new);
 			return -EIO;
 		}
 		ext = (struct lanyfs_ext *) bh->b_data;

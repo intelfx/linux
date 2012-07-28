@@ -26,7 +26,7 @@ int lanyfs_chain_set_next(struct super_block *sb, lanyfs_blk_t addr,
 
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return -EIO;
 	}
 	chain = (struct lanyfs_chain *) bh->b_data;
@@ -56,7 +56,7 @@ int lanyfs_chain_create(struct super_block *sb, lanyfs_blk_t addr)
 	fsi = LANYFS_SB(sb);
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return -EIO;
 	}
 	chain = (struct lanyfs_chain *) bh->b_data;
@@ -90,7 +90,7 @@ int lanyfs_chain_pop(struct super_block *sb, lanyfs_blk_t addr,
 	fsi = LANYFS_SB(sb);
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return -EIO;
 	}
 	chain = (struct lanyfs_chain *) bh->b_data;
@@ -141,7 +141,7 @@ int lanyfs_chain_push(struct super_block *sb, lanyfs_blk_t addr,
 	fsi = LANYFS_SB(sb);
 	bh = sb_bread(sb, addr);
 	if (unlikely(!bh)) {
-		lanyfs_msg(sb, KERN_ERR, "block #%llu read error", (u64) addr);
+		lanyfs_err(sb, "block #%llu read error", (u64) addr);
 		return -EIO;
 	}
 	chain = (struct lanyfs_chain *) bh->b_data;

@@ -62,6 +62,7 @@ static int lanyfs_getblk(struct inode *inode, sector_t iblock,
 static int lanyfs_writepage(struct page *page, struct writeback_control *wbc)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	return block_write_full_page(page, lanyfs_getblk, wbc);
 }
 
@@ -73,6 +74,7 @@ static int lanyfs_writepage(struct page *page, struct writeback_control *wbc)
 static int lanyfs_readpage(struct file *fp, struct page *page)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	return block_read_full_page(page, lanyfs_getblk);
 }
 
@@ -84,6 +86,7 @@ static int lanyfs_readpage(struct file *fp, struct page *page)
 static sector_t lanyfs_bmap(struct address_space *mapping, sector_t block)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	return generic_block_bmap(mapping, block, lanyfs_getblk);
 }
 

@@ -12,7 +12,7 @@
 #include "lanyfs_km.h"
 
 /**
- * lanyfs_init() - initialize lanyfs module
+ * lanyfs_init() - Initialize LanyFS module.
  *
  * Initializes the inode cache and registers the filesystem.
  */
@@ -34,12 +34,12 @@ static int __init lanyfs_init(void)
 exit_ino:
 	lanyfs_inodecache_destroy();
 exit_err:
-	pr_warn("LANYFS: register filesystem failed\n");
+	pr_err("LANYFS: register filesystem failed\n");
 	return err;
 }
 
 /**
- * lanyfs_exit() - exit lanyfs module
+ * lanyfs_exit() - Exit LanyFS module.
  *
  * Takes care of destroying inode cache and unregistering the filesystem.
  */

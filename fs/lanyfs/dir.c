@@ -17,6 +17,8 @@
  */
 static int lanyfs_dir_is_empty(struct dentry *dentry)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	if (!dentry || !dentry->d_inode ||
 	    LANYFS_I(dentry->d_inode)->subtree)
 		return 0;
@@ -135,7 +137,7 @@ static int lanyfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	bh = sb_bread(sb, addr);
 
 	if (!bh) {
-		lanyfs_debug("error reading block #%llu", (u64) addr);
+		lanyfs_err(sb, "error reading block #%llu", (u64) addr);
 		err = -EIO;
 		goto exit_release;
 	}
@@ -352,7 +354,7 @@ static int lanyfs_create(struct inode *dir, struct dentry *dentry,
 	/* create file block */
 	bh = sb_bread(sb, addr);
 	if (!bh) {
-		lanyfs_debug("error reading block #%llu", (u64) addr);
+		lanyfs_err(sb, "error reading block #%llu", (u64) addr);
 		return -EIO;
 	}
 	file = (struct lanyfs_file *) bh->b_data;

@@ -28,6 +28,7 @@ static struct kmem_cache *lanyfs_inode_cachep;
 struct lanyfs_lii *LANYFS_I(struct inode *inode)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	return list_entry(inode, struct lanyfs_lii, vfs_inode);
 }
 
@@ -43,6 +44,7 @@ struct lanyfs_lii *LANYFS_I(struct inode *inode)
 static void lanyfs_inodecache_kmcinit(void *ptr)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	inode_init_once(&((struct lanyfs_lii *) ptr)->vfs_inode);
 }
 
@@ -56,6 +58,7 @@ static void lanyfs_inodecache_kmcinit(void *ptr)
 int lanyfs_inodecache_init(void)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	lanyfs_inode_cachep = kmem_cache_create("lanyfs_inode_cache",
 		sizeof(struct lanyfs_lii),
 		0,
@@ -76,6 +79,7 @@ int lanyfs_inodecache_init(void)
 void lanyfs_inodecache_destroy(void)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	kmem_cache_destroy(lanyfs_inode_cachep);
 }
 

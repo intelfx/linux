@@ -21,6 +21,8 @@ static const struct inode_operations lanyfs_file_inode_operations;
  */
 void lanyfs_inode_poke(struct inode *inode)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	if (inode) {
 		spin_lock(&inode->i_lock);
 		inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
@@ -124,7 +126,6 @@ struct inode *lanyfs_iget(struct super_block *sb, lanyfs_blk_t addr)
 	/* name */
 	memset(lii->name, 0x00, LANYFS_NAME_LENGTH);
 	strncpy(lii->name, b->vi_meta.name, LANYFS_NAME_LENGTH - 1);
-	lanyfs_debug("iget name=%s", lii->name);
 	lii->len = strlen(lii->name);
 	/* uid, gid */
 	inode->i_uid = fsi->opts.uid;

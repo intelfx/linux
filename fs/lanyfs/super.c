@@ -130,7 +130,7 @@ exit_ok:
 	return 0;
 exit_invalid:
 	if (!silent)
-		lanyfs_msg(sb, KERN_ERR,
+		lanyfs_err(sb,
 			   "invalid mount option or bad parameter \"%s\"", p);
 	return -EINVAL;
 }
@@ -155,7 +155,8 @@ static void lanyfs_super_sync(struct super_block *sb)
 	fsi = LANYFS_SB(sb);
 	bh = sb_bread(sb, LANYFS_SUPERBLOCK);
 	if (!bh) {
-		lanyfs_debug("error reading block #%llu", LANYFS_SUPERBLOCK);
+		lanyfs_err(sb, "error reading block #%llu",
+			   (u64) LANYFS_SUPERBLOCK);
 		return;
 	}
 	rawsb = (struct lanyfs_sb *) bh->b_data;
@@ -202,6 +203,7 @@ static void lanyfs_put_super(struct super_block *sb)
 static void lanyfs_kill_super(struct super_block *sb)
 {
 	lanyfs_debug_function(__FILE__, __func__);
+
 	kill_block_super(sb);
 }
 
@@ -240,8 +242,7 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 	/* set blocksize to minimum size for fetching superblock */
 	if (!sb_set_blocksize(sb, 1 << LANYFS_MIN_BLOCKSIZE)) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_ERR,
-				   "error setting blocksize to %d bytes",
+			lanyfs_err(sb, "error setting blocksize to %d bytes",
 				   1 << LANYFS_MIN_BLOCKSIZE);
 		return -EIO;
 	}
@@ -250,7 +251,7 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 	bh = sb_bread(sb, LANYFS_SUPERBLOCK);
 	if (!bh) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_ERR, "error reading superblock");
+			lanyfs_err(sb, "error reading superblock");
 		return -EIO;
 	}
 	lanysb = (struct lanyfs_sb *) bh->b_data;
@@ -258,8 +259,8 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 	/* check magic */
 	if (lanysb->magic != cpu_to_le32(LANYFS_SUPER_MAGIC)) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_INFO, "bad magic 0x%x",
-				   lanysb->magic);
+			lanyfs_info(sb, "bad magic 0x%x",
+				    lanysb->magic);
 		goto exit_invalid;
 	}
 	sb->s_magic = LANYFS_SUPER_MAGIC;
@@ -267,15 +268,14 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 	/* check block type */
 	if (lanysb->type != LANYFS_TYPE_SB) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_ERR, "bad superblock type 0x%x",
-				   lanysb->type);
+			lanyfs_err(sb, "bad block type 0x%x", lanysb->type);
 		goto exit_invalid;
 	}
 
 	/* check version */
 	if (lanysb->major > LANYFS_MAJOR_VERSION) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_ERR, "major version mismatch");
+			lanyfs_err(sb, "major version mismatch");
 		goto exit_invalid;
 	}
 
@@ -283,7 +283,7 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 	if (lanysb->addrlen < LANYFS_MIN_ADDRLEN ||
 	    lanysb->addrlen > LANYFS_MAX_ADDRLEN) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_ERR, "unsupported address length");
+			lanyfs_err(sb, "unsupported address length");
 		goto exit_invalid;
 	}
 	fsi->addrlen = lanysb->addrlen;
@@ -292,7 +292,7 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 	if (lanysb->blocksize < LANYFS_MIN_BLOCKSIZE ||
 	    lanysb->blocksize > LANYFS_MAX_BLOCKSIZE) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_ERR, "unsupported blocksize");
+			lanyfs_err(sb, "unsupported blocksize");
 		goto exit_invalid;
 	}
 	fsi->blocksize = lanysb->blocksize;
@@ -324,8 +324,7 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 	/* set blocksize to correct size */
 	if (!sb_set_blocksize(sb, 1 << fsi->blocksize)) {
 		if (!silent)
-			lanyfs_msg(sb, KERN_ERR,
-				   "error setting blocksize to %d bytes",
+			lanyfs_err(sb, "error setting blocksize to %d bytes",
 				   1 << fsi->blocksize);
 		return -EIO;
 	}
@@ -350,7 +349,7 @@ static int lanyfs_fill_super(struct super_block *sb, void *options, int silent)
 exit_invalid:
 	brelse(bh);
 	if (!silent)
-		lanyfs_msg(sb, KERN_INFO, "no valid lanyard filesystem found");
+		lanyfs_info(sb, "no valid lanyard filesystem found");
 	return -EINVAL;
 }
 
@@ -364,6 +363,8 @@ exit_invalid:
 static struct dentry *lanyfs_mount(struct file_system_type *fs_type, int flags,
 				   const char *device_name, void *data)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	return mount_bdev(fs_type, flags, device_name, data, lanyfs_fill_super);
 }
 
@@ -397,7 +398,7 @@ lanyfs_blk_t lanyfs_enslave(struct super_block *sb)
 		fsi->freeblocks--;
 		spin_unlock(&fsi->lock);
 		lanyfs_super_sync(sb);
-		lanyfs_debug("enslaved block #%llu", addr);
+		lanyfs_debug("enslaved block #%llu on %s", addr, sb->s_id);
 		return addr;
 		break;
 	default:
@@ -434,10 +435,9 @@ int lanyfs_release(struct super_block *sb, lanyfs_blk_t addr)
 			goto exit_err;
 		spin_lock(&fsi->lock);
 		fsi->freehead = fsi->freetail = addr;
-		fsi->freeblocks = 1;
+		fsi->freeblocks = 0;
 		spin_unlock(&fsi->lock);
-		lanyfs_super_sync(sb);
-		return 0;
+		goto exit_ok;
 	}
 
 	/* append block to existing chain */
@@ -450,15 +450,20 @@ int lanyfs_release(struct super_block *sb, lanyfs_blk_t addr)
 		err = lanyfs_chain_set_next(sb, fsi->freetail, addr);
 		spin_lock(&fsi->lock);
 		fsi->freetail = addr;
-		fsi->freeblocks++;
 		spin_unlock(&fsi->lock);
-		return 0;
+		goto exit_ok;
 	} else if (err) {
 		goto exit_err;
 	}
+exit_ok:
+	spin_lock(&fsi->lock);
+	fsi->freeblocks++;
+	spin_unlock(&fsi->lock);
+	lanyfs_super_sync(sb);
+	lanyfs_debug("released block #%llu on %s", addr, sb->s_id);
 	return 0;
 exit_err:
-	lanyfs_msg(sb, KERN_WARNING, "error freeing block #%llu", (u64) addr);
+	lanyfs_err(sb, "error freeing block #%llu", (u64) addr);
 	return err;
 }
 
@@ -475,6 +480,8 @@ exit_err:
  */
 static int lanyfs_show_stats(struct seq_file *m, struct dentry *dentry)
 {
+	lanyfs_debug_function(__FILE__, __func__);
+
 	seq_printf(m, "Can we try with real bullets now? (Mathilda)\n");
 	return 0;
 }
@@ -489,6 +496,7 @@ static int lanyfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct lanyfs_fsi *fsi;
 	u64 fsid;
 	lanyfs_debug_function(__FILE__, __func__);
+
 	fsi = LANYFS_SB(dentry->d_sb);
 	fsid = huge_encode_dev(dentry->d_sb->s_bdev->bd_dev);
 	buf->f_type = LANYFS_SUPER_MAGIC;
