@@ -59,12 +59,12 @@
 
 /* debug messaging */
 #ifdef LANYFS_DEBUG
-#define lanyfs_debug(fmt, ...) \
-	pr_devel("LANYFS: " pr_fmt(fmt) "\n", ##__VA_ARGS__)
+#define lanyfs_debug(fmt, ...)						\
+	printk(KERN_DEBUG "LANYFS: " pr_fmt(fmt) "\n", ##__VA_ARGS__)
 #else
-#define lanyfs_debug(fmt, ...) \
-	no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
-#endif /* LANYFS_DEBUG */
+#define lanyfs_debug(fmt, ...)						\
+	do { } while (0)
+#endif /* !LANYFS_DEBUG */
 
 /**
  * typedef lanyfs_blk_t - the address of a logical block

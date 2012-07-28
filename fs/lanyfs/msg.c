@@ -20,7 +20,8 @@
  */
 void lanyfs_debug_function(const char *file, const char *func)
 {
-	lanyfs_debug("%s: %s", file, func);
+	/* reverse order of arguments is intended */
+	lanyfs_debug("%s (%s)", func, file);
 }
 
 /**

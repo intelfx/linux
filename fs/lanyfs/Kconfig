@@ -12,7 +12,6 @@ config LANYFS_FS
 config LANYFS_DEBUG
 	bool "LanyFS debugging support"
 	depends on LANYFS_FS
-	select DEBUG
 	help
 	  Enables debugging for the lanyard file system (LanyFS).
 
