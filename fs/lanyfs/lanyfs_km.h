@@ -60,7 +60,7 @@
 /* debug messaging */
 #ifdef LANYFS_DEBUG
 #define lanyfs_debug(fmt, ...) \
-	pr_devel("LANYFS: " (fmt) "\n", ##__VA_ARGS__)
+	pr_devel("LANYFS: " pr_fmt(fmt) "\n", ##__VA_ARGS__)
 #else
 #define lanyfs_debug(fmt, ...) \
 	no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
