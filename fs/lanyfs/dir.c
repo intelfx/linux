@@ -12,17 +12,16 @@
 #include "lanyfs_km.h"
 
 /**
- * lanyfs_dir_is_empty() - Tests wether a directory is empty or not.
- * @dentry:			directory entry to test
+ * lanyfs_empty() - Test wether a directory is empty or not.
+ * @inode:			directory inode to test
  */
-static int lanyfs_dir_is_empty(struct dentry *dentry)
+static int lanyfs_empty(struct inode *inode)
 {
 	lanyfs_debug_function(__FILE__, __func__);
 
-	if (!dentry || !dentry->d_inode ||
-	    LANYFS_I(dentry->d_inode)->subtree)
+	if (unlikely(!inode) || unlikely(!S_ISDIR(inode->i_mode)))
 		return 0;
-	return 1;
+	return !LANYFS_I(inode)->subtree;
 }
 
 /**
@@ -109,16 +108,16 @@ static int lanyfs_readdir(struct file *fp, void *dirent, filldir_t filldir)
 
 /**
  * lanyfs_mkdir() - Creates a new directory.
- * @dir:			current directory
+ * @pdir:			current directory
  * @dentry:			directory to create
  * @mode:			requested mode of new directory
  */
-static int lanyfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+static int lanyfs_mkdir(struct inode *pdir, struct dentry *dentry, umode_t mode)
 {
 	struct super_block *sb;
 	lanyfs_blk_t addr;
 	struct buffer_head *bh;
-	union lanyfs_b *b;
+	struct lanyfs_dir *dir;
 	struct inode *inode;
 	int err;
 	lanyfs_debug_function(__FILE__, __func__);
@@ -127,7 +126,7 @@ static int lanyfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 	if (dentry->d_name.len >= LANYFS_NAME_LENGTH)
 		return -ENAMETOOLONG;
 
-	sb = dir->i_sb;
+	sb = pdir->i_sb;
 	/* get free block */
 	addr = lanyfs_enslave(sb);
 	if (!addr)
@@ -141,15 +140,15 @@ static int lanyfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 		err = -EIO;
 		goto exit_release;
 	}
-	b = (union lanyfs_b *) bh->b_data;
+	dir = (struct lanyfs_dir *) bh->b_data;
 
 	lock_buffer(bh);
 	memset(bh->b_data, 0x00, 1 << LANYFS_SB(sb)->blocksize);
-	b->dir.type = LANYFS_TYPE_DIR;
-	lanyfs_time_lts_now(&b->dir.meta.created);
-	b->dir.meta.modified = b->dir.meta.created;
-	b->dir.meta.attr = lanyfs_mode_to_attr(mode, 0);
-	strncpy(b->dir.meta.name, dentry->d_name.name, LANYFS_NAME_LENGTH - 1);
+	dir->type = LANYFS_TYPE_DIR;
+	lanyfs_time_lts_now(&dir->meta.created);
+	dir->meta.modified = dir->meta.created;
+	dir->meta.attr = lanyfs_mode_to_attr(mode, 0);
+	strncpy(dir->meta.name, dentry->d_name.name, LANYFS_NAME_LENGTH - 1);
 	unlock_buffer(bh);
 	mark_buffer_dirty(bh);
 	if (LANYFS_SB(sb)->opts.flush)
@@ -161,7 +160,7 @@ static int lanyfs_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 		err = -ENOMEM;
 		goto exit_release;
 	}
-	err = lanyfs_btree_add_inode(dir, inode);
+	err = lanyfs_btree_add_inode(pdir, inode);
 	if (err)
 		goto exit_ino;
 	inc_nlink(inode);
@@ -193,7 +192,7 @@ static int lanyfs_rmdir(struct inode *dir, struct dentry *dentry)
 		return -ENAMETOOLONG;
 
 	/* empty check */
-	if (!lanyfs_dir_is_empty(dentry))
+	if (!lanyfs_empty(dentry->d_inode))
 		return -ENOTEMPTY;
 
 	addr = dentry->d_inode->i_ino;
@@ -237,10 +236,7 @@ static int lanyfs_unlink(struct inode *dir, struct dentry *dentry)
 	if (err)
 		return err;
 
-	drop_nlink(dentry->d_inode);
-	clear_inode(dentry->d_inode);
-	iput(dentry->d_inode);
-	dput(dentry);
+	drop_nlink(inode);
 	lanyfs_inode_poke(dir);
 	lanyfs_release(sb, addr);
 	return 0;
@@ -271,46 +267,40 @@ static int lanyfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	struct super_block *sb;
 	const char *old_name;
 	const char *new_name;
+	struct inode *old_inode;
+	struct inode *new_inode;
 	int err;
 	lanyfs_debug_function(__FILE__, __func__);
 
 	sb = old_dir->i_sb;
 	old_name = old_dentry->d_name.name;
 	new_name = new_dentry->d_name.name;
+	old_inode = old_dentry->d_inode;
+	new_inode = new_dentry->d_inode;
 
-
-	if (new_dentry->d_inode && S_ISDIR(new_dentry->d_inode->i_mode)) {
-		/*
-		 * target exists and is a directory
-		 * if empty we remove
-		 */
-		err = lanyfs_rmdir(new_dir, new_dentry);
-		if (err)
-			return err;
-	}
-
-	if (new_dentry->d_inode && !S_ISDIR(new_dentry->d_inode->i_mode)) {
-		/*
-		 * target exists and is a file
-		 * we remove it
-		 */
-		err = lanyfs_unlink(new_dir, new_dentry);
-		if (err)
-			return err;
+	/* remove target if it exists */
+	if (new_inode) {
+		if (S_ISDIR(old_inode->i_mode)) {
+			if (!lanyfs_empty(new_inode)) 
+				return -ENOTEMPTY;
+			lanyfs_rmdir(new_dir, new_dentry);
+		} else {
+			lanyfs_unlink(new_dir, new_dentry);
+		}
 	}
 
 	/* remove node from old binary tree */
 	lanyfs_btree_del_inode(old_dir, old_name);
-	lanyfs_btree_clear_inode(old_dentry->d_inode);
+	lanyfs_btree_clear_inode(old_inode);
 
 	/* change name */
-	lanyfs_inode_rename(old_dentry->d_inode, new_name);
+	lanyfs_inode_rename(old_inode, new_name);
 
 	/* add node to new binary tree */
-	err = lanyfs_btree_add_inode(new_dir, old_dentry->d_inode);
+	err = lanyfs_btree_add_inode(new_dir, old_inode);
 	if (err)
 		return err;
-	lanyfs_inode_poke(old_dentry->d_inode);
+	lanyfs_inode_poke(old_inode);
 	lanyfs_inode_poke(old_dir);
 	lanyfs_inode_poke(new_dir);
 	return 0;

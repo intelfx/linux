@@ -21,7 +21,7 @@ static int __init lanyfs_init(void)
 	int err;
 	lanyfs_debug_function(__FILE__, __func__);
 
-	pr_info("LANYFS: register filesystem\n");
+	pr_info("lanyfs: register filesystem\n");
 	lanyfs_debug("debug=enabled");
 	err = lanyfs_inodecache_init();
 	if (err)
@@ -34,7 +34,7 @@ static int __init lanyfs_init(void)
 exit_ino:
 	lanyfs_inodecache_destroy();
 exit_err:
-	pr_err("LANYFS: register filesystem failed\n");
+	pr_err("lanyfs: register filesystem failed\n");
 	return err;
 }
 
@@ -46,7 +46,7 @@ exit_err:
 static void __exit lanyfs_exit(void)
 {
 	lanyfs_debug_function(__FILE__, __func__);
-	pr_info("LANYFS: unregister filesystem\n");
+	pr_info("lanyfs: unregister filesystem\n");
 
 	lanyfs_inodecache_destroy();
 	unregister_filesystem(&lanyfs_file_system_type);
