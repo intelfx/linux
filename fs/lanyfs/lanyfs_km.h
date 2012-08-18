@@ -39,23 +39,23 @@
 
 /* messaging */
 #define lanyfs_info(sb, fmt, ...)					\
-	do {								\
+	{								\
 		if (sb)							\
 			pr_info("lanyfs (%s): " pr_fmt(fmt) "\n",	\
 				sb->s_id, ##__VA_ARGS__);		\
-	} while (0)
+	}
 #define lanyfs_err(sb, fmt, ...)					\
-	do {								\
+	{								\
 		if (sb)							\
 			pr_err("lanyfs (%s): " pr_fmt(fmt) "\n",	\
 			       sb->s_id, ##__VA_ARGS__);		\
-	} while (0)
+	}
 #define lanyfs_warn(sb, fmt, ...)					\
-	do {								\
+	{								\
 		if (sb)							\
-			pr_warning("lanyfs (%s): " pr_fmt(fmt) "\n",	\
-				   sb->s_id, ##__VA_ARGS__);		\
-	} while (0)
+			pr_warn("lanyfs (%s): " pr_fmt(fmt) "\n",	\
+				sb->s_id, ##__VA_ARGS__);		\
+	}
 
 /* debug messaging */
 #ifdef LANYFS_DEBUG

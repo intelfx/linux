@@ -281,7 +281,7 @@ static int lanyfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	/* remove target if it exists */
 	if (new_inode) {
 		if (S_ISDIR(old_inode->i_mode)) {
-			if (!lanyfs_empty(new_inode)) 
+			if (!lanyfs_empty(new_inode))
 				return -ENOTEMPTY;
 			lanyfs_rmdir(new_dir, new_dentry);
 		} else {
