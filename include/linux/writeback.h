@@ -7,6 +7,12 @@
 #include <linux/sched.h>
 #include <linux/fs.h>
 
+static inline int is_flush_bd_task(struct task_struct *task)
+{
+       return task->flags & PF_FLUSHER;
+}
+#define current_is_flush_bd_task()  is_flush_bd_task(current)
+
 /*
  * The 1/4 region under the global dirty thresh is for smooth dirty throttling:
  *
@@ -79,6 +85,24 @@ struct writeback_control {
 	unsigned tagged_writepages:1;	/* tag-and-write to avoid livelock */
 	unsigned for_reclaim:1;		/* Invoked from the page allocator */
 	unsigned range_cyclic:1;	/* range_start is cyclic */
+};
+
+/*
+ * Passed into wb_writeback(), essentially a subset of writeback_control
+ */
+struct wb_writeback_work {
+	long nr_pages;
+	struct super_block *sb;
+	unsigned long *older_than_this;
+	enum writeback_sync_modes sync_mode;
+	unsigned int tagged_writepages:1;
+	unsigned int for_kupdate:1;
+	unsigned int range_cyclic:1;
+	unsigned int for_background:1;
+	enum wb_reason reason;		/* why was writeback initiated? */
+
+	struct list_head list;		/* pending work list */
+	struct completion *done;	/* set if the caller waits */
 };
 
 /*
