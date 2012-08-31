@@ -87,8 +87,8 @@ typedef u64 lanyfs_blk_t;
  * @flush:			force instant writing of changed data
  */
 struct lanyfs_opts {
-	uid_t			uid;
-	gid_t			gid;
+	kuid_t			uid;
+	kgid_t			gid;
 	unsigned int		dmask;
 	unsigned int		fmask;
 	unsigned int		discard:1,
