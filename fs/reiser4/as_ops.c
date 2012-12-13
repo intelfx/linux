@@ -43,6 +43,7 @@
 #include <linux/backing-dev.h>
 #include <linux/quotaops.h>
 #include <linux/security.h>
+#include <linux/migrate.h>
 
 /* address space operations */
 
@@ -301,6 +302,91 @@ int reiser4_releasepage(struct page *page, gfp_t gfp UNUSED_ARG)
 		spin_unlock_jnode(node);
 		assert("nikita-3020", reiser4_schedulable());
 		return 0;
+	}
+}
+
+int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
+			struct page *page, enum migrate_mode mode)
+{
+	jnode *node;
+	int result;
+
+	assert("???-1", PageLocked(page));
+	assert("???-2", !PageWriteback(page));
+	assert("???-3", reiser4_schedulable());
+
+	if (PageDirty(page)) {
+		/*
+		 * Logic from migrate.c:fallback_migrate_page()
+		 * Only writeback pages in full synchronous migration
+		 */
+		if (mode != MIGRATE_SYNC)
+			return -EBUSY;
+		return write_one_page(page, true) < 0 ? -EIO : -EAGAIN;
+	}
+
+	assert("???-4", !PageDirty(page));
+
+	assert("???-5", page->mapping != NULL);
+	assert("???-6", page->mapping->host != NULL);
+
+	/*
+	 * Iteration 1: release page before default migration by migrate_page().
+	 * Iteration 2: check if the page is releasable; if true, directly replace
+	 *              jnode's page pointer instead of releasing, then migrate using
+	 *              default migrate_page().
+	 */
+
+	/* -- comment taken from mm/migrate.c:migrate_page_move_mapping() --
+	 * The number of remaining references must be:
+	 * 1 for anonymous pages without a mapping
+	 * 2 for pages with a mapping
+	 * 3 for pages with a mapping and PagePrivate/PagePrivate2 set.
+	 */
+
+	if (page_count(page) > (PagePrivate(page) ? 3 : 2))
+		return -EIO;
+
+	/*
+	 * Non-referenced non-PagePrivate pages are e. g. anonymous pages.
+	 * If any, just migrate them using default routine.
+	 */
+
+	if (!PagePrivate(page))
+		return migrate_page(mapping, newpage, page, mode);
+
+	node = jnode_by_page(page);
+	assert("???-7", node != NULL);
+
+	/* releasable() needs jnode lock, because it looks at the jnode fields
+	 * and we need jload_lock here to avoid races with jload(). */
+	spin_lock_jnode(node);
+	spin_lock(&(node->load));
+	if (jnode_is_releasable(node)) {
+		jref(node);
+
+		/* there is no need to synchronize against
+		 * jnode_extent_write() here, because pages seen by
+		 * jnode_extent_write() are !releasable(). */
+		page_clear_jnode(page, node);
+		result = migrate_page(mapping, newpage, page, mode);
+		if (unlikely(result)) {
+			jnode_attach_page(node, page); /* migration failed - reattach the old page */
+		} else {
+			jnode_attach_page(node, newpage);
+		}
+
+		jput(node);
+
+		spin_unlock(&(node->load));
+		spin_unlock_jnode(node);
+		assert("???-9", reiser4_schedulable());
+		return result;
+	} else {
+		spin_unlock(&(node->load));
+		spin_unlock_jnode(node);
+		assert("???-8", reiser4_schedulable());
+		return -EIO;
 	}
 }
 
