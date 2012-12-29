@@ -372,18 +372,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 
 		if(jprivate(newpage)) {
 			// FIXME: warning or what? happens on a regular basis, behavior is unaffected.
-			jnode *maybe_jnode = jprivate(newpage);
-
-#ifdef REISER4_DEBUG
-			warning("???-10", "Migration dest page has a non-NULL private field (%p) - jnode magic %x (%s)",
-			        maybe_jnode,
-			        maybe_jnode->magic,
-			        maybe_jnode->magic == JMAGIC ? "LOOKS LIKE JNODE" : "garbage");
-#else
-			warning("???-10", "Migration dest page has a non-NULL private field (%p)",
-					maybe_jnode);
-#endif
-
+			warning("???-10", "Migration destination page has a non-NULL private field (%p) - resetting it", page_private(newpage));
 			set_page_private(newpage, 0ul);
 		}
 
