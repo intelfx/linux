@@ -345,7 +345,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 	 */
 
 	if (page_count(page) > (PagePrivate(page) ? 3 : 2))
-		return -EIO;
+		return -EAGAIN;
 
 	/*
 	 * Non-referenced non-PagePrivate pages are e. g. anonymous pages.
@@ -393,7 +393,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 		spin_unlock(&(node->load));
 		spin_unlock_jnode(node);
 		assert("???-8", reiser4_schedulable());
-		return -EIO;
+		return -EAGAIN;
 	}
 }
 
