@@ -322,7 +322,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 		 */
 		if (mode != MIGRATE_SYNC)
 			return -EBUSY;
-		return write_one_page(page, true) < 0 ? -EIO : -EAGAIN;
+		return writeout(mapping, page);
 	}
 
 	assert("???-4", !PageDirty(page));
