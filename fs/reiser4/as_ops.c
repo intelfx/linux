@@ -348,8 +348,8 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 		return -EAGAIN;
 
 	/*
-	 * Non-referenced non-PagePrivate pages are e. g. anonymous pages.
-	 * If any, just migrate them using default routine.
+	 * If there are non-referenced non-PagePrivate pages,
+	 * just migrate them using default routine.
 	 */
 
 	if (!PagePrivate(page))
