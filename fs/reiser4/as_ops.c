@@ -371,8 +371,6 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 		page_clear_jnode(page, node);
 
 		if(jprivate(newpage)) {
-			// FIXME: warning or what? happens on a regular basis, behavior is unaffected.
-			warning("???-10", "Migration destination page has a non-NULL private field (%p) - resetting it", page_private(newpage));
 			set_page_private(newpage, 0ul);
 		}
 
