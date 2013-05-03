@@ -2265,14 +2265,13 @@ ssize_t write_unix_file(struct file *file,
 		drop_access(uf_info);
 		ea = NEITHER_OBTAINED;
 
-		/*
-		 * tell VM how many pages were dirtied. Maybe number of pages
-		 * which were dirty already should not be counted
-		 */
-		reiser4_throttle_write(inode, size_in_pages(written));
-		left -= written;
-		buf += written;
-		*pos += written;
+		if(likely(written != 0)) {
+			/* tell VM that pages were dirtied. */
+			reiser4_throttle_write(inode);
+			left -= written;
+			buf += written;
+			*pos += written;
+		}
 	}
 	if (result == 0 && ((file->f_flags & O_SYNC) || IS_SYNC(inode))) {
 		reiser4_txn_restart_current();
