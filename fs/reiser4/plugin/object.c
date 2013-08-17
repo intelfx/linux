@@ -102,7 +102,8 @@ static sector_t bmap_bugop(struct address_space *mapping, sector_t sector)
 	return 0;
 }
 
-static void invalidatepage_bugop(struct page *page, unsigned long offset)
+static void invalidatepage_bugop(struct page *page, unsigned offset,
+				 unsigned length)
 {
 	BUG_ON(1);
 }
