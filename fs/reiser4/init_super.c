@@ -558,7 +558,7 @@ int reiser4_init_read_super(struct super_block *super, int silent)
 	master_sb = (struct reiser4_master_sb *)super_bh->b_data;
 	/* check reiser4 magic string */
 	if (!strncmp(master_sb->magic, REISER4_SUPER_MAGIC_STRING,
-		     sizeof(REISER4_SUPER_MAGIC_STRING))) {
+		     strlen(REISER4_SUPER_MAGIC_STRING))) {
 		/* reiser4 master super block contains filesystem blocksize */
 		blocksize = le16_to_cpu(get_unaligned(&master_sb->blocksize));
 
