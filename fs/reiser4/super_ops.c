@@ -407,6 +407,7 @@ static int reiser4_sync_fs(struct super_block *super, int wait)
 		.sync_mode	= WB_SYNC_ALL,
 		.range_cyclic	= 0,
 		.nr_pages	= LONG_MAX,
+		.for_sync	= 1,
 		.reason		= WB_REASON_SYNC,
 	};
 	struct writeback_control wbc = {
