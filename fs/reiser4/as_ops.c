@@ -307,7 +307,7 @@ int reiser4_releasepage(struct page *page, gfp_t gfp UNUSED_ARG)
 
 #ifdef CONFIG_MIGRATION
 int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
-			struct page *page, enum migrate_mode mode)
+			struct page *page)
 {
 	jnode *node;
 	int result;
@@ -319,10 +319,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 	if (PageDirty(page)) {
 		/*
 		 * Logic from migrate.c:fallback_migrate_page()
-		 * Only writeback pages in full synchronous migration
 		 */
-		if (mode != MIGRATE_SYNC)
-			return -EBUSY;
 		return writeout(mapping, page);
 	}
 
@@ -354,7 +351,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 	 */
 
 	if (!PagePrivate(page))
-		return migrate_page(mapping, newpage, page, mode);
+		return migrate_page(mapping, newpage, page);
 
 	node = jnode_by_page(page);
 	assert("???-7", node != NULL);
@@ -375,7 +372,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 			set_page_private(newpage, 0ul);
 		}
 
-		result = migrate_page(mapping, newpage, page, mode);
+		result = migrate_page(mapping, newpage, page);
 		if (unlikely(result)) {
 			jnode_attach_page(node, page); /* migration failed - reattach the old page */
 		} else {
