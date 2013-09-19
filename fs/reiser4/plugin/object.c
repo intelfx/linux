@@ -114,7 +114,8 @@ static int releasepage_bugop(struct page *page, gfp_t gfp)
 }
 
 static int migratepage_bugop(struct address_space *mapping,
-			     struct page *page, struct page *newpage)
+			     struct page *page, struct page *newpage,
+			     enum migrate_mode mode)
 {
 	BUG_ON(1);
 	return 0;

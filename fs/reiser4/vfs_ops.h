@@ -27,7 +27,7 @@ int reiser4_releasepage(struct page *, gfp_t);
 
 #ifdef CONFIG_MIGRATION
 int reiser4_migratepage(struct address_space *, struct page *,
-			struct page *);
+			struct page *, enum migrate_mode);
 #else
 #define reiser4_migratepage NULL
 #endif /* CONFIG_MIGRATION */
