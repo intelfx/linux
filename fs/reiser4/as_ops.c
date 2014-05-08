@@ -312,9 +312,9 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 	jnode *node;
 	int result;
 
-	assert("???-1", PageLocked(page));
-	assert("???-2", !PageWriteback(page));
-	assert("???-3", reiser4_schedulable());
+	assert("intelfx-33", PageLocked(page));
+	assert("intelfx-34", !PageWriteback(page));
+	assert("intelfx-35", reiser4_schedulable());
 
 	if (PageDirty(page)) {
 		/*
@@ -323,10 +323,10 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 		return writeout(mapping, page);
 	}
 
-	assert("???-4", !PageDirty(page));
+	assert("intelfx-36", !PageDirty(page));
 
-	assert("???-5", page->mapping != NULL);
-	assert("???-6", page->mapping->host != NULL);
+	assert("intelfx-37", page->mapping != NULL);
+	assert("intelfx-38", page->mapping->host != NULL);
 
 	/*
 	 * Iteration 1: release page before default migration by migrate_page().
@@ -354,7 +354,7 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 		return migrate_page(mapping, newpage, page);
 
 	node = jnode_by_page(page);
-	assert("???-7", node != NULL);
+	assert("intelfx-39", node != NULL);
 
 	/* releasable() needs jnode lock, because it looks at the jnode fields
 	 * and we need jload_lock here to avoid races with jload(). */
@@ -383,12 +383,12 @@ int reiser4_migratepage(struct address_space *mapping, struct page *newpage,
 
 		spin_unlock(&(node->load));
 		spin_unlock_jnode(node);
-		assert("???-9", reiser4_schedulable());
+		assert("intelfx-41", reiser4_schedulable());
 		return result;
 	} else {
 		spin_unlock(&(node->load));
 		spin_unlock_jnode(node);
-		assert("???-8", reiser4_schedulable());
+		assert("intelfx-40", reiser4_schedulable());
 		return -EAGAIN;
 	}
 }
