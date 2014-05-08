@@ -57,6 +57,9 @@ extern int migrate_page_move_mapping(struct address_space *mapping,
 		struct page *newpage, struct page *page,
 		struct buffer_head *head, enum migrate_mode mode,
 		int extra_count);
+
+extern int writeout(struct address_space *mapping, struct page *page);
+
 #else
 
 static inline void putback_lru_pages(struct list_head *l) {}
@@ -80,6 +83,11 @@ static inline void migrate_page_copy(struct page *newpage,
 
 static inline int migrate_huge_page_move_mapping(struct address_space *mapping,
 				  struct page *newpage, struct page *page)
+{
+	return -ENOSYS;
+}
+
+static inline int writeout(struct address_space *mapping, struct page *page)
 {
 	return -ENOSYS;
 }
