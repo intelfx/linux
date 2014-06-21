@@ -992,6 +992,7 @@ reiser4_dealloc_blocks(const reiser4_block_nr * start,
 	int ret;
 	reiser4_context *ctx;
 	reiser4_super_info_data *sbinfo;
+	void *new_entry = NULL;
 
 	ctx = get_current_context();
 	sbinfo = get_super_private(ctx->super);
@@ -1007,17 +1008,13 @@ reiser4_dealloc_blocks(const reiser4_block_nr * start,
 	}
 
 	if (flags & BA_DEFER) {
-		blocknr_set_entry *bsep = NULL;
-
-		/* storing deleted block numbers in a blocknr set
-		   datastructure for further actual deletion */
+		/* store deleted block numbers in the atom's deferred delete set
+		   for further actual deletion */
 		do {
 			atom = get_current_atom_locked();
 			assert("zam-430", atom != NULL);
 
-			ret =
-			    blocknr_set_add_extent(atom, &atom->delete_set,
-						   &bsep, start, len);
+			ret = atom_dset_deferred_add_extent(atom, &new_entry, start, len);
 
 			if (ret == -ENOMEM)
 				return ret;
@@ -1031,6 +1028,25 @@ reiser4_dealloc_blocks(const reiser4_block_nr * start,
 		spin_unlock_atom(atom);
 
 	} else {
+		/* store deleted block numbers in the atom's immediate delete set
+		   for further processing */
+		do {
+			atom = get_current_atom_locked();
+			assert("intelfx-51", atom != NULL);
+
+			ret = atom_dset_immediate_add_extent(atom, &new_entry, start, len);
+
+			if (ret == -ENOMEM)
+				return ret;
+
+			/* This loop might spin at most two times */
+		} while (ret == -E_REPEAT);
+
+		assert("intelfx-52", ret == 0);
+		assert("intelfx-53", atom != NULL);
+
+		spin_unlock_atom(atom);
+
 		assert("zam-425", get_current_super_private() != NULL);
 		sa_dealloc_blocks(reiser4_get_space_allocator(ctx->super),
 				  *start, *len);
@@ -1128,7 +1144,7 @@ void reiser4_post_commit_hook(void)
 
 	/* do the block deallocation which was deferred
 	   until commit is done */
-	blocknr_set_iterator(atom, &atom->delete_set, apply_dset, NULL, 1);
+	atom_dset_deferred_apply(atom, apply_dset, NULL, 0);
 
 	assert("zam-504", get_current_super_private() != NULL);
 	sa_post_commit_hook();

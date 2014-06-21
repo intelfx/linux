@@ -245,9 +245,26 @@ struct txn_atom {
 	/* Start time. */
 	unsigned long start_time;
 
-	/* The atom's delete set. It collects block numbers of the nodes
-	   which were deleted during the transaction. */
-	struct list_head delete_set;
+	/* The atom's delete sets.
+	   "simple" are blocknr_set instances and are used when discard is disabled.
+	   "discard" are blocknr_list instances and are used when discard is enabled. */
+	union {
+		struct {
+		/* The atom's delete set. It collects block numbers of the nodes
+		   which were deleted during the transaction. */
+			struct list_head delete_set;
+		} nodiscard;
+
+		struct {
+			/* The atom's delete set. It collects block numbers which were
+			   deallocated with BA_DEFER, i. e. of ordinary nodes. */
+			struct list_head delete_set;
+
+			/* The atom's auxiliary delete set. It collects block numbers
+			   which were deallocated without BA_DEFER, i. e. immediately. */
+			struct list_head aux_delete_set;
+		} discard;
+	};
 
 	/* The atom's wandered_block mapping. */
 	struct list_head wandered_map;
@@ -503,6 +520,27 @@ extern int blocknr_list_iterator(txn_atom *atom,
                                  blocknr_set_actor_f actor,
                                  void *data,
                                  int delete);
+
+/* These are wrappers for accessing and modifying atom's delete lists,
+   depending on whether discard is enabled or not.
+   If it is enabled. both deferred and immediate delete lists are maintained,
+   and (less memory efficient) blocknr_lists are used for storage. Otherwise, only
+   deferred delete list is maintained and blocknr_set is used for its storage. */
+extern void atom_dset_init(txn_atom *atom);
+extern void atom_dset_destroy(txn_atom *atom);
+extern void atom_dset_merge(txn_atom *from, txn_atom *to);
+extern int atom_dset_deferred_apply(txn_atom* atom,
+                                    blocknr_set_actor_f actor,
+                                    void *data,
+                                    int delete);
+extern int atom_dset_deferred_add_extent(txn_atom *atom,
+                                         void **new_entry,
+                                         const reiser4_block_nr *start,
+                                         const reiser4_block_nr *len);
+extern int atom_dset_immediate_add_extent(txn_atom *atom,
+                                          void **new_entry,
+                                          const reiser4_block_nr *start,
+                                          const reiser4_block_nr *len);
 
 /* flush code takes care about how to fuse flush queues */
 extern void flush_init_atom(txn_atom * atom);
