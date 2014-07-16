@@ -1007,7 +1007,8 @@ reiser4_dealloc_blocks(const reiser4_block_nr * start,
 		spin_unlock_reiser4_super(sbinfo);
 	}
 
-	if (flags & BA_DEFER) {
+	if ((flags & BA_DEFER) ||
+	    reiser4_is_set(reiser4_get_current_sb(), REISER4_DISCARD)) {
 		/* store deleted block numbers in the atom's deferred delete set
 		   for further actual deletion */
 		do {
@@ -1028,25 +1029,6 @@ reiser4_dealloc_blocks(const reiser4_block_nr * start,
 		spin_unlock_atom(atom);
 
 	} else {
-		/* store deleted block numbers in the atom's immediate delete set
-		   for further processing */
-		do {
-			atom = get_current_atom_locked();
-			assert("intelfx-51", atom != NULL);
-
-			ret = atom_dset_immediate_add_extent(atom, &new_entry, start, len);
-
-			if (ret == -ENOMEM)
-				return ret;
-
-			/* This loop might spin at most two times */
-		} while (ret == -E_REPEAT);
-
-		assert("intelfx-52", ret == 0);
-		assert("intelfx-53", atom != NULL);
-
-		spin_unlock_atom(atom);
-
 		assert("zam-425", get_current_super_private() != NULL);
 		sa_dealloc_blocks(reiser4_get_space_allocator(ctx->super),
 				  *start, *len);
@@ -1150,22 +1132,27 @@ void reiser4_post_commit_hook(void)
 
 void reiser4_post_write_back_hook(void)
 {
+	struct list_head discarded_set;
 	txn_atom *atom;
 	int ret;
 
 	/* process and issue discard requests */
+	blocknr_list_init (&discarded_set);
 	do {
 		atom = get_current_atom_locked();
-		ret = discard_atom(*atom);
+		ret = discard_atom(atom, &discarded_set);
 	} while (ret == -E_REPEAT);
 
 	if (ret) {
 		warning("intelfx-8", "discard atom failed (%d)", ret);
 	}
 
+	atom = get_current_atom_locked();
+	discard_atom_post(atom, &discarded_set);
+
 	/* do the block deallocation which was deferred
 	   until commit is done */
-	atom_dset_deferred_apply(atom, apply_dset, NULL, 0);
+	atom_dset_deferred_apply(atom, apply_dset, NULL, 1);
 
 	assert("zam-504", get_current_super_private() != NULL);
 	sa_post_write_back_hook();

@@ -11,11 +11,22 @@
 
 /**
  * Issue discard requests for all block extents recorded in @atom's delete sets,
- * if discard is enabled. In this case the delete sets are cleared.
+ * if discard is enabled. The extents processed are removed from the @atom's
+ * delete sets and stored in @processed_set.
  *
- * @atom should be locked on entry and is unlocked on exit.
+ * @atom must be locked on entry and is unlocked on exit.
+ * @processed_set must be initialized with blocknr_list_init().
  */
-extern int discard_atom(txn_atom *atom);
+extern int discard_atom(txn_atom *atom, struct list_head *processed_set);
+
+/**
+ * Splices @processed_set back to @atom's delete set.
+ * Must be called after discard_atom() loop, using the same @processed_set.
+ *
+ * @atom must be locked on entry and is unlocked on exit.
+ * @processed_set must be the same as passed to discard_atom().
+ */
+extern void discard_atom_post(txn_atom *atom, struct list_head *processed_set);
 
 /* __FS_REISER4_DISCARD_H__ */
 #endif

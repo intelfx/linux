@@ -3081,7 +3081,6 @@ void atom_dset_init(txn_atom *atom)
 {
 	if (reiser4_is_set(reiser4_get_current_sb(), REISER4_DISCARD)) {
 		blocknr_list_init(&atom->discard.delete_set);
-		blocknr_list_init(&atom->discard.aux_delete_set);
 	} else {
 		blocknr_set_init(&atom->nodiscard.delete_set);
 	}
@@ -3091,7 +3090,6 @@ void atom_dset_destroy(txn_atom *atom)
 {
 	if (reiser4_is_set(reiser4_get_current_sb(), REISER4_DISCARD)) {
 		blocknr_list_destroy(&atom->discard.delete_set);
-		blocknr_list_destroy(&atom->discard.aux_delete_set);
 	} else {
 		blocknr_set_destroy(&atom->nodiscard.delete_set);
 	}
@@ -3101,7 +3099,6 @@ void atom_dset_merge(txn_atom *from, txn_atom *to)
 {
 	if (reiser4_is_set(reiser4_get_current_sb(), REISER4_DISCARD)) {
 		blocknr_list_merge(&from->discard.delete_set, &to->discard.delete_set);
-		blocknr_list_merge(&from->discard.aux_delete_set, &to->discard.aux_delete_set);
 	} else {
 		blocknr_set_merge(&from->nodiscard.delete_set, &to->nodiscard.delete_set);
 	}
@@ -3150,27 +3147,6 @@ extern int atom_dset_deferred_add_extent(txn_atom *atom,
 		                             (blocknr_set_entry**)new_entry,
 		                             start,
 		                             len);
-	}
-
-	return ret;
-}
-
-extern int atom_dset_immediate_add_extent(txn_atom *atom,
-                                          void **new_entry,
-                                          const reiser4_block_nr *start,
-                                          const reiser4_block_nr *len)
-{
-	int ret;
-
-	if (reiser4_is_set(reiser4_get_current_sb(), REISER4_DISCARD)) {
-		ret = blocknr_list_add_extent(atom,
-		                             &atom->discard.aux_delete_set,
-		                             (blocknr_list_entry**)new_entry,
-		                             start,
-		                             len);
-	} else {
-		/* no-op */
-		ret = 0;
 	}
 
 	return ret;

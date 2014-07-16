@@ -33,24 +33,43 @@
  * MECHANISM:
  *
  * During the transaction deallocated extents are recorded in atom's delete
- * sets. There are two delete sets, because data in one of them (delete_set) is
- * also used by other parts of reiser4. The second delete set (aux_delete_set)
- * complements the first one and is maintained only when discard is enabled.
+ * set. In reiser4, there are two methods to deallocate a block:
+ * 1. deferred deallocation, enabled by BA_DEFER flag to reiser4_dealloc_block().
+ *    In this mode, blocks are stored to delete set instead of being marked free
+ *    immediately. After committing the transaction, the delete set is "applied"
+ *    by the block allocator and all these blocks are marked free in memory
+ *    (see reiser4_post_write_back_hook()).
+ *    Space management plugins also read the delete set to update on-disk
+ *    allocation records (see reiser4_pre_commit_hook()).
+ * 2. immediate deallocation (the opposite).
+ *    In this mode, blocks are marked free immediately. This is used by the
+ *    journal subsystem to manage space used by the journal records, so these
+ *    allocations are not visible to the space management plugins and never hit
+ *    the disk.
  *
- * Together these sets constitute "the discard set" -- blocks that have to be
- * considered for discarding. On atom commit we will generate a minimal
- * superset of the discard set, comprised of whole erase units.
+ * When discard is enabled, all immediate deallocations become deferred. This
+ * is OK because journal's allocations happen after reiser4_pre_commit_hook()
+ * where the on-disk space allocation records are updated. So, in this mode
+ * the atom's delete set becomes "the discard set" -- list of blocks that have
+ * to be considered for discarding.
+ *
+ * On atom commit we will generate a minimal superset of the discard set,
+ * comprised of whole erase units.
+ *
+ * Discarding is performed before completing deferred deallocations, hence all
+ * extents in the discard set are still marked as allocated and cannot contain
+ * any data. Thus we can avoid any checks for blocks directly present in the
+ * discard set.
+ *
+ * However, we pad each extent from both sides to erase unit boundaries, and
+ * these paddings still have to be checked if they fall outside of initial
+ * extent (may not happen if block size > erase unit size).
  *
  * So, at commit time the following actions take place:
  * - delete sets are merged to form the discard set;
  * - elements of the discard set are sorted;
  * - the discard set is iterated, joining any adjacent extents;
- * - each of resulting extents is "covered" by erase units:
- *   - its start is rounded down to the closest erase unit boundary;
- *   - starting from this block, extents of erase unit length are created
- *     until the original extent is fully covered;
- * - the calculated erase units are checked to be fully deallocated;
- * - remaining (valid) erase units are then passed to blkdev_issue_discard().
+ * - <TODO>
  */
 
 #include "discard.h"
@@ -167,7 +186,7 @@ static int discard_extent(txn_atom *atom UNUSED_ARG,
 	return 0;
 }
 
-int discard_atom(txn_atom *atom)
+int discard_atom(txn_atom *atom, struct list_head *processed_set)
 {
 	int ret;
 	struct list_head discard_set;
@@ -178,30 +197,47 @@ int discard_atom(txn_atom *atom)
 	}
 
 	assert("intelfx-28", atom != NULL);
+	assert("intelfx-59", processed_entries != NULL);
 
-	if (list_empty(&atom->discard.delete_set) &&
-	    list_empty(&atom->discard.aux_delete_set)) {
-		spin_unlock_atom(atom);
+	if (list_empty(&atom->discard.delete_set)) {
+		/* Nothing left to discard. */
 		return 0;
 	}
 
 	/* Take the delete sets from the atom in order to release atom spinlock. */
 	blocknr_list_init(&discard_set);
 	blocknr_list_merge(&atom->discard.delete_set, &discard_set);
-	blocknr_list_merge(&atom->discard.aux_delete_set, &discard_set);
 	spin_unlock_atom(atom);
 
 	/* Sort the discard list, joining adjacent and overlapping extents. */
 	blocknr_list_sort_and_join(&discard_set);
 
 	/* Perform actual dirty work. */
-	ret = blocknr_list_iterator(NULL, &discard_set, &discard_extent, NULL, 1);
+	ret = blocknr_list_iterator(NULL, &discard_set, &discard_extent, NULL, 0);
+
+	/* Add processed extents to the temporary list. */
+	blocknr_list_merge(&discard_set, processed_set);
+
 	if (ret != 0) {
 		return ret;
 	}
 
 	/* Let's do this again for any new extents in the atom's discard set. */
 	return -E_REPEAT;
+}
+
+void discard_atom_post(txn_atom *atom, struct list_head *processed_set)
+{
+	assert("intelfx-60", atom != NULL);
+	assert("intelfx-61", processed_entries != NULL);
+
+	if (!reiser4_is_set(reiser4_get_current_sb(), REISER4_DISCARD)) {
+		spin_unlock_atom(atom);
+		return;
+	}
+
+	blocknr_list_merge(processed_set, &atom->discard.delete_set);
+	spin_unlock_atom(atom);
 }
 
 /* Make Linus happy.
