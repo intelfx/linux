@@ -1089,17 +1089,6 @@ static int commit_current_atom(long *nr_submitted, txn_atom ** atom)
 	if (ret < 0)
 		reiser4_panic("zam-597", "write log failed (%ld)\n", ret);
 
-	/* process and issue discard requests */
-	do {
-		spin_lock_atom(*atom);
-		ret = discard_atom(*atom);
-	} while (ret == -E_REPEAT);
-
-	if (ret) {
-		warning("intelfx-8", "discard atom failed (%ld)", ret);
-		ret = 0; /* the discard is optional, don't fail the commit */
-	}
-
 	/* The atom->ovrwr_nodes list is processed under commit mutex held
 	   because of bitmap nodes which are captured by special way in
 	   reiser4_pre_commit_hook_bitmap(), that way does not include

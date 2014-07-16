@@ -1136,15 +1136,13 @@ apply_dset(txn_atom * atom UNUSED_ARG, const reiser4_block_nr * a,
 
 void reiser4_post_commit_hook(void)
 {
+#ifdef REISER4_DEBUG
 	txn_atom *atom;
 
 	atom = get_current_atom_locked();
 	assert("zam-452", atom->stage == ASTAGE_POST_COMMIT);
 	spin_unlock_atom(atom);
-
-	/* do the block deallocation which was deferred
-	   until commit is done */
-	atom_dset_deferred_apply(atom, apply_dset, NULL, 0);
+#endif
 
 	assert("zam-504", get_current_super_private() != NULL);
 	sa_post_commit_hook();
@@ -1152,8 +1150,24 @@ void reiser4_post_commit_hook(void)
 
 void reiser4_post_write_back_hook(void)
 {
-	assert("zam-504", get_current_super_private() != NULL);
+	txn_atom *atom;
+	int ret;
 
+	/* process and issue discard requests */
+	do {
+		atom = get_current_atom_locked();
+		ret = discard_atom(*atom);
+	} while (ret == -E_REPEAT);
+
+	if (ret) {
+		warning("intelfx-8", "discard atom failed (%d)", ret);
+	}
+
+	/* do the block deallocation which was deferred
+	   until commit is done */
+	atom_dset_deferred_apply(atom, apply_dset, NULL, 0);
+
+	assert("zam-504", get_current_super_private() != NULL);
 	sa_post_write_back_hook();
 }
 
