@@ -26,6 +26,16 @@ struct blocknr_list_entry {
 
 #define blocknr_list_entry(ptr) list_entry(ptr, blocknr_list_entry, link)
 
+reiser4_block_nr blocknr_list_entry_start(struct list_head *ptr)
+{
+	return blocknr_list_entry(ptr)->start;
+}
+
+reiser4_block_nr blocknr_list_entry_len(struct list_head *ptr)
+{
+	return blocknr_list_entry(ptr)->len;
+}
+
 static void blocknr_list_entry_init(blocknr_list_entry *entry)
 {
 	assert("intelfx-11", entry != NULL);

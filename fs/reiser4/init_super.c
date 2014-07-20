@@ -407,6 +407,9 @@ static noinline void push_sb_field_opts(struct opt_desc **p,
 	/* carry flags used for insert operations */
 	PUSH_SB_FIELD_OPT(tree.carry.insert_flags, "%u");
 
+	PUSH_SB_FIELD_OPT(discard.unit, "%u");
+	PUSH_SB_FIELD_OPT(discard.offset, "%u");
+
 #ifdef CONFIG_REISER4_BADBLOCKS
 	/*
 	 * Alternative master superblock location in case if it's original
@@ -573,6 +576,7 @@ int reiser4_init_super_data(struct super_block *super, char *opt_string)
 		warning("nikita-2497", "optimal_io_size is too small");
 		return RETERR(-EINVAL);
 	}
+	check_discard_params(super);
 	return result;
 }
 
