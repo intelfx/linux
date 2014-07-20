@@ -12,6 +12,7 @@
 #include "entd.h"
 #include "wander.h"
 #include "fsdata.h"
+#include "discard.h"
 #include "plugin/object.h"
 #include "plugin/space/space_allocator.h"
 
@@ -205,6 +206,9 @@ struct reiser4_super_info_data {
 
 	/* transaction manager */
 	txn_mgr tmgr;
+
+	/* discard params */
+	discard_params discard;
 
 	/* ent thread */
 	entd_context entd;

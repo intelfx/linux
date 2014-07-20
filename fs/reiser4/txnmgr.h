@@ -509,6 +509,8 @@ extern void blocknr_list_init(struct list_head *blist);
 extern void blocknr_list_destroy(struct list_head *blist);
 extern void blocknr_list_merge(struct list_head *from, struct list_head *to);
 extern void blocknr_list_sort_and_join(struct list_head *blist);
+extern reiser4_block_nr blocknr_list_entry_start(struct list_head *blist);
+extern reiser4_block_nr blocknr_list_entry_len(struct list_head *blist);
 /**
  * The @atom should be locked.
  */

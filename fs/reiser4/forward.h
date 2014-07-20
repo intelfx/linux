@@ -34,6 +34,7 @@ typedef struct reiser4_journal reiser4_journal;
 typedef struct txn_atom txn_atom;
 typedef struct txn_handle txn_handle;
 typedef struct txn_mgr txn_mgr;
+typedef struct discard_params discard_params;
 typedef struct reiser4_dir_entry_desc reiser4_dir_entry_desc;
 typedef struct reiser4_context reiser4_context;
 typedef struct carry_level carry_level;
