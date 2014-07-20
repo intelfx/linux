@@ -6,8 +6,12 @@
 #if !defined(__FS_REISER4_DISCARD_H__)
 #define __FS_REISER4_DISCARD_H__
 
-#include "forward.h"
-#include "dformat.h"
+struct discard_params {
+	int offset; /* discard offset in blocks */
+	int unit; /* erase unit size in blocks */
+};
+
+extern void check_discard_params(struct super_block *sb);
 
 /**
  * Issue discard requests for all block extents recorded in @atom's delete sets,
