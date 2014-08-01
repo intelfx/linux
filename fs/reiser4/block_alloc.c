@@ -269,7 +269,7 @@ int reiser4_check_block_counters(const struct super_block *super)
 static int
 reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 {
-	__u64 free_blocks;
+	__u64 free_blocks, reserved_blocks, total_blocks, used_blocks;
 	int ret = 0, use_reserved = flags & BA_RESERVED;
 	reiser4_super_info_data *sbinfo;
 
@@ -286,9 +286,16 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 	spin_lock_reiser4_super(sbinfo);
 
 	free_blocks = sbinfo->blocks_free;
+	reserved_blocks = sbinfo->blocks_reserved;
+	total_blocks = sbinfo->block_count;
+	used_blocks = sbinfo->blocks_used;
+
+	if (flags & BA_ALL) {
+		count = total_blocks - used_blocks;
+	}
 
 	if ((use_reserved && free_blocks < count) ||
-	    (!use_reserved && free_blocks < count + sbinfo->blocks_reserved)) {
+	    (!use_reserved && free_blocks < count + reserved_blocks)) {
 		ret = RETERR(-ENOSPC);
 		goto unlock_and_ret;
 	}
@@ -309,6 +316,9 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 	ctx->grab_enabled = 0;
 
 unlock_and_ret:
+	if (flags & BA_ALL) {
+		reiser4_print_block_counters (ctx->super, total_blocks);
+	}
 	spin_unlock_reiser4_super(sbinfo);
 
 	return ret;
