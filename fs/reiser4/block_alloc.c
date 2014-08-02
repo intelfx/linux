@@ -218,6 +218,24 @@ static void sub_from_atom_flush_reserved_nolock(txn_atom * atom, __u32 count)
 	atom->flush_reserved -= count;
 }
 
+static void reiser4_print_block_counters(const struct super_block *super, __u64 sum)
+{
+	printk("super block counters: "
+	       "used %llu, free %llu, "
+	       "grabbed %llu, fake allocated (formatetd %llu, unformatted %llu), "
+	       "reserved %llu, clustered %llu, sum %llu, must be (block count) %llu\n",
+	       (unsigned long long)reiser4_data_blocks(super),
+	       (unsigned long long)reiser4_free_blocks(super),
+	       (unsigned long long)reiser4_grabbed_blocks(super),
+	       (unsigned long long)reiser4_fake_allocated(super),
+	       (unsigned long long)
+	       reiser4_fake_allocated_unformatted(super),
+	       (unsigned long long)reiser4_flush_reserved(super),
+	       (unsigned long long)reiser4_clustered_blocks(super),
+	       (unsigned long long)sum,
+	       (unsigned long long)reiser4_block_count(super));
+}
+
 /* super block has 6 counters: free, used, grabbed, fake allocated
    (formatted and unformatted) and flush reserved. Their sum must be
    number of blocks on a device. This function checks this */
@@ -230,20 +248,7 @@ int reiser4_check_block_counters(const struct super_block *super)
 	    reiser4_fake_allocated_unformatted(super) + reiser4_flush_reserved(super) +
 	    reiser4_clustered_blocks(super);
 	if (reiser4_block_count(super) != sum) {
-		printk("super block counters: "
-		       "used %llu, free %llu, "
-		       "grabbed %llu, fake allocated (formatetd %llu, unformatted %llu), "
-		       "reserved %llu, clustered %llu, sum %llu, must be (block count) %llu\n",
-		       (unsigned long long)reiser4_data_blocks(super),
-		       (unsigned long long)reiser4_free_blocks(super),
-		       (unsigned long long)reiser4_grabbed_blocks(super),
-		       (unsigned long long)reiser4_fake_allocated(super),
-		       (unsigned long long)
-		       reiser4_fake_allocated_unformatted(super),
-		       (unsigned long long)reiser4_flush_reserved(super),
-		       (unsigned long long)reiser4_clustered_blocks(super),
-		       (unsigned long long)sum,
-		       (unsigned long long)reiser4_block_count(super));
+		reiser4_print_block_counters (super, sum);
 		return 0;
 	}
 	return 1;
