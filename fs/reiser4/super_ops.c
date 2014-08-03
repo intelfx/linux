@@ -479,6 +479,141 @@ static int reiser4_show_options(struct seq_file *m, struct dentry *dentry)
 	return 0;
 }
 
+/**
+ * reiser4_trim_fs - discards all free space in a filesystem
+ * @super: the superblock of filesystem to discard
+ * @range: parameters for discarding
+ *
+ * Called from @reiser4_ioctl_dir_common().
+ */
+int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range)
+{
+	reiser4_blocknr_hint hint;
+	reiser4_block_nr start, end, len, minlen, discarded_count = 0;
+	reiser4_context *ctx;
+	txn_atom *atom;
+	int ret, finished = 0;
+
+	reiser4_blocknr_hint_init(&hint);
+	ctx = get_current_context();
+
+	/*
+	 * Configure the hint for block allocator.
+	 * We will allocate in forward direction only.
+	 */
+	hint.blk = range->start >> super->s_blocksize_bits;
+	hint.max_dist = range->len >> super->s_blocksize_bits;
+	hint.block_stage = BLOCK_GRABBED;
+	hint.monotonic_forward = 1;
+
+	end = hint.blk + hint.max_dist;
+	minlen = range->minlen >> super->s_blocksize_bits;
+
+	/*
+	 * We will perform the process in iterations in order not to starve
+	 * the rest of the system of disk space.
+	 * Each iteration we will grab some space (using the BA_SOME_SPACE
+	 * flag, which currently grabs 25% of free disk space), create an empty
+	 * atom and sequentially allocate extents of disk space while we can
+	 * afford it (i. e. while we haven't reached the end of partition AND
+	 * while we haven't exhausted the grabbed space).
+	 */
+	do {
+		/*
+		 * Grab some sane amount of space.
+		 * We will allocate blocks until end of the partition or until
+		 * the grabbed space is exhausted.
+		 */
+		ret = reiser4_grab_reserved(super, 0, BA_CAN_COMMIT | BA_SOME_SPACE);
+		if (ret != 0)
+			goto out;
+		if (ctx->grabbed_blocks == 0)
+			goto out;
+
+		/*
+		 * We will not capture anything, so we need an empty atom.
+		 */
+		ret = reiser4_create_atom();
+		if (ret != 0)
+			goto out;
+
+		do {
+			/*
+			 * Allocate no more than is grabbed.
+			 * FIXME: use minlen.
+			 *
+			 * NOTE: we do not use BA_PERMANENT in our allocations
+			 * even though we deallocate with BA_DEFER.
+			 * Our atom takes the "shortcut" in commit_current_atom()
+			 * and as such the pre-commit hook is not applied.
+			 */
+			assert("intelfx-75", ctx->grabbed_blocks != 0);
+			len = ctx->grabbed_blocks;
+			ret = reiser4_alloc_blocks(&hint, &start, &len, 0 /* flags */);
+			if (ret == -ENOSPC) {
+				/*
+				 * We have reached the end of the filesystem --
+				 * no more blocks to discard.
+				 */
+				ret = 0;
+				finished = 1;
+				break;
+			}
+			if (ret != 0)
+				goto out;
+
+			/*
+			 * Update the hint in order for the next scan to start
+			 * right after the newly allocated extent.
+			 */
+			hint.blk = start + len;
+			hint.max_dist = end - hint.blk;
+
+			/*
+			 * Mark the newly allocated extent for deallocation.
+			 * Discard happens on deallocation.
+			 */
+			ret = reiser4_dealloc_blocks(&start, &len, 0, BA_DEFER);
+			if (ret != 0)
+				goto out;
+
+			/*
+			 * FIXME: get the actual discarded block count,
+			 * accounting for speculative discard of extent heads and tails.
+			 *
+			 * PRIORITY: LOW because we have already allocated all
+			 * possible space, so allocations of heads/tails will
+			 * fail unless there is a concurrent process reclaiming
+			 * space.
+			 */
+			discarded_count += len;
+		} while (ctx->grabbed_blocks != 0);
+
+		assert("intelfx-64", ret == 0);
+
+		/*
+		 * Extents marked for deallocation are discarded here, as part
+		 * of committing current atom.
+		 */
+		all_grabbed2free();
+		atom = get_current_atom_locked();
+		spin_lock_txnh(ctx->trans);
+		force_commit_atom(ctx->trans);
+		grab_space_enable();
+	} while (!finished);
+
+out:
+	reiser4_release_reserved(super);
+	reiser4_blocknr_hint_done(&hint);
+
+	/*
+	 * Update the statistics.
+	 */
+	range->len = discarded_count << super->s_blocksize_bits;
+
+	return ret;
+}
+
 struct super_operations reiser4_super_operations = {
 	.alloc_inode = reiser4_alloc_inode,
 	.destroy_inode = reiser4_destroy_inode,
