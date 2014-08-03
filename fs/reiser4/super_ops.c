@@ -477,6 +477,36 @@ static int reiser4_show_options(struct seq_file *m, struct dentry *dentry)
 	return 0;
 }
 
+/**
+ * reiser4_trim_fs - discards all free space in a filesystem
+ * @super: the superblock of filesystem to discard
+ * @range: parameters for discarding
+ *
+ * Called from @reiser4_ioctl_dir_common().
+ */
+int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range)
+{
+	reiser4_super_info_data *sbinfo;
+	int ret;
+
+	if (reiser4_grab_reserved(super, 0, BA_CAN_COMMIT | BA_ALL)) {
+		return RETERR(-ENOSPC);
+	}
+
+	sbinfo = get_super_private(super);
+	spin_lock_reiser4_super(sbinfo);
+
+	warning("intelfx-62", "FITRIM ioctl not implemented, %llu blocks reserved",
+		(unsigned long long)sbinfo->blocks_grabbed);
+
+	spin_unlock_reiser4_super(sbinfo);
+	ret = RETERR(-ENOSYS);
+
+ungrab_reserved:
+	reiser4_release_reserved(super);
+	return ret;
+}
+
 struct super_operations reiser4_super_operations = {
 	.alloc_inode = reiser4_alloc_inode,
 	.destroy_inode = reiser4_destroy_inode,
