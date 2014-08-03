@@ -14,6 +14,7 @@
 #include <linux/debugfs.h>
 #include <linux/backing-dev.h>
 #include <linux/module.h>
+#include <linux/delay.h>
 
 /* slab cache for inodes */
 static struct kmem_cache *inode_cache;
@@ -486,6 +487,7 @@ static int reiser4_show_options(struct seq_file *m, struct dentry *dentry)
  */
 int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range)
 {
+	reiser4_block_nr grabbed;
 	reiser4_super_info_data *sbinfo;
 	int ret;
 
@@ -496,10 +498,16 @@ int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range)
 	sbinfo = get_super_private(super);
 	spin_lock_reiser4_super(sbinfo);
 
-	warning("intelfx-62", "FITRIM ioctl not implemented, %llu blocks reserved",
-		(unsigned long long)sbinfo->blocks_grabbed);
+	grabbed = sbinfo->blocks_grabbed;
 
 	spin_unlock_reiser4_super(sbinfo);
+
+	warning("intelfx-62", "FITRIM ioctl not implemented, %llu blocks reserved, will sleep for 10 seconds",
+		(unsigned long long)grabbed);
+
+	msleep (10 * 1000);
+
+	warning("intelfx-63", "FITRIM stub: sleeping done");
 	ret = RETERR(-ENOSYS);
 
 ungrab_reserved:
