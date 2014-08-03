@@ -8,6 +8,9 @@
 #include "../inode.h"
 #include "object.h"
 
+#include <linux/fs.h>
+#include <linux/blkdev.h>
+
 /* file operations */
 
 /* implementation of vfs's llseek method of struct file_operations for
@@ -19,6 +22,9 @@ loff_t reiser4_llseek_dir_common(struct file *, loff_t, int origin);
    typical directory can be found in file_ops_readdir.c
 */
 int reiser4_iterate_common(struct file *, struct dir_context *);
+
+/* this function is implemented in super_ops.c */
+int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range);
 
 /**
  * reiser4_release_dir_common - release of struct file_operations
@@ -121,9 +127,38 @@ long reiser4_ioctl_dir_common(struct file *file, unsigned int cmd, unsigned long
 		return PTR_ERR(ctx);
 
 	switch (cmd) {
-	case FITRIM:
-		warning("intelfx-62", "FITRIM ioctl not implemented");
-		/* fall-through to -ENOTTY */
+	case FITRIM: {
+		struct request_queue *q = bdev_get_queue(super->s_bdev);
+		struct fstrim_range range;
+
+		if (!capable(CAP_SYS_ADMIN)) {
+			ret = RETERR(-EPERM);
+			break;
+		}
+
+		if (!blk_queue_discard(q)) {
+			ret = RETERR(-EOPNOTSUPP);
+			break;
+		}
+
+		if (copy_from_user(&range, (struct fstrim_range __user *)arg,
+		    sizeof(range))) {
+			ret = RETERR(-EFAULT);
+			break;
+		}
+
+		range.minlen = max((unsigned int)range.minlen,
+				   q->limits.discard_granularity);
+
+		ret = reiser4_trim_fs(super, &range);
+
+		if (copy_to_user((struct fstrim_range __user *)arg, &range,
+		    sizeof(range))) {
+			ret = RETERR(-EFAULT);
+		}
+
+		break;
+	}
 
 	default:
 		ret = RETERR(-ENOTTY);
