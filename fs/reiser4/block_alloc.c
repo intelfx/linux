@@ -360,37 +360,40 @@ int reiser4_grab_reserved(struct super_block *super,
 			  __u64 count, reiser4_ba_flags_t flags)
 {
 	reiser4_super_info_data *sbinfo = get_super_private(super);
+	int ret;
 
 	assert("nikita-3175", flags & BA_CAN_COMMIT);
 
 	/* Check the delete mutex already taken by us, we assume that
 	 * reading of machine word is atomic. */
 	if (sbinfo->delete_mutex_owner == current) {
-		if (reiser4_grab_space
-		    (count, (flags | BA_RESERVED) & ~BA_CAN_COMMIT)) {
+		ret = reiser4_grab_space (count, (flags | BA_RESERVED) & ~BA_CAN_COMMIT);
+
+		if (ret != 0) {
 			warning("zam-1003",
 				"nested call of grab_reserved fails count=(%llu)",
 				(unsigned long long)count);
 			reiser4_release_reserved(super);
-			return RETERR(-ENOSPC);
 		}
-		return 0;
+	} else {
+		ret = reiser4_grab_space(count, flags);
+
+		if (ret != 0) {
+			mutex_lock(&sbinfo->delete_mutex);
+			assert("nikita-2929", sbinfo->delete_mutex_owner == NULL);
+			sbinfo->delete_mutex_owner = current;
+			ret = reiser4_grab_space(count, flags | BA_RESERVED);
+
+			if (ret != 0) {
+				warning("zam-833",
+					"reserved space is not enough (%llu)",
+					(unsigned long long)count);
+				reiser4_release_reserved(super);
+			}
+		}
 	}
 
-	if (reiser4_grab_space(count, flags)) {
-		mutex_lock(&sbinfo->delete_mutex);
-		assert("nikita-2929", sbinfo->delete_mutex_owner == NULL);
-		sbinfo->delete_mutex_owner = current;
-
-		if (reiser4_grab_space(count, flags | BA_RESERVED)) {
-			warning("zam-833",
-				"reserved space is not enough (%llu)",
-				(unsigned long long)count);
-			reiser4_release_reserved(super);
-			return RETERR(-ENOSPC);
-		}
-	}
-	return 0;
+	return ret;
 }
 
 void reiser4_release_reserved(struct super_block *super)
