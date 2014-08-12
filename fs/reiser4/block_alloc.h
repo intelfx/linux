@@ -82,7 +82,7 @@ enum reiser4_ba_flags {
 	BA_USE_DEFAULT_SEARCH_START = (1 << 6),
 
 	/* grab all space possible, must be used with BA_RESERVED */
-	BA_ALL = (1 << 7)
+	BA_ALL = (1 << 7),
 };
 
 typedef enum reiser4_ba_flags reiser4_ba_flags_t;

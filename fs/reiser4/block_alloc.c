@@ -254,6 +254,20 @@ int reiser4_check_block_counters(const struct super_block *super)
 	return 1;
 }
 
+static int have_grabbed_or_special(const struct reiser4_super_info_data *sbinfo)
+{
+	return sbinfo->blocks_free + sbinfo->blocks_used < sbinfo->block_count;
+}
+
+static void grab_semaphore_up_read_or_write(struct reiser4_super_info_data *sbinfo)
+{
+	if (sbinfo->grab_semaphore_write_locked) {
+		up_write(&sbinfo->grab_semaphore);
+	} else {
+		up_read(&sbinfo->grab_semaphore);
+	}
+}
+
 /* Adjust "working" free blocks counter for number of blocks we are going to
    allocate.  Record number of grabbed blocks in fs-wide and per-thread
    counters.  This function should be called before bitmap scanning or
@@ -267,10 +281,11 @@ int reiser4_check_block_counters(const struct super_block *super)
 */
 
 static int
-reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
+reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags,
+	     int for_writing)
 {
 	__u64 free_blocks, reserved_blocks, total_blocks, used_blocks;
-	int ret = 0, use_reserved = flags & BA_RESERVED;
+	int ret = 0, use_reserved = flags & BA_RESERVED, need_up;
 	reiser4_super_info_data *sbinfo;
 
 	assert("vs-1276", ctx == get_current_context());
@@ -283,12 +298,69 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 
 	sbinfo = get_super_private(ctx->super);
 
+	/*
+	 * grab_semaphore semantics.
+	 *
+	 * DEFINITIONS: "special" space is not either used or free
+	 * (checked by have_grabbed_or_special() function above).
+	 *
+	 * Its purpose is to be taken for reading when there is some special
+	 * space in the filesystem, and released when there is no such space (all
+	 * blocks are either used for data or free).
+	 * If someone needs to grab all space, then they must take grab_semaphore
+	 * for writing, which will ensure there are no readers. After grabbing
+	 * the required amount of space, the write lock shall be downgraded to
+	 * read lock.
+	 *
+	 * We intend to keep the readers count of the semaphore equal to 1. Thus,
+	 * if someone happens to drop the "special" counters to zero, they should
+	 * do a single up_read() to release the semaphore.
+	 *
+	 * However, during incrementing "special" counters we always do our own
+	 * down_read(), possibly increasing readers count beyond 1.
+	 *
+	 * If we were just checking that the semaphore is already taken, then a
+	 * following race could happen:
+	 *
+	 * INITIAL SITUATION:
+	 * - semaphore taken for reading, count == 1
+	 * - X blocks grabbed
+	 *
+	 * OUR THREAD (grabbing)                   OTHER THREAD (releasing)
+	 * - semaphore is already taken?
+	 *   yes -> don't do anything, count == 1
+	 *                                         - spin lock the super block
+	 *                                         - ungrab X blocks
+	 *                                         - spin unlock the super block
+	 *                                         - up_read the semaphore, count == 0
+	 * - spin lock the super block
+	 * - grab Y blocks
+	 * - spin unlock the super block
+	 *
+	 * OUTCOME:
+	 * - Y bloks grabbed
+	 * - semaphore is released
+	 *
+	 * So we down_read() the semaphore unconditionally and up_read() it once
+	 * after grabbing if there already was some grabbed space.
+	 */
+
+	if (for_writing) {
+		down_write(&sbinfo->grab_semaphore);
+	} else {
+		down_read(&sbinfo->grab_semaphore);
+	}
 	spin_lock_reiser4_super(sbinfo);
+	need_up = have_grabbed_or_special(sbinfo);
+	sbinfo->grab_semaphore_write_locked = for_writing;
 
 	free_blocks = sbinfo->blocks_free;
 	reserved_blocks = sbinfo->blocks_reserved;
 	total_blocks = sbinfo->block_count;
 	used_blocks = sbinfo->blocks_used;
+
+	/* If we took the semaphore for writing, we have to be the only grabber. */
+	assert("intelfx-64", ergo(for_writing, !need_up));
 
 	if (flags & BA_ALL) {
 		count = total_blocks - used_blocks;
@@ -319,6 +391,10 @@ unlock_and_ret:
 	if (flags & BA_ALL) {
 		reiser4_print_block_counters (ctx->super, total_blocks);
 	}
+
+	if (need_up || ret != 0 || count == 0) {
+		grab_semaphore_up_read_or_write(sbinfo);
+	}
 	spin_unlock_reiser4_super(sbinfo);
 
 	return ret;
@@ -336,7 +412,7 @@ int reiser4_grab_space(__u64 count, reiser4_ba_flags_t flags)
 	if (!(flags & BA_FORCE) && !is_grab_enabled(ctx))
 		return 0;
 
-	ret = reiser4_grab(ctx, count, flags);
+	ret = reiser4_grab(ctx, count, flags, 0);
 	if (ret == -ENOSPC) {
 
 		/* Trying to commit the all transactions if BA_CAN_COMMIT flag
@@ -344,7 +420,7 @@ int reiser4_grab_space(__u64 count, reiser4_ba_flags_t flags)
 		if (flags & BA_CAN_COMMIT) {
 			txnmgr_force_commit_all(ctx->super, 0);
 			ctx->grab_enabled = 1;
-			ret = reiser4_grab(ctx, count, flags);
+			ret = reiser4_grab(ctx, count, flags, 1);
 		}
 	}
 	/*
@@ -574,6 +650,10 @@ static void grabbed2used(reiser4_context *ctx, reiser4_super_info_data *sbinfo,
 
 	assert("nikita-2679", reiser4_check_block_counters(ctx->super));
 
+	if (!have_grabbed_or_special(sbinfo) && count != 0) {
+		grab_semaphore_up_read_or_write(sbinfo);
+	}
+
 	spin_unlock_reiser4_super(sbinfo);
 }
 
@@ -588,6 +668,10 @@ static void fake_allocated2used(reiser4_super_info_data *sbinfo, __u64 count,
 
 	assert("nikita-2680",
 	       reiser4_check_block_counters(reiser4_get_current_sb()));
+
+	if (!have_grabbed_or_special(sbinfo) && count != 0) {
+		grab_semaphore_up_read_or_write(sbinfo);
+	}
 
 	spin_unlock_reiser4_super(sbinfo);
 }
@@ -609,6 +693,10 @@ static void flush_reserved2used(txn_atom * atom, __u64 count)
 
 	assert("zam-789",
 	       reiser4_check_block_counters(reiser4_get_current_sb()));
+
+	if (!have_grabbed_or_special(sbinfo) && count != 0) {
+		grab_semaphore_up_read_or_write(sbinfo);
+	}
 
 	spin_unlock_reiser4_super(sbinfo);
 }
@@ -767,7 +855,12 @@ static void
 used2fake_allocated(reiser4_super_info_data * sbinfo, __u64 count,
 		    int formatted)
 {
+	int need_up_read;
+
+	down_read(&sbinfo->grab_semaphore);
 	spin_lock_reiser4_super(sbinfo);
+	need_up_read = have_grabbed_or_special(sbinfo);
+	sbinfo->grab_semaphore_write_locked = 0;
 
 	if (formatted)
 		sbinfo->blocks_fake_allocated += count;
@@ -780,18 +873,26 @@ used2fake_allocated(reiser4_super_info_data * sbinfo, __u64 count,
 	       reiser4_check_block_counters(reiser4_get_current_sb()));
 
 	spin_unlock_reiser4_super(sbinfo);
+	if (need_up_read || count == 0) {
+		up_read(&sbinfo->grab_semaphore);
+	}
 }
 
 static void
 used2flush_reserved(reiser4_super_info_data * sbinfo, txn_atom * atom,
 		    __u64 count, reiser4_ba_flags_t flags UNUSED_ARG)
 {
+	int need_up_read;
+
 	assert("nikita-2791", atom != NULL);
 	assert_spin_locked(&(atom->alock));
 
 	add_to_atom_flush_reserved_nolock(atom, (__u32) count);
 
+	down_read(&sbinfo->grab_semaphore);
 	spin_lock_reiser4_super(sbinfo);
+	need_up_read = have_grabbed_or_special(sbinfo);
+	sbinfo->grab_semaphore_write_locked = 0;
 
 	sbinfo->blocks_flush_reserved += count;
 	/*add_to_sb_flush_reserved(sbinfo, count); */
@@ -801,6 +902,9 @@ used2flush_reserved(reiser4_super_info_data * sbinfo, txn_atom * atom,
 	       reiser4_check_block_counters(reiser4_get_current_sb()));
 
 	spin_unlock_reiser4_super(sbinfo);
+	if (need_up_read || count == 0) {
+		up_read(&sbinfo->grab_semaphore);
+	}
 }
 
 /* disk space, virtually used by fake block numbers is counted as "grabbed"
@@ -867,6 +971,10 @@ void grabbed2free(reiser4_context *ctx, reiser4_super_info_data *sbinfo,
 	sub_from_sb_grabbed(sbinfo, count);
 	sbinfo->blocks_free += count;
 	assert("nikita-2684", reiser4_check_block_counters(ctx->super));
+
+	if (!have_grabbed_or_special(sbinfo) && count != 0) {
+		grab_semaphore_up_read_or_write(sbinfo);
+	}
 
 	spin_unlock_reiser4_super(sbinfo);
 }
@@ -949,9 +1057,14 @@ static void
 used2grabbed(reiser4_context * ctx, reiser4_super_info_data * sbinfo,
 	     __u64 count)
 {
+	int need_up_read;
+
 	add_to_ctx_grabbed(ctx, count);
 
+	down_read(&sbinfo->grab_semaphore);
 	spin_lock_reiser4_super(sbinfo);
+	need_up_read = have_grabbed_or_special(sbinfo);
+	sbinfo->grab_semaphore_write_locked = 0;
 
 	sbinfo->blocks_grabbed += count;
 	sub_from_sb_used(sbinfo, count);
@@ -959,6 +1072,9 @@ used2grabbed(reiser4_context * ctx, reiser4_super_info_data * sbinfo,
 	assert("nikita-2685", reiser4_check_block_counters(ctx->super));
 
 	spin_unlock_reiser4_super(sbinfo);
+	if (need_up_read || count == 0) {
+		up_read(&sbinfo->grab_semaphore);
+	}
 }
 
 /* this used to be done through used2grabbed and grabbed2free*/

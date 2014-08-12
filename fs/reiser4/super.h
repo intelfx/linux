@@ -251,6 +251,23 @@ struct reiser4_super_info_data {
 	struct formatted_ra_params ra_params;
 
 	/*
+	 * A read-write semaphore for implementing exclusive grab operations.
+	 * Typical space grabbers should take this semaphore in read mode
+	 * when some space is grabbed, and release it when all space becomes
+	 * either free or used by persistent data.
+	 * Exclusive space grabbers, including second retry in a BA_CAN_COMMIT
+	 * sequence, should take this semaphore in write mode.
+	 */
+	struct rw_semaphore grab_semaphore;
+
+	/*
+	 * Specifies whether the grab_semaphore has been taken for writing.
+	 * This is for routines which release grab_semaphore (as they need
+	 * to know what kind of lock to release).
+	 */
+	int grab_semaphore_write_locked;
+
+	/*
 	 * A mutex for serializing cut tree operation if out-of-free-space:
 	 * the only one cut_tree thread is allowed to grab space from reserved
 	 * area (it is 5% of disk space)

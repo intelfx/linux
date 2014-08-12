@@ -28,6 +28,7 @@ int reiser4_init_fs_info(struct super_block *super)
 	ON_DEBUG(INIT_LIST_HEAD(&sbinfo->all_jnodes));
 	ON_DEBUG(spin_lock_init(&sbinfo->all_guard));
 
+	init_rwsem(&sbinfo->grab_semaphore);
 	mutex_init(&sbinfo->delete_mutex);
 	spin_lock_init(&(sbinfo->guard));
 
