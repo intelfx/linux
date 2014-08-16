@@ -270,12 +270,6 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 
 	assert("vs-1276", ctx == get_current_context());
 
-	/* Do not grab anything on ro-mounted fs. */
-	if (rofs_super(ctx->super)) {
-		ctx->grab_enabled = 0;
-		return 0;
-	}
-
 	sbinfo = get_super_private(ctx->super);
 
 	spin_lock_reiser4_super(sbinfo);
@@ -300,9 +294,6 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 
 	assert("nikita-2986", reiser4_check_block_counters(ctx->super));
 
-	/* disable grab space in current context */
-	ctx->grab_enabled = 0;
-
 unlock_and_ret:
 	spin_unlock_reiser4_super(sbinfo);
 
@@ -321,6 +312,12 @@ int reiser4_grab_space(__u64 count, reiser4_ba_flags_t flags)
 	if (!(flags & BA_FORCE) && !is_grab_enabled(ctx))
 		return 0;
 
+	/* Do not grab anything on ro-mounted fs. */
+	if (rofs_super(ctx->super)) {
+		ctx->grab_enabled = 0;
+		return 0;
+	}
+
 	ret = reiser4_grab(ctx, count, flags);
 	if (ret == -ENOSPC) {
 
@@ -328,10 +325,15 @@ int reiser4_grab_space(__u64 count, reiser4_ba_flags_t flags)
 		   present */
 		if (flags & BA_CAN_COMMIT) {
 			txnmgr_force_commit_all(ctx->super, 0);
-			ctx->grab_enabled = 1;
 			ret = reiser4_grab(ctx, count, flags);
 		}
 	}
+
+	if (ret == 0) {
+		/* disable grab space in current context */
+		ctx->grab_enabled = 0;
+	}
+
 	/*
 	 * allocation from reserved pool cannot fail. This is severe error.
 	 */
