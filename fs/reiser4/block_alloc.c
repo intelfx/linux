@@ -270,12 +270,6 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 
 	assert("vs-1276", ctx == get_current_context());
 
-	/* Do not grab anything on ro-mounted fs. */
-	if (rofs_super(ctx->super)) {
-		ctx->grab_enabled = 0;
-		return 0;
-	}
-
 	sbinfo = get_super_private(ctx->super);
 
 	spin_lock_reiser4_super(sbinfo);
@@ -300,9 +294,6 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 
 	assert("nikita-2986", reiser4_check_block_counters(ctx->super));
 
-	/* disable grab space in current context */
-	ctx->grab_enabled = 0;
-
 unlock_and_ret:
 	spin_unlock_reiser4_super(sbinfo);
 
@@ -321,17 +312,38 @@ int reiser4_grab_space(__u64 count, reiser4_ba_flags_t flags)
 	if (!(flags & BA_FORCE) && !is_grab_enabled(ctx))
 		return 0;
 
+	/* Do not grab anything on ro-mounted fs. */
+	if (rofs_super(ctx->super)) {
+		ctx->grab_enabled = 0;
+		return 0;
+	}
+
 	ret = reiser4_grab(ctx, count, flags);
 	if (ret == -ENOSPC) {
 
 		/* Trying to commit the all transactions if BA_CAN_COMMIT flag
 		   present */
 		if (flags & BA_CAN_COMMIT) {
+			/* The call to txnmgr_force_commit_all() does not modify
+			 * ctx->grab_enabled because it only performs force-grabbing
+			 * of space (see below).
+			 *
+			 * Otherwise, we would need to save+restore grab_enabled
+			 * to avoid incorrectly setting it to 0 in cases when
+			 * both (our) grabbing attempts fail. */
 			txnmgr_force_commit_all(ctx->super, 0);
-			ctx->grab_enabled = 1;
 			ret = reiser4_grab(ctx, count, flags);
 		}
 	}
+
+	/* On success, disable further space grabbing in current context.
+	 *
+	 * Only do this if not BA_FORCE: such requests are "transparent"
+	 * wrt. ctx->grab_enabled. */
+	if (!(flags & BA_FORCE) && ret == 0) {
+		ctx->grab_enabled = 0;
+	}
+
 	/*
 	 * allocation from reserved pool cannot fail. This is severe error.
 	 */
