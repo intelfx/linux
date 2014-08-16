@@ -264,7 +264,7 @@ int reiser4_check_block_counters(const struct super_block *super)
 static int
 reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 {
-	__s64 allowed_blocks;
+	__u64 allowed_blocks;
 	int ret = 0, use_reserved = flags & BA_RESERVED;
 	reiser4_super_info_data *sbinfo;
 
@@ -285,7 +285,7 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 
 	if (flags & BA_SOME_SPACE) {
 		/* Reserve 25% of all free space */
-		if (allowed_blocks <= 0) {
+		if (allowed_blocks == 0) {
 			/* No space at all */
 			ret = RETERR(-ENOSPC);
 			goto unlock_and_ret;
