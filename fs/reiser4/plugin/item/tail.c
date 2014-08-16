@@ -603,8 +603,7 @@ static int write_extent_reserve_space(struct inode *inode)
 	count = estimate_one_insert_item(tree) +
 		estimate_insert_flow(tree->height) +
 		estimate_one_insert_item(tree);
-	grab_space_enable();
-	return reiser4_grab_space(count, 0 /* flags */);
+	return reiser4_grab_space(count, BA_FORCE);
 }
 
 #define PAGE_PER_FLOW 4

@@ -130,13 +130,11 @@ int safe_link_grab(reiser4_tree * tree, reiser4_ba_flags_t flags)
 {
 	int result;
 
-	grab_space_enable();
 	/* The sbinfo->delete_mutex can be taken here.
 	 * safe_link_release() should be called before leaving reiser4
 	 * context. */
 	result =
-	    reiser4_grab_reserved(tree->super, safe_link_tograb(tree), flags);
-	grab_space_enable();
+	    reiser4_grab_reserved(tree->super, safe_link_tograb(tree), flags | BA_FORCE);
 	return result;
 }
 

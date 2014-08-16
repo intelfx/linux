@@ -221,13 +221,13 @@ static int reserve_tail2extent_iteration(struct inode *inode)
 	 *     5. possible update of stat-data
 	 *
 	 */
-	grab_space_enable();
 	return reiser4_grab_space
 	    (2 * tree->height +
 	     TAIL2EXTENT_PAGE_NUM +
 	     TAIL2EXTENT_PAGE_NUM * estimate_one_insert_into_item(tree) +
 	     1 + estimate_one_insert_item(tree) +
-	     inode_file_plugin(inode)->estimate.update(inode), BA_CAN_COMMIT);
+	     inode_file_plugin(inode)->estimate.update(inode),
+	     BA_CAN_COMMIT | BA_FORCE);
 }
 
 /* clear stat data's flag indicating that conversion is being converted */
@@ -235,10 +235,9 @@ static int complete_conversion(struct inode *inode)
 {
 	int result;
 
-	grab_space_enable();
 	result =
 	    reiser4_grab_space(inode_file_plugin(inode)->estimate.update(inode),
-			       BA_CAN_COMMIT);
+			       BA_CAN_COMMIT | BA_FORCE);
 	if (result == 0) {
 		reiser4_inode_clr_flag(inode, REISER4_PART_MIXED);
 		result = reiser4_update_sd(inode);
@@ -552,12 +551,12 @@ static int reserve_extent2tail_iteration(struct inode *inode)
 	 *
 	 *     4. possible update of stat-data
 	 */
-	grab_space_enable();
 	return reiser4_grab_space
 	    (estimate_one_item_removal(tree) +
 	     estimate_insert_flow(tree->height) +
 	     1 + estimate_one_insert_item(tree) +
-	     inode_file_plugin(inode)->estimate.update(inode), BA_CAN_COMMIT);
+	     inode_file_plugin(inode)->estimate.update(inode),
+	     BA_CAN_COMMIT | BA_FORCE);
 }
 
 /* for every page of file: read page, cut part of extent pointing to this page,
