@@ -282,6 +282,12 @@ reiser4_grab(reiser4_context * ctx, __u64 count, reiser4_ba_flags_t flags)
 
 	free_blocks = sbinfo->blocks_free;
 
+	if (flags & BA_SOME_SPACE) {
+		/* Reserve 25% of all free space. */
+		count = free_blocks;
+		do_div(count, 4);
+	}
+
 	if ((use_reserved && free_blocks < count) ||
 	    (!use_reserved && free_blocks < count + sbinfo->blocks_reserved)) {
 		ret = RETERR(-ENOSPC);
