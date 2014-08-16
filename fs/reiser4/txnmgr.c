@@ -709,6 +709,9 @@ static int atom_begin_and_assign_to_txnh(txn_atom ** atom_alloc, txn_handle * tx
 			return RETERR(-ENOMEM);
 	}
 
+	atom = *atom_alloc;
+	*atom_alloc = NULL;
+
 	/* and, also, txnmgr spin lock should be taken before jnode and txnh
 	   locks. */
 	mgr = &get_super_private(reiser4_get_current_sb())->tmgr;
@@ -717,17 +720,13 @@ static int atom_begin_and_assign_to_txnh(txn_atom ** atom_alloc, txn_handle * tx
 
 	/* Check whether new atom still needed */
 	if (txnh->atom != NULL) {
-		/* NOTE-NIKITA probably it is rather better to free
-		 * atom_alloc here than thread it up to reiser4_try_capture() */
-
 		spin_unlock_txnh(txnh);
 		spin_unlock_txnmgr(mgr);
 
+		kmem_cache_free(_atom_slab, atom);
+
 		return -E_REPEAT;
 	}
-
-	atom = *atom_alloc;
-	*atom_alloc = NULL;
 
 	atom_init(atom);
 
@@ -2029,15 +2028,6 @@ int reiser4_try_capture(jnode *node, znode_lock_mode lock_mode,
 		   looks like busy loop?
 		 */
 		goto repeat;
-	}
-
-	/* free extra atom object that was possibly allocated by
-	   try_capture_block().
-
-	   Do this before acquiring jnode spin lock to
-	   minimize time spent under lock. --nikita */
-	if (atom_alloc != NULL) {
-		kmem_cache_free(_atom_slab, atom_alloc);
 	}
 
 	if (ret != 0) {
