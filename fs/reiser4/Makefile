@@ -46,6 +46,8 @@ reiser4-y := \
 		   status_flags.o \
 		   init_super.o \
 		   safe_link.o \
+		   blocknrlist.o \
+		   discard.o \
            \
 		   plugin/plugin.o \
 		   plugin/plugin_set.o \

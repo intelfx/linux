@@ -245,9 +245,24 @@ struct txn_atom {
 	/* Start time. */
 	unsigned long start_time;
 
-	/* The atom's delete set. It collects block numbers of the nodes
-	   which were deleted during the transaction. */
-	struct list_head delete_set;
+	/* The atom's delete sets.
+	   "simple" are blocknr_set instances and are used when discard is disabled.
+	   "discard" are blocknr_list instances and are used when discard is enabled. */
+	union {
+		struct {
+		/* The atom's delete set. It collects block numbers of the nodes
+		   which were deleted during the transaction. */
+			struct list_head delete_set;
+		} nodiscard;
+
+		struct {
+			/* The atom's delete set. It collects all blocks that have been
+			   deallocated (both immediate and deferred) during the transaction.
+			   These blocks are considered for discarding at commit time.
+			   For details see discard.c */
+			struct list_head delete_set;
+		} discard;
+	};
 
 	/* The atom's wandered_block mapping. */
 	struct list_head wandered_map;
@@ -465,6 +480,8 @@ int capture_bulk(jnode **, int count);
 
 /* See the comment on the function blocknrset.c:blocknr_set_add for the
    calling convention of these three routines. */
+extern int blocknr_set_init_static(void);
+extern void blocknr_set_done_static(void);
 extern void blocknr_set_init(struct list_head * bset);
 extern void blocknr_set_destroy(struct list_head * bset);
 extern void blocknr_set_merge(struct list_head * from, struct list_head * into);
@@ -484,6 +501,43 @@ typedef int (*blocknr_set_actor_f) (txn_atom *, const reiser4_block_nr *,
 extern int blocknr_set_iterator(txn_atom * atom, struct list_head * bset,
 				blocknr_set_actor_f actor, void *data,
 				int delete);
+
+/* This is the block list interface (see blocknrlist.c) */
+extern int blocknr_list_init_static(void);
+extern void blocknr_list_done_static(void);
+extern void blocknr_list_init(struct list_head *blist);
+extern void blocknr_list_destroy(struct list_head *blist);
+extern void blocknr_list_merge(struct list_head *from, struct list_head *to);
+extern void blocknr_list_sort_and_join(struct list_head *blist);
+/**
+ * The @atom should be locked.
+ */
+extern int blocknr_list_add_extent(txn_atom *atom,
+                                   struct list_head *blist,
+                                   blocknr_list_entry **new_entry,
+                                   const reiser4_block_nr *start,
+                                   const reiser4_block_nr *len);
+extern int blocknr_list_iterator(txn_atom *atom,
+                                 struct list_head *blist,
+                                 blocknr_set_actor_f actor,
+                                 void *data,
+                                 int delete);
+
+/* These are wrappers for accessing and modifying atom's delete lists,
+   depending on whether discard is enabled or not.
+   If it is enabled, (less memory efficient) blocknr_list is used for delete
+   list storage. Otherwise, blocknr_set is used for this purpose. */
+extern void atom_dset_init(txn_atom *atom);
+extern void atom_dset_destroy(txn_atom *atom);
+extern void atom_dset_merge(txn_atom *from, txn_atom *to);
+extern int atom_dset_deferred_apply(txn_atom* atom,
+                                    blocknr_set_actor_f actor,
+                                    void *data,
+                                    int delete);
+extern int atom_dset_deferred_add_extent(txn_atom *atom,
+                                         void **new_entry,
+                                         const reiser4_block_nr *start,
+                                         const reiser4_block_nr *len);
 
 /* flush code takes care about how to fuse flush queues */
 extern void flush_init_atom(txn_atom * atom);
