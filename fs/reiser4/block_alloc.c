@@ -416,7 +416,7 @@ int reiser4_grab_space(__u64 count, reiser4_ba_flags_t flags)
 		   present */
 		if (flags & BA_CAN_COMMIT) {
 			txnmgr_force_commit_all(ctx->super, 0);
-			ret = reiser4_grab(ctx, count, flags, 1);
+			ret = reiser4_grab(ctx, count, flags, 0);
 		}
 	}
 
