@@ -1127,7 +1127,8 @@ static int alloc_blocks_forward(reiser4_blocknr_hint *hint, int needed,
 	/* There is only one bitmap search if max_dist was specified or first
 	   pass was from the beginning of the bitmap. We also do one pass for
 	   scanning bitmap in backward direction. */
-	if (!(actual_len != 0 || hint->max_dist != 0 || search_start == 0)) {
+	if (actual_len == 0 && search_start != 0 &&
+	    hint->max_dist == 0 && hint->forward == 0) {
 		/* next step is a scanning from 0 to search_start */
 		search_end = search_start;
 		search_start = 0;

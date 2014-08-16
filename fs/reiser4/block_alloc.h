@@ -51,9 +51,10 @@ struct reiser4_blocknr_hint {
 	/* block allocator assumes that blocks, which will be mapped to disk,
 	   are in this specified block_stage */
 	block_stage_t block_stage;
-	/* If direction = 1 allocate blocks in backward direction from the end
-	 * of disk to the beginning of disk.  */
+	/* Allocate blocks only in backward direction starting from blk. */
 	unsigned int backward:1;
+	/* Allocate blocks only in forward direction starting from blk. */
+	unsigned int forward:1;
 
 };
 
