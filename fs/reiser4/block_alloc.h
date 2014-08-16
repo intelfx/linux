@@ -79,7 +79,10 @@ enum reiser4_ba_flags {
 	BA_FORCE = (1 << 5),
 
 	/* use default start value for free blocks search. */
-	BA_USE_DEFAULT_SEARCH_START = (1 << 6)
+	BA_USE_DEFAULT_SEARCH_START = (1 << 6),
+
+	/* reserve some fixed amount of space */
+	BA_SOME_SPACE = (1 << 7),
 };
 
 typedef enum reiser4_ba_flags reiser4_ba_flags_t;
