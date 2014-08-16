@@ -1140,7 +1140,6 @@ static int write_tx_back(struct commit_handle * ch)
 	int ret;
 	int barrier;
 
-	reiser4_post_commit_hook();
 	fq = get_fq_for_current_atom();
 	if (IS_ERR(fq))
 		return  PTR_ERR(fq);
@@ -1165,7 +1164,6 @@ static int write_tx_back(struct commit_handle * ch)
 		if (ret)
 			return ret;
 	}
-	reiser4_post_write_back_hook();
 	return 0;
 }
 
@@ -1251,9 +1249,9 @@ int reiser4_write_logs(long *nr_submitted)
 	spin_lock_atom(atom);
 	reiser4_atom_set_stage(atom, ASTAGE_POST_COMMIT);
 	spin_unlock_atom(atom);
+	reiser4_post_commit_hook();
 
 	ret = write_tx_back(&ch);
-	reiser4_post_write_back_hook();
 
       up_and_ret:
 	if (ret) {
@@ -1265,6 +1263,8 @@ int reiser4_write_logs(long *nr_submitted)
 	/* free blocks of flushed transaction */
 	dealloc_tx_list(&ch);
 	dealloc_wmap(&ch);
+
+	reiser4_post_write_back_hook();
 
 	put_overwrite_set(&ch);
 
