@@ -933,8 +933,7 @@ static int write_extent_reserve_space(struct inode *inode)
 	count = estimate_one_insert_item(tree) +
 		WRITE_GRANULARITY * (1 + estimate_one_insert_into_item(tree)) +
 		estimate_one_insert_item(tree);
-	grab_space_enable();
-	return reiser4_grab_space(count, 0 /* flags */);
+	return reiser4_grab_space(count, BA_FORCE);
 }
 
 /*

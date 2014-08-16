@@ -388,14 +388,13 @@ static int reserve_cryptcompress2unixfile(struct inode *inode)
 	 *     5. possible update of stat-data
 	 *
 	 */
-	grab_space_enable();
 	return reiser4_grab_space
 		(2 * tree->height +
 		 unformatted_nodes  +
 		 unformatted_nodes * estimate_one_insert_into_item(tree) +
 		 1 + estimate_one_insert_item(tree) +
 		 inode_file_plugin(inode)->estimate.update(inode),
-		 BA_CAN_COMMIT);
+		 BA_CAN_COMMIT | BA_FORCE);
 }
 
 /**
