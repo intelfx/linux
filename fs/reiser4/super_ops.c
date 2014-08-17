@@ -487,7 +487,7 @@ static int reiser4_show_options(struct seq_file *m, struct dentry *dentry)
 int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range)
 {
 	reiser4_blocknr_hint hint;
-	reiser4_block_nr start, end, len, minlen, discarded_count = 0;
+	reiser4_block_nr start, end, len, discarded_count = 0;
 	reiser4_context *ctx;
 	txn_atom *atom;
 	int ret, finished = 0;
@@ -501,11 +501,11 @@ int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range)
 	 */
 	hint.blk = range->start >> super->s_blocksize_bits;
 	hint.max_dist = range->len >> super->s_blocksize_bits;
+	hint.min_len = range->minlen >> super->s_blocksize_bits;
 	hint.block_stage = BLOCK_GRABBED;
 	hint.forward = 1;
 
 	end = hint.blk + hint.max_dist;
-	minlen = range->minlen >> super->s_blocksize_bits;
 
 	/*
 	 * We will perform the process in iterations in order not to starve
@@ -538,7 +538,6 @@ int reiser4_trim_fs(struct super_block *super, struct fstrim_range* range)
 		while (ctx->grabbed_blocks != 0) {
 			/*
 			 * Allocate no more than is grabbed.
-			 * FIXME: use minlen.
 			 */
 			len = ctx->grabbed_blocks;
 			ret = reiser4_alloc_blocks(&hint, &start, &len, 0 /* flags */);
