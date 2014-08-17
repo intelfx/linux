@@ -45,6 +45,8 @@ struct reiser4_blocknr_hint {
 	reiser4_block_nr blk;
 	/* if not zero, it is a region size we search for free blocks in */
 	reiser4_block_nr max_dist;
+	/* if not zero, minimal length of an extent to allocate */
+	reiser4_block_nr min_len;
 	/* level for allocation, may be useful have branch-level and higher
 	   write-optimized. */
 	tree_level level;

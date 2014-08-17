@@ -1101,7 +1101,7 @@ static int alloc_blocks_forward(reiser4_blocknr_hint *hint, int needed,
 				reiser4_block_nr *start, reiser4_block_nr *len)
 {
 	struct super_block *super = get_current_context()->super;
-	int actual_len;
+	int min_len, actual_len;
 
 	reiser4_block_nr search_start;
 	reiser4_block_nr search_end;
@@ -1117,12 +1117,17 @@ static int alloc_blocks_forward(reiser4_blocknr_hint *hint, int needed,
 		    LIMIT(hint->blk + hint->max_dist,
 			  reiser4_block_count(super));
 
+	if (hint->min_len == 0)
+		min_len = 1;
+	else
+		min_len = (int)hint->min_len;
+
 	/* We use @hint -> blk as a search start and search from it to the end
 	   of the disk or in given region if @hint -> max_dist is not zero */
 	search_start = hint->blk;
 
 	actual_len =
-	    bitmap_alloc_forward(&search_start, &search_end, 1, needed);
+	    bitmap_alloc_forward(&search_start, &search_end, min_len, needed);
 
 	/* There is only one bitmap search if max_dist was specified, first
 	   pass was from the beginning of the bitmap, or if the monotonic flag
@@ -1134,7 +1139,7 @@ static int alloc_blocks_forward(reiser4_blocknr_hint *hint, int needed,
 		search_end = search_start;
 		search_start = 0;
 		actual_len =
-		    bitmap_alloc_forward(&search_start, &search_end, 1, needed);
+		    bitmap_alloc_forward(&search_start, &search_end, min_len, needed);
 	}
 	if (actual_len == 0)
 		return RETERR(-ENOSPC);
@@ -1151,7 +1156,7 @@ static int alloc_blocks_backward(reiser4_blocknr_hint * hint, int needed,
 {
 	reiser4_block_nr search_start;
 	reiser4_block_nr search_end;
-	int actual_len;
+	int min_len, actual_len;
 
 	ON_DEBUG(struct super_block *super = reiser4_get_current_sb());
 
@@ -1165,8 +1170,13 @@ static int alloc_blocks_backward(reiser4_blocknr_hint * hint, int needed,
 	else
 		search_end = search_start - hint->max_dist;
 
+	if (hint->min_len == 0)
+		min_len = 1;
+	else
+		min_len = (int)hint->min_len;
+
 	actual_len =
-	    bitmap_alloc_backward(&search_start, &search_end, 1, needed);
+	    bitmap_alloc_backward(&search_start, &search_end, min_len, needed);
 	if (actual_len == 0)
 		return RETERR(-ENOSPC);
 	if (actual_len < 0)
