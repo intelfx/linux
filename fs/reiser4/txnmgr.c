@@ -1064,15 +1064,20 @@ static int commit_current_atom(long *nr_submitted, txn_atom ** atom)
 		return RETERR(-E_REPEAT);
 	}
 
-	if ((*atom)->capture_count == 0)
-		goto done;
-
 	/* Up to this point we have been flushing and after flush is called we
 	   return -E_REPEAT.  Now we can commit.  We cannot return -E_REPEAT
 	   at this point, commit should be successful. */
 	reiser4_atom_set_stage(*atom, ASTAGE_PRE_COMMIT);
 	ON_DEBUG(((*atom)->committer = current));
 	spin_unlock_atom(*atom);
+
+	if ((*atom)->capture_count == 0) {
+		/* Process the atom's delete set.
+		 * Even if the atom has no captured nodes, the delete set may
+		 * still be non-empty (see e. g. reiser4_trim_fs()). */
+		reiser4_post_write_back_hook();
+		goto done;
+	}
 
 	ret = current_atom_complete_writes();
 	if (ret)
@@ -1100,8 +1105,8 @@ static int commit_current_atom(long *nr_submitted, txn_atom ** atom)
 	reiser4_invalidate_list(ATOM_WB_LIST(*atom));
 	assert("zam-927", list_empty(&(*atom)->inodes));
 
+done:
 	spin_lock_atom(*atom);
- done:
 	reiser4_atom_set_stage(*atom, ASTAGE_DONE);
 	ON_DEBUG((*atom)->committer = NULL);
 
