@@ -335,11 +335,10 @@ static int find_file_state(struct inode *inode, struct unix_file_info *uf_info)
  */
 static int reserve_partial_page(reiser4_tree * tree)
 {
-	grab_space_enable();
 	return reiser4_grab_reserved(reiser4_get_current_sb(),
 				     1 +
 				     2 * estimate_one_insert_into_item(tree),
-				     BA_CAN_COMMIT);
+				     BA_CAN_COMMIT | BA_FORCE);
 }
 
 /* estimate and reserve space needed to cut one item and update one stat data */
@@ -350,11 +349,10 @@ static int reserve_cut_iteration(reiser4_tree * tree)
 
 	assert("nikita-3172", lock_stack_isclean(get_current_lock_stack()));
 
-	grab_space_enable();
 	/* We need to double our estimate now that we can delete more than one
 	   node. */
 	return reiser4_grab_reserved(reiser4_get_current_sb(), estimate * 2,
-				     BA_CAN_COMMIT);
+				     BA_CAN_COMMIT | BA_FORCE);
 }
 
 int reiser4_update_file_size(struct inode *inode, loff_t new_size,
@@ -875,10 +873,9 @@ static int capture_page_and_create_extent(struct page *page)
 	/* page capture may require extent creation (if it does not exist yet)
 	   and stat data's update (number of blocks changes on extent
 	   creation) */
-	grab_space_enable();
 	result = reiser4_grab_space(2 * estimate_one_insert_into_item
 				    (reiser4_tree_by_inode(inode)),
-				    BA_CAN_COMMIT);
+				    BA_CAN_COMMIT | BA_FORCE);
 	if (likely(!result))
 		result = find_or_create_extent(page);
 
@@ -2421,9 +2418,8 @@ static int unpack(struct file *filp, struct inode *inode, int forever)
 
 		set_file_notail(inode);
 
-		grab_space_enable();
 		tograb = inode_file_plugin(inode)->estimate.update(inode);
-		result = reiser4_grab_space(tograb, BA_CAN_COMMIT);
+		result = reiser4_grab_space(tograb, BA_CAN_COMMIT | BA_FORCE);
 		result = reiser4_update_sd(inode);
 	}
 
