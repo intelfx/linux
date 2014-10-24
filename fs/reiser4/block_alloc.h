@@ -109,6 +109,9 @@ int reiser4_alloc_blocks(reiser4_blocknr_hint * hint,
 int reiser4_dealloc_blocks(const reiser4_block_nr *,
 			   const reiser4_block_nr *,
 			   block_stage_t, reiser4_ba_flags_t flags);
+int reiser4_alloc_blocks_exact(const reiser4_block_nr * start,
+			       const reiser4_block_nr * len,
+			       block_stage_t stage, reiser4_ba_flags_t flags);
 
 static inline int reiser4_alloc_block(reiser4_blocknr_hint * hint,
 				      reiser4_block_nr * start,

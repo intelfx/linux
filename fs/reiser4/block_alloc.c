@@ -759,6 +759,42 @@ int reiser4_alloc_blocks(reiser4_blocknr_hint * hint, reiser4_block_nr * blk,
 	return ret;
 }
 
+/* This is a version of reiser4_alloc_blocks() for use in special conditions,
+ * where an allocation must have exact length and position.
+ *
+ * It does not use reiser4_blocknr_hint; instead, all parameters are passed
+ * directly.
+ */
+int reiser4_alloc_blocks_exact(const reiser4_block_nr * blk,
+			       const reiser4_block_nr * len,
+			       block_stage_t stage, reiser4_ba_flags_t flags)
+{
+	int ret;
+	reiser4_context *ctx;
+
+	assert("intelfx-70", blk != NULL);
+	assert("intelfx-71", len != NULL);
+
+	ctx = get_current_context();
+
+	ret = reiser4_alloc_blocks_pre(*len, stage, flags);
+
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = sa_alloc_blocks_exact(reiser4_get_space_allocator(ctx->super),
+				    blk, len);
+
+	if (ret == 0) {
+		reiser4_alloc_blocks_post_success(*blk, *len, stage, flags);
+	} else {
+		reiser4_alloc_blocks_post_failure(*len, stage);
+	}
+
+	return ret;
+}
+
 /**
  * ask block allocator for some unformatted blocks
  */
