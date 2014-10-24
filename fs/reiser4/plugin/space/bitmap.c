@@ -1222,8 +1222,14 @@ void reiser4_dealloc_blocks_bitmap(reiser4_space_allocator * allocator,
 	release_and_unlock_bnode(bnode);
 }
 
+typedef enum {
+	CHECK_FREE,
+	CHECK_FREE_AND_ALLOC,
+	CHECK_BUSY
+} check_blocks_mode;
+
 static int check_blocks_one_bitmap(bmap_nr_t bmap, bmap_off_t start_offset,
-                                    bmap_off_t end_offset, int desired)
+				   bmap_off_t end_offset, check_blocks_mode mode)
 {
 	struct super_block *super = reiser4_get_current_sb();
 	struct bitmap_node *bnode = get_bnode(super, bmap);
@@ -1236,14 +1242,29 @@ static int check_blocks_one_bitmap(bmap_nr_t bmap, bmap_off_t start_offset,
 
 	assert("nikita-2216", jnode_is_loaded(bnode->wjnode));
 
-	if (desired) {
+	switch (mode) {
+	case CHECK_BUSY:
 		ret = reiser4_find_next_zero_bit(bnode_working_data(bnode),
-						  end_offset, start_offset)
-		      >= end_offset;
-	} else {
-		ret = reiser4_find_next_set_bit(bnode_working_data(bnode),
 						 end_offset, start_offset)
 		      >= end_offset;
+
+		break;
+
+	case CHECK_FREE:
+	case CHECK_FREE_AND_ALLOC:
+		ret = reiser4_find_next_set_bit(bnode_working_data(bnode),
+						end_offset, start_offset)
+		      >= end_offset;
+
+		if (mode == CHECK_FREE_AND_ALLOC && ret) {
+			reiser4_set_bits(bnode_working_data(bnode),
+					 start_offset, end_offset);
+		}
+
+		break;
+
+	default:
+		impossible("intelfx-67", "wrong block check/alloc mode: %d", mode);
 	}
 
 	release_and_unlock_bnode(bnode);
@@ -1251,9 +1272,8 @@ static int check_blocks_one_bitmap(bmap_nr_t bmap, bmap_off_t start_offset,
 	return ret;
 }
 
-/* plugin->u.space_allocator.check_blocks(). */
-int reiser4_check_blocks_bitmap(const reiser4_block_nr * start,
-				 const reiser4_block_nr * len, int desired)
+static int check_blocks_bitmap(reiser4_block_nr start, reiser4_block_nr len,
+			       check_blocks_mode mode)
 {
 	struct super_block *super = reiser4_get_current_sb();
 
@@ -1262,21 +1282,13 @@ int reiser4_check_blocks_bitmap(const reiser4_block_nr * start,
 	bmap_off_t offset, end_offset;
 	const bmap_off_t max_offset = bmap_bit_count(super->s_blocksize);
 
-	assert("intelfx-9", start != NULL);
-	assert("intelfx-10", ergo(len != NULL, *len > 0));
+	assert("intelfx-10", len > 0);
 
-	if (len != NULL) {
-		check_block_range(start, len);
-		end = *start + *len - 1;
-	} else {
-		/* on next line, end is used as temporary len for check_block_range() */
-		end = 1; check_block_range(start, &end);
-		end = *start;
-	}
+	check_block_range(&start, &len);
+	parse_blocknr(&start, &bmap, &offset);
 
-	parse_blocknr(start, &bmap, &offset);
-
-	if (end == *start) {
+	end = start + len - 1;
+	if (end == start) {
 		end_bmap = bmap;
 		end_offset = offset;
 	} else {
@@ -1288,11 +1300,45 @@ int reiser4_check_blocks_bitmap(const reiser4_block_nr * start,
 	assert("intelfx-5", ergo(end_bmap == bmap, end_offset >= offset));
 
 	for (; bmap < end_bmap; bmap++, offset = 0) {
-		if (!check_blocks_one_bitmap(bmap, offset, max_offset, desired)) {
+		if (!check_blocks_one_bitmap(bmap, offset, max_offset, mode)) {
 			return 0;
 		}
 	}
-	return check_blocks_one_bitmap(bmap, offset, end_offset, desired);
+	return check_blocks_one_bitmap(bmap, offset, end_offset, mode);
+}
+
+/* plugin->u.space_allocator.alloc_blocks_exact() */
+int reiser4_alloc_blocks_exact_bitmap(reiser4_space_allocator * allocator,
+				      const reiser4_block_nr * start,
+				      const reiser4_block_nr * len)
+{
+	int ret;
+
+	assert("intelfx-66", start != NULL);
+
+	if (len != NULL)
+		ret = check_blocks_bitmap(*start, *len, CHECK_FREE_AND_ALLOC);
+	else
+		ret = check_blocks_bitmap(*start, 1, CHECK_FREE_AND_ALLOC);
+
+	if (ret == 0)
+		return RETERR(-ENOSPC);
+	else
+		return 0;
+}
+
+/* plugin->u.space_allocator.check_blocks(). */
+int reiser4_check_blocks_bitmap(const reiser4_block_nr * start,
+				const reiser4_block_nr * len, int desired)
+{
+	check_blocks_mode mode = desired ? CHECK_BUSY : CHECK_FREE;
+
+	assert("intelfx-9", start != NULL);
+
+	if (len != NULL)
+		return check_blocks_bitmap (*start, *len, mode);
+	else
+		return check_blocks_bitmap (*start, 1, mode);
 }
 
 /* conditional insertion of @node into atom's overwrite set  if it was not there */
