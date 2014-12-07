@@ -509,6 +509,7 @@ extern void blocknr_list_init(struct list_head *blist);
 extern void blocknr_list_destroy(struct list_head *blist);
 extern void blocknr_list_merge(struct list_head *from, struct list_head *to);
 extern void blocknr_list_sort_and_join(struct list_head *blist);
+extern void blocknr_list_del(struct list_head *blist);
 extern reiser4_block_nr blocknr_list_entry_start(struct list_head *blist);
 extern reiser4_block_nr blocknr_list_entry_len(struct list_head *blist);
 /**
@@ -519,6 +520,9 @@ extern int blocknr_list_add_extent(txn_atom *atom,
                                    blocknr_list_entry **new_entry,
                                    const reiser4_block_nr *start,
                                    const reiser4_block_nr *len);
+extern void blocknr_list_update_extent(struct list_head *blist,
+                                       const reiser4_block_nr *start,
+                                       const reiser4_block_nr *len);
 extern int blocknr_list_iterator(txn_atom *atom,
                                  struct list_head *blist,
                                  blocknr_set_actor_f actor,
