@@ -243,6 +243,17 @@ void blocknr_list_sort_and_join(struct list_head *blist)
 	}
 }
 
+void blocknr_list_del(struct list_head *blist)
+{
+	struct blocknr_list_entry *entry;
+
+	assert("intelfx-72", blist != NULL);
+
+	entry = blocknr_list_entry(blist);
+	list_del_init (blist);
+	blocknr_list_entry_free(entry);
+}
+
 int blocknr_list_add_extent(txn_atom *atom,
                             struct list_head *blist,
                             blocknr_list_entry **new_entry,
@@ -285,6 +296,23 @@ int blocknr_list_add_extent(txn_atom *atom,
 	list_add_tail(&(*new_entry)->link, blist);
 
 	return 0;
+}
+
+void blocknr_list_update_extent(struct list_head *blist,
+                                const reiser4_block_nr *start,
+                                const reiser4_block_nr *len)
+{
+	blocknr_list_entry *entry;
+
+	assert("intelfx-73", blist != NULL);
+
+	entry = blocknr_list_entry(blist);
+	if (start != NULL) {
+		entry->start = *start;
+	}
+	if (len != NULL) {
+		entry->len = *len;
+	}
 }
 
 int blocknr_list_iterator(txn_atom *atom,
