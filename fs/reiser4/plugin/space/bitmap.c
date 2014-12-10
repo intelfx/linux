@@ -1322,14 +1322,12 @@ static void cond_add_to_overwrite_set(txn_atom * atom, jnode * node)
    pages in a single-linked list */
 static int
 apply_dset_to_commit_bmap(txn_atom * atom, const reiser4_block_nr * start,
-			  const reiser4_block_nr * len, void *data)
+			  const reiser4_block_nr * len, void *data UNUSED_ARG)
 {
 
 	bmap_nr_t bmap;
 	bmap_off_t offset;
 	int ret;
-
-	long long *blocks_freed_p = data;
 
 	struct bitmap_node *bnode;
 
@@ -1366,11 +1364,8 @@ apply_dset_to_commit_bmap(txn_atom * atom, const reiser4_block_nr * start,
 		assert("zam-443",
 		       offset + *len <= bmap_bit_count(sb->s_blocksize));
 		reiser4_clear_bits(data, offset, (bmap_off_t) (offset + *len));
-
-		(*blocks_freed_p) += *len;
 	} else {
 		reiser4_clear_bit(offset, data);
-		(*blocks_freed_p)++;
 	}
 
 	bnode_set_commit_crc(bnode, bnode_calc_crc(bnode, sb->s_blocksize));
@@ -1392,8 +1387,6 @@ int reiser4_pre_commit_hook_bitmap(void)
 {
 	struct super_block *super = reiser4_get_current_sb();
 	txn_atom *atom;
-
-	long long blocks_freed = 0;
 
 	atom = get_current_atom_locked();
 	assert("zam-876", atom->stage == ASTAGE_PRE_COMMIT);
@@ -1460,19 +1453,7 @@ int reiser4_pre_commit_hook_bitmap(void)
 		}
 	}
 
-	atom_dset_deferred_apply(atom, apply_dset_to_commit_bmap, &blocks_freed, 0);
-
-	blocks_freed -= atom->nr_blocks_allocated;
-
-	{
-		reiser4_super_info_data *sbinfo;
-
-		sbinfo = get_super_private(super);
-
-		spin_lock_reiser4_super(sbinfo);
-		sbinfo->blocks_free_committed += blocks_freed;
-		spin_unlock_reiser4_super(sbinfo);
-	}
+	atom_dset_deferred_apply(atom, apply_dset_to_commit_bmap, NULL, 0);
 
 	return 0;
 }

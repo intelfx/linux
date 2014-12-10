@@ -998,6 +998,19 @@ reiser4_check_blocks(const reiser4_block_nr * start,
 /* BA_FORMATTED bit is only used when BA_DEFER in not present: it is used to
    distinguish blocks allocated for unformatted and formatted nodes */
 
+/* if BA_DEFER is enabled, @target_stage and other @flags are ignored.
+ *
+ * @target_stage is implied to be BLOCK_NOT_COUNTED.
+ * (assumption is used in reiser4_post_write_back_hook() and apply_dset())
+ *
+ * @flags are implied to have BA_PERMANENT.
+ * (assumption is used in reiser4_pre_commit_hook() which counts deallocated
+ *  blocks)
+ * 
+ * That is, if a deferred deallocation is done after reiser4_pre_commit_hook(),
+ * then BA_PERMANENT is implied to be disabled.
+ */
+
 int
 reiser4_dealloc_blocks(const reiser4_block_nr * start,
 		       const reiser4_block_nr * len,
@@ -1094,10 +1107,39 @@ reiser4_dealloc_blocks(const reiser4_block_nr * start,
 	return 0;
 }
 
+/* an actor for counting blocks that are going to be deallocated */
+static int
+count_dset_blocks(txn_atom * atom, const reiser4_block_nr * start,
+                  const reiser4_block_nr * len, void *data)
+{
+	reiser4_block_nr *blocks_freed_p = data;
+
+	if (len != NULL) {
+		(*blocks_freed_p) += *len;
+	} else {
+		(*blocks_freed_p)++;
+	}
+	return 0;
+}
+
 /* wrappers for block allocator plugin methods */
 int reiser4_pre_commit_hook(void)
 {
-	assert("zam-502", get_current_super_private() != NULL);
+	reiser4_block_nr blocks_freed = 0;
+	reiser4_super_info_data *sbinfo = get_current_super_private();
+	txn_atom *atom = get_current_atom_locked();
+
+	assert("zam-502", sbinfo != NULL);
+
+	assert("zam-876", atom->stage == ASTAGE_PRE_COMMIT);
+	spin_unlock_atom(atom);
+
+	atom_dset_deferred_apply(atom, count_dset_blocks, &blocks_freed, 0);
+
+	spin_lock_reiser4_super(sbinfo);
+	sbinfo->blocks_free_committed += blocks_freed - atom->nr_blocks_allocated;
+	spin_unlock_reiser4_super(sbinfo);
+
 	sa_pre_commit_hook();
 	return 0;
 }
