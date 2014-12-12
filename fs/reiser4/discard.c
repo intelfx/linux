@@ -366,18 +366,10 @@ static int discard_sorted_merged_extents(struct list_head *head)
 					/*
 					 * jump to the glued extent
 					 */
-					if (end + tailp < next_start + next_len) {
-						/*
-						 * the glued extent doesn't
-						 * fit into the tail padding,
-						 * so update the last one
-						 */
-						tailp = extent_get_tailp(next_start + next_len,
-									 d_off, d_uni);
-						alen += (next_start + next_len - end);
-					}
 					pos = next;
+					alen += (next_start + next_len - end);
 					end = next_start + next_len;
+					tailp = extent_get_tailp(end, d_off, d_uni);
 					/*
 					 * try to glue more extents
 					 */
