@@ -185,8 +185,13 @@ static inline struct list_head *get_next_at(struct list_head *pos,
 	return pos->next == head ? NULL : pos->next;
 }
 
-static inline int check_free_blocks(const reiser4_block_nr start,
-				    const reiser4_block_nr len)
+/*
+ * Check if a given block range is free (clean) and allocate it.
+ *
+ * NOTE: this operation is not idempotent.
+ */
+static inline int try_allocate_blocks(const reiser4_block_nr start,
+				      const reiser4_block_nr len)
 {
 	/*
 	 * NOTE: we do not use BA_PERMANENT in out allocations
@@ -321,7 +326,7 @@ static int discard_precise_extents(struct list_head *head)
 		}
 		else if (p_start >= p_headp /* discard unit is complete */ &&
 			 !headp_is_known_dirty &&
-			 check_free_blocks(start - headp, headp)) {
+			 try_allocate_blocks(start - headp, headp)) {
 			/*
 			 * pad the head
 			 */
@@ -379,7 +384,7 @@ static int discard_precise_extents(struct list_head *head)
 				 * check space between the extents;
 				 * if it is free, then allocate it
 				 */
-				if (check_free_blocks(end, next_start - end)) {
+				if (try_allocate_blocks(end, next_start - end)) {
 					/*
 					 * jump to the glued extent
 					 */
@@ -422,7 +427,7 @@ static int discard_precise_extents(struct list_head *head)
 				 */
 				if (tailp == 0)
 					break;
-				else if (check_free_blocks(end, tailp)) {
+				else if (try_allocate_blocks(end, tailp)) {
 					/*
 					 * tail padding is clean,
 					 * pad the tail
