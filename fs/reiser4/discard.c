@@ -272,8 +272,56 @@ static int discard_precise_extents(struct list_head *head)
 	int d_off;
 	struct list_head *pos;
 	struct super_block *sb = reiser4_get_current_sb();
-	int headp_is_known_dirty = 0;
 	int blkbits = sb->s_blocksize_bits;
+
+	/* This is a "cache" which holds the last block range checked during
+	 * processing of an extent. This information is used to avoid allocating
+	 * the same blocks multiple times, if two successive extents become
+	 * overlapped (in terms of disk blocks) after padding.
+	 *
+	 * The problem with allocating the same blocks multiple times:
+	 * our function try_allocate_blocks() is not idempotent. More precisely,
+	 * after a positive result has been returned for a given range [A;B), we
+	 * must not call try_allocate_blocks() on any range which overlaps [A;B),
+	 * or we will get a false negative result.
+	 * (Also, we must not call try_allocate_blocks() on any range which
+	 * overlaps extents in the discard set.)
+	 *
+	 * Let's show that we can avoid false-negatives with this cache.
+	 *
+	 * 1. All blocks between the stored tail padding and the beginning of
+	 *    the current extent are safe to allocate.
+	 *
+	 * 2. Let's analyze all combinations of the previous tail padding's check
+	 *    result and the current head padding's disposition relative to the
+	 *    previous tail padding. Note that we are speaking in terms of
+	 *    occupied disk blocks.
+	 *
+	 * 2.0. The head padding does not overlap the tail padding.
+	 *      In this case head padding is safe to allocate.
+	 *
+	 * 2.1. The tail padding is dirty. The head padding partially overlaps it.
+	 *      In this case both parts of the head padding are safe to allocate.
+	 *
+	 * 2.2. The tail padding is dirty. The head padding completely covers it
+	 *      (maybe extending back beyond).
+	 *      In this case the head padding is transitively dirty.
+	 *
+	 * 2.3. The tail padding is clean. The head padding overlaps or covers it
+	 *      (not extending back beyond).
+	 *      In this case:
+	 *      - the overlapping part of the head padding can be skipped
+	 *      - the rest is safe to allocate
+	 *
+	 * 2.4. The tail padding is clean. The head padding extends beyond it.
+	 *      This is not possible. It would mean that our head padding
+	 *      shares an erase unit with the previous tail padding.
+	 *      Such extent combinations are handled by the gluing code.
+	 */
+
+	reiser4_block_nr last_padding_start = 0;
+	reiser4_block_nr last_padding_end = 0;
+	int last_padding_clean = 0;
 
 	d_off = get_super_private(sb)->discard.offset;
 	d_uni = get_super_private(sb)->discard.unit;
@@ -316,34 +364,89 @@ static int discard_precise_extents(struct list_head *head)
 		p_headp = precise_extent_headp(p_start, d_off, d_uni);
 		headp = size_in_blocks(p_headp, blkbits);
 
+		/*
+		 * Our head padding can't extend back beyond the saved tail
+		 * padding, if the latter is clean.
+		 * (cf. situation 2.4 from the above description)
+		 */
+		assert("intelfx-80", ergo(last_padding_clean,
+					  last_padding_start <= start - headp));
+
 		if (headp == 0) {
 			/*
 			 * empty head padding
 			 */
-			assert("edward-1635", headp_is_known_dirty == 0);
 			a_start = p_start;
 			a_len = p_len;
-		}
-		else if (p_start >= p_headp /* discard unit is complete */ &&
-			 !headp_is_known_dirty &&
-			 try_allocate_blocks(start - headp, headp)) {
-			/*
-			 * pad the head
-			 */
-			a_start = p_start - p_headp;
-			a_len = p_len + p_headp;
-			estart -= headp;
 		} else {
+			int headp_is_clean;
+
 			/*
-			 * head padding is dirty,
-			 * or discard unit is incomplete (can not
-			 * check blocks outside of the partition),
-			 * cut the head
+			 * If our discard unit is incomplete, don't pad.
 			 */
-			headp_is_known_dirty = 0;
-			a_start = p_start + (d_uni - p_headp);
-			a_len = p_len - (d_uni - p_headp);
+			if (p_start < p_headp)
+				headp_is_clean = 0;
+
+			/*
+			 * Maybe last checked extent is dirty and completely
+			 * embedded in ours? Then our one is dirty too.
+			 * (cf. situation 2.2 from the above description)
+			 */
+			else if (!last_padding_clean &&
+				 last_padding_start >= start - headp &&
+				 last_padding_end <= start)
+				headp_is_clean = 0;
+
+			/*
+			 * Maybe last checked extent is clean and completely
+			 * covers ours? Then our one is clean too.
+			 * (cf. situation 2.3 from the above description)
+			 */
+			else if (last_padding_clean &&
+				 last_padding_end >= start)
+				headp_is_clean = 1;
+
+			/*
+			 * Maybe last checked extent is clean and partially
+			 * overlaps ours? Then we must check the remaining part.
+			 * (cf. situation 2.3 from the above description)
+			 */
+			else if (last_padding_clean &&
+				 last_padding_end > start - headp) {
+				headp_is_clean = try_allocate_blocks(last_padding_end, start - last_padding_end);
+				if (headp_is_clean)
+					estart = last_padding_end;
+			}
+
+			/*
+			 * Otherwise check the whole padding.
+			 * (cf. situations 2.0, 2.1 from the above description)
+			 */
+			else {
+				headp_is_clean = try_allocate_blocks(start - headp, headp);
+				if (headp_is_clean)
+					estart -= headp;
+			}
+
+			if (headp_is_clean) {
+				/*
+				 * head padding is clean,
+				 * pad the head
+				 */
+				a_start = p_start - p_headp;
+				a_len = p_len + p_headp;
+			} else {
+				/*
+				 * head padding is dirty,
+				 * or discard unit is incomplete (can not
+				 * check blocks outside of the partition),
+				 * cut the head
+				 */
+				a_start = p_start + (d_uni - p_headp);
+				a_len = p_len - (d_uni - p_headp);
+			}
 		}
+
 		/*
 		 * Step II. Try to glue all nearby extents to the tail
 		 *          Cut or pad the tail of the last extent.
@@ -410,10 +513,14 @@ static int discard_precise_extents(struct list_head *head)
 					/*
 					 * gluing failed, cut the tail
 					 */
-					if (p_end + p_tailp > p_next_start)
-						headp_is_known_dirty = 1;
-
 					a_len -= (d_uni - p_tailp);
+
+					/*
+					 * save the tail padding
+					 */
+					last_padding_start = end;
+					last_padding_end = next_start;
+					last_padding_clean = 0;
 					break;
 				}
 
@@ -425,21 +532,44 @@ static int discard_precise_extents(struct list_head *head)
 				 * rest of tail padding and finish with
 				 * the extent
 				 */
-				if (tailp == 0)
-					break;
-				else if (try_allocate_blocks(end, tailp)) {
+				if (tailp == 0) {
+					/*
+					 * empty tail padding.
+					 *
+					 * save a fake tail padding to aid debugging
+					 */
+					last_padding_start = end;
+					last_padding_end = end;
+					last_padding_clean = 1;
+
+				} else if (try_allocate_blocks(end, tailp)) {
 					/*
 					 * tail padding is clean,
 					 * pad the tail
 					 */
 					a_len += p_tailp;
 					eend += tailp;
-				} else
+
+					/*
+					 * save the tail padding
+					 */
+					last_padding_start = end;
+					last_padding_end = end + tailp;
+					last_padding_clean = 1;
+				} else {
 					/*
 					 * tail padding is dirty,
 					 * cut the tail
 					 */
 					a_len -= (d_uni - p_tailp);
+
+					/*
+					 * save the tail padding
+					 */
+					last_padding_start = end;
+					last_padding_end = end + tailp;
+					last_padding_clean = 0;
+				}
 				break;
 			}
 		}
