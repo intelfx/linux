@@ -154,6 +154,10 @@ struct reiser4_inode {
 	 * fs/reiser4/search.c:handle_vroot() */
 	reiser4_block_nr vroot;
 	struct mutex loading;
+
+#ifdef CONFIG_QUOTA
+	struct dquot *i_dquot[MAXQUOTAS];
+#endif
 };
 
 void loading_init_once(reiser4_inode *);

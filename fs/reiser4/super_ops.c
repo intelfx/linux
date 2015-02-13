@@ -113,6 +113,9 @@ static struct inode *reiser4_alloc_inode(struct super_block *super)
 		/* this deals with info's loading semaphore */
 		loading_alloc(info);
 		info->vroot = UBER_TREE_ADDR;
+#ifdef CONFIG_QUOTA
+		memset(&info->i_dquot, 0, sizeof(info->i_dquot));
+#endif
 		return &obj->vfs_inode;
 	} else
 		return NULL;
@@ -477,6 +480,13 @@ static int reiser4_show_options(struct seq_file *m, struct dentry *dentry)
 	return 0;
 }
 
+#ifdef CONFIG_QUOTA
+static struct dquot **reiser4_get_dquots(struct inode *inode)
+{
+	return reiser4_inode_data(inode)->i_dquot;
+}
+#endif
+
 struct super_operations reiser4_super_operations = {
 	.alloc_inode = reiser4_alloc_inode,
 	.destroy_inode = reiser4_destroy_inode,
@@ -487,7 +497,10 @@ struct super_operations reiser4_super_operations = {
 	.statfs = reiser4_statfs,
 	.remount_fs = reiser4_remount,
 	.writeback_inodes = reiser4_writeback_inodes,
-	.show_options = reiser4_show_options
+	.show_options = reiser4_show_options,
+#ifdef CONFIG_QUOTA
+	.get_dquots = reiser4_get_dquots,
+#endif
 };
 
 /**
