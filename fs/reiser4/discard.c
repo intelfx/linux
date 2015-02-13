@@ -542,7 +542,8 @@ static int discard_precise_extents(struct list_head *head)
 					last_padding_end = end;
 					last_padding_clean = 1;
 
-				} else if (try_allocate_blocks(end, tailp)) {
+				} else if (end + tailp <= reiser4_block_count(sb) &&
+					   try_allocate_blocks(end, tailp)) {
 					/*
 					 * tail padding is clean,
 					 * pad the tail
