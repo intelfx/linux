@@ -41,6 +41,7 @@
 #include <linux/module.h>
 #include <linux/writeback.h>
 #include <linux/backing-dev.h>
+#include <linux/quotaops.h>
 #include <linux/security.h>
 #include <linux/migrate.h>
 

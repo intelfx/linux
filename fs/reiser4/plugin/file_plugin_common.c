@@ -9,6 +9,8 @@
 #include "object.h"
 #include "../safe_link.h"
 
+#include <linux/quotaops.h>
+
 static int insert_new_sd(struct inode *inode);
 static int update_sd(struct inode *inode);
 
@@ -942,6 +944,9 @@ common_object_delete_no_reserve(struct inode *inode/* object to remove */)
 
 	if (!reiser4_inode_get_flag(inode, REISER4_NO_SD)) {
 		reiser4_key sd_key;
+
+		dquot_free_inode(inode);
+		dquot_drop(inode);
 
 		build_sd_key(inode, &sd_key);
 		result =

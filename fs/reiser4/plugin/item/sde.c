@@ -16,6 +16,7 @@
 
 #include <linux/fs.h>		/* for struct inode */
 #include <linux/dcache.h>	/* for struct dentry */
+#include <linux/quotaops.h>
 
 /* ->extract_key() method of simple directory item plugin. */
 int extract_key_de(const coord_t * coord /* coord of item */ ,
@@ -118,7 +119,9 @@ int add_entry_de(struct inode *dir /* directory of item */ ,
 	data.user = 0;
 	data.iplug = item_plugin_by_id(SIMPLE_DIR_ENTRY_ID);
 
-	inode_add_bytes(dir, data.length);
+	/* NOTE-NIKITA quota plugin */
+	if (dquot_alloc_space_nodirty(dir, data.length))
+		return -EDQUOT;
 
 	result = insert_by_coord(coord, &data, &entry->key, lh, 0 /*flags */ );
 	if (result != 0)
@@ -164,7 +167,8 @@ int rem_entry_de(struct inode *dir /* directory of item */ ,
 	result =
 	    kill_node_content(coord, &shadow, NULL, NULL, NULL, NULL, NULL, 0);
 	if (result == 0) {
-		inode_sub_bytes(dir, length);
+		/* NOTE-NIKITA quota plugin */
+		dquot_free_space_nodirty(dir, length);
 	}
 	return result;
 }

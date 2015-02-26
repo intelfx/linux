@@ -46,6 +46,7 @@
 #include <linux/module.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
+#include <linux/quotaops.h>
 #include <linux/security.h>
 #include <linux/reboot.h>
 #include <linux/rcupdate.h>

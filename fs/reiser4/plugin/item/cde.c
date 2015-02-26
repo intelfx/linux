@@ -70,6 +70,7 @@
 
 #include <linux/fs.h>		/* for struct inode */
 #include <linux/dcache.h>	/* for struct dentry */
+#include <linux/quotaops.h>
 
 #if 0
 #define CHECKME(coord)						\
@@ -930,7 +931,9 @@ int add_entry_cde(struct inode *dir /* directory object */ ,
 	result = is_dot_key(&dir_entry->key);
 	data.length = estimate_cde(result ? coord : NULL, &data);
 
-	inode_add_bytes(dir, cde_bytes(result, &data));
+	/* NOTE-NIKITA quota plugin? */
+	if (dquot_alloc_space_nodirty(dir, cde_bytes(result, &data)))
+		return RETERR(-EDQUOT);
 
 	if (result)
 		result = insert_by_coord(coord, &data, &dir_entry->key, lh, 0);
@@ -979,7 +982,8 @@ int rem_entry_cde(struct inode *dir /* directory of item */ ,
 	result =
 	    kill_node_content(coord, &shadow, NULL, NULL, NULL, NULL, NULL, 0);
 	if (result == 0) {
-		inode_sub_bytes(dir, length);
+		/* NOTE-NIKITA quota plugin? */
+		dquot_free_space_nodirty(dir, length);
 	}
 	return result;
 }
