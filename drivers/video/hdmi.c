@@ -31,14 +31,14 @@
 static void hdmi_infoframe_checksum(void *buffer, size_t size)
 {
 	u8 *ptr = buffer;
-	u8 csum = 0;
+	int csum = 0;
 	size_t i;
 
 	/* compute checksum */
 	for (i = 0; i < size; i++)
-		csum += ptr[i];
+		csum -= ptr[i];
 
-	ptr[3] = 256 - csum;
+	ptr[3] = csum;
 }
 
 /**

@@ -1,6 +1,7 @@
 /dts-v1/;
 
 #include "dove.dtsi"
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
 	model = "SolidRun CuBox";
@@ -62,6 +63,41 @@
 		pinctrl-0 = <&pmx_gpio_19>;
 		pinctrl-names = "default";
 	};
+
+	spdif_codec: spdif-codec {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+	};
+
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "Cubox Audio";
+
+		simple-audio-card,dai-link@0 {	/* S/PDIF - HDMI & S/PDIF */
+			format = "i2s";
+			cpu {
+				sound-dai = <&audio1 1>;
+			};
+			codec {
+				sound-dai = <&hdmi 0>, <&spdif_codec>;
+			};
+		};
+
+		simple-audio-card,dai-link@1 {	/* I2S - HDMI */
+			format = "i2s";
+			cpu {
+				sound-dai = <&audio1 0>;
+			};
+			codec {
+				sound-dai = <&hdmi 1>;
+			};
+		};
+	};
+
+	video {
+		compatible = "marvell,dove-video";
+		marvell,video-devices = <&lcd0>;
+	};
 };
 
 &uart0 { status = "okay"; };
@@ -107,6 +143,25 @@
 			silabs,pll-master;
 		};
 	};
+
+	hdmi: hdmi-encoder {
+		compatible = "nxp,tda998x";
+		reg = <0x70>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <27 IRQ_TYPE_EDGE_FALLING>;
+		pinctrl-0 = <&pmx_camera>;
+		pinctrl-names = "default";
+
+		audio-ports = <0x04>, <0x03>;
+		audio-port-names = "spdif", "i2s";
+		#sound-dai-cells = <1>;
+
+		port {
+			hdmi_0: endpoint@0 {
+				remote-endpoint = <&lcd0_0>;
+			};
+		};
+	};
 };
 
 &sdio0 {
@@ -130,4 +185,16 @@
 	clock-names = "internal", "extclk";
 	pinctrl-0 = <&pmx_audio1_i2s1_spdifo &pmx_audio1_extclk>;
 	pinctrl-names = "default";
+	#sound-dai-cells = <1>;
+};
+
+&lcd0 {
+	status = "okay";
+	clocks = <&si5351 0>;
+	clock-names = "ext_ref_clk1";
+	port {
+		lcd0_0: endpoint@0 {
+			remote-endpoint = <&hdmi_0>;
+		};
+	};
 };

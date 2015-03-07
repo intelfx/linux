@@ -65,7 +65,8 @@ properties should also be placed in the codec node if needed.
 
 Required CPU/CODEC subnodes properties:
 
-- sound-dai				: phandle and port of CPU/CODEC
+- sound-dai				: phandle and port of CPU
+					  or list of phandle and port of CODECs
 
 Optional CPU/CODEC subnodes properties:
 
@@ -150,6 +151,22 @@ sound {
 		};
 		codec {
 			sound-dai = <&spdif_codec>;
+		};
+	};
+};
+
+Example 3 - many CODECs
+
+sound {
+	compatible = "simple-audio-card";
+	simple-audio-card,name = "Cubox Simple Audio";
+
+	simple-audio-card,dai-link {		/* S/PDIF - HDMI & S/PDIF */
+		cpu {
+			sound-dai = <&audio1 1>;
+		};
+		codec {
+			sound-dai = <&tda998x 1>, <&spdif_codec>;
 		};
 	};
 };
