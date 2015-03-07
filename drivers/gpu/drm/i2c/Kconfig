@@ -28,6 +28,8 @@ config DRM_I2C_SIL164
 config DRM_I2C_NXP_TDA998X
 	tristate "NXP Semiconductors TDA998X HDMI encoder"
 	default m if DRM_TILCDC
+	select SND_SOC_HDMI_CODEC
+	select HDMI_CEC_CORE
 	help
 	  Support for NXP Semiconductors TDA998X HDMI encoders.
 

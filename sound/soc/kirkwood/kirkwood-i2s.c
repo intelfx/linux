@@ -44,6 +44,8 @@ static int kirkwood_i2s_set_fmt(struct snd_soc_dai *cpu_dai,
 	unsigned long mask;
 	unsigned long value;
 
+//test
+pr_info("kirkwood %s set fmt %04x\n", cpu_dai->name, fmt);
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_RIGHT_J:
 		mask = KIRKWOOD_I2S_CTL_RJ;
@@ -144,6 +146,11 @@ static int kirkwood_i2s_hw_params(struct snd_pcm_substream *substream,
 	uint32_t ctl_play, ctl_rec;
 	unsigned int i2s_reg;
 	unsigned long i2s_value;
+
+//test:trace
+pr_info("kirkwood audio hw %s sub %p %p fmt %d rate %d\n",
+ dai->name, priv->substream_play, substream,
+ params_format(params), params_rate(params));
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		i2s_reg = KIRKWOOD_I2S_PLAYCTL;
@@ -279,6 +286,7 @@ static int kirkwood_i2s_play_trigger(struct snd_pcm_substream *substream,
 		}
 
 		/* enable playback */
+//test: black screen stays black when no start (and no irq)
 		writel(ctl, priv->io + KIRKWOOD_PLAYCTL);
 		break;
 
@@ -392,8 +400,6 @@ static int kirkwood_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 		return kirkwood_i2s_play_trigger(substream, cmd, dai);
 	else
 		return kirkwood_i2s_rec_trigger(substream, cmd, dai);
-
-	return 0;
 }
 
 static int kirkwood_i2s_init(struct kirkwood_dma_data *priv)
@@ -404,6 +410,8 @@ static int kirkwood_i2s_init(struct kirkwood_dma_data *priv)
 	/* put system in a "safe" state : */
 	/* disable audio interrupts */
 	writel(0xffffffff, priv->io + KIRKWOOD_INT_CAUSE);
+//test black screen
+	writel(0x0000007f, priv->io + KIRKWOOD_ERR_CAUSE);
 	writel(0, priv->io + KIRKWOOD_INT_MASK);
 
 	reg_data = readl(priv->io + 0x1200);

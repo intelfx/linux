@@ -11,6 +11,8 @@
 		gpio0 = &gpio0;
 		gpio1 = &gpio1;
 		gpio2 = &gpio2;
+		lcd0 = &lcd0;
+		lcd1 = &lcd1;
 	};
 
 	cpus {
@@ -631,17 +633,35 @@
 				ngpios = <8>;
 			};
 
+			corepll: fixed-clock {
+				compatible = "fixed-clock";
+				#clock-cells = <0>;
+				clock-frequency = <400000000>;
+			};
+
 			lcd1: lcd-controller@810000 {
 				compatible = "marvell,dove-lcd";
-				reg = <0x810000 0x1000>;
+				reg = <0x810000 0x1c8>;
 				interrupts = <46>;
+				clocks = <&corepll>;
+				clock-names = "plldivider";
 				status = "disabled";
 			};
 
 			lcd0: lcd-controller@820000 {
 				compatible = "marvell,dove-lcd";
-				reg = <0x820000 0x1000>;
+				reg = <0x820000 0x1c8>;
 				interrupts = <47>;
+				clocks = <&corepll>;
+				clock-names = "plldivider";
+				status = "disabled";
+			};
+
+			/* display controller and image rotation engine */
+			dcon: display-controller@830000 {
+				compatible = "marvell,dove-dcon";
+				reg = <0x830000 0xc4>, <0x831000 0x8c>;
+				interrupts = <45>;
 				status = "disabled";
 			};
 		};
