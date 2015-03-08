@@ -230,7 +230,7 @@ static int dove_pm_suspend(struct device *dev)
 	struct dove_lcd *dove_lcd;
 	int i;
 
-	drm_kms_helper_poll_disable(&dove_drm->drm);
+	drm_kms_helper_poll_disable(dove_drm->drm);
 	for (i = 0; i < MAX_DOVE_LCD; i++) {
 		dove_lcd = dove_drm->lcds[i];
 		if (dove_lcd)
@@ -251,7 +251,7 @@ static int dove_pm_resume(struct device *dev)
 		 && dove_lcd->dpms == DRM_MODE_DPMS_ON)
 			dove_crtc_start(dove_lcd);
 	}
-	drm_kms_helper_poll_enable(&dove_drm->drm);
+	drm_kms_helper_poll_enable(dove_drm->drm);
 	return 0;
 }
 #endif
