@@ -545,6 +545,10 @@ ssize_t reiser4_write_dispatch(struct file *file, const char __user *buf,
 	result = generic_write_checks(&iocb, &iter);
 	if (unlikely(result <= 0))
 		goto exit;
+
+	/* HACK: iocb.ki_pos may be changed by generic_write_checks() in case of an O_APPEND (IOCB_APPEND) file */
+	*off = iocb.ki_pos;
+
 	/**
 	 * First step.
 	 * Start write with initial file plugin.
