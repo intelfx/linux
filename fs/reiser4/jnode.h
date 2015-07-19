@@ -245,9 +245,6 @@ typedef enum {
 	/* write is in progress */
 	JNODE_WRITEBACK = 18,
 
-	/* FIXME: now it is used by crypto-compress plugin only */
-	JNODE_NEW = 19,
-
 	/* delimiting keys are already set for this znode. */
 	JNODE_DKSET = 20,
 
@@ -260,6 +257,13 @@ typedef enum {
 	JNODE_REPACK = 23,
 	/* node should be converted by flush in squalloc phase */
 	JNODE_CONVERTIBLE = 24,
+	/*
+	 * The following 2 flags implement an "economical counter" which is
+	 * used to indicate possible races when punching holes).
+	 * Just don't want to add an additional field to struct jnode.
+	 */
+	JNODE_USED_1 = 25, /* only one user checked in modifications */
+	JNODE_USED_2_AND_MORE = 26, /* two or more users checked in */
 	/*
 	 * When jnode is dirtied for the first time in given transaction,
 	 * do_jnode_make_dirty() checks whether this jnode can possible became
@@ -333,6 +337,30 @@ static inline void spin_unlock_jnode(jnode *node)
 static inline int jnode_is_in_deleteset(const jnode * node)
 {
 	return JF_ISSET(node, JNODE_RELOC);
+}
+
+/*
+ * operations with "modulated" economical counter, which is represented
+ * by two jnode flags: JNODE_USED_1 and JNODE_USED_2_AND_MORE
+ */
+static inline void jnode_inc_ucnt(jnode *node)
+{
+	if (JF_TEST_AND_SET(node, JNODE_USED_1))
+		JF_SET(node, JNODE_USED_2_AND_MORE);
+}
+
+static inline void jnode_clr_ucnt(jnode *node)
+{
+	JF_CLR(node, JNODE_USED_2_AND_MORE);
+	JF_CLR(node, JNODE_USED_1);
+}
+
+static inline int jnode_get_ucnt(const jnode *node)
+{
+	assert("edward-1644",
+	       ergo(JF_ISSET(node, JNODE_USED_2_AND_MORE),
+		    JF_ISSET(node, JNODE_USED_1)));
+	return JF_ISSET(node, JNODE_USED_2_AND_MORE);
 }
 
 extern int init_jnodes(void);
