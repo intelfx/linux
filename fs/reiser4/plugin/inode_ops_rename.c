@@ -435,7 +435,7 @@ int reiser4_rename2_common(struct inode *old_dir /* directory where @old
 	 * We support:
 	 * - RENAME_NOREPLACE (no-op)
 	 */
-	if (flags & supported_flags != flags)
+	if ((flags & supported_flags) != flags)
 		return RETERR(-EINVAL);
 
 	old_entry = kzalloc(3 * sizeof(*old_entry) + 2 * sizeof(*new_lh) +
