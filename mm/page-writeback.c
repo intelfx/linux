@@ -2514,17 +2514,21 @@ EXPORT_SYMBOL(account_page_redirty);
  */
 int set_page_dirty_notag(struct page *page)
 {
-	struct address_space *mapping = page->mapping;
+	struct mem_cgroup *memcg;
 
+	memcg = mem_cgroup_begin_page_stat(page);
 	if (!TestSetPageDirty(page)) {
+		struct address_space *mapping = page->mapping;
 		unsigned long flags;
 		WARN_ON_ONCE(!PagePrivate(page) && !PageUptodate(page));
 		local_irq_save(flags);
-		account_page_dirtied(page, mapping);
+		account_page_dirtied(page, mapping, memcg);
 		local_irq_restore(flags);
+		mem_cgroup_end_page_stat(memcg);
 		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
 		return 1;
 	}
+	mem_cgroup_end_page_stat(memcg);
 	return 0;
 }
 EXPORT_SYMBOL(set_page_dirty_notag);
