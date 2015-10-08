@@ -782,7 +782,9 @@ static int write_jnodes_to_disk_extent(
 					node_plugin_by_node(JZNODE(cur))->csum(JZNODE(cur), 0);
 				zrelse(JZNODE(cur));
 			}
+
 			ClearPageError(pg);
+			set_page_dirty_notag(pg);
 			set_page_writeback(pg);
 
 			if (get_current_context()->entd) {
