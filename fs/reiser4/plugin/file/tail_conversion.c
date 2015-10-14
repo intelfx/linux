@@ -175,6 +175,7 @@ static int replace(struct inode *inode, struct page **pages, unsigned nr_pages, 
 								i_mapping));
 		if (result)
 			break;
+		set_page_dirty_notag(pages[i]);
 		unlock_page(pages[i]);
 		result = find_or_create_extent(pages[i]);
 		if (result) {
