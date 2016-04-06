@@ -1478,8 +1478,8 @@ static int squeeze_right_twig(znode * left, znode * right, flush_pos_t *pos)
 	 * @left and @right nodes participated in the
 	 * implicit shift, determined by the pair of
 	 * functions:
-	 * . squalloc_extent()
-	 * . squalloc_right_twig_cut()
+	 * . squalloc_extent() - append units to the @left
+	 * . squalloc_right_twig_cut() - cut the units from @right
 	 * so update their delimiting keys
 	 */
 	tree = znode_get_tree(left);
