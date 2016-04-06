@@ -2525,10 +2525,10 @@ EXPORT_SYMBOL(account_page_redirty);
 int set_page_dirty_notag(struct page *page)
 {
 	struct mem_cgroup *memcg;
+	struct address_space *mapping = page->mapping;
 
 	memcg = mem_cgroup_begin_page_stat(page);
 	if (!TestSetPageDirty(page)) {
-		struct address_space *mapping = page->mapping;
 		unsigned long flags;
 		WARN_ON_ONCE(!PagePrivate(page) && !PageUptodate(page));
 		local_irq_save(flags);
