@@ -511,6 +511,25 @@ static inline void done_dispatch_context(struct dispatch_context * cont,
 	}
 }
 
+static inline ssize_t reiser4_write_checks(struct file *file,
+					   const char __user *buf,
+					   size_t count, loff_t *off)
+{
+	ssize_t result;
+	struct iovec iov = { .iov_base = (void __user *)buf, .iov_len = count };
+	struct kiocb iocb;
+	struct iov_iter iter;
+
+	init_sync_kiocb(&iocb, file);
+	iocb.ki_pos = *off;
+	iov_iter_init(&iter, WRITE, &iov, 1, count);
+
+	result = generic_write_checks(&iocb, &iter);
+	/* HACK: iocb.ki_pos may be changed by generic_write_checks() in case of an O_APPEND (IOCB_APPEND) file */
+	*off = iocb.ki_pos;
+	return result;
+}
+
 /*
  * ->write() VFS file operation
  *
@@ -527,14 +546,6 @@ ssize_t reiser4_write_dispatch(struct file *file, const char __user *buf,
 	struct dispatch_context cont;
 	struct inode * inode = file_inode(file);
 
-	struct iovec iov = { .iov_base = (void __user *)buf, .iov_len = count };
-	struct kiocb iocb;
-	struct iov_iter iter;
-
-	init_sync_kiocb(&iocb, file);
-	iocb.ki_pos = *off;
-	iov_iter_init(&iter, WRITE, &iov, 1, count);
-
 	ctx = reiser4_init_context(inode->i_sb);
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
@@ -542,12 +553,9 @@ ssize_t reiser4_write_dispatch(struct file *file, const char __user *buf,
 	init_dispatch_context(&cont);
 	mutex_lock(&inode->i_mutex);
 
-	result = generic_write_checks(&iocb, &iter);
+	result = reiser4_write_checks(file, buf, count, off);
 	if (unlikely(result <= 0))
 		goto exit;
-
-	/* HACK: iocb.ki_pos may be changed by generic_write_checks() in case of an O_APPEND (IOCB_APPEND) file */
-	*off = iocb.ki_pos;
 
 	/**
 	 * First step.
