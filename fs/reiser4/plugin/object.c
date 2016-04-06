@@ -197,7 +197,7 @@ static struct file_operations regular_file_f_ops = {
 	.open = reiser4_open_dispatch,
 	.release = reiser4_release_dispatch,
 	.fsync = reiser4_sync_file_common,
-	.splice_read = generic_file_splice_read
+	.splice_read = generic_file_splice_read,
 };
 static struct address_space_operations regular_file_a_ops = {
 	.writepage = reiser4_writepage,
