@@ -321,7 +321,7 @@ static int try_init_format40(struct super_block *super,
 	       super->s_id,
 	       get_format40_version(sb_copy));
 	if (incomplete_compatibility(sb_copy))
-		printk("reiser4 (%s): format version number (4.0.%u) is "
+		printk("reiser4: %s: format version number (4.0.%u) is "
 		       "greater than release number (4.%u.%u) of reiser4 "
 		       "kernel module. Some objects of the volume can be "
 		       "inaccessible.\n",
@@ -375,7 +375,7 @@ static int try_init_format40(struct super_block *super,
 	kfree(sb_copy);
 
 	if (update_backup_version(sb_copy))
-		printk("reiser4 (%s): use 'fsck.reiser4 --fix' "
+		printk("reiser4: %s: use 'fsck.reiser4 --fix' "
 		       "to complete disk format upgrade.\n", super->s_id);
 
 	sbinfo->fsuid = 0;
@@ -623,10 +623,10 @@ int version_update_format40(struct super_block *super) {
 	if (get_super_private(super)->version >= get_release_number_minor())
 		return 0;
 
-	printk("reiser4 (%s): upgrading disk format to 4.0.%u.\n",
+	printk("reiser4: %s: upgrading disk format to 4.0.%u.\n",
 	       super->s_id,
 	       get_release_number_minor());
-	printk("reiser4 (%s): use 'fsck.reiser4 --fix' "
+	printk("reiser4: %s: use 'fsck.reiser4 --fix' "
 	       "to complete disk format upgrade.\n", super->s_id);
 
 	/* Mark the uber znode dirty to call log_super on write_logs. */

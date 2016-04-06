@@ -711,7 +711,7 @@ int extent2tail(struct file * file, struct unix_file_info *uf_info)
 		page_cache_release(page);
 
 		drop_exclusive_access(uf_info);
-		/* * throttle the conversion. */
+		/* throttle the conversion. */
 		reiser4_throttle_write(inode);
 		get_exclusive_access(uf_info);
 		/*
