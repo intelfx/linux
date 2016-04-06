@@ -3272,13 +3272,13 @@ static int prune_cryptcompress(struct inode *inode,
 	clust.hint = hint;
 
 	/*
-	 * index of the rightmost logical cluster
+	 * index of the leftmost logical cluster
 	 * that will be completely truncated
 	 */
 	from_idx = size_in_lc(new_size, inode);
 	to_idx = size_in_lc(inode->i_size, inode);
 	/*
-	 * truncate all disk clusters starting from @from_idx
+	 * truncate all complete disk clusters starting from @from_idx
 	 */
 	assert("edward-1174", from_idx <= to_idx);
 
@@ -3298,8 +3298,7 @@ static int prune_cryptcompress(struct inode *inode,
 		if (unlikely(result))
 			goto out;
 	}
-	if (!off_to_cloff(new_size, inode)) {
-		assert("edward-1145", inode->i_size == new_size);
+	if (off_to_cloff(new_size, inode) == 0) {
 		goto truncate_hole;
 	}
 	assert("edward-1146", new_size < inode->i_size);
@@ -3307,8 +3306,8 @@ static int prune_cryptcompress(struct inode *inode,
 	to_prune = inode->i_size - new_size;
 	/*
 	 * Partial truncate of the last logical cluster.
-	 * If the last one is not a hole, then it we'll be
-	 * captured and submitted
+	 * Partial hole will be converted to zeros. The resulted
+	 * logical cluster will be captured and submitted to disk
 	 */
 	result = alloc_cluster_pgset(&clust, cluster_nrpages(inode));
 	if (result)
