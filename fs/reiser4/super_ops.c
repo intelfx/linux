@@ -6,6 +6,7 @@
 #include "ktxnmgrd.h"
 #include "flush.h"
 #include "safe_link.h"
+#include "checksum.h"
 
 #include <linux/vfs.h>
 #include <linux/writeback.h>
@@ -249,6 +250,7 @@ static void reiser4_put_super(struct super_block *super)
 		get_super_private(super)->df_plug->release(super);
 
 	reiser4_done_formatted_fake(super);
+	reiser4_done_csum_tfm(sbinfo->csum_tfm);
 
 	/* stop daemons: ktxnmgr and entd */
 	reiser4_done_entd(super);
@@ -514,6 +516,10 @@ static int fill_super(struct super_block *super, void *data, int silent)
 		goto failed_init_sinfo;
 
 	sbinfo = get_super_private(super);
+
+	if ((result = reiser4_init_csum_tfm(&sbinfo->csum_tfm)) != 0)
+		goto failed_init_csum_tfm;
+
 	/* initialize various reiser4 parameters, parse mount options */
 	if ((result = reiser4_init_super_data(super, data)) != 0)
 		goto failed_init_super_data;
@@ -590,6 +596,7 @@ static int fill_super(struct super_block *super, void *data, int silent)
 	reiser4_done_txnmgr(&sbinfo->tmgr);
  failed_init_read_super:
  failed_init_super_data:
+ failed_init_csum_tfm:
 	reiser4_done_fs_info(super);
  failed_init_sinfo:
 	reiser4_exit_context(&ctx);
@@ -639,8 +646,10 @@ static int __init init_reiser4(void)
 	int result;
 
 	printk(KERN_INFO
-	       "Loading Reiser4. "
-	       "See www.namesys.com for a description of Reiser4.\n");
+	       "Loading Reiser4 (format release: 4.%d.%d) "
+	       "See www.namesys.com for a description of Reiser4.\n",
+	       get_release_number_major(),
+	       get_release_number_minor());
 
 	/* initialize slab cache of inodes */
 	if ((result = init_inodes()) != 0)

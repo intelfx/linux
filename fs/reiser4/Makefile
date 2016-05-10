@@ -48,6 +48,7 @@ reiser4-y := \
 		   safe_link.o \
 		   blocknrlist.o \
 		   discard.o \
+		   checksum.o \
            \
 		   plugin/plugin.o \
 		   plugin/plugin_set.o \
@@ -69,6 +70,7 @@ reiser4-y := \
 		   plugin/dir/hashed_dir.o \
 		   plugin/dir/seekable_dir.o \
 		   plugin/node/node40.o \
+		   plugin/node/node41.o \
            \
 		   plugin/crypto/cipher.o \
 		   plugin/crypto/digest.o \

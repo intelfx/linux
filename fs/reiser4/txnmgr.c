@@ -3008,6 +3008,7 @@ void reiser4_uncapture_block(jnode * node)
 	JF_CLR(node, JNODE_CREATED);
 	JF_CLR(node, JNODE_WRITEBACK);
 	JF_CLR(node, JNODE_REPACK);
+	jnode_clr_ucnt(node);
 
 	list_del_init(&node->capture_link);
 	if (JF_ISSET(node, JNODE_FLUSH_QUEUED)) {

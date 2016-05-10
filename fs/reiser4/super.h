@@ -50,10 +50,10 @@ typedef enum {
 	REISER4_DONT_LOAD_BITMAP = 5,
 	/* enforce atomicity during write(2) */
 	REISER4_ATOMIC_WRITE = 6,
-	/* don't use write barriers in the log writer code. */
-	REISER4_NO_WRITE_BARRIER = 7,
 	/* enable issuing of discard requests */
-	REISER4_DISCARD = 8
+	REISER4_DISCARD = 8,
+	/* disable hole punching at flush time */
+	REISER4_DONT_PUNCH_HOLES = 9
 } reiser4_fs_flag;
 
 /*
@@ -273,6 +273,7 @@ struct reiser4_super_info_data {
 	 * more details
 	 */
 	struct d_cursor_info d_info;
+	struct crypto_shash *csum_tfm;
 
 #ifdef CONFIG_REISER4_BADBLOCKS
 	/* Alternative master superblock offset (in bytes) */

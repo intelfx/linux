@@ -175,6 +175,8 @@ static int replace(struct inode *inode, struct page **pages, unsigned nr_pages, 
 								i_mapping));
 		if (result)
 			break;
+		SetPageUptodate(pages[i]);
+		set_page_dirty_notag(pages[i]);
 		unlock_page(pages[i]);
 		result = find_or_create_extent(pages[i]);
 		if (result) {
@@ -188,7 +190,6 @@ static int replace(struct inode *inode, struct page **pages, unsigned nr_pages, 
 				result);
 			break;
 		}
-		SetPageUptodate(pages[i]);
 	}
 	return result;
 }
@@ -710,7 +711,7 @@ int extent2tail(struct file * file, struct unix_file_info *uf_info)
 		page_cache_release(page);
 
 		drop_exclusive_access(uf_info);
-		/* * throttle the conversion. */
+		/* throttle the conversion. */
 		reiser4_throttle_write(inode);
 		get_exclusive_access(uf_info);
 		/*
