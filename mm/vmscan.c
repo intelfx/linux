@@ -2651,7 +2651,10 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
 	unsigned long total_scanned = 0;
 	unsigned long writeback_threshold;
 	bool zones_reclaimable;
+	void *save = current->journal_info; /* save journal info */
+
 retry:
+	current->journal_info = NULL;
 	delayacct_freepages_start();
 
 	if (global_reclaim(sc))
@@ -2693,6 +2696,8 @@ retry:
 	} while (--sc->priority >= 0);
 
 	delayacct_freepages_end();
+	/* restore journal info */
+	current->journal_info = save;
 
 	if (sc->nr_reclaimed)
 		return sc->nr_reclaimed;

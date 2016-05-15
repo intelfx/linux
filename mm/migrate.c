@@ -678,7 +678,7 @@ EXPORT_SYMBOL(buffer_migrate_page);
 /*
  * Writeback a page to clean the dirty state
  */
-static int writeout(struct address_space *mapping, struct page *page)
+int writeout(struct address_space *mapping, struct page *page)
 {
 	struct writeback_control wbc = {
 		.sync_mode = WB_SYNC_NONE,
@@ -715,6 +715,7 @@ static int writeout(struct address_space *mapping, struct page *page)
 
 	return (rc < 0) ? -EIO : -EAGAIN;
 }
+EXPORT_SYMBOL(writeout);
 
 /*
  * Default handling if a filesystem does not provide a migration function.
