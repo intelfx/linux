@@ -551,7 +551,7 @@ ssize_t reiser4_write_dispatch(struct file *file, const char __user *buf,
 		return PTR_ERR(ctx);
 	current->backing_dev_info = inode_to_bdi(inode);
 	init_dispatch_context(&cont);
-	mutex_lock(&inode->i_mutex);
+	inode_lock(inode);
 
 	result = reiser4_write_checks(file, buf, count, off);
 	if (unlikely(result <= 0))
@@ -599,7 +599,7 @@ ssize_t reiser4_write_dispatch(struct file *file, const char __user *buf,
 						      off,
 						      NULL);
  exit:
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 	done_dispatch_context(&cont, inode);
 	current->backing_dev_info = NULL;
 	context_set_commit_async(ctx);
