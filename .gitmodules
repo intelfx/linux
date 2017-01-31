@@ -1,0 +1,3 @@
+[submodule "fs/reiser4"]
+	path = fs/reiser4
+	url = https://github.com/edward6/reiser4
