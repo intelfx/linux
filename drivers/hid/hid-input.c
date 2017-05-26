@@ -1069,6 +1069,16 @@ mapped:
 	if (usage->type == EV_KEY) {
 		set_bit(EV_MSC, input->evbit);
 		set_bit(MSC_SCAN, input->mscbit);
+
+		if (field->logical_minimum > 0) {
+			hid_err(device, "XXX: EV_KEY logical_minimum = %d != 0 - updating\n", field->logical_minimum);
+			field->logical_minimum = 0;
+			if (field->logical_maximum != 1) {
+				hid_err(device, "XXX: EV_KEY logical_maximum = %d != 1 - updating\n", field->logical_maximum);
+				field->logical_maximum = 1;
+			}
+		}
+
 	}
 
 ignore:
