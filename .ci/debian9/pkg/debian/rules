@@ -66,7 +66,7 @@ ifndef BUILD_STAGE1
 endif
 
 DIR_ORIG = ../orig/$(SOURCE)-$(VERSION_UPSTREAM)
-TAR_ORIG_NAME = $(SOURCE)_$(VERSION_UPSTREAM).orig.tar.xz
+TAR_ORIG_NAME = $(SOURCE)_$(VERSION_UPSTREAM).orig.tar
 TAR_ORIG = $(firstword $(wildcard ../$(TAR_ORIG_NAME)) $(wildcard ../orig/$(TAR_ORIG_NAME)))
 
 orig: $(DIR_ORIG)

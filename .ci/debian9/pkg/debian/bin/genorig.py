@@ -34,7 +34,7 @@ class Main(object):
         self.log('Using source name %s, version %s, dfsg %s\n' % (source, version.upstream, self.version_dfsg))
 
         self.orig = '%s-%s' % (source, version.upstream)
-        self.orig_tar = '%s_%s.orig.tar.xz' % (source, version.upstream)
+        self.orig_tar = '%s_%s.orig.tar' % (source, version.upstream)
         self.tag = 'v' + version.linux_upstream_full
 
     def __call__(self):
