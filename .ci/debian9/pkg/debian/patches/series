@@ -111,7 +111,6 @@ bugfix/all/tracing-Use-strlcpy-instead-of-strcpy-in-__trace_fin.patch
 bugfix/all/sunrpc-refactor-svc_set_num_threads.patch
 bugfix/all/nfsv4-fix-callback-server-shutdown.patch
 bugfix/all/nfsv4.x-callback-create-the-callback-service-through.patch
-bugfix/all/mm-fix-new-crash-in-unmapped_area_topdown.patch
 
 # Fix exported symbol versions
 bugfix/ia64/revert-ia64-move-exports-to-definitions.patch
