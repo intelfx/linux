@@ -33,7 +33,12 @@
 #include <linux/of_platform.h>
 
 #include <linux/spi/spi.h>
+#ifdef CONFIG_ARCH_MSM
+#include <asm/mach/flash.h>
+#else
 #include <linux/spi/flash.h>
+#endif
+
 
 /* Flash opcodes. */
 #define	OPCODE_WREN		0x06	/* Write enable */
@@ -168,6 +173,7 @@ static inline int set_4byte(struct m25p *flash, u32 jedec_id, int enable)
 {
 	switch (JEDEC_MFR(jedec_id)) {
 	case CFI_MFR_MACRONIX:
+	case 0xEF /* winbond */:
 		flash->command[0] = enable ? OPCODE_EN4B : OPCODE_EX4B;
 		return spi_write(flash->spi, flash->command, 1);
 	default:
@@ -247,7 +253,7 @@ static int m25p_cmdsz(struct m25p *flash)
  *
  * Returns 0 if successful, non-zero otherwise.
  */
-static int erase_sector(struct m25p *flash, u32 offset)
+static int erase_sector(struct m25p *flash, u32 offset, int len, unsigned char opcode)
 {
 	pr_debug("%s: %s %dKiB at 0x%08x\n", dev_name(&flash->spi->dev),
 			__func__, flash->mtd.erasesize / 1024, offset);
@@ -260,7 +266,7 @@ static int erase_sector(struct m25p *flash, u32 offset)
 	write_enable(flash);
 
 	/* Set up command buffer. */
-	flash->command[0] = flash->erase_opcode;
+	flash->command[0] = opcode;
 	m25p_addr2cmd(flash, offset, flash->command);
 
 	spi_write(flash->spi, flash->command, m25p_cmdsz(flash));
@@ -281,8 +287,10 @@ static int erase_sector(struct m25p *flash, u32 offset)
 static int m25p80_erase(struct mtd_info *mtd, struct erase_info *instr)
 {
 	struct m25p *flash = mtd_to_m25p(mtd);
-	u32 addr,len;
+	u32 addr, sector_size;
+	int len;
 	uint32_t rem;
+	u8 opcode;
 
 	pr_debug("%s: %s at 0x%llx, len %lld\n", dev_name(&flash->spi->dev),
 			__func__, (long long)instr->addr,
@@ -292,7 +300,7 @@ static int m25p80_erase(struct mtd_info *mtd, struct erase_info *instr)
 	if (instr->addr + instr->len > flash->mtd.size)
 		return -EINVAL;
 	div_u64_rem(instr->len, mtd->erasesize, &rem);
-	if (rem)
+	if (rem && instr->len != 4096)
 		return -EINVAL;
 
 	addr = instr->addr;
@@ -315,15 +323,24 @@ static int m25p80_erase(struct mtd_info *mtd, struct erase_info *instr)
 
 	/* "sector"-at-a-time erase */
 	} else {
-		while (len) {
-			if (erase_sector(flash, addr)) {
+		while (len > 0) {
+			if (len >= 65536
+			    && (addr & 0xffff) == 0 // 64k aligned
+			    && flash->erase_opcode == OPCODE_BE_4K) {
+				opcode = OPCODE_SE;
+				sector_size = 65536;
+			} else {
+				opcode = flash->erase_opcode;
+				sector_size = mtd->erasesize;
+			}
+
+			if (erase_sector(flash, addr, len, opcode)) {
 				instr->state = MTD_ERASE_FAILED;
 				mutex_unlock(&flash->lock);
 				return -EIO;
 			}
-
-			addr += mtd->erasesize;
-			len -= mtd->erasesize;
+			addr += sector_size;
+			len -= sector_size;
 		}
 	}
 
@@ -495,6 +512,37 @@ static int m25p80_write(struct mtd_info *mtd, loff_t to, size_t len,
 	mutex_unlock(&flash->lock);
 
 	return 0;
+}
+
+static int m25p80_read_fact(struct mtd_info *mtd, loff_t from, size_t len,
+			    size_t *retlen, u_char *buf)
+{
+	struct m25p *flash = mtd_to_m25p(mtd);
+	int ret;
+
+	mutex_lock(&flash->lock);
+
+	if (from == 0) {
+		/* return nand id */
+		u8 code = OPCODE_RDID;
+		ret = spi_write_then_read(flash->spi, &code, 1, buf, len);
+	}
+	else if (from == 4 && len <= 32) {
+		/* custom read command */
+		char tx[4];
+		memcpy(tx, buf, 4);
+		memset(buf, 0, len);
+		ret = spi_write_then_read(flash->spi, tx, 4, buf, len);
+	} else {
+		printk("m25p80_read_fact ERROR: from (%d) != 4"
+		       " or rx len (%d) > 32\n",
+		       (int)from, len);
+		ret = -EINVAL;
+	}
+
+	mutex_unlock(&flash->lock);
+	*retlen = len;
+	return ret;
 }
 
 static int sst_write(struct mtd_info *mtd, loff_t to, size_t len,
@@ -669,11 +717,15 @@ static const struct spi_device_id m25p_ids[] = {
 	{ "en25p32", INFO(0x1c2016, 0, 64 * 1024,  64, 0) },
 	{ "en25q32b", INFO(0x1c3016, 0, 64 * 1024,  64, 0) },
 	{ "en25p64", INFO(0x1c2017, 0, 64 * 1024, 128, 0) },
+	{ "en25q128", INFO(0x1c7018, 0, 64 * 1024, 256, SECT_4K) },
 
 	/* Intel/Numonyx -- xxxs33b */
 	{ "160s33b",  INFO(0x898911, 0, 64 * 1024,  32, 0) },
 	{ "320s33b",  INFO(0x898912, 0, 64 * 1024,  64, 0) },
 	{ "640s33b",  INFO(0x898913, 0, 64 * 1024, 128, 0) },
+
+	/* ISSI - 4k erase works, but is slower than 64k erase */
+	{ "is25lp128", INFO(0x9d6018, 0, 64 * 1024, 256, SECT_4K) },
 
 	/* Macronix */
 	{ "mx25l4005a",  INFO(0xc22013, 0, 64 * 1024,   8, SECT_4K) },
@@ -692,6 +744,7 @@ static const struct spi_device_id m25p_ids[] = {
 	{ "s25sl004a",  INFO(0x010212,      0,  64 * 1024,   8, 0) },
 	{ "s25sl008a",  INFO(0x010213,      0,  64 * 1024,  16, 0) },
 	{ "s25sl016a",  INFO(0x010214,      0,  64 * 1024,  32, 0) },
+	{ "s25fl116k",  INFO(0x014015,      0,  64 * 1024,  32, 0) },
 	{ "s25sl032a",  INFO(0x010215,      0,  64 * 1024,  64, 0) },
 	{ "s25sl032p",  INFO(0x010215, 0x4d00,  64 * 1024,  64, SECT_4K) },
 	{ "s25sl064a",  INFO(0x010216,      0,  64 * 1024, 128, 0) },
@@ -701,10 +754,11 @@ static const struct spi_device_id m25p_ids[] = {
 	{ "s70fl01gs",  INFO(0x010221, 0x4d00, 256 * 1024, 256, 0) },
 	{ "s25sl12800", INFO(0x012018, 0x0300, 256 * 1024,  64, 0) },
 	{ "s25sl12801", INFO(0x012018, 0x0301,  64 * 1024, 256, 0) },
+	//TODO:JEDEC//{ "s25fl128k",  INFO(0x012018, 0x4018,  64 * 1024, 256, 0) },
 	{ "s25fl129p0", INFO(0x012018, 0x4d00, 256 * 1024,  64, 0) },
 	{ "s25fl129p1", INFO(0x012018, 0x4d01,  64 * 1024, 256, 0) },
 	{ "s25fl016k",  INFO(0xef4015,      0,  64 * 1024,  32, SECT_4K) },
-	{ "s25fl064k",  INFO(0xef4017,      0,  64 * 1024, 128, SECT_4K) },
+//	{ "s25fl064k",  INFO(0xef4017,      0,  64 * 1024, 128, SECT_4K) },
 
 	/* SST -- large erase sizes are "overlays", "sectors" are 4K */
 	{ "sst25vf040b", INFO(0xbf258d, 0, 64 * 1024,  8, SECT_4K) },
@@ -758,7 +812,16 @@ static const struct spi_device_id m25p_ids[] = {
 	{ "w25x32", INFO(0xef3016, 0, 64 * 1024,  64, SECT_4K) },
 	{ "w25q32", INFO(0xef4016, 0, 64 * 1024,  64, SECT_4K) },
 	{ "w25x64", INFO(0xef3017, 0, 64 * 1024, 128, SECT_4K) },
+	{ "w25q16", INFO(0xef7015, 0, 64 * 1024,  32, SECT_4K) },
 	{ "w25q64", INFO(0xef4017, 0, 64 * 1024, 128, SECT_4K) },
+	{ "w25q64fw", INFO(0xef6017, 0, 64 * 1024, 128, SECT_4K) },
+	{ "w25q128fw", INFO(0xef6018, 0, 64 * 1024, 256, SECT_4K) },
+	{ "w25q128jv", INFO(0xef7018, 0, 64 * 1024, 256, SECT_4K) },
+	{ "w25q128", INFO(0xef4018, 0, 64 * 1024, 256, SECT_4K) },
+	{ "w25q256", INFO(0xef4019, 0, 64 * 1024, 512, SECT_4K) },
+
+	/* Micron */
+	{ "n25q128a", INFO(0x20ba18, 0, 64 * 1024, 256, 0) },
 
 	/* Catalyst / On Semiconductor -- non-JEDEC */
 	{ "cat25c11", CAT25_INFO(  16, 8, 16, 1) },
@@ -910,6 +973,7 @@ static int __devinit m25p_probe(struct spi_device *spi)
 	flash->mtd.size = info->sector_size * info->n_sectors;
 	flash->mtd.erase = m25p80_erase;
 	flash->mtd.read = m25p80_read;
+	flash->mtd.read_fact_prot_reg = m25p80_read_fact;
 
 	/* sst flash chips use AAI word program */
 	if (JEDEC_MFR(info->jedec_id) == CFI_MFR_SST)
@@ -938,7 +1002,7 @@ static int __devinit m25p_probe(struct spi_device *spi)
 		flash->addr_width = info->addr_width;
 	else {
 		/* enable 4-byte addressing if the device exceeds 16MiB */
-		if (flash->mtd.size > 0x1000000) {
+		if (flash->mtd.size > 0x1000000 && data && data->use_4b_cmd) {
 			flash->addr_width = 4;
 			set_4byte(flash, info->jedec_id, 1);
 		} else

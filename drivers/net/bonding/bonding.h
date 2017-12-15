@@ -15,12 +15,16 @@
 #ifndef _LINUX_BONDING_H
 #define _LINUX_BONDING_H
 
+#undef CONFIG_IPV6
+#undef CONFIG_IPV6_MODULE
+
 #include <linux/timer.h>
 #include <linux/proc_fs.h>
 #include <linux/if_bonding.h>
 #include <linux/cpumask.h>
 #include <linux/in6.h>
 #include <linux/netpoll.h>
+#include <linux/etherdevice.h>
 #include "bond_3ad.h"
 #include "bond_alb.h"
 
@@ -248,6 +252,9 @@ struct bonding {
 	/* debugging suport via debugfs */
 	struct	 dentry *debug_dir;
 #endif /* CONFIG_DEBUG_FS */
+	struct rtnl_link_stats64 stats_tot;
+	bool stats_last_valid;
+	struct rtnl_link_stats64 stats_last;
 };
 
 static inline bool bond_vlan_used(struct bonding *bond)
@@ -436,6 +443,18 @@ static inline void bond_destroy_proc_dir(struct bond_net *bn)
 }
 #endif
 
+static inline struct slave *bond_slave_has_mac(struct bonding *bond,
+					       const u8 *mac)
+{
+	int i = 0;
+	struct slave *tmp;
+
+	bond_for_each_slave(bond, tmp, i)
+		if (!compare_ether_addr_64bits(mac, tmp->dev->dev_addr))
+			return tmp;
+
+	return NULL;
+}
 
 /* exported from bond_main.c */
 extern int bond_net_id;

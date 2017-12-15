@@ -193,7 +193,7 @@ static grant_ref_t xennet_get_rx_ref(struct netfront_info *np,
 	return ref;
 }
 
-#ifdef CONFIG_SYSFS
+#if 0 /*ifdef CONFIG_SYSFS*/
 static int xennet_sysfs_addif(struct net_device *netdev);
 static void xennet_sysfs_delif(struct net_device *netdev);
 #else /* !CONFIG_SYSFS */
@@ -1307,7 +1307,7 @@ static struct net_device * __devinit xennet_create_dev(struct xenbus_device *dev
 	netif_napi_add(netdev, &np->napi, xennet_poll, 64);
 	netdev->features        = NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
 				  NETIF_F_GSO_ROBUST;
-	netdev->hw_features	= NETIF_F_IP_CSUM | NETIF_F_SG | NETIF_F_TSO;
+	netdev->hw_features	= NETIF_F_IP_CSUM | NETIF_F_SG;// | NETIF_F_TSO;
 
 	/*
          * Assume that all hw features are available for now. This set
@@ -1783,6 +1783,7 @@ static const struct ethtool_ops xennet_ethtool_ops =
 	.get_strings = xennet_get_strings,
 };
 
+#if 0
 #ifdef CONFIG_SYSFS
 static ssize_t show_rxbuf_min(struct device *dev,
 			      struct device_attribute *attr, char *buf)
@@ -1913,6 +1914,7 @@ static void xennet_sysfs_delif(struct net_device *netdev)
 }
 
 #endif /* CONFIG_SYSFS */
+#endif
 
 static const struct xenbus_device_id netfront_ids[] = {
 	{ "vif" },
