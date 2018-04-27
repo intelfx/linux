@@ -49,6 +49,8 @@
 #include "i915_drv.h"
 #include "gvt.h"
 
+#include "vgpu_rom.c"
+
 static const struct intel_gvt_ops *intel_gvt_ops;
 
 /* helper macros copied from vfio-pci */
@@ -929,6 +931,23 @@ static int intel_vgpu_aperture_rw(struct intel_vgpu *vgpu, u64 off,
 	return 0;
 }
 
+static int intel_vgpu_rom_read(struct intel_vgpu *vgpu, uint64_t off,
+		void *buf, unsigned long count)
+{
+	unsigned long len;
+
+	if (off >= gvt_vgpu_rom_bin_len)
+		len = 0;
+	else
+		len = min(count, gvt_vgpu_rom_bin_len - off);
+
+	memcpy(buf, gvt_vgpu_rom_bin + off, len);
+	if (len < count)
+		memset(buf + len, 0, count - len);
+
+	return 0;
+}
+
 static ssize_t intel_vgpu_rw(struct mdev_device *mdev, char *buf,
 			size_t count, loff_t *ppos, bool is_write)
 {
@@ -959,12 +978,16 @@ static ssize_t intel_vgpu_rw(struct mdev_device *mdev, char *buf,
 	case VFIO_PCI_BAR2_REGION_INDEX:
 		ret = intel_vgpu_aperture_rw(vgpu, pos, buf, count, is_write);
 		break;
+	case VFIO_PCI_ROM_REGION_INDEX:
+		if (is_write)
+			return -EINVAL;
+		ret = intel_vgpu_rom_read(vgpu, pos, buf, count);
+		break;
 	case VFIO_PCI_BAR1_REGION_INDEX:
 	case VFIO_PCI_BAR3_REGION_INDEX:
 	case VFIO_PCI_BAR4_REGION_INDEX:
 	case VFIO_PCI_BAR5_REGION_INDEX:
 	case VFIO_PCI_VGA_REGION_INDEX:
-	case VFIO_PCI_ROM_REGION_INDEX:
 		break;
 	default:
 		if (index >= VFIO_PCI_NUM_REGIONS + vgpu->vdev.num_regions)
@@ -1371,6 +1394,11 @@ static long intel_vgpu_ioctl(struct mdev_device *mdev, unsigned int cmd,
 			break;
 
 		case VFIO_PCI_ROM_REGION_INDEX:
+			info.offset = VFIO_PCI_INDEX_TO_OFFSET(info.index);
+			info.size = vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_ROM].size;
+			info.flags = VFIO_REGION_INFO_FLAG_READ;
+			break;
+
 		case VFIO_PCI_VGA_REGION_INDEX:
 			info.offset = VFIO_PCI_INDEX_TO_OFFSET(info.index);
 			info.size = 0;
