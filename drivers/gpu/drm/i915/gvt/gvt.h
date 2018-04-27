@@ -540,6 +540,14 @@ int intel_vgpu_emulate_cfg_read(struct intel_vgpu *vgpu, unsigned int offset,
 int intel_vgpu_emulate_cfg_write(struct intel_vgpu *vgpu, unsigned int offset,
 		void *p_data, unsigned int bytes);
 
+enum {
+	INTEL_GVT_PCI_BAR_GTTMMIO = 0,
+	INTEL_GVT_PCI_BAR_APERTURE,
+	INTEL_GVT_PCI_BAR_PIO,
+	INTEL_GVT_PCI_BAR_ROM,
+	INTEL_GVT_PCI_BAR_MAX,
+};
+
 static inline u64 intel_vgpu_get_bar_gpa(struct intel_vgpu *vgpu, int bar)
 {
 	/* We are 64bit bar. */
