@@ -34,13 +34,6 @@
 #include "i915_drv.h"
 #include "gvt.h"
 
-enum {
-	INTEL_GVT_PCI_BAR_GTTMMIO = 0,
-	INTEL_GVT_PCI_BAR_APERTURE,
-	INTEL_GVT_PCI_BAR_PIO,
-	INTEL_GVT_PCI_BAR_MAX,
-};
-
 /* bitmap for writable bits (RW or RW1C bits, but cannot co-exist in one
  * byte) byte by byte in standard pci configuration space. (not the full
  * 256 bytes.)
@@ -224,9 +217,10 @@ static int emulate_pci_rom_bar_write(struct intel_vgpu *vgpu,
 
 	if ((new & PCI_ROM_ADDRESS_MASK) == PCI_ROM_ADDRESS_MASK)
 		/* We don't have rom, return size of 0. */
-		*pval = 0;
+		*pval = ~(vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_ROM].size - 1);
 	else
 		vgpu_pci_cfg_mem_write(vgpu, offset, p_data, bytes);
+
 	return 0;
 }
 
@@ -404,12 +398,14 @@ void intel_vgpu_init_cfg_space(struct intel_vgpu *vgpu,
 	memset(vgpu_cfg_space(vgpu) + PCI_BASE_ADDRESS_1, 0, 4);
 	memset(vgpu_cfg_space(vgpu) + PCI_BASE_ADDRESS_3, 0, 4);
 	memset(vgpu_cfg_space(vgpu) + PCI_BASE_ADDRESS_4, 0, 8);
+	memset(vgpu_cfg_space(vgpu) + PCI_ROM_ADDRESS, 0, 4);
 	memset(vgpu_cfg_space(vgpu) + INTEL_GVT_PCI_OPREGION, 0, 4);
 
 	vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_GTTMMIO].size =
 		pci_resource_len(gvt->gt->i915->drm.pdev, 0);
 	vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_APERTURE].size =
 		pci_resource_len(gvt->gt->i915->drm.pdev, 2);
+	vgpu->cfg_space.bar[INTEL_GVT_PCI_BAR_ROM].size = 32*1024;
 
 	memset(vgpu_cfg_space(vgpu) + PCI_ROM_ADDRESS, 0, 4);
 
