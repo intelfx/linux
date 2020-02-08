@@ -222,6 +222,7 @@ iwl_parse_nvm_sections(struct iwl_mvm *mvm)
 	const __le16 *sw, *calib, *regulatory, *mac_override, *phy_sku;
 	u8 tx_ant = mvm->fw->valid_tx_ant;
 	u8 rx_ant = mvm->fw->valid_rx_ant;
+	bool lar_enabled;
 	int regulatory_type;
 
 	/* Checking for required sections */
@@ -278,9 +279,13 @@ iwl_parse_nvm_sections(struct iwl_mvm *mvm)
 	if (mvm->set_rx_ant)
 		rx_ant &= mvm->set_rx_ant;
 
+	lar_enabled = !iwlwifi_mod_params.lar_disable &&
+		      fw_has_capa(&mvm->fw->ucode_capa,
+				  IWL_UCODE_TLV_CAPA_LAR_SUPPORT);
+
 	return iwl_parse_nvm_data(mvm->trans, mvm->cfg, mvm->fw, hw, sw, calib,
 				  regulatory, mac_override, phy_sku,
-				  tx_ant, rx_ant);
+				  tx_ant, rx_ant, lar_enabled);
 }
 
 /* Loads the NVM data stored in mvm->nvm_sections into the NIC */
