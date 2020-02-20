@@ -13,6 +13,7 @@
 #include <crypto/chacha.h>
 #include <crypto/hash.h>
 #include <crypto/poly1305.h>
+#include <crypto/skcipher.h>
 #include <keys/user-type.h>
 
 static u64 bch2_checksum_init(unsigned type)
