@@ -5052,6 +5052,13 @@ static void quirk_intel_no_flr(struct pci_dev *dev)
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1502, quirk_intel_no_flr);
 DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1503, quirk_intel_no_flr);
 
+// USB controller [0c03]: Advanced Micro Devices, Inc. [AMD] Matisse USB 3.0 Host Controller [1022:149c]
+DECLARE_PCI_FIXUP_EARLY(0x1022, 0x149c, quirk_intel_no_flr);
+// Audio device [0403]: Advanced Micro Devices, Inc. [AMD] Starship/Matisse HD Audio Controller [1022:1487]
+DECLARE_PCI_FIXUP_EARLY(0x1022, 0x1487, quirk_intel_no_flr);
+// Encryption controller [1080]: Advanced Micro Devices, Inc. [AMD] Starship/Matisse Cryptographic Coprocessor PSPCPP [1022:1486]
+DECLARE_PCI_FIXUP_EARLY(0x1022, 0x1486, quirk_intel_no_flr);
+
 static void quirk_no_ext_tags(struct pci_dev *pdev)
 {
 	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
