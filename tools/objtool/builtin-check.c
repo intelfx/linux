@@ -41,7 +41,7 @@ const struct option check_options[] = {
 
 int cmd_check(int argc, const char **argv)
 {
-	const char *objname, *s;
+	const char *objname;
 
 	argc = parse_options(argc, argv, check_options, check_usage, 0);
 
@@ -49,10 +49,6 @@ int cmd_check(int argc, const char **argv)
 		usage_with_options(check_usage, check_options);
 
 	objname = argv[0];
-
-	s = strstr(objname, "vmlinux.o");
-	if (s && !s[9])
-		vmlinux = true;
 
 	return check(objname, false);
 }
