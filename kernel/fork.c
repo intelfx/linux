@@ -95,6 +95,7 @@
 #include <linux/stackleak.h>
 #include <linux/kasan.h>
 #include <linux/scs.h>
+#include <linux/user_namespace.h>
 
 #ifdef CONFIG_USER_NS
 #include <linux/user_namespace.h>
