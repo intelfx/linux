@@ -574,7 +574,7 @@ applications. Unset this tunable if you need/want to control weights.
     Scheduler", Proceedings of the First Workshop on Mobile System
     Technologies (MST-2015), May 2015.
 
-    http://algogroup.unimore.it/people/paolo/disk_sched/mst-2015.pdf
+    https://algogroup.unimore.it/people/paolo/disk_sched/mst-2015.pdf
 
 [2]
     P. Valente and M. Andreolini, "Improving Application
@@ -584,7 +584,7 @@ applications. Unset this tunable if you need/want to control weights.
 
     Slightly extended version:
 
-    http://algogroup.unimore.it/people/paolo/disk_sched/bfq-v1-suite-results.pdf
+    https://algogroup.unimore.it/people/paolo/disk_sched/bfq-v1-suite-results.pdf
 
 [3]
    https://github.com/Algodev-github/S

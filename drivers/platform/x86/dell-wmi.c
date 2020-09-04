@@ -173,6 +173,11 @@ static const struct key_entry dell_wmi_keymap_type_0000[] = {
 	/* Dell Support Center key */
 	{ KE_IGNORE, 0xe06e, { KEY_RESERVED } },
 
+	/* Dell Vostro 3360 multimedia keys with mangled DSDT */
+	{ KE_KEY,    0xe0f1, { KEY_PROG1 } },
+	{ KE_KEY,    0xe0f2, { KEY_PROG2 } },
+	{ KE_KEY,    0xe0f3, { KEY_PROG3 } },
+
 	{ KE_IGNORE, 0xe0f7, { KEY_MUTE } },
 	{ KE_IGNORE, 0xe0f8, { KEY_VOLUMEDOWN } },
 	{ KE_IGNORE, 0xe0f9, { KEY_VOLUMEUP } },
