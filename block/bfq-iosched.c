@@ -99,19 +99,19 @@
  * [1] P. Valente, A. Avanzini, "Evolution of the BFQ Storage I/O
  *     Scheduler", Proceedings of the First Workshop on Mobile System
  *     Technologies (MST-2015), May 2015.
- *     http://algogroup.unimore.it/people/paolo/disk_sched/mst-2015.pdf
+ *     https://algogroup.unimore.it/people/paolo/disk_sched/mst-2015.pdf
  *
  * [2] Jon C.R. Bennett and H. Zhang, "Hierarchical Packet Fair Queueing
  *     Algorithms", IEEE/ACM Transactions on Networking, 5(5):675-689,
  *     Oct 1997.
  *
- * http://www.cs.cmu.edu/~hzhang/papers/TON-97-Oct.ps.gz
+ * https://www.cs.cmu.edu/~hzhang/papers/TON-97-Oct.ps.gz
  *
  * [3] I. Stoica and H. Abdel-Wahab, "Earliest Eligible Virtual Deadline
  *     First: A Flexible and Accurate Mechanism for Proportional Share
  *     Resource Allocation", technical report.
  *
- * http://www.cs.berkeley.edu/~istoica/papers/eevdf-tr-95.pdf
+ * https://www.cs.berkeley.edu/~istoica/papers/eevdf-tr-95.pdf
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -4714,7 +4714,7 @@ static struct request *__bfq_dispatch_request(struct blk_mq_hw_ctx *hctx)
 	 * some unlucky request wait for as long as the device
 	 * wishes.
 	 *
-	 * Of course, serving one request at at time may cause loss of
+	 * Of course, serving one request at a time may cause loss of
 	 * throughput.
 	 */
 	if (bfqd->strict_guarantees && bfqd->rq_in_driver > 0)
