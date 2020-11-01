@@ -455,7 +455,7 @@ static int create_mcount_loc_sections(struct objtool_file *file)
 	list_for_each_entry(insn, &file->mcount_loc_list, mcount_loc_node)
 		idx++;
 
-	sec = elf_create_section(file->elf, "__mcount_loc", 0, sizeof(unsigned long), idx);
+	sec = elf_create_section(file->elf, "__mcount_loc", sizeof(unsigned long), idx);
 	if (!sec)
 		return -1;
 
@@ -2930,7 +2930,7 @@ int check(const char *_objname, bool orc)
 	}
 
 	if (mcount) {
-		ret = create_mcount_loc_sections(file);
+		ret = create_mcount_loc_sections(&file);
 		if (ret < 0)
 			goto out;
 		warnings += ret;
