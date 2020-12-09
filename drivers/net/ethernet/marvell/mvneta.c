@@ -2640,10 +2640,11 @@ mvneta_tso_put_data(struct net_device *dev, struct mvneta_tx_queue *txq,
 static int mvneta_tx_tso(struct sk_buff *skb, struct net_device *dev,
 			 struct mvneta_tx_queue *txq)
 {
-	int hdr_len, total_len, data_left;
+	int total_len, data_left;
 	int desc_count = 0;
 	struct mvneta_port *pp = netdev_priv(dev);
 	struct tso_t tso;
+	int hdr_len = skb_transport_offset(skb) + tcp_hdrlen(skb);
 	int i;
 
 	/* Count needed descriptors */
@@ -2656,7 +2657,7 @@ static int mvneta_tx_tso(struct sk_buff *skb, struct net_device *dev,
 	}
 
 	/* Initialize the TSO handler, and prepare the first payload */
-	hdr_len = tso_start(skb, &tso);
+	tso_start(skb, &tso);
 
 	total_len = skb->len - hdr_len;
 	while (total_len > 0) {
