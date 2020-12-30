@@ -171,7 +171,7 @@ static umode_t amd_energy_is_visible(const void *_data,
 				     enum hwmon_sensor_types type,
 				     u32 attr, int channel)
 {
-	return 0440;
+	return 0444;
 }
 
 static int energy_accumulator(void *p)
