@@ -63,6 +63,41 @@ config SPARSEMEM_MANUAL
 
 endchoice
 
+config UNEVICTABLE_ACTIVEFILE
+	bool "Keep some active file pages under memory pressure"
+	depends on SYSCTL
+	def_bool y
+	help
+	  Keep some active file pages still mapped under memory pressure to avoid
+	  potential disk thrashing that may occur due to evicting running executables
+	  code.
+
+	  The UNEVICTABLE_ACTIVEFILE_KBYTES_LOW value defines a threshold to activate
+	  file pages eviction throttling. The vm.unevictable_activefile_kbytes_low
+	  sysctl knob is used to change the amount in the runtime (setting it to 0
+	  effectively disables this feature).
+
+	  Recommended value: 524288 for typical desktop workload.
+
+	  The UNEVICTABLE_ACTIVEFILE_KBYTES_MIN value sets the amount of pages to keep
+	  as a hard limit. The vm.unevictable_activefile_kbytes_min sysctl knob is used
+	  to change the amount in the runtime (setting it to 0 effectively disables
+	  this feature).
+
+	  Recommended value: 262144 for typical desktop workload.
+
+	  See also: Documentation/admin-guide/sysctl/vm.rst
+
+config UNEVICTABLE_ACTIVEFILE_KBYTES_LOW
+	int "Default value for vm.unevictable_activefile_kbytes_low"
+	depends on UNEVICTABLE_ACTIVEFILE
+	default "524288"
+
+config UNEVICTABLE_ACTIVEFILE_KBYTES_MIN
+	int "Default value for vm.unevictable_activefile_kbytes_min"
+	depends on UNEVICTABLE_ACTIVEFILE
+	default "262144"
+
 config DISCONTIGMEM
 	def_bool y
 	depends on (!SELECT_MEMORY_MODEL && ARCH_DISCONTIGMEM_ENABLE) || DISCONTIGMEM_MANUAL
