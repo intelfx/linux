@@ -166,6 +166,11 @@ struct scan_control {
 #define prefetchw_prev_lru_page(_page, _base, _field) do { } while (0)
 #endif
 
+#if defined(CONFIG_UNEVICTABLE_ACTIVEFILE)
+extern unsigned long sysctl_unevictable_activefile_kbytes_low;
+extern unsigned long sysctl_unevictable_activefile_kbytes_min;
+#endif
+
 /*
  * From 0 .. 200.  Higher means more swappy.
  */
@@ -2223,6 +2228,10 @@ enum scan_balance {
 	SCAN_FILE,
 };
 
+#if defined(CONFIG_UNEVICTABLE_ACTIVEFILE)
+#define K(x) ((x) << (PAGE_SHIFT - 10))
+#endif
+
 /*
  * Determine how aggressively the anon and file LRU lists should be
  * scanned.  The relative value of each set of LRU lists is determined
@@ -2416,6 +2425,19 @@ out:
 			BUG();
 		}
 
+#if defined(CONFIG_UNEVICTABLE_ACTIVEFILE)
+		if (lru == LRU_ACTIVE_FILE) {
+			unsigned long activefile_kbytes_now = K(global_node_page_state(NR_ACTIVE_FILE));
+			unsigned long low_scan_granularity = SWAP_CLUSTER_MAX >> sc->priority;
+
+			if (activefile_kbytes_now < sysctl_unevictable_activefile_kbytes_low &&
+				activefile_kbytes_now > sysctl_unevictable_activefile_kbytes_min &&
+				scan > low_scan_granularity)
+				scan = low_scan_granularity;
+			else if (activefile_kbytes_now <= sysctl_unevictable_activefile_kbytes_min)
+				scan = 0;
+		}
+#endif
 		nr[lru] = scan;
 	}
 }
