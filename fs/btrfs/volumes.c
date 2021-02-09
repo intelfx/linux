@@ -618,6 +618,35 @@ static int btrfs_free_stale_devices(const char *path,
 }
 
 /*
+ * Checks if after adding the new device the filesystem is going to have mixed
+ * types of devices (non-rotational and rotational).
+ *
+ * @fs_devices:          list of devices
+ * @new_device_rotating: if the new device is rotational
+ *
+ * Returns true if there are mixed types of devices, otherwise returns false.
+ */
+static bool btrfs_check_mixed(struct btrfs_fs_devices *fs_devices,
+			      bool new_device_rotating)
+{
+	struct btrfs_device *device, *prev_device;
+
+	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+		if (prev_device == NULL &&
+		    device->rotating != new_device_rotating)
+			return true;
+		if (prev_device != NULL &&
+		    (device->rotating != prev_device->rotating ||
+		     device->rotating != new_device_rotating))
+			return true;
+
+		prev_device = device;
+	}
+
+	return false;
+}
+
+/*
  * This is only used on mount, and we are protected from competing things
  * messing with our fs_devices by the uuid_mutex, thus we do not need the
  * fs_devices->device_list_mutex here.
@@ -629,6 +658,7 @@ static int btrfs_open_one_device(struct btrfs_fs_devices *fs_devices,
 	struct request_queue *q;
 	struct block_device *bdev;
 	struct btrfs_super_block *disk_super;
+	bool rotating;
 	u64 devid;
 	int ret;
 
@@ -669,8 +699,12 @@ static int btrfs_open_one_device(struct btrfs_fs_devices *fs_devices,
 	}
 
 	q = bdev_get_queue(bdev);
-	if (!blk_queue_nonrot(q))
+	rotating = !blk_queue_nonrot(q);
+	device->rotating = rotating;
+	if (rotating)
 		fs_devices->rotating = true;
+	if (!fs_devices->mixed)
+		fs_devices->mixed = btrfs_check_mixed(fs_devices, rotating);
 
 	device->bdev = bdev;
 	clear_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state);
@@ -2418,6 +2452,7 @@ static int btrfs_prepare_sprout(struct btrfs_fs_info *fs_info)
 	fs_devices->open_devices = 0;
 	fs_devices->missing_devices = 0;
 	fs_devices->rotating = false;
+	fs_devices->mixed = false;
 	list_add(&seed_devices->seed_list, &fs_devices->seed_list);
 
 	generate_random_uuid(fs_devices->fsid);
@@ -2522,6 +2557,7 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 	int seeding_dev = 0;
 	int ret = 0;
 	bool locked = false;
+	bool rotating;
 
 	if (sb_rdonly(sb) && !fs_devices->seeding)
 		return -EROFS;
@@ -2621,8 +2657,12 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 
 	atomic64_add(device->total_bytes, &fs_info->free_chunk_space);
 
-	if (!blk_queue_nonrot(q))
+	rotating = !blk_queue_nonrot(q);
+	device->rotating = rotating;
+	if (rotating)
 		fs_devices->rotating = true;
+	if (!fs_devices->mixed)
+		fs_devices->mixed = btrfs_check_mixed(fs_devices, rotating);
 
 	orig_super_total_bytes = btrfs_super_total_bytes(fs_info->super_copy);
 	btrfs_set_super_total_bytes(fs_info->super_copy,
