@@ -6796,6 +6796,7 @@ struct btrfs_device *btrfs_alloc_device(struct btrfs_fs_info *fs_info,
 		kfree(dev);
 		return ERR_PTR(-ENOMEM);
 	}
+	atomic_set(&dev->last_offset, 0);
 
 	if (devid)
 		tmp = *devid;

@@ -183,6 +183,7 @@ struct btrfs_device {
 
 	/* I/O stats for raid1 mirror selection */
 	struct percpu_counter inflight;
+	atomic_t last_offset;
 };
 
 /*

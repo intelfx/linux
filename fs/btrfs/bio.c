@@ -172,6 +172,8 @@ static void btrfs_clone_write_end_io(struct bio *bio)
 
 static void btrfs_submit_dev_bio(struct btrfs_device *dev, struct bio *bio)
 {
+	u64 physical, length;
+
 	if (!dev || !dev->bdev ||
 	    test_bit(BTRFS_DEV_STATE_MISSING, &dev->dev_state) ||
 	    (btrfs_op(bio) == BTRFS_MAP_WRITE &&
@@ -180,8 +182,12 @@ static void btrfs_submit_dev_bio(struct btrfs_device *dev, struct bio *bio)
 		return;
 	}
 
+	physical = bio->bi_iter.bi_sector << SECTOR_SHIFT;
+	length = bio->bi_iter.bi_size;
+
 	bio_set_dev(bio, dev->bdev);
 	percpu_counter_inc(&dev->inflight);
+	atomic_set(&dev->last_offset, physical + length);
 
 	/*
 	 * For zone append writing, bi_sector must point the beginning of the
