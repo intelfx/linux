@@ -1151,7 +1151,7 @@ static ssize_t btrfs_generation_show(struct kobject *kobj,
 }
 BTRFS_ATTR(, generation, btrfs_generation_show);
 
-static const char * const btrfs_read_policy_name[] = { "pid" };
+static const char * const btrfs_read_policy_name[] = { "pid", "roundrobin" };
 
 static ssize_t btrfs_read_policy_show(struct kobject *kobj,
 				      struct kobj_attribute *a, char *buf)
@@ -1251,8 +1251,99 @@ static const struct attribute *btrfs_attrs[] = {
 	NULL,
 };
 
+static ssize_t btrfs_roundrobin_nonlocal_inc_mixed_only_show(
+	struct kobject *kobj, struct kobj_attribute *a, char *buf)
+{
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 READ_ONCE(fs_devices->roundrobin_nonlocal_inc_mixed_only));
+}
+
+static ssize_t btrfs_roundrobin_nonlocal_inc_mixed_only_store(
+	struct kobject *kobj, struct kobj_attribute *a, const char *buf,
+	size_t len)
+{
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
+	bool val;
+	int ret;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return -EINVAL;
+
+	WRITE_ONCE(fs_devices->roundrobin_nonlocal_inc_mixed_only, val);
+	return len;
+}
+BTRFS_ATTR_RW(read_policies, roundrobin_nonlocal_inc_mixed_only,
+	      btrfs_roundrobin_nonlocal_inc_mixed_only_show,
+	      btrfs_roundrobin_nonlocal_inc_mixed_only_store);
+
+static ssize_t btrfs_roundrobin_nonrot_nonlocal_inc_show(struct kobject *kobj,
+							 struct kobj_attribute *a,
+							 char *buf)
+{
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 READ_ONCE(fs_devices->roundrobin_nonrot_nonlocal_inc));
+}
+
+static ssize_t btrfs_roundrobin_nonrot_nonlocal_inc_store(struct kobject *kobj,
+							  struct kobj_attribute *a,
+							  const char *buf,
+							  size_t len)
+{
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
+	u32 val;
+	int ret;
+
+	ret = kstrtou32(buf, 10, &val);
+	if (ret)
+		return -EINVAL;
+
+	WRITE_ONCE(fs_devices->roundrobin_nonrot_nonlocal_inc, val);
+	return len;
+}
+BTRFS_ATTR_RW(read_policies, roundrobin_nonrot_nonlocal_inc,
+	      btrfs_roundrobin_nonrot_nonlocal_inc_show,
+	      btrfs_roundrobin_nonrot_nonlocal_inc_store);
+
+static ssize_t btrfs_roundrobin_rot_nonlocal_inc_show(struct kobject *kobj,
+						      struct kobj_attribute *a,
+						      char *buf)
+{
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 READ_ONCE(fs_devices->roundrobin_rot_nonlocal_inc));
+}
+
+static ssize_t btrfs_roundrobin_rot_nonlocal_inc_store(struct kobject *kobj,
+						       struct kobj_attribute *a,
+						       const char *buf,
+						       size_t len)
+{
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
+	u32 val;
+	int ret;
+
+	ret = kstrtou32(buf, 10, &val);
+	if (ret)
+		return -EINVAL;
+
+	WRITE_ONCE(fs_devices->roundrobin_rot_nonlocal_inc, val);
+	return len;
+}
+BTRFS_ATTR_RW(read_policies, roundrobin_rot_nonlocal_inc,
+	      btrfs_roundrobin_rot_nonlocal_inc_show,
+	      btrfs_roundrobin_rot_nonlocal_inc_store);
+
 static const struct attribute *read_policies_attrs[] = {
 	BTRFS_ATTR_PTR(read_policies, policy),
+	BTRFS_ATTR_PTR(read_policies, roundrobin_nonlocal_inc_mixed_only),
+	BTRFS_ATTR_PTR(read_policies, roundrobin_nonrot_nonlocal_inc),
+	BTRFS_ATTR_PTR(read_policies, roundrobin_rot_nonlocal_inc),
 	NULL,
 };
 

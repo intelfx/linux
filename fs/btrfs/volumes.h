@@ -293,8 +293,14 @@ enum btrfs_chunk_allocation_policy {
 enum btrfs_read_policy {
 	/* Use process PID to choose the stripe */
 	BTRFS_READ_POLICY_PID,
+	/* Round robin */
+	BTRFS_READ_POLICY_ROUNDROBIN,
 	BTRFS_NR_READ_POLICY,
 };
+
+/* Default raid1 policies config */
+#define BTRFS_DEFAULT_ROUNDROBIN_NONROT_NONLOCAL_INC 0
+#define BTRFS_DEFAULT_ROUNDROBIN_ROT_NONLOCAL_INC 1
 
 struct btrfs_fs_devices {
 	u8 fsid[BTRFS_FSID_SIZE]; /* FS specific uuid */
@@ -382,6 +388,10 @@ struct btrfs_fs_devices {
 
 	/* Policy used to read the mirrored stripes */
 	enum btrfs_read_policy read_policy;
+	/* Policies config */
+	bool roundrobin_nonlocal_inc_mixed_only;
+	u32 roundrobin_nonrot_nonlocal_inc;
+	u32 roundrobin_rot_nonlocal_inc;
 };
 
 #define BTRFS_MAX_DEVS(info) ((BTRFS_MAX_ITEM_SIZE(info)	\

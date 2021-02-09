@@ -1264,6 +1264,11 @@ static int open_fs_devices(struct btrfs_fs_devices *fs_devices,
 	fs_devices->total_rw_bytes = 0;
 	fs_devices->chunk_alloc_policy = BTRFS_CHUNK_ALLOC_REGULAR;
 	fs_devices->read_policy = BTRFS_READ_POLICY_PID;
+	fs_devices->roundrobin_nonlocal_inc_mixed_only = true;
+	fs_devices->roundrobin_nonrot_nonlocal_inc =
+		BTRFS_DEFAULT_ROUNDROBIN_NONROT_NONLOCAL_INC;
+	fs_devices->roundrobin_rot_nonlocal_inc =
+		BTRFS_DEFAULT_ROUNDROBIN_ROT_NONLOCAL_INC;
 
 	return 0;
 }
@@ -5868,8 +5873,125 @@ static u64 stripe_physical(const struct map_lookup *map, u32 stripe_index,
 		stripe_nr * map->stripe_len;
 }
 
+/*
+ * Calculates the load of the given mirror. Load is defines as the number of
+ * inflight requests + potential penalty value.
+ *
+ * @fs_info:       the filesystem
+ * @map:           mapping containing the logical extent
+ * @mirror_index:  number of mirror to check
+ * @stripe_offset: offset of the block in its stripe
+ * @stripe_nr:     index of the stripe whete the block falls in
+ */
+static int mirror_load(struct btrfs_fs_info *fs_info, struct map_lookup *map,
+		       int mirror_index, u64 stripe_offset, u64 stripe_nr)
+{
+	struct btrfs_fs_devices *fs_devices;
+	struct btrfs_device *dev;
+	int last_offset;
+	u64 physical;
+	int load;
+
+	dev = map->stripes[mirror_index].dev;
+	load = percpu_counter_sum(&dev->inflight);
+	last_offset = atomic_read(&dev->last_offset);
+	physical = stripe_physical(map, mirror_index, stripe_offset, stripe_nr);
+
+	fs_devices = fs_info->fs_devices;
+
+	/*
+	 * If the filesystem has mixed type of devices (or we enable adding a
+	 * penalty value regardless) and the request is non-local, add a
+	 * penalty value.
+	 */
+	if ((!fs_devices->roundrobin_nonlocal_inc_mixed_only ||
+	     fs_devices->mixed) && last_offset != physical) {
+		if (dev->rotating)
+			return load + fs_devices->roundrobin_rot_nonlocal_inc;
+		return load + fs_devices->roundrobin_nonrot_nonlocal_inc;
+	}
+
+	return load;
+}
+
+/*
+ * Checks if the given mirror can process more requests.
+ *
+ * @fs_info:       the filesystem
+ * @map:           mapping containing the logical extent
+ * @mirror_index:  index of the mirror to check
+ * @stripe_offset: offset of the block in its stripe
+ * @stripe_nr:     index of the stripe whete the block falls in
+ *
+ * Returns true if more requests can be processes, otherwise returns false.
+ */
+static bool mirror_queue_not_filled(struct btrfs_fs_info *fs_info,
+				    struct map_lookup *map, int mirror_index,
+				    u64 stripe_offset, u64 stripe_nr)
+{
+	struct block_device *bdev;
+	unsigned int queue_depth;
+	int inflight;
+
+	bdev = map->stripes[mirror_index].dev->bdev;
+	inflight = mirror_load(fs_info, map, mirror_index, stripe_offset,
+			       stripe_nr);
+	queue_depth = blk_queue_depth(bdev->bd_disk->queue);
+
+	return inflight < queue_depth;
+}
+
+/*
+ * Find a mirror using the round-robin technique which has lower load than
+ * queue depth. Load is defined as the number of inflight requests + potential
+ * penalty value.
+ *
+ * @fs_info:       the filesystem
+ * @map:           mapping containing the logical extent
+ * @first:         index of the first device in the stripes array
+ * @num_stripes:   number of stripes in the stripes array
+ * @stripe_offset: offset of the block in its stripe
+ * @stripe_nr:     index of the stripe whete the block falls in
+ *
+ * Returns the index of selected mirror.
+ */
+static int find_live_mirror_roundrobin(struct btrfs_fs_info *fs_info,
+				       struct map_lookup *map, int first,
+				       int num_stripes, u64 stripe_offset,
+				       u64 stripe_nr)
+{
+	int preferred_mirror;
+	int last_mirror;
+	int i;
+
+	last_mirror = this_cpu_read(*fs_info->last_mirror);
+
+	for (i = last_mirror; i < first + num_stripes; i++) {
+		if (mirror_queue_not_filled(fs_info, map, i, stripe_offset,
+					    stripe_nr)) {
+			preferred_mirror = i;
+			goto out;
+		}
+	}
+
+	for (i = first; i < last_mirror; i++) {
+		if (mirror_queue_not_filled(fs_info, map, i, stripe_offset,
+					    stripe_nr)) {
+			preferred_mirror = i;
+			goto out;
+		}
+	}
+
+	preferred_mirror = last_mirror;
+
+out:
+	this_cpu_write(*fs_info->last_mirror, preferred_mirror);
+	return preferred_mirror;
+}
+
 static int find_live_mirror(struct btrfs_fs_info *fs_info,
 			    struct map_lookup *map, int first,
+			    u64 stripe_offset, u64 stripe_nr,
 			    int dev_replace_is_ongoing)
 {
 	int i;
@@ -5896,6 +6018,11 @@ static int find_live_mirror(struct btrfs_fs_info *fs_info,
 		fallthrough;
 	case BTRFS_READ_POLICY_PID:
 		preferred_mirror = first + (current->pid % num_stripes);
+		break;
+	case BTRFS_READ_POLICY_ROUNDROBIN:
+		preferred_mirror = find_live_mirror_roundrobin(
+			fs_info, map, first, num_stripes, stripe_offset,
+			stripe_nr);
 		break;
 	}
 
@@ -6513,7 +6640,9 @@ int __btrfs_map_block(struct btrfs_fs_info *fs_info, enum btrfs_map_op op,
 			stripe_index = mirror_num - 1;
 		else {
 			stripe_index = find_live_mirror(fs_info, map, 0,
-					    dev_replace_is_ongoing);
+							stripe_offset,
+							stripe_nr,
+							dev_replace_is_ongoing);
 			mirror_num = stripe_index + 1;
 		}
 
@@ -6539,8 +6668,10 @@ int __btrfs_map_block(struct btrfs_fs_info *fs_info, enum btrfs_map_op op,
 		else {
 			int old_stripe_index = stripe_index;
 			stripe_index = find_live_mirror(fs_info, map,
-					      stripe_index,
-					      dev_replace_is_ongoing);
+							stripe_index,
+							stripe_offset,
+							stripe_nr,
+							dev_replace_is_ongoing);
 			mirror_num = stripe_index - old_stripe_index + 1;
 		}
 
