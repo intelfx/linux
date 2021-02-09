@@ -143,6 +143,9 @@ struct btrfs_device {
 	struct completion kobj_unregister;
 	/* For sysfs/FSID/devinfo/devid/ */
 	struct kobject devid_kobj;
+
+	/* I/O stats for raid1 mirror selection */
+	struct percpu_counter inflight;
 };
 
 /*

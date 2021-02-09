@@ -376,6 +376,7 @@ void btrfs_free_device(struct btrfs_device *device)
 	extent_io_tree_release(&device->alloc_state);
 	bio_put(device->flush_bio);
 	btrfs_destroy_dev_zone_info(device);
+	percpu_counter_destroy(&device->inflight);
 	kfree(device);
 }
 
@@ -438,6 +439,11 @@ static struct btrfs_device *__alloc_device(struct btrfs_fs_info *fs_info)
 	INIT_RADIX_TREE(&dev->reada_extents, GFP_NOFS & ~__GFP_DIRECT_RECLAIM);
 	extent_io_tree_init(fs_info, &dev->alloc_state,
 			    IO_TREE_DEVICE_ALLOC_STATE, NULL);
+
+	if (percpu_counter_init(&dev->inflight, 0, GFP_KERNEL)) {
+		kfree(dev);
+		return ERR_PTR(-ENOMEM);
+	}
 
 	return dev;
 }
@@ -6313,6 +6319,7 @@ static inline void btrfs_end_bbio(struct btrfs_bio *bbio, struct bio *bio)
 
 static void btrfs_end_bio(struct bio *bio)
 {
+	struct btrfs_device *dev = btrfs_io_bio(bio)->device;
 	struct btrfs_bio *bbio = bio->bi_private;
 	int is_orig_bio = 0;
 
@@ -6320,8 +6327,6 @@ static void btrfs_end_bio(struct bio *bio)
 		atomic_inc(&bbio->error);
 		if (bio->bi_status == BLK_STS_IOERR ||
 		    bio->bi_status == BLK_STS_TARGET) {
-			struct btrfs_device *dev = btrfs_io_bio(bio)->device;
-
 			ASSERT(dev->bdev);
 			if (bio_op(bio) == REQ_OP_WRITE)
 				btrfs_dev_stat_inc_and_print(dev,
@@ -6339,6 +6344,7 @@ static void btrfs_end_bio(struct bio *bio)
 		is_orig_bio = 1;
 
 	btrfs_bio_counter_dec(bbio->fs_info);
+	percpu_counter_dec(&dev->inflight);
 
 	if (atomic_dec_and_test(&bbio->stripes_pending)) {
 		if (!is_orig_bio) {
@@ -6383,6 +6389,7 @@ static void submit_stripe_bio(struct btrfs_bio *bbio, struct bio *bio,
 	bio_set_dev(bio, dev->bdev);
 
 	btrfs_bio_counter_inc_noblocked(fs_info);
+	percpu_counter_inc(&dev->inflight);
 
 	btrfsic_submit_bio(bio);
 }
