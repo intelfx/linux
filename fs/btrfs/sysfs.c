@@ -1156,7 +1156,7 @@ static const char * const btrfs_read_policy_name[] = { "pid" };
 static ssize_t btrfs_read_policy_show(struct kobject *kobj,
 				      struct kobj_attribute *a, char *buf)
 {
-	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj);
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
 	ssize_t ret = 0;
 	int i;
 
@@ -1180,7 +1180,7 @@ static ssize_t btrfs_read_policy_store(struct kobject *kobj,
 				       struct kobj_attribute *a,
 				       const char *buf, size_t len)
 {
-	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj);
+	struct btrfs_fs_devices *fs_devices = to_fs_devs(kobj->parent);
 	int i;
 
 	for (i = 0; i < BTRFS_NR_READ_POLICY; i++) {
@@ -1197,7 +1197,7 @@ static ssize_t btrfs_read_policy_store(struct kobject *kobj,
 
 	return -EINVAL;
 }
-BTRFS_ATTR_RW(, read_policy, btrfs_read_policy_show, btrfs_read_policy_store);
+BTRFS_ATTR_RW(read_policies, policy, btrfs_read_policy_show, btrfs_read_policy_store);
 
 static ssize_t btrfs_bg_reclaim_threshold_show(struct kobject *kobj,
 					       struct kobj_attribute *a,
@@ -1245,9 +1245,14 @@ static const struct attribute *btrfs_attrs[] = {
 	BTRFS_ATTR_PTR(, checksum),
 	BTRFS_ATTR_PTR(, exclusive_operation),
 	BTRFS_ATTR_PTR(, generation),
-	BTRFS_ATTR_PTR(, read_policy),
+	//BTRFS_ATTR_PTR(, read_policy),
 	BTRFS_ATTR_PTR(, bg_reclaim_threshold),
 	BTRFS_ATTR_PTR(, commit_stats),
+	NULL,
+};
+
+static const struct attribute *read_policies_attrs[] = {
+	BTRFS_ATTR_PTR(read_policies, policy),
 	NULL,
 };
 
@@ -1401,6 +1406,12 @@ void btrfs_sysfs_remove_mounted(struct btrfs_fs_info *fs_info)
 
 	sysfs_remove_link(fsid_kobj, "bdi");
 
+	if (fs_info->fs_devices->read_policies_kobj) {
+		sysfs_remove_files(fs_info->fs_devices->read_policies_kobj,
+				   read_policies_attrs);
+		kobject_del(fs_info->fs_devices->read_policies_kobj);
+		kobject_put(fs_info->fs_devices->read_policies_kobj);
+	}
 	if (fs_info->space_info_kobj) {
 		sysfs_remove_files(fs_info->space_info_kobj, allocation_attrs);
 		kobject_del(fs_info->space_info_kobj);
@@ -2008,6 +2019,19 @@ int btrfs_sysfs_add_mounted(struct btrfs_fs_info *fs_info)
 	}
 
 	error = sysfs_create_files(fs_info->space_info_kobj, allocation_attrs);
+	if (error)
+		goto failure;
+
+	fs_devs->read_policies_kobj = kobject_create_and_add("read_policies",
+							     fsid_kobj);
+
+	if (!fs_devs->read_policies_kobj) {
+		error = -ENOMEM;
+		goto failure;
+	}
+
+	error = sysfs_create_files(fs_devs->read_policies_kobj,
+				   read_policies_attrs);
 	if (error)
 		goto failure;
 
