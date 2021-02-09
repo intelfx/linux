@@ -397,6 +397,7 @@ void btrfs_free_device(struct btrfs_device *device)
 	rcu_string_free(device->name);
 	extent_io_tree_release(&device->alloc_state);
 	btrfs_destroy_dev_zone_info(device);
+	percpu_counter_destroy(&device->inflight);
 	kfree(device);
 }
 
@@ -6790,6 +6791,11 @@ struct btrfs_device *btrfs_alloc_device(struct btrfs_fs_info *fs_info,
 	atomic_set(&dev->dev_stats_ccnt, 0);
 	btrfs_device_data_ordered_init(dev);
 	extent_io_tree_init(fs_info, &dev->alloc_state, IO_TREE_DEVICE_ALLOC_STATE);
+
+	if (percpu_counter_init(&dev->inflight, 0, GFP_KERNEL)) {
+		kfree(dev);
+		return ERR_PTR(-ENOMEM);
+	}
 
 	if (devid)
 		tmp = *devid;

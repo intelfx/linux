@@ -97,11 +97,13 @@ static void btrfs_simple_end_io(struct bio *bio)
 {
 	struct btrfs_fs_info *fs_info = bio->bi_private;
 	struct btrfs_bio *bbio = btrfs_bio(bio);
+	struct btrfs_device *dev = bbio->device;
 
 	btrfs_bio_counter_dec(fs_info);
+	percpu_counter_dec(&dev->inflight);
 
 	if (bio->bi_status)
-		btrfs_log_dev_io_error(bio, bbio->device);
+		btrfs_log_dev_io_error(bio, dev);
 
 	if (bio_op(bio) == REQ_OP_READ) {
 		INIT_WORK(&bbio->end_io_work, btrfs_end_bio_work);
@@ -128,12 +130,14 @@ static void btrfs_orig_write_end_io(struct bio *bio)
 	struct btrfs_io_stripe *stripe = bio->bi_private;
 	struct btrfs_io_context *bioc = stripe->bioc;
 	struct btrfs_bio *bbio = btrfs_bio(bio);
+	struct btrfs_device *dev = stripe->dev;
 
 	btrfs_bio_counter_dec(bioc->fs_info);
+	percpu_counter_dec(&dev->inflight);
 
 	if (bio->bi_status) {
 		atomic_inc(&bioc->error);
-		btrfs_log_dev_io_error(bio, stripe->dev);
+		btrfs_log_dev_io_error(bio, dev);
 	}
 
 	/*
@@ -152,10 +156,13 @@ static void btrfs_orig_write_end_io(struct bio *bio)
 static void btrfs_clone_write_end_io(struct bio *bio)
 {
 	struct btrfs_io_stripe *stripe = bio->bi_private;
+	struct btrfs_device *dev = stripe->dev;
+
+	percpu_counter_dec(&dev->inflight);
 
 	if (bio->bi_status) {
 		atomic_inc(&stripe->bioc->error);
-		btrfs_log_dev_io_error(bio, stripe->dev);
+		btrfs_log_dev_io_error(bio, dev);
 	}
 
 	/* Pass on control to the original bio this one was cloned from */
@@ -174,6 +181,7 @@ static void btrfs_submit_dev_bio(struct btrfs_device *dev, struct bio *bio)
 	}
 
 	bio_set_dev(bio, dev->bdev);
+	percpu_counter_inc(&dev->inflight);
 
 	/*
 	 * For zone append writing, bi_sector must point the beginning of the

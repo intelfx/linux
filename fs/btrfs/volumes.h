@@ -180,6 +180,9 @@ struct btrfs_device {
 
 	/* Bandwidth limit for scrub, in bytes */
 	u64 scrub_speed_max;
+
+	/* I/O stats for raid1 mirror selection */
+	struct percpu_counter inflight;
 };
 
 /*
