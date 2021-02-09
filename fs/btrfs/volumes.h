@@ -184,6 +184,9 @@ struct btrfs_device {
 	/* I/O stats for raid1 mirror selection */
 	struct percpu_counter inflight;
 	atomic_t last_offset;
+
+	/* If the device is rotational */
+	bool rotating;
 };
 
 /*
@@ -362,6 +365,10 @@ struct btrfs_fs_devices {
 	bool rotating;
 	/* Devices support TRIM/discard commands */
 	bool discardable;
+	/* Set when we find or add both nonrot and rot disks in the
+	 * filesystem
+	 */
+	bool mixed;
 
 	struct btrfs_fs_info *fs_info;
 	/* sysfs kobjects */

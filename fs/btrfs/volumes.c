@@ -586,6 +586,28 @@ static int btrfs_free_stale_devices(dev_t devt, struct btrfs_device *skip_device
 }
 
 /*
+ * Checks if after adding the new device the filesystem is going to have mixed
+ * types of devices (non-rotational and rotational).
+ *
+ * @fs_devices:          list of devices
+ * @new_device_rotating: if the new device is rotational
+ *
+ * Returns true if there are mixed types of devices, otherwise returns false.
+ */
+static bool btrfs_check_mixed(struct btrfs_fs_devices *fs_devices,
+			      struct btrfs_device *new_device)
+{
+	struct btrfs_device *device;
+
+	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+		if (device->rotating != new_device->rotating)
+			return true;
+	}
+
+	return false;
+}
+
+/*
  * This is only used on mount, and we are protected from competing things
  * messing with our fs_devices by the uuid_mutex, thus we do not need the
  * fs_devices->device_list_mutex here.
@@ -635,8 +657,12 @@ static int btrfs_open_one_device(struct btrfs_fs_devices *fs_devices,
 			set_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state);
 	}
 
-	if (!bdev_nonrot(bdev))
+	if (!bdev_nonrot(bdev)) {
+		device->rotating = true;
 		fs_devices->rotating = true;
+	}
+	if (btrfs_check_mixed(fs_devices, device))
+		fs_devices->mixed = true;
 
 	if (bdev_max_discard_sectors(bdev))
 		fs_devices->discardable = true;
@@ -2513,6 +2539,7 @@ static void btrfs_setup_sprout(struct btrfs_fs_info *fs_info,
 	fs_devices->open_devices = 0;
 	fs_devices->missing_devices = 0;
 	fs_devices->rotating = false;
+	fs_devices->mixed = false;
 	list_add(&seed_devices->seed_list, &fs_devices->seed_list);
 
 	generate_random_uuid(fs_devices->fsid);
@@ -2719,8 +2746,12 @@ int btrfs_init_new_device(struct btrfs_fs_info *fs_info, const char *device_path
 
 	atomic64_add(device->total_bytes, &fs_info->free_chunk_space);
 
-	if (!bdev_nonrot(bdev))
+	if (!bdev_nonrot(bdev)) {
 		fs_devices->rotating = true;
+		device->rotating = true;
+	}
+	if (btrfs_check_mixed(fs_devices, device))
+		fs_devices->mixed = true;
 
 	orig_super_total_bytes = btrfs_super_total_bytes(fs_info->super_copy);
 	btrfs_set_super_total_bytes(fs_info->super_copy,
