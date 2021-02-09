@@ -444,6 +444,7 @@ static struct btrfs_device *__alloc_device(struct btrfs_fs_info *fs_info)
 		kfree(dev);
 		return ERR_PTR(-ENOMEM);
 	}
+	atomic_set(&dev->last_offset, 0);
 
 	return dev;
 }
@@ -6376,11 +6377,13 @@ static void submit_stripe_bio(struct btrfs_bio *bbio, struct bio *bio,
 			      u64 physical, struct btrfs_device *dev)
 {
 	struct btrfs_fs_info *fs_info = bbio->fs_info;
+	u64 length;
 
 	bio->bi_private = bbio;
 	btrfs_io_bio(bio)->device = dev;
 	bio->bi_end_io = btrfs_end_bio;
 	bio->bi_iter.bi_sector = physical >> 9;
+	length = bio->bi_iter.bi_size;
 	btrfs_debug_in_rcu(fs_info,
 	"btrfs_map_bio: rw %d 0x%x, sector=%llu, dev=%lu (%s id %llu), size=%u",
 		bio_op(bio), bio->bi_opf, bio->bi_iter.bi_sector,
@@ -6390,6 +6393,7 @@ static void submit_stripe_bio(struct btrfs_bio *bbio, struct bio *bio,
 
 	btrfs_bio_counter_inc_noblocked(fs_info);
 	percpu_counter_inc(&dev->inflight);
+	atomic_set(&dev->last_offset, physical + length);
 
 	btrfsic_submit_bio(bio);
 }
