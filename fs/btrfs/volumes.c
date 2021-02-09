@@ -5499,6 +5499,23 @@ int btrfs_is_parity_mirror(struct btrfs_fs_info *fs_info, u64 logical, u64 len)
 	return ret;
 }
 
+/*
+ * Calculates the physical location for the given stripe and I/O geometry.
+ *
+ * @map:           mapping containing the logical extent
+ * @stripe_index:  index of the stripe to make a calculation for
+ * @stripe_offset: offset of the block in its stripe
+ * @stripe_nr:     index of the stripe whete the block falls in
+ *
+ * Returns the physical location.
+ */
+static u64 stripe_physical(struct map_lookup *map, u32 stripe_index,
+			   u64 stripe_offset, u64 stripe_nr)
+{
+	return map->stripes[stripe_index].physical + stripe_offset +
+		stripe_nr * map->stripe_len;
+}
+
 static int find_live_mirror(struct btrfs_fs_info *fs_info,
 			    struct map_lookup *map, int first,
 			    int dev_replace_is_ongoing)
@@ -6224,8 +6241,9 @@ static int __btrfs_map_block(struct btrfs_fs_info *fs_info,
 	}
 
 	for (i = 0; i < num_stripes; i++) {
-		bbio->stripes[i].physical = map->stripes[stripe_index].physical +
-			stripe_offset + stripe_nr * map->stripe_len;
+		bbio->stripes[i].physical = stripe_physical(map, stripe_index,
+							    stripe_offset,
+							    stripe_nr);
 		bbio->stripes[i].dev = map->stripes[stripe_index].dev;
 		stripe_index++;
 	}
