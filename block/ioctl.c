@@ -103,7 +103,8 @@ static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
 	uint64_t range[2];
 	uint64_t start, len;
 	struct request_queue *q = bdev_get_queue(bdev);
-	int err;
+	struct address_space *mapping = bdev->bd_inode->i_mapping;
+
 
 	if (!(mode & FMODE_WRITE))
 		return -EBADF;
@@ -124,11 +125,7 @@ static int blk_ioctl_discard(struct block_device *bdev, fmode_t mode,
 
 	if (start + len > i_size_read(bdev->bd_inode))
 		return -EINVAL;
-
-	err = truncate_bdev_range(bdev, mode, start, start + len - 1);
-	if (err)
-		return err;
-
+	truncate_inode_pages_range(mapping, start, start + len - 1);
 	return blkdev_issue_discard(bdev, start >> 9, len >> 9,
 				    GFP_KERNEL, flags);
 }
@@ -137,8 +134,8 @@ static int blk_ioctl_zeroout(struct block_device *bdev, fmode_t mode,
 		unsigned long arg)
 {
 	uint64_t range[2];
+	struct address_space *mapping;
 	uint64_t start, end, len;
-	int err;
 
 	if (!(mode & FMODE_WRITE))
 		return -EBADF;
@@ -160,9 +157,8 @@ static int blk_ioctl_zeroout(struct block_device *bdev, fmode_t mode,
 		return -EINVAL;
 
 	/* Invalidate the page cache, including dirty pages */
-	err = truncate_bdev_range(bdev, mode, start, end);
-	if (err)
-		return err;
+	mapping = bdev->bd_inode->i_mapping;
+	truncate_inode_pages_range(mapping, start, end);
 
 	return blkdev_issue_zeroout(bdev, start >> 9, len >> 9, GFP_KERNEL,
 			BLKDEV_ZERO_NOUNMAP);
