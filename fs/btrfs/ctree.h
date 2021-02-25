@@ -976,7 +976,7 @@ struct btrfs_fs_info {
 	u64 max_zone_append_size;
 
 	/* Last mirror picked in round-robin selection */
-	int __percpu *last_mirror;
+	atomic_t last_mirror;
 
 #ifdef CONFIG_BTRFS_FS_REF_VERIFY
 	spinlock_t ref_verify_lock;

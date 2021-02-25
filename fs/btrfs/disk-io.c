@@ -1491,7 +1491,6 @@ void btrfs_free_fs_info(struct btrfs_fs_info *fs_info)
 	btrfs_extent_buffer_leak_debug_check(fs_info);
 	kfree(fs_info->super_copy);
 	kfree(fs_info->super_for_commit);
-	free_percpu(fs_info->last_mirror);
 	kvfree(fs_info);
 }
 
@@ -2796,7 +2795,7 @@ void btrfs_init_fs_info(struct btrfs_fs_info *fs_info)
 
 	fs_info->send_in_progress = 0;
 
-	fs_info->last_mirror = __alloc_percpu(sizeof(int), __alignof__(int));
+	atomic_set(&fs_info->last_mirror, 0);
 }
 
 static int init_mount_fs_info(struct btrfs_fs_info *fs_info, struct super_block *sb)

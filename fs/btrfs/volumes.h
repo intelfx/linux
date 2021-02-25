@@ -145,7 +145,7 @@ struct btrfs_device {
 	struct kobject devid_kobj;
 
 	/* I/O stats for raid1 mirror selection */
-	struct percpu_counter inflight;
+	atomic_t inflight;
 	atomic_t last_offset;
 
 	/* If the device is rotational */

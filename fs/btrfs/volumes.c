@@ -376,7 +376,6 @@ void btrfs_free_device(struct btrfs_device *device)
 	extent_io_tree_release(&device->alloc_state);
 	bio_put(device->flush_bio);
 	btrfs_destroy_dev_zone_info(device);
-	percpu_counter_destroy(&device->inflight);
 	kfree(device);
 }
 
@@ -440,10 +439,7 @@ static struct btrfs_device *__alloc_device(struct btrfs_fs_info *fs_info)
 	extent_io_tree_init(fs_info, &dev->alloc_state,
 			    IO_TREE_DEVICE_ALLOC_STATE, NULL);
 
-	if (percpu_counter_init(&dev->inflight, 0, GFP_KERNEL)) {
-		kfree(dev);
-		return ERR_PTR(-ENOMEM);
-	}
+	atomic_set(&dev->inflight, 0);
 	atomic_set(&dev->last_offset, 0);
 
 	return dev;
@@ -5581,7 +5577,7 @@ static int mirror_load(struct btrfs_fs_info *fs_info, struct map_lookup *map,
 	int load;
 
 	dev = map->stripes[mirror_index].dev;
-	load = percpu_counter_sum(&dev->inflight);
+	load = atomic_read(&dev->inflight);
 	last_offset = atomic_read(&dev->last_offset);
 	physical = stripe_physical(map, mirror_index, stripe_offset, stripe_nr);
 
@@ -5650,30 +5646,31 @@ static int find_live_mirror_roundrobin(struct btrfs_fs_info *fs_info,
 {
 	int preferred_mirror;
 	int last_mirror;
+	int min_load = INT_MAX;
 	int i;
 
-	last_mirror = this_cpu_read(*fs_info->last_mirror);
+	last_mirror = atomic_read(&fs_info->last_mirror);
 
-	for (i = last_mirror; i < first + num_stripes; i++) {
-		if (mirror_queue_not_filled(fs_info, map, i, stripe_offset,
-					    stripe_nr)) {
+	/* avoid picking last_mirror in case of a tie */
+	for (i = last_mirror + 1; i < first + num_stripes; ++i) {
+		int load = mirror_load(fs_info, map, i, stripe_offset,
+		                       stripe_nr);
+		if (load < min_load) {
+			min_load = load;
 			preferred_mirror = i;
-			goto out;
 		}
 	}
 
-	for (i = first; i < last_mirror; i++) {
-		if (mirror_queue_not_filled(fs_info, map, i, stripe_offset,
-					    stripe_nr)) {
+	for (i = first; i <= last_mirror; i++) {
+		int load = mirror_load(fs_info, map, i, stripe_offset,
+		                       stripe_nr);
+		if (load < min_load) {
+			min_load = load;
 			preferred_mirror = i;
-			goto out;
 		}
 	}
 
-	preferred_mirror = last_mirror;
-
-out:
-	this_cpu_write(*fs_info->last_mirror, preferred_mirror);
+	atomic_set(&fs_info->last_mirror, preferred_mirror);
 	return preferred_mirror;
 }
 
@@ -6534,7 +6531,7 @@ static void btrfs_end_bio(struct bio *bio)
 		is_orig_bio = 1;
 
 	btrfs_bio_counter_dec(bbio->fs_info);
-	percpu_counter_dec(&dev->inflight);
+	atomic_dec(&dev->inflight);
 
 	if (atomic_dec_and_test(&bbio->stripes_pending)) {
 		if (!is_orig_bio) {
@@ -6581,7 +6578,7 @@ static void submit_stripe_bio(struct btrfs_bio *bbio, struct bio *bio,
 	bio_set_dev(bio, dev->bdev);
 
 	btrfs_bio_counter_inc_noblocked(fs_info);
-	percpu_counter_inc(&dev->inflight);
+	atomic_inc(&dev->inflight);
 	atomic_set(&dev->last_offset, physical + length);
 
 	btrfsic_submit_bio(bio);
