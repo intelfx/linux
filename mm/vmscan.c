@@ -115,6 +115,14 @@ struct scan_control {
 	/* There is easily reclaimable cold cache in the current node */
 	unsigned int cache_trim_mode:1;
 
+#if defined(CONFIG_UNEVICTABLE_FILE)
+	/* The file pages on the current node are low */
+	unsigned int file_is_low:1;
+
+	/* The file pages on the current node are minimal */
+	unsigned int file_is_min:1;
+#endif
+
 	/* The file pages on the current node are dangerously low */
 	unsigned int file_is_tiny:1;
 
@@ -162,6 +170,11 @@ struct scan_control {
 	} while (0)
 #else
 #define prefetchw_prev_lru_page(_page, _base, _field) do { } while (0)
+#endif
+
+#if defined(CONFIG_UNEVICTABLE_FILE)
+extern unsigned long sysctl_unevictable_file_kbytes_low;
+extern unsigned long sysctl_unevictable_file_kbytes_min;
 #endif
 
 /*
@@ -2427,6 +2440,15 @@ out:
 			BUG();
 		}
 
+#if defined(CONFIG_UNEVICTABLE_FILE)
+		if (file && scan) {
+			if (sc->file_is_low)
+				scan = min(scan, SWAP_CLUSTER_MAX >> sc->priority);
+			else if (sc->file_is_min)
+				scan = 0;
+		}
+#endif
+
 		nr[lru] = scan;
 	}
 }
@@ -2673,6 +2695,10 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, NULL)));
 }
 
+#if defined(CONFIG_UNEVICTABLE_FILE)
+#define K(x) ((x) << (PAGE_SHIFT - 10))
+#endif
+
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	struct reclaim_state *reclaim_state = current->reclaim_state;
@@ -2775,6 +2801,13 @@ again:
 			file + free <= total_high_wmark &&
 			!(sc->may_deactivate & DEACTIVATE_ANON) &&
 			anon >> sc->priority;
+
+#if defined(CONFIG_UNEVICTABLE_FILE)
+		sc->file_is_low = K(file) < sysctl_unevictable_file_kbytes_low &&
+				  K(file) > sysctl_unevictable_file_kbytes_min;
+
+		sc->file_is_min = K(file) <= sysctl_unevictable_file_kbytes_min;
+#endif
 	}
 
 	shrink_node_memcgs(pgdat, sc);
