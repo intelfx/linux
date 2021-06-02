@@ -333,8 +333,19 @@ static inline int gtt_get_entry64(void *pt,
 		ret = intel_gvt_read_gpa(vgpu, gpa +
 				(index << info->gtt_entry_size_shift),
 				&e->val64, 8);
-		if (WARN_ON(ret))
+		/*
+		 * We end up in this error case, if we tried to read memory that
+		 * the hypervisor doesn't know about. Trying to continue usually
+		 * results in getting these errors over and over again and
+		 * results in follow-up weirdness in the GVT code. So instead
+		 * just nuke the guest and don't go down this rabbit hole.
+		 */
+		if (WARN_ONCE(ret,
+			      "failed to read from guest %#lx %#lx %#x, entering failsafe mode",
+			      gpa, index, info->gtt_entry_size_shift)) {
+			enter_failsafe_mode(vgpu, GVT_FAILSAFE_GUEST_ERR);
 			return ret;
+		}
 	} else if (!pt) {
 		e->val64 = read_pte64(vgpu->gvt->gt->ggtt, index);
 	} else {
