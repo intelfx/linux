@@ -2422,7 +2422,8 @@ static noinline int btrfs_ioctl_snap_destroy(struct file *file,
 		} else {
 			struct inode *old_dir;
 
-			if (vol_args2->subvolid < BTRFS_FIRST_FREE_OBJECTID) {
+			if (vol_args2->subvolid < BTRFS_FIRST_FREE_OBJECTID ||
+			    vol_args2->subvolid > BTRFS_LAST_FREE_OBJECTID) {
 				ret = -EINVAL;
 				goto out;
 			}
