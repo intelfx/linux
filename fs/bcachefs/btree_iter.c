@@ -2182,13 +2182,17 @@ struct bkey_i *__bch2_btree_trans_peek_updates(struct btree_iter *iter)
 {
 	struct btree_insert_entry *i;
 
-	trans_for_each_update(iter->trans, i)
+	trans_for_each_update(iter->trans, i) {
+		if (i->key_cache_already_flushed)
+			continue;
+
 		if ((cmp_int(iter->btree_id,	i->btree_id) ?:
 		     bpos_cmp(iter->path->pos,	i->k->k.p)) <= 0) {
 			if (iter->btree_id ==	i->btree_id)
 				return i->k;
 			break;
 		}
+	}
 
 	return NULL;
 }
