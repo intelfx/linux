@@ -652,6 +652,8 @@ err_locked:
 	/* Try to cannibalize another cached btree node: */
 	if (bc->alloc_lock == current) {
 		b2 = btree_node_cannibalize(c);
+		bch2_btree_node_hash_remove(bc, b2);
+
 		if (b) {
 			swap(b->data, b2->data);
 			swap(b->aux_data, b2->aux_data);
@@ -664,8 +666,6 @@ err_locked:
 		}
 
 		mutex_unlock(&bc->lock);
-
-		bch2_btree_node_hash_remove(bc, b);
 
 		trace_btree_node_cannibalize(c);
 		goto out;
