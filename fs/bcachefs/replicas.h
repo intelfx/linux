@@ -6,9 +6,9 @@
 #include "replicas_types.h"
 
 void bch2_replicas_entry_sort(struct bch_replicas_entry *);
-void bch2_replicas_entry_to_text(struct bch_printbuf *,
+void bch2_replicas_entry_to_text(struct printbuf *,
 				 struct bch_replicas_entry *);
-void bch2_cpu_replicas_to_text(struct bch_printbuf *, struct bch_replicas_cpu *);
+void bch2_cpu_replicas_to_text(struct printbuf *, struct bch_replicas_cpu *);
 
 static inline struct bch_replicas_entry *
 cpu_replicas_entry(struct bch_replicas_cpu *r, unsigned i)

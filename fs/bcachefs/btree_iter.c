@@ -590,9 +590,9 @@ static void bch2_btree_path_verify_level(struct btree_trans *trans,
 	struct btree_node_iter tmp;
 	bool locked;
 	struct bkey_packed *p, *k;
-	struct bch_printbuf buf1 = BCH_PRINTBUF;
-	struct bch_printbuf buf2 = BCH_PRINTBUF;
-	struct bch_printbuf buf3 = BCH_PRINTBUF;
+	struct printbuf buf1 = PRINTBUF;
+	struct printbuf buf2 = PRINTBUF;
+	struct printbuf buf3 = PRINTBUF;
 	const char *msg;
 
 	if (!bch2_debug_check_iterators)
@@ -646,14 +646,14 @@ err:
 		struct bkey uk = bkey_unpack_key(l->b, p);
 		bch2_bkey_to_text(&buf2, &uk);
 	} else {
-		pr_buf(&buf2, "(none)");
+		prt_printf(&buf2, "(none)");
 	}
 
 	if (k) {
 		struct bkey uk = bkey_unpack_key(l->b, k);
 		bch2_bkey_to_text(&buf3, &uk);
 	} else {
-		pr_buf(&buf3, "(none)");
+		prt_printf(&buf3, "(none)");
 	}
 
 	panic("path should be %s key at level %u:\n"
@@ -758,7 +758,7 @@ static int bch2_btree_iter_verify_ret(struct btree_iter *iter, struct bkey_s_c k
 	if (!bkey_cmp(prev.k->p, k.k->p) &&
 	    bch2_snapshot_is_ancestor(trans->c, iter->snapshot,
 				      prev.k->p.snapshot) > 0) {
-		struct bch_printbuf buf1 = BCH_PRINTBUF, buf2 = BCH_PRINTBUF;
+		struct printbuf buf1 = PRINTBUF, buf2 = PRINTBUF;
 
 		bch2_bkey_to_text(&buf1, k.k);
 		bch2_bkey_to_text(&buf2, prev.k);
@@ -779,7 +779,7 @@ void bch2_assert_pos_locked(struct btree_trans *trans, enum btree_id id,
 {
 	struct btree_path *path;
 	unsigned idx;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 
 	trans_for_each_path_inorder(trans, path, idx) {
 		int cmp = cmp_int(path->btree_id, id) ?:
@@ -1091,10 +1091,10 @@ static void btree_path_verify_new_node(struct btree_trans *trans,
 	if (!k ||
 	    bkey_deleted(k) ||
 	    bkey_cmp_left_packed(l->b, k, &b->key.k.p)) {
-		struct bch_printbuf buf1 = BCH_PRINTBUF;
-		struct bch_printbuf buf2 = BCH_PRINTBUF;
-		struct bch_printbuf buf3 = BCH_PRINTBUF;
-		struct bch_printbuf buf4 = BCH_PRINTBUF;
+		struct printbuf buf1 = PRINTBUF;
+		struct printbuf buf2 = PRINTBUF;
+		struct printbuf buf3 = PRINTBUF;
+		struct printbuf buf4 = PRINTBUF;
 		struct bkey uk = bkey_unpack_key(b, k);
 
 		bch2_dump_btree_node(c, l->b);
@@ -1824,57 +1824,57 @@ free:
 	__bch2_path_free(trans, path);
 }
 
-void bch2_trans_updates_to_text(struct bch_printbuf *buf, struct btree_trans *trans)
+void bch2_trans_updates_to_text(struct printbuf *buf, struct btree_trans *trans)
 {
 	struct btree_insert_entry *i;
 
-	pr_buf(buf, "transaction updates for %s journal seq %llu",
+	prt_printf(buf, "transaction updates for %s journal seq %llu",
 	       trans->fn, trans->journal_res.seq);
-	pr_newline(buf);
-	pr_indent_push(buf, 2);
+	prt_newline(buf);
+	printbuf_indent_add(buf, 2);
 
 	trans_for_each_update(trans, i) {
 		struct bkey_s_c old = { &i->old_k, i->old_v };
 
-		pr_buf(buf, "update: btree=%s cached=%u %pS",
+		prt_printf(buf, "update: btree=%s cached=%u %pS",
 		       bch2_btree_ids[i->btree_id],
 		       i->cached,
 		       (void *) i->ip_allocated);
-		pr_newline(buf);
+		prt_newline(buf);
 
-		pr_buf(buf, "  old ");
+		prt_printf(buf, "  old ");
 		bch2_bkey_val_to_text(buf, trans->c, old);
-		pr_newline(buf);
+		prt_newline(buf);
 
-		pr_buf(buf, "  new ");
+		prt_printf(buf, "  new ");
 		bch2_bkey_val_to_text(buf, trans->c, bkey_i_to_s_c(i->k));
-		pr_newline(buf);
+		prt_newline(buf);
 	}
 
-	pr_indent_pop(buf, 2);
+	printbuf_indent_sub(buf, 2);
 }
 
 noinline __cold
 void bch2_dump_trans_updates(struct btree_trans *trans)
 {
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 
 	bch2_trans_updates_to_text(&buf, trans);
 	bch_err(trans->c, "%s", buf.buf);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 }
 
 noinline __cold
 void bch2_dump_trans_paths_updates(struct btree_trans *trans)
 {
 	struct btree_path *path;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	unsigned idx;
 
 	btree_trans_sort_paths(trans);
 
 	trans_for_each_path_inorder(trans, path, idx) {
-		bch2_printbuf_reset(&buf);
+		printbuf_reset(&buf);
 
 		bch2_bpos_to_text(&buf, path->pos);
 
@@ -1894,7 +1894,7 @@ void bch2_dump_trans_paths_updates(struct btree_trans *trans)
 		       );
 	}
 
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 
 	bch2_dump_trans_updates(trans);
 }
@@ -3370,11 +3370,11 @@ void bch2_trans_exit(struct btree_trans *trans)
 }
 
 static void __maybe_unused
-bch2_btree_path_node_to_text(struct bch_printbuf *out,
+bch2_btree_path_node_to_text(struct printbuf *out,
 			     struct btree_bkey_cached_common *_b,
 			     bool cached)
 {
-	pr_buf(out, "    l=%u %s:",
+	prt_printf(out, "    l=%u %s:",
 	       _b->level, bch2_btree_ids[_b->btree_id]);
 	bch2_bpos_to_text(out, btree_node_pos(_b, cached));
 }
@@ -3391,7 +3391,7 @@ static bool trans_has_locks(struct btree_trans *trans)
 }
 #endif
 
-void bch2_btree_trans_to_text(struct bch_printbuf *out, struct bch_fs *c)
+void bch2_btree_trans_to_text(struct printbuf *out, struct bch_fs *c)
 {
 #ifdef CONFIG_BCACHEFS_DEBUG_TRANSACTIONS
 	struct btree_trans *trans;
@@ -3405,28 +3405,28 @@ void bch2_btree_trans_to_text(struct bch_printbuf *out, struct bch_fs *c)
 		if (!trans_has_locks(trans))
 			continue;
 
-		pr_buf(out, "%i %s\n", trans->pid, trans->fn);
+		prt_printf(out, "%i %s\n", trans->pid, trans->fn);
 
 		trans_for_each_path(trans, path) {
 			if (!path->nodes_locked)
 				continue;
 
-			pr_buf(out, "  path %u %c l=%u %s:",
+			prt_printf(out, "  path %u %c l=%u %s:",
 			       path->idx,
 			       path->cached ? 'c' : 'b',
 			       path->level,
 			       bch2_btree_ids[path->btree_id]);
 			bch2_bpos_to_text(out, path->pos);
-			pr_buf(out, "\n");
+			prt_printf(out, "\n");
 
 			for (l = 0; l < BTREE_MAX_DEPTH; l++) {
 				if (btree_node_locked(path, l)) {
-					pr_buf(out, "    %s l=%u ",
+					prt_printf(out, "    %s l=%u ",
 					       btree_node_intent_locked(path, l) ? "i" : "r", l);
 					bch2_btree_path_node_to_text(out,
 							(void *) path->l[l].b,
 							path->cached);
-					pr_buf(out, "\n");
+					prt_printf(out, "\n");
 				}
 			}
 		}
@@ -3434,7 +3434,7 @@ void bch2_btree_trans_to_text(struct bch_printbuf *out, struct bch_fs *c)
 		b = READ_ONCE(trans->locking);
 		if (b) {
 			path = &trans->paths[trans->locking_path_idx];
-			pr_buf(out, "  locking path %u %c l=%u %c %s:",
+			prt_printf(out, "  locking path %u %c l=%u %c %s:",
 			       trans->locking_path_idx,
 			       path->cached ? 'c' : 'b',
 			       trans->locking_level,
@@ -3442,10 +3442,10 @@ void bch2_btree_trans_to_text(struct bch_printbuf *out, struct bch_fs *c)
 			       bch2_btree_ids[trans->locking_btree_id]);
 			bch2_bpos_to_text(out, trans->locking_pos);
 
-			pr_buf(out, " node ");
+			prt_printf(out, " node ");
 			bch2_btree_path_node_to_text(out,
 					(void *) b, path->cached);
-			pr_buf(out, "\n");
+			prt_printf(out, "\n");
 		}
 	}
 	mutex_unlock(&c->btree_trans_lock);

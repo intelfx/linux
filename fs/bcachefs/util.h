@@ -11,6 +11,7 @@
 #include <linux/sched/clock.h>
 #include <linux/llist.h>
 #include <linux/log2.h>
+#include <linux/printbuf.h>
 #include <linux/percpu.h>
 #include <linux/preempt.h>
 #include <linux/ratelimit.h>
@@ -237,140 +238,26 @@ do {									\
 #define ANYSINT_MAX(t)							\
 	((((t) 1 << (sizeof(t) * 8 - 2)) - (t) 1) * (t) 2 + (t) 1)
 
-enum printbuf_units {
-	PRINTBUF_UNITS_RAW,
-	PRINTBUF_UNITS_BYTES,
-	PRINTBUF_UNITS_HUMAN_READABLE,
-};
 
-struct bch_printbuf {
-	char			*buf;
-	unsigned		size;
-	unsigned		pos;
-	unsigned		last_newline;
-	unsigned		last_field;
-	unsigned		indent;
-	enum printbuf_units	units:8;
-	u8			atomic;
-	bool			allocation_failure:1;
-	u8			tabstop;
-	u8			tabstops[4];
-};
-
-#define BCH_PRINTBUF ((struct bch_printbuf) { NULL })
-
-static inline void bch2_printbuf_exit(struct bch_printbuf *buf)
-{
-	kfree(buf->buf);
-	buf->buf = ERR_PTR(-EINTR); /* poison value */
-}
-
-static inline void bch2_printbuf_reset(struct bch_printbuf *buf)
-{
-	buf->pos		= 0;
-	buf->last_newline	= 0;
-	buf->last_field		= 0;
-	buf->indent		= 0;
-	buf->tabstop		= 0;
-}
-
-static inline size_t bch2_printbuf_remaining(struct bch_printbuf *buf)
-{
-	return buf->size - buf->pos;
-}
-
-static inline size_t printbuf_linelen(struct bch_printbuf *buf)
-{
-	return buf->pos - buf->last_newline;
-}
-
-void bch2_pr_buf(struct bch_printbuf *out, const char *fmt, ...)
-	__attribute__ ((format (printf, 2, 3)));
-
-#define pr_buf(_out, ...) bch2_pr_buf(_out, __VA_ARGS__)
-
-static inline void pr_char(struct bch_printbuf *out, char c)
-{
-	bch2_pr_buf(out, "%c", c);
-}
-
-static inline void pr_indent_push(struct bch_printbuf *buf, unsigned spaces)
-{
-	buf->indent += spaces;
-	while (spaces--)
-		pr_char(buf, ' ');
-}
-
-static inline void pr_indent_pop(struct bch_printbuf *buf, unsigned spaces)
-{
-	if (buf->last_newline + buf->indent == buf->pos) {
-		buf->pos -= spaces;
-		buf->buf[buf->pos] = '\0';
-	}
-	buf->indent -= spaces;
-}
-
-static inline void pr_newline(struct bch_printbuf *buf)
-{
-	unsigned i;
-
-	pr_char(buf, '\n');
-
-	buf->last_newline	= buf->pos;
-
-	for (i = 0; i < buf->indent; i++)
-		pr_char(buf, ' ');
-
-	buf->last_field		= buf->pos;
-	buf->tabstop = 0;
-}
-
-static inline void pr_tab(struct bch_printbuf *buf)
-{
-	BUG_ON(buf->tabstop > ARRAY_SIZE(buf->tabstops));
-
-	while (bch2_printbuf_remaining(buf) > 1 &&
-	       printbuf_linelen(buf) < buf->tabstops[buf->tabstop])
-		pr_char(buf, ' ');
-
-	buf->last_field = buf->pos;
-	buf->tabstop++;
-}
-
-void bch2_pr_tab_rjust(struct bch_printbuf *);
-
-static inline void pr_tab_rjust(struct bch_printbuf *buf)
-{
-	bch2_pr_tab_rjust(buf);
-}
-
-void bch2_pr_units(struct bch_printbuf *, s64, s64);
-#define pr_units(...) bch2_pr_units(__VA_ARGS__)
-
-static inline void pr_sectors(struct bch_printbuf *out, u64 v)
-{
-	bch2_pr_units(out, v, v << 9);
-}
-
-void bch2_pr_time_units(struct bch_printbuf *, u64);
+void bch2_pr_time_units(struct printbuf *, u64);
 
 #ifdef __KERNEL__
-static inline void pr_time(struct bch_printbuf *out, u64 time)
+static inline void pr_time(struct printbuf *out, u64 time)
 {
-	pr_buf(out, "%llu", time);
+	prt_printf(out, "%llu", time);
 }
 #else
 #include <time.h>
-static inline void pr_time(struct bch_printbuf *out, u64 _time)
+static inline void pr_time(struct printbuf *out, u64 _time)
 {
 	char time_str[64];
 	time_t time = _time;
 	struct tm *tm = localtime(&time);
 	size_t err = strftime(time_str, sizeof(time_str), "%c", tm);
 	if (!err)
-		pr_buf(out, "(formatting error)");
+		prt_printf(out, "(formatting error)");
 	else
-		pr_buf(out, "%s", time_str);
+		prt_printf(out, "%s", time_str);
 }
 #endif
 
@@ -383,12 +270,12 @@ static inline void uuid_unparse_lower(u8 *uuid, char *out)
 #include <uuid/uuid.h>
 #endif
 
-static inline void pr_uuid(struct bch_printbuf *out, u8 *uuid)
+static inline void pr_uuid(struct printbuf *out, u8 *uuid)
 {
 	char uuid_str[40];
 
 	uuid_unparse_lower(uuid, uuid_str);
-	pr_buf(out, "%s", uuid_str);
+	prt_printf(out, "%s", uuid_str);
 }
 
 int bch2_strtoint_h(const char *, int *);
@@ -454,7 +341,7 @@ static inline int bch2_strtoul_h(const char *cp, long *res)
 })
 
 #define snprint(out, var)						\
-	pr_buf(out,							\
+	prt_printf(out,							\
 		   type_is(var, int)		? "%i\n"		\
 		 : type_is(var, unsigned)	? "%u\n"		\
 		 : type_is(var, long)		? "%li\n"		\
@@ -464,14 +351,8 @@ static inline int bch2_strtoul_h(const char *cp, long *res)
 		 : type_is(var, char *)		? "%s\n"		\
 		 : "%i\n", var)
 
-void bch2_hprint(struct bch_printbuf *, s64);
-
 bool bch2_is_zero(const void *, size_t);
 
-void bch2_string_opt_to_text(struct bch_printbuf *,
-			     const char * const [], size_t);
-
-void bch2_flags_to_text(struct bch_printbuf *, const char * const[], u64);
 u64 bch2_read_flag_list(char *, const char * const[]);
 
 #define NR_QUANTILES	15
@@ -518,7 +399,7 @@ static inline void bch2_time_stats_update(struct bch2_time_stats *stats, u64 sta
 	__bch2_time_stats_update(stats, start, local_clock());
 }
 
-void bch2_time_stats_to_text(struct bch_printbuf *, struct bch2_time_stats *);
+void bch2_time_stats_to_text(struct printbuf *, struct bch2_time_stats *);
 
 void bch2_time_stats_exit(struct bch2_time_stats *);
 void bch2_time_stats_init(struct bch2_time_stats *);
@@ -575,7 +456,7 @@ struct bch_pd_controller {
 
 void bch2_pd_controller_update(struct bch_pd_controller *, s64, s64, int);
 void bch2_pd_controller_init(struct bch_pd_controller *);
-void bch2_pd_controller_debug_to_text(struct bch_printbuf *, struct bch_pd_controller *);
+void bch2_pd_controller_debug_to_text(struct printbuf *, struct bch_pd_controller *);
 
 #define sysfs_pd_controller_attribute(name)				\
 	rw_attribute(name##_rate);					\

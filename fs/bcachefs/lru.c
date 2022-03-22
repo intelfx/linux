@@ -9,12 +9,12 @@
 #include "recovery.h"
 
 int bch2_lru_invalid(const struct bch_fs *c, struct bkey_s_c k,
-		     int rw, struct bch_printbuf *err)
+		     int rw, struct printbuf *err)
 {
 	const struct bch_lru *lru = bkey_s_c_to_lru(k).v;
 
 	if (bkey_val_bytes(k.k) < sizeof(*lru)) {
-		pr_buf(err, "incorrect value size (%zu < %zu)",
+		prt_printf(err, "incorrect value size (%zu < %zu)",
 		       bkey_val_bytes(k.k), sizeof(*lru));
 		return -EINVAL;
 	}
@@ -22,12 +22,12 @@ int bch2_lru_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_lru_to_text(struct bch_printbuf *out, struct bch_fs *c,
+void bch2_lru_to_text(struct printbuf *out, struct bch_fs *c,
 		      struct bkey_s_c k)
 {
 	const struct bch_lru *lru = bkey_s_c_to_lru(k).v;
 
-	pr_buf(out, "idx %llu", le64_to_cpu(lru->idx));
+	prt_printf(out, "idx %llu", le64_to_cpu(lru->idx));
 }
 
 int bch2_lru_delete(struct btree_trans *trans, u64 id, u64 idx, u64 time,
@@ -36,7 +36,7 @@ int bch2_lru_delete(struct btree_trans *trans, u64 id, u64 idx, u64 time,
 	struct btree_iter iter;
 	struct bkey_s_c k;
 	u64 existing_idx;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	int ret = 0;
 
 	if (!time)
@@ -73,7 +73,7 @@ int bch2_lru_delete(struct btree_trans *trans, u64 id, u64 idx, u64 time,
 	ret = bch2_btree_delete_at(trans, &iter, 0);
 err:
 	bch2_trans_iter_exit(trans, &iter);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 	return ret;
 }
 
@@ -136,8 +136,8 @@ static int bch2_check_lru_key(struct btree_trans *trans,
 	struct btree_iter iter;
 	struct bkey_s_c lru_k, k;
 	struct bch_alloc_v4 a;
-	struct bch_printbuf buf1 = BCH_PRINTBUF;
-	struct bch_printbuf buf2 = BCH_PRINTBUF;
+	struct printbuf buf1 = PRINTBUF;
+	struct printbuf buf2 = PRINTBUF;
 	struct bpos alloc_pos;
 	int ret;
 
@@ -188,8 +188,8 @@ static int bch2_check_lru_key(struct btree_trans *trans,
 err:
 fsck_err:
 	bch2_trans_iter_exit(trans, &iter);
-	bch2_printbuf_exit(&buf2);
-	bch2_printbuf_exit(&buf1);
+	printbuf_exit(&buf2);
+	printbuf_exit(&buf1);
 	return ret;
 }
 

@@ -293,45 +293,45 @@ int bch2_inode_write(struct btree_trans *trans,
 	return bch2_trans_update(trans, iter, &inode_p->inode.k_i, 0);
 }
 
-static int __bch2_inode_invalid(struct bkey_s_c k, struct bch_printbuf *err)
+static int __bch2_inode_invalid(struct bkey_s_c k, struct printbuf *err)
 {
 	struct bch_inode_unpacked unpacked;
 
 	if (k.k->p.inode) {
-		pr_buf(err, "nonzero k.p.inode");
+		prt_printf(err, "nonzero k.p.inode");
 		return -EINVAL;
 	}
 
 	if (k.k->p.offset < BLOCKDEV_INODE_MAX) {
-		pr_buf(err, "fs inode in blockdev range");
+		prt_printf(err, "fs inode in blockdev range");
 		return -EINVAL;
 	}
 
 	if (bch2_inode_unpack(k, &unpacked)){
-		pr_buf(err, "invalid variable length fields");
+		prt_printf(err, "invalid variable length fields");
 		return -EINVAL;
 	}
 
 	if (unpacked.bi_data_checksum >= BCH_CSUM_OPT_NR + 1) {
-		pr_buf(err, "invalid data checksum type (%u >= %u",
+		prt_printf(err, "invalid data checksum type (%u >= %u",
 			unpacked.bi_data_checksum, BCH_CSUM_OPT_NR + 1);
 		return -EINVAL;
 	}
 
 	if (unpacked.bi_compression >= BCH_COMPRESSION_OPT_NR + 1) {
-		pr_buf(err, "invalid data checksum type (%u >= %u)",
+		prt_printf(err, "invalid data checksum type (%u >= %u)",
 		       unpacked.bi_compression, BCH_COMPRESSION_OPT_NR + 1);
 		return -EINVAL;
 	}
 
 	if ((unpacked.bi_flags & BCH_INODE_UNLINKED) &&
 	    unpacked.bi_nlink != 0) {
-		pr_buf(err, "flagged as unlinked but bi_nlink != 0");
+		prt_printf(err, "flagged as unlinked but bi_nlink != 0");
 		return -EINVAL;
 	}
 
 	if (unpacked.bi_subvol && !S_ISDIR(unpacked.bi_mode)) {
-		pr_buf(err, "subvolume root but not a directory");
+		prt_printf(err, "subvolume root but not a directory");
 		return -EINVAL;
 	}
 
@@ -339,18 +339,18 @@ static int __bch2_inode_invalid(struct bkey_s_c k, struct bch_printbuf *err)
 }
 
 int bch2_inode_invalid(const struct bch_fs *c, struct bkey_s_c k,
-		       int rw, struct bch_printbuf *err)
+		       int rw, struct printbuf *err)
 {
 	struct bkey_s_c_inode inode = bkey_s_c_to_inode(k);
 
 	if (bkey_val_bytes(k.k) < sizeof(*inode.v)) {
-		pr_buf(err, "incorrect value size (%zu < %zu)",
+		prt_printf(err, "incorrect value size (%zu < %zu)",
 		       bkey_val_bytes(k.k), sizeof(*inode.v));
 		return -EINVAL;
 	}
 
 	if (INODE_STR_HASH(inode.v) >= BCH_STR_HASH_NR) {
-		pr_buf(err, "invalid str hash type (%llu >= %u)",
+		prt_printf(err, "invalid str hash type (%llu >= %u)",
 		       INODE_STR_HASH(inode.v), BCH_STR_HASH_NR);
 		return -EINVAL;
 	}
@@ -359,18 +359,18 @@ int bch2_inode_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_inode_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct bch_printbuf *err)
+			  int rw, struct printbuf *err)
 {
 	struct bkey_s_c_inode_v2 inode = bkey_s_c_to_inode_v2(k);
 
 	if (bkey_val_bytes(k.k) < sizeof(*inode.v)) {
-		pr_buf(err, "incorrect value size (%zu < %zu)",
+		prt_printf(err, "incorrect value size (%zu < %zu)",
 		       bkey_val_bytes(k.k), sizeof(*inode.v));
 		return -EINVAL;
 	}
 
 	if (INODEv2_STR_HASH(inode.v) >= BCH_STR_HASH_NR) {
-		pr_buf(err, "invalid str hash type (%llu >= %u)",
+		prt_printf(err, "invalid str hash type (%llu >= %u)",
 		       INODEv2_STR_HASH(inode.v), BCH_STR_HASH_NR);
 		return -EINVAL;
 	}
@@ -378,31 +378,31 @@ int bch2_inode_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return __bch2_inode_invalid(k, err);
 }
 
-static void __bch2_inode_unpacked_to_text(struct bch_printbuf *out, struct bch_inode_unpacked *inode)
+static void __bch2_inode_unpacked_to_text(struct printbuf *out, struct bch_inode_unpacked *inode)
 {
-	pr_buf(out, "mode %o flags %x journal_seq %llu",
+	prt_printf(out, "mode %o flags %x journal_seq %llu",
 	       inode->bi_mode, inode->bi_flags,
 	       inode->bi_journal_seq);
 
 #define x(_name, _bits)						\
-	pr_buf(out, " "#_name " %llu", (u64) inode->_name);
+	prt_printf(out, " "#_name " %llu", (u64) inode->_name);
 	BCH_INODE_FIELDS()
 #undef  x
 }
 
-void bch2_inode_unpacked_to_text(struct bch_printbuf *out, struct bch_inode_unpacked *inode)
+void bch2_inode_unpacked_to_text(struct printbuf *out, struct bch_inode_unpacked *inode)
 {
-	pr_buf(out, "inum: %llu ", inode->bi_inum);
+	prt_printf(out, "inum: %llu ", inode->bi_inum);
 	__bch2_inode_unpacked_to_text(out, inode);
 }
 
-void bch2_inode_to_text(struct bch_printbuf *out, struct bch_fs *c,
+void bch2_inode_to_text(struct printbuf *out, struct bch_fs *c,
 		       struct bkey_s_c k)
 {
 	struct bch_inode_unpacked inode;
 
 	if (bch2_inode_unpack(k, &inode)) {
-		pr_buf(out, "(unpack error)");
+		prt_printf(out, "(unpack error)");
 		return;
 	}
 
@@ -410,15 +410,15 @@ void bch2_inode_to_text(struct bch_printbuf *out, struct bch_fs *c,
 }
 
 int bch2_inode_generation_invalid(const struct bch_fs *c, struct bkey_s_c k,
-				  int rw, struct bch_printbuf *err)
+				  int rw, struct printbuf *err)
 {
 	if (k.k->p.inode) {
-		pr_buf(err, "nonzero k.p.inode");
+		prt_printf(err, "nonzero k.p.inode");
 		return -EINVAL;
 	}
 
 	if (bkey_val_bytes(k.k) != sizeof(struct bch_inode_generation)) {
-		pr_buf(err, "incorrect value size (%zu != %zu)",
+		prt_printf(err, "incorrect value size (%zu != %zu)",
 		       bkey_val_bytes(k.k), sizeof(struct bch_inode_generation));
 		return -EINVAL;
 	}
@@ -426,12 +426,12 @@ int bch2_inode_generation_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_inode_generation_to_text(struct bch_printbuf *out, struct bch_fs *c,
+void bch2_inode_generation_to_text(struct printbuf *out, struct bch_fs *c,
 				   struct bkey_s_c k)
 {
 	struct bkey_s_c_inode_generation gen = bkey_s_c_to_inode_generation(k);
 
-	pr_buf(out, "generation: %u", le32_to_cpu(gen.v->bi_generation));
+	prt_printf(out, "generation: %u", le32_to_cpu(gen.v->bi_generation));
 }
 
 void bch2_inode_init_early(struct bch_fs *c,

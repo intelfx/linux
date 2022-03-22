@@ -860,33 +860,33 @@ static inline int do_bch2_trans_commit(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	struct btree_insert_entry *i;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	int ret, u64s_delta = 0;
 	int rw = (trans->flags & BTREE_INSERT_JOURNAL_REPLAY) ? READ : WRITE;
 
 	trans_for_each_update(trans, i) {
 		if (bch2_bkey_invalid(c, bkey_i_to_s_c(i->k),
 				      i->bkey_type, rw, &buf)) {
-			bch2_printbuf_reset(&buf);
-			pr_buf(&buf, "invalid bkey on insert from %s -> %ps",
+			printbuf_reset(&buf);
+			prt_printf(&buf, "invalid bkey on insert from %s -> %ps",
 			       trans->fn, (void *) i->ip_allocated);
-			pr_newline(&buf);
-			pr_indent_push(&buf, 2);
+			prt_newline(&buf);
+			printbuf_indent_add(&buf, 2);
 
 			bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(i->k));
-			pr_newline(&buf);
+			prt_newline(&buf);
 
 			bch2_bkey_invalid(c, bkey_i_to_s_c(i->k),
 					  i->bkey_type, rw, &buf);
 
 			bch2_trans_inconsistent(trans, "%s", buf.buf);
-			bch2_printbuf_exit(&buf);
+			printbuf_exit(&buf);
 			return -EINVAL;
 		}
 		btree_insert_entry_checks(trans, i);
 	}
 
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 
 	trans_for_each_update(trans, i) {
 		if (i->cached)

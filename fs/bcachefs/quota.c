@@ -18,12 +18,12 @@ static const char * const bch2_quota_counters[] = {
 };
 
 static int bch2_sb_quota_validate(struct bch_sb *sb, struct bch_sb_field *f,
-				  struct bch_printbuf *err)
+				  struct printbuf *err)
 {
 	struct bch_sb_field_quota *q = field_to_type(f, quota);
 
 	if (vstruct_bytes(&q->field) < sizeof(*q)) {
-		pr_buf(err, "wrong size (got %zu should be %zu)",
+		prt_printf(err, "wrong size (got %zu should be %zu)",
 		       vstruct_bytes(&q->field), sizeof(*q));
 		return -EINVAL;
 	}
@@ -31,24 +31,24 @@ static int bch2_sb_quota_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_quota_to_text(struct bch_printbuf *out, struct bch_sb *sb,
+static void bch2_sb_quota_to_text(struct printbuf *out, struct bch_sb *sb,
 				  struct bch_sb_field *f)
 {
 	struct bch_sb_field_quota *q = field_to_type(f, quota);
 	unsigned qtyp, counter;
 
 	for (qtyp = 0; qtyp < ARRAY_SIZE(q->q); qtyp++) {
-		pr_buf(out, "%s: flags %llx",
+		prt_printf(out, "%s: flags %llx",
 		       bch2_quota_types[qtyp],
 		       le64_to_cpu(q->q[qtyp].flags));
 
 		for (counter = 0; counter < Q_COUNTERS; counter++)
-			pr_buf(out, " %s timelimit %u warnlimit %u",
+			prt_printf(out, " %s timelimit %u warnlimit %u",
 			       bch2_quota_counters[counter],
 			       le32_to_cpu(q->q[qtyp].c[counter].timelimit),
 			       le32_to_cpu(q->q[qtyp].c[counter].warnlimit));
 
-		pr_newline(out);
+		prt_newline(out);
 	}
 }
 
@@ -58,16 +58,16 @@ const struct bch_sb_field_ops bch_sb_field_ops_quota = {
 };
 
 int bch2_quota_invalid(const struct bch_fs *c, struct bkey_s_c k,
-		       int rw, struct bch_printbuf *err)
+		       int rw, struct printbuf *err)
 {
 	if (k.k->p.inode >= QTYP_NR) {
-		pr_buf(err, "invalid quota type (%llu >= %u)",
+		prt_printf(err, "invalid quota type (%llu >= %u)",
 		       k.k->p.inode, QTYP_NR);
 		return -EINVAL;
 	}
 
 	if (bkey_val_bytes(k.k) != sizeof(struct bch_quota)) {
-		pr_buf(err, "incorrect value size (%zu != %zu)",
+		prt_printf(err, "incorrect value size (%zu != %zu)",
 		       bkey_val_bytes(k.k), sizeof(struct bch_quota));
 		return -EINVAL;
 	}
@@ -75,14 +75,14 @@ int bch2_quota_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_quota_to_text(struct bch_printbuf *out, struct bch_fs *c,
+void bch2_quota_to_text(struct printbuf *out, struct bch_fs *c,
 			struct bkey_s_c k)
 {
 	struct bkey_s_c_quota dq = bkey_s_c_to_quota(k);
 	unsigned i;
 
 	for (i = 0; i < Q_COUNTERS; i++)
-		pr_buf(out, "%s hardlimit %llu softlimit %llu",
+		prt_printf(out, "%s hardlimit %llu softlimit %llu",
 		       bch2_quota_counters[i],
 		       le64_to_cpu(dq.v->c[i].hardlimit),
 		       le64_to_cpu(dq.v->c[i].softlimit));

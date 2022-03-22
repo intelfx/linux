@@ -70,13 +70,13 @@ const struct bch_hash_desc bch2_xattr_hash_desc = {
 };
 
 int bch2_xattr_invalid(const struct bch_fs *c, struct bkey_s_c k,
-		       int rw, struct bch_printbuf *err)
+		       int rw, struct printbuf *err)
 {
 	const struct xattr_handler *handler;
 	struct bkey_s_c_xattr xattr = bkey_s_c_to_xattr(k);
 
 	if (bkey_val_bytes(k.k) < sizeof(struct bch_xattr)) {
-		pr_buf(err, "incorrect value size (%zu < %zu)",
+		prt_printf(err, "incorrect value size (%zu < %zu)",
 		       bkey_val_bytes(k.k), sizeof(*xattr.v));
 		return -EINVAL;
 	}
@@ -84,7 +84,7 @@ int bch2_xattr_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	if (bkey_val_u64s(k.k) <
 	    xattr_val_u64s(xattr.v->x_name_len,
 			   le16_to_cpu(xattr.v->x_val_len))) {
-		pr_buf(err, "value too small (%zu < %u)",
+		prt_printf(err, "value too small (%zu < %u)",
 		       bkey_val_u64s(k.k),
 		       xattr_val_u64s(xattr.v->x_name_len,
 				      le16_to_cpu(xattr.v->x_val_len)));
@@ -95,7 +95,7 @@ int bch2_xattr_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	if (bkey_val_u64s(k.k) >
 	    xattr_val_u64s(xattr.v->x_name_len,
 			   le16_to_cpu(xattr.v->x_val_len) + 4)) {
-		pr_buf(err, "value too big (%zu > %u)",
+		prt_printf(err, "value too big (%zu > %u)",
 		       bkey_val_u64s(k.k),
 		       xattr_val_u64s(xattr.v->x_name_len,
 				      le16_to_cpu(xattr.v->x_val_len) + 4));
@@ -104,19 +104,19 @@ int bch2_xattr_invalid(const struct bch_fs *c, struct bkey_s_c k,
 
 	handler = bch2_xattr_type_to_handler(xattr.v->x_type);
 	if (!handler) {
-		pr_buf(err, "invalid type (%u)", xattr.v->x_type);
+		prt_printf(err, "invalid type (%u)", xattr.v->x_type);
 		return -EINVAL;
 	}
 
 	if (memchr(xattr.v->x_name, '\0', xattr.v->x_name_len)) {
-		pr_buf(err, "xattr name has invalid characters");
+		prt_printf(err, "xattr name has invalid characters");
 		return -EINVAL;
 	}
 
 	return 0;
 }
 
-void bch2_xattr_to_text(struct bch_printbuf *out, struct bch_fs *c,
+void bch2_xattr_to_text(struct printbuf *out, struct bch_fs *c,
 			struct bkey_s_c k)
 {
 	const struct xattr_handler *handler;
@@ -124,13 +124,13 @@ void bch2_xattr_to_text(struct bch_printbuf *out, struct bch_fs *c,
 
 	handler = bch2_xattr_type_to_handler(xattr.v->x_type);
 	if (handler && handler->prefix)
-		pr_buf(out, "%s", handler->prefix);
+		prt_printf(out, "%s", handler->prefix);
 	else if (handler)
-		pr_buf(out, "(type %u)", xattr.v->x_type);
+		prt_printf(out, "(type %u)", xattr.v->x_type);
 	else
-		pr_buf(out, "(unknown type %u)", xattr.v->x_type);
+		prt_printf(out, "(unknown type %u)", xattr.v->x_type);
 
-	pr_buf(out, "%.*s:%.*s",
+	prt_printf(out, "%.*s:%.*s",
 	       xattr.v->x_name_len,
 	       xattr.v->x_name,
 	       le16_to_cpu(xattr.v->x_val_len),
@@ -441,7 +441,7 @@ static int __bch2_xattr_bcachefs_get(const struct xattr_handler *handler,
 		bch2_inode_opts_to_opts(bch2_inode_opts_get(&inode->ei_inode));
 	const struct bch_option *opt;
 	int id, inode_opt_id;
-	struct bch_printbuf out = BCH_PRINTBUF;
+	struct printbuf out = PRINTBUF;
 	int ret;
 	u64 v;
 
@@ -476,7 +476,7 @@ static int __bch2_xattr_bcachefs_get(const struct xattr_handler *handler,
 			memcpy(buffer, out.buf, out.pos);
 	}
 
-	bch2_printbuf_exit(&out);
+	printbuf_exit(&out);
 	return ret;
 }
 

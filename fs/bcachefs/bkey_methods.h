@@ -21,8 +21,8 @@ extern const char * const bch2_bkey_types[];
 */
 struct bkey_ops {
 	int		(*key_invalid)(const struct bch_fs *c, struct bkey_s_c k,
-				       int rw, struct bch_printbuf *err);
-	void		(*val_to_text)(struct bch_printbuf *, struct bch_fs *,
+				       int rw, struct printbuf *err);
+	void		(*val_to_text)(struct printbuf *, struct bch_fs *,
 				       struct bkey_s_c);
 	void		(*swab)(struct bkey_s);
 	bool		(*key_normalize)(struct bch_fs *, struct bkey_s);
@@ -38,18 +38,18 @@ struct bkey_ops {
 
 extern const struct bkey_ops bch2_bkey_ops[];
 
-int bch2_bkey_val_invalid(struct bch_fs *, struct bkey_s_c, int, struct bch_printbuf *);
+int bch2_bkey_val_invalid(struct bch_fs *, struct bkey_s_c, int, struct printbuf *);
 int __bch2_bkey_invalid(struct bch_fs *, struct bkey_s_c,
-			enum btree_node_type, int, struct bch_printbuf *);
+			enum btree_node_type, int, struct printbuf *);
 int bch2_bkey_invalid(struct bch_fs *, struct bkey_s_c,
-		      enum btree_node_type, int, struct bch_printbuf *);
-int bch2_bkey_in_btree_node(struct btree *, struct bkey_s_c, struct bch_printbuf *);
+		      enum btree_node_type, int, struct printbuf *);
+int bch2_bkey_in_btree_node(struct btree *, struct bkey_s_c, struct printbuf *);
 
-void bch2_bpos_to_text(struct bch_printbuf *, struct bpos);
-void bch2_bkey_to_text(struct bch_printbuf *, const struct bkey *);
-void bch2_val_to_text(struct bch_printbuf *, struct bch_fs *,
+void bch2_bpos_to_text(struct printbuf *, struct bpos);
+void bch2_bkey_to_text(struct printbuf *, const struct bkey *);
+void bch2_val_to_text(struct printbuf *, struct bch_fs *,
 		      struct bkey_s_c);
-void bch2_bkey_val_to_text(struct bch_printbuf *, struct bch_fs *,
+void bch2_bkey_val_to_text(struct printbuf *, struct bch_fs *,
 			   struct bkey_s_c);
 
 void bch2_bkey_swab_val(struct bkey_s);

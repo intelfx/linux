@@ -295,11 +295,11 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans, struct bc
 	struct bch_alloc_v4 a;
 	u64 b = free_entry & ~(~0ULL << 56);
 	unsigned genbits = free_entry >> 56;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	int ret;
 
 	if (b < ca->mi.first_bucket || b >= ca->mi.nbuckets) {
-		pr_buf(&buf, "freespace btree has bucket outside allowed range %u-%llu\n"
+		prt_printf(&buf, "freespace btree has bucket outside allowed range %u-%llu\n"
 		       "  freespace key ",
 			ca->mi.first_bucket, ca->mi.nbuckets);
 		bch2_bkey_val_to_text(&buf, c, freespace_k);
@@ -319,11 +319,11 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans, struct bc
 	bch2_alloc_to_v4(k, &a);
 
 	if (genbits != (alloc_freespace_genbits(a) >> 56)) {
-		pr_buf(&buf, "bucket in freespace btree with wrong genbits (got %u should be %llu)\n"
+		prt_printf(&buf, "bucket in freespace btree with wrong genbits (got %u should be %llu)\n"
 		       "  freespace key ",
 		       genbits, alloc_freespace_genbits(a) >> 56);
 		bch2_bkey_val_to_text(&buf, c, freespace_k);
-		pr_buf(&buf, "\n  ");
+		prt_printf(&buf, "\n  ");
 		bch2_bkey_val_to_text(&buf, c, k);
 		bch2_trans_inconsistent(trans, "%s", buf.buf);
 		ob = ERR_PTR(-EIO);
@@ -332,10 +332,10 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans, struct bc
 	}
 
 	if (a.data_type != BCH_DATA_free) {
-		pr_buf(&buf, "non free bucket in freespace btree\n"
+		prt_printf(&buf, "non free bucket in freespace btree\n"
 		       "  freespace key ");
 		bch2_bkey_val_to_text(&buf, c, freespace_k);
-		pr_buf(&buf, "\n  ");
+		prt_printf(&buf, "\n  ");
 		bch2_bkey_val_to_text(&buf, c, k);
 		bch2_trans_inconsistent(trans, "%s", buf.buf);
 		ob = ERR_PTR(-EIO);
@@ -351,7 +351,7 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans, struct bc
 		iter.path->preserve = false;
 err:
 	bch2_trans_iter_exit(trans, &iter);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 	return ob;
 }
 
@@ -1372,7 +1372,7 @@ void bch2_fs_allocator_foreground_init(struct bch_fs *c)
 	}
 }
 
-void bch2_open_buckets_to_text(struct bch_printbuf *out, struct bch_fs *c)
+void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct open_bucket *ob;
 
@@ -1381,7 +1381,7 @@ void bch2_open_buckets_to_text(struct bch_printbuf *out, struct bch_fs *c)
 	     ob++) {
 		spin_lock(&ob->lock);
 		if (ob->valid && !ob->on_partial_list) {
-			pr_buf(out, "%zu ref %u type %s %u:%llu:%u\n",
+			prt_printf(out, "%zu ref %u type %s %u:%llu:%u\n",
 			       ob - c->open_buckets,
 			       atomic_read(&ob->pin),
 			       bch2_data_types[ob->data_type],
@@ -1398,7 +1398,7 @@ static const char * const bch2_write_point_states[] = {
 	NULL
 };
 
-void bch2_write_points_to_text(struct bch_printbuf *out, struct bch_fs *c)
+void bch2_write_points_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct write_point *wp;
 	unsigned i;
@@ -1406,17 +1406,17 @@ void bch2_write_points_to_text(struct bch_printbuf *out, struct bch_fs *c)
 	for (wp = c->write_points;
 	     wp < c->write_points + ARRAY_SIZE(c->write_points);
 	     wp++) {
-		pr_buf(out, "%lu: ", wp->write_point);
-		bch2_hprint(out, wp->sectors_allocated);
+		prt_printf(out, "%lu: ", wp->write_point);
+		prt_human_readable_u64(out, wp->sectors_allocated);
 
-		pr_buf(out, " last wrote: ");
+		prt_printf(out, " last wrote: ");
 		bch2_pr_time_units(out, sched_clock() - wp->last_used);
 
 		for (i = 0; i < WRITE_POINT_STATE_NR; i++) {
-			pr_buf(out, " %s: ", bch2_write_point_states[i]);
+			prt_printf(out, " %s: ", bch2_write_point_states[i]);
 			bch2_pr_time_units(out, wp->time[i]);
 		}
 
-		pr_newline(out);
+		prt_newline(out);
 	}
 }

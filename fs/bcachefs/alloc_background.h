@@ -80,12 +80,12 @@ int bch2_bucket_io_time_reset(struct btree_trans *, unsigned, size_t, int);
 
 #define ALLOC_SCAN_BATCH(ca)		max_t(size_t, 1, (ca)->mi.nbuckets >> 9)
 
-int bch2_alloc_v1_invalid(const struct bch_fs *, struct bkey_s_c, int, struct bch_printbuf *);
-int bch2_alloc_v2_invalid(const struct bch_fs *, struct bkey_s_c, int, struct bch_printbuf *);
-int bch2_alloc_v3_invalid(const struct bch_fs *, struct bkey_s_c, int, struct bch_printbuf *);
-int bch2_alloc_v4_invalid(const struct bch_fs *, struct bkey_s_c, int, struct bch_printbuf *);
+int bch2_alloc_v1_invalid(const struct bch_fs *, struct bkey_s_c, int, struct printbuf *);
+int bch2_alloc_v2_invalid(const struct bch_fs *, struct bkey_s_c, int, struct printbuf *);
+int bch2_alloc_v3_invalid(const struct bch_fs *, struct bkey_s_c, int, struct printbuf *);
+int bch2_alloc_v4_invalid(const struct bch_fs *, struct bkey_s_c, int, struct printbuf *);
 void bch2_alloc_v4_swab(struct bkey_s);
-void bch2_alloc_to_text(struct bch_printbuf *, struct bch_fs *, struct bkey_s_c);
+void bch2_alloc_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 
 #define bch2_bkey_ops_alloc (struct bkey_ops) {		\
 	.key_invalid	= bch2_alloc_v1_invalid,	\

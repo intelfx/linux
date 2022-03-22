@@ -61,7 +61,7 @@ void bch2_dump_bset(struct bch_fs *c, struct btree *b,
 	struct bkey_packed *_k, *_n;
 	struct bkey uk, n;
 	struct bkey_s_c k;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 
 	if (!i->u64s)
 		return;
@@ -73,7 +73,7 @@ void bch2_dump_bset(struct bch_fs *c, struct btree *b,
 
 		k = bkey_disassemble(b, _k, &uk);
 
-		bch2_printbuf_reset(&buf);
+		printbuf_reset(&buf);
 		if (c)
 			bch2_bkey_val_to_text(&buf, c, k);
 		else
@@ -96,7 +96,7 @@ void bch2_dump_bset(struct bch_fs *c, struct btree *b,
 			printk(KERN_ERR "Duplicate keys\n");
 	}
 
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 }
 
 void bch2_dump_btree_node(struct bch_fs *c, struct btree *b)
@@ -113,7 +113,7 @@ void bch2_dump_btree_node_iter(struct btree *b,
 			      struct btree_node_iter *iter)
 {
 	struct btree_node_iter_set *set;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 
 	printk(KERN_ERR "btree node iter with %u/%u sets:\n",
 	       __btree_node_iter_used(iter), b->nsets);
@@ -123,13 +123,13 @@ void bch2_dump_btree_node_iter(struct btree *b,
 		struct bset_tree *t = bch2_bkey_to_bset(b, k);
 		struct bkey uk = bkey_unpack_key(b, k);
 
-		bch2_printbuf_reset(&buf);
+		printbuf_reset(&buf);
 		bch2_bkey_to_text(&buf, &uk);
 		printk(KERN_ERR "set %zu key %u: %s\n",
 		       t - b->set, set->k, buf.buf);
 	}
 
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 }
 
 #ifdef CONFIG_BCACHEFS_DEBUG
@@ -165,8 +165,8 @@ static void bch2_btree_node_iter_next_check(struct btree_node_iter *_iter,
 		struct btree_node_iter_set *set;
 		struct bkey ku = bkey_unpack_key(b, k);
 		struct bkey nu = bkey_unpack_key(b, n);
-		struct bch_printbuf buf1 = BCH_PRINTBUF;
-		struct bch_printbuf buf2 = BCH_PRINTBUF;
+		struct printbuf buf1 = PRINTBUF;
+		struct printbuf buf2 = PRINTBUF;
 
 		bch2_dump_btree_node(NULL, b);
 		bch2_bkey_to_text(&buf1, &ku);
@@ -237,8 +237,8 @@ void bch2_verify_insert_pos(struct btree *b, struct bkey_packed *where,
 	struct bset_tree *t = bch2_bkey_to_bset(b, where);
 	struct bkey_packed *prev = bch2_bkey_prev_all(b, t, where);
 	struct bkey_packed *next = (void *) (where->_data + clobber_u64s);
-	struct bch_printbuf buf1 = BCH_PRINTBUF;
-	struct bch_printbuf buf2 = BCH_PRINTBUF;
+	struct printbuf buf1 = PRINTBUF;
+	struct printbuf buf2 = PRINTBUF;
 #if 0
 	BUG_ON(prev &&
 	       bkey_iter_cmp(b, prev, insert) > 0);
@@ -1557,7 +1557,7 @@ void bch2_btree_keys_stats(struct btree *b, struct bset_stats *stats)
 	}
 }
 
-void bch2_bfloat_to_text(struct bch_printbuf *out, struct btree *b,
+void bch2_bfloat_to_text(struct printbuf *out, struct btree *b,
 			 struct bkey_packed *k)
 {
 	struct bset_tree *t = bch2_bkey_to_bset(b, k);
@@ -1578,12 +1578,12 @@ void bch2_bfloat_to_text(struct bch_printbuf *out, struct btree *b,
 	switch (bkey_float(b, t, j)->exponent) {
 	case BFLOAT_FAILED:
 		uk = bkey_unpack_key(b, k);
-		pr_buf(out,
+		prt_printf(out,
 		       "    failed unpacked at depth %u\n"
 		       "\t",
 		       ilog2(j));
 		bch2_bpos_to_text(out, uk.p);
-		pr_buf(out, "\n");
+		prt_printf(out, "\n");
 		break;
 	}
 }

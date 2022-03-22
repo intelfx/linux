@@ -38,8 +38,8 @@ BCH_SB_FIELDS()
 extern const char * const bch2_sb_fields[];
 
 struct bch_sb_field_ops {
-	int	(*validate)(struct bch_sb *, struct bch_sb_field *, struct bch_printbuf *);
-	void	(*to_text)(struct bch_printbuf *, struct bch_sb *, struct bch_sb_field *);
+	int	(*validate)(struct bch_sb *, struct bch_sb_field *, struct printbuf *);
+	void	(*to_text)(struct printbuf *, struct bch_sb *, struct bch_sb_field *);
 };
 
 static inline __le64 bch2_sb_magic(struct bch_fs *c)
@@ -118,9 +118,9 @@ int bch2_sb_clean_validate_late(struct bch_fs *, struct bch_sb_field_clean *, in
 int bch2_fs_mark_dirty(struct bch_fs *);
 void bch2_fs_mark_clean(struct bch_fs *);
 
-void bch2_sb_field_to_text(struct bch_printbuf *, struct bch_sb *,
+void bch2_sb_field_to_text(struct printbuf *, struct bch_sb *,
 			   struct bch_sb_field *);
-void bch2_sb_layout_to_text(struct bch_printbuf *, struct bch_sb_layout *);
-void bch2_sb_to_text(struct bch_printbuf *, struct bch_sb *, bool, unsigned);
+void bch2_sb_layout_to_text(struct printbuf *, struct bch_sb_layout *);
+void bch2_sb_to_text(struct printbuf *, struct bch_sb *, bool, unsigned);
 
 #endif /* _BCACHEFS_SUPER_IO_H */

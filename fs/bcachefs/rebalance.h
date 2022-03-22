@@ -19,7 +19,7 @@ void bch2_rebalance_add_key(struct bch_fs *, struct bkey_s_c,
 			    struct bch_io_opts *);
 void bch2_rebalance_add_work(struct bch_fs *, u64);
 
-void bch2_rebalance_work_to_text(struct bch_printbuf *, struct bch_fs *);
+void bch2_rebalance_work_to_text(struct printbuf *, struct bch_fs *);
 
 void bch2_rebalance_stop(struct bch_fs *);
 int bch2_rebalance_start(struct bch_fs *);

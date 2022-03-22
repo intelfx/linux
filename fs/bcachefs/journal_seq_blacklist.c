@@ -190,7 +190,7 @@ int bch2_blacklist_table_initialize(struct bch_fs *c)
 
 static int bch2_sb_journal_seq_blacklist_validate(struct bch_sb *sb,
 						  struct bch_sb_field *f,
-						  struct bch_printbuf *err)
+						  struct printbuf *err)
 {
 	struct bch_sb_field_journal_seq_blacklist *bl =
 		field_to_type(f, journal_seq_blacklist);
@@ -201,7 +201,7 @@ static int bch2_sb_journal_seq_blacklist_validate(struct bch_sb *sb,
 
 		if (le64_to_cpu(e->start) >=
 		    le64_to_cpu(e->end)) {
-			pr_buf(err, "entry %u start >= end (%llu >= %llu)",
+			prt_printf(err, "entry %u start >= end (%llu >= %llu)",
 			       i, le64_to_cpu(e->start), le64_to_cpu(e->end));
 			return -EINVAL;
 		}
@@ -209,7 +209,7 @@ static int bch2_sb_journal_seq_blacklist_validate(struct bch_sb *sb,
 		if (i + 1 < nr &&
 		    le64_to_cpu(e[0].end) >
 		    le64_to_cpu(e[1].start)) {
-			pr_buf(err, "entry %u out of order with next entry (%llu > %llu)",
+			prt_printf(err, "entry %u out of order with next entry (%llu > %llu)",
 			       i + 1, le64_to_cpu(e[0].end), le64_to_cpu(e[1].start));
 			return -EINVAL;
 		}
@@ -218,7 +218,7 @@ static int bch2_sb_journal_seq_blacklist_validate(struct bch_sb *sb,
 	return 0;
 }
 
-static void bch2_sb_journal_seq_blacklist_to_text(struct bch_printbuf *out,
+static void bch2_sb_journal_seq_blacklist_to_text(struct printbuf *out,
 						  struct bch_sb *sb,
 						  struct bch_sb_field *f)
 {
@@ -229,13 +229,13 @@ static void bch2_sb_journal_seq_blacklist_to_text(struct bch_printbuf *out,
 
 	for (i = bl->start; i < bl->start + nr; i++) {
 		if (i != bl->start)
-			pr_buf(out, " ");
+			prt_printf(out, " ");
 
-		pr_buf(out, "%llu-%llu",
+		prt_printf(out, "%llu-%llu",
 		       le64_to_cpu(i->start),
 		       le64_to_cpu(i->end));
 	}
-	pr_newline(out);
+	prt_newline(out);
 }
 
 const struct bch_sb_field_ops bch_sb_field_ops_journal_seq_blacklist = {

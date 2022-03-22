@@ -307,7 +307,7 @@ static inline bool bch2_btree_node_insert_fits(struct bch_fs *c,
 	return u64s <= bch_btree_keys_u64s_remaining(c, b);
 }
 
-void bch2_btree_updates_to_text(struct bch_printbuf *, struct bch_fs *);
+void bch2_btree_updates_to_text(struct printbuf *, struct bch_fs *);
 
 bool bch2_btree_interior_updates_flush(struct bch_fs *);
 

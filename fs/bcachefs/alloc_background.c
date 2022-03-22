@@ -294,13 +294,13 @@ static unsigned bch_alloc_v1_val_u64s(const struct bch_alloc *a)
 }
 
 int bch2_alloc_v1_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct bch_printbuf *err)
+			  int rw, struct printbuf *err)
 {
 	struct bkey_s_c_alloc a = bkey_s_c_to_alloc(k);
 
 	/* allow for unknown fields */
 	if (bkey_val_u64s(a.k) < bch_alloc_v1_val_u64s(a.v)) {
-		pr_buf(err, "incorrect value size (%zu < %u)",
+		prt_printf(err, "incorrect value size (%zu < %u)",
 		       bkey_val_u64s(a.k), bch_alloc_v1_val_u64s(a.v));
 		return -EINVAL;
 	}
@@ -309,12 +309,12 @@ int bch2_alloc_v1_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_alloc_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct bch_printbuf *err)
+			  int rw, struct printbuf *err)
 {
 	struct bkey_alloc_unpacked u;
 
 	if (bch2_alloc_unpack_v2(&u, k)) {
-		pr_buf(err, "unpack error");
+		prt_printf(err, "unpack error");
 		return -EINVAL;
 	}
 
@@ -322,12 +322,12 @@ int bch2_alloc_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_alloc_v3_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct bch_printbuf *err)
+			  int rw, struct printbuf *err)
 {
 	struct bkey_alloc_unpacked u;
 
 	if (bch2_alloc_unpack_v3(&u, k)) {
-		pr_buf(err, "unpack error");
+		prt_printf(err, "unpack error");
 		return -EINVAL;
 	}
 
@@ -335,19 +335,19 @@ int bch2_alloc_v3_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_alloc_v4_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct bch_printbuf *err)
+			  int rw, struct printbuf *err)
 {
 	struct bkey_s_c_alloc_v4 a = bkey_s_c_to_alloc_v4(k);
 
 	if (bkey_val_bytes(k.k) != sizeof(struct bch_alloc_v4)) {
-		pr_buf(err, "bad val size (%zu != %zu)",
+		prt_printf(err, "bad val size (%zu != %zu)",
 		       bkey_val_bytes(k.k), sizeof(struct bch_alloc_v4));
 		return -EINVAL;
 	}
 
 	if (rw == WRITE) {
 		if (alloc_data_type(*a.v, a.v->data_type) != a.v->data_type) {
-			pr_buf(err, "invalid data type (got %u should be %u)",
+			prt_printf(err, "invalid data type (got %u should be %u)",
 			       a.v->data_type, alloc_data_type(*a.v, a.v->data_type));
 			return -EINVAL;
 		}
@@ -359,7 +359,7 @@ int bch2_alloc_v4_invalid(const struct bch_fs *c, struct bkey_s_c k,
 			if (a.v->dirty_sectors ||
 			    a.v->cached_sectors ||
 			    a.v->stripe) {
-				pr_buf(err, "empty data type free but have data");
+				prt_printf(err, "empty data type free but have data");
 				return -EINVAL;
 			}
 			break;
@@ -369,7 +369,7 @@ int bch2_alloc_v4_invalid(const struct bch_fs *c, struct bkey_s_c k,
 		case BCH_DATA_user:
 		case BCH_DATA_parity:
 			if (!a.v->dirty_sectors) {
-				pr_buf(err, "data_type %s but dirty_sectors==0",
+				prt_printf(err, "data_type %s but dirty_sectors==0",
 				       bch2_data_types[a.v->data_type]);
 				return -EINVAL;
 			}
@@ -378,19 +378,19 @@ int bch2_alloc_v4_invalid(const struct bch_fs *c, struct bkey_s_c k,
 			if (!a.v->cached_sectors ||
 			    a.v->dirty_sectors ||
 			    a.v->stripe) {
-				pr_buf(err, "data type inconsistency");
+				prt_printf(err, "data type inconsistency");
 				return -EINVAL;
 			}
 
 			if (!a.v->io_time[READ] &&
 			    test_bit(BCH_FS_CHECK_ALLOC_TO_LRU_REFS_DONE, &c->flags)) {
-				pr_buf(err, "cached bucket with read_time == 0");
+				prt_printf(err, "cached bucket with read_time == 0");
 				return -EINVAL;
 			}
 			break;
 		case BCH_DATA_stripe:
 			if (!a.v->stripe) {
-				pr_buf(err, "data_type %s but stripe==0",
+				prt_printf(err, "data_type %s but stripe==0",
 				       bch2_data_types[a.v->data_type]);
 				return -EINVAL;
 			}
@@ -415,23 +415,23 @@ void bch2_alloc_v4_swab(struct bkey_s k)
 	a->nr_external_backpointers = swab32(a->nr_external_backpointers);
 }
 
-void bch2_alloc_to_text(struct bch_printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+void bch2_alloc_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bch_alloc_v4 a;
 
 	bch2_alloc_to_v4(k, &a);
 
-	pr_buf(out, "gen %u oldest_gen %u data_type %s journal_seq %llu need_discard %llu need_inc_gen %llu",
+	prt_printf(out, "gen %u oldest_gen %u data_type %s journal_seq %llu need_discard %llu need_inc_gen %llu",
 	       a.gen, a.oldest_gen, bch2_data_types[a.data_type],
 	       a.journal_seq,
 	       BCH_ALLOC_V4_NEED_DISCARD(&a),
 	       BCH_ALLOC_V4_NEED_INC_GEN(&a));
-	pr_buf(out, " dirty_sectors %u",	a.dirty_sectors);
-	pr_buf(out, " cached_sectors %u",	a.cached_sectors);
-	pr_buf(out, " stripe %u",		a.stripe);
-	pr_buf(out, " stripe_redundancy %u",	a.stripe_redundancy);
-	pr_buf(out, " read_time %llu",		a.io_time[READ]);
-	pr_buf(out, " write_time %llu",		a.io_time[WRITE]);
+	prt_printf(out, " dirty_sectors %u",	a.dirty_sectors);
+	prt_printf(out, " cached_sectors %u",	a.cached_sectors);
+	prt_printf(out, " stripe %u",		a.stripe);
+	prt_printf(out, " stripe_redundancy %u",	a.stripe_redundancy);
+	prt_printf(out, " read_time %llu",		a.io_time[READ]);
+	prt_printf(out, " write_time %llu",		a.io_time[WRITE]);
 }
 
 int bch2_alloc_read(struct bch_fs *c)
@@ -484,7 +484,7 @@ static int bch2_bucket_do_index(struct btree_trans *trans,
 	enum btree_id btree;
 	enum bch_bkey_type old_type = !set ? KEY_TYPE_set : KEY_TYPE_deleted;
 	enum bch_bkey_type new_type =  set ? KEY_TYPE_set : KEY_TYPE_deleted;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	int ret;
 
 	if (a->data_type != BCH_DATA_free &&
@@ -536,7 +536,7 @@ static int bch2_bucket_do_index(struct btree_trans *trans,
 	ret = bch2_trans_update(trans, &iter, k, 0);
 err:
 	bch2_trans_iter_exit(trans, &iter);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 	return ret;
 }
 
@@ -614,8 +614,8 @@ static int bch2_check_alloc_key(struct btree_trans *trans,
 	struct bch_alloc_v4 a;
 	unsigned discard_key_type, freespace_key_type;
 	struct bkey_s_c alloc_k, k;
-	struct bch_printbuf buf = BCH_PRINTBUF;
-	struct bch_printbuf buf2 = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
+	struct printbuf buf2 = PRINTBUF;
 	int ret;
 
 	alloc_k = bch2_btree_iter_peek(alloc_iter);
@@ -684,7 +684,7 @@ static int bch2_check_alloc_key(struct btree_trans *trans,
 			"  %s",
 			bch2_bkey_types[k.k->type],
 			bch2_bkey_types[freespace_key_type],
-			(bch2_printbuf_reset(&buf),
+			(printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, alloc_k), buf.buf))) {
 		struct bkey_i *update =
 			bch2_trans_kmalloc(trans, sizeof(*update));
@@ -706,8 +706,8 @@ err:
 fsck_err:
 	bch2_trans_iter_exit(trans, &freespace_iter);
 	bch2_trans_iter_exit(trans, &discard_iter);
-	bch2_printbuf_exit(&buf2);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf2);
+	printbuf_exit(&buf);
 	return ret;
 }
 
@@ -723,7 +723,7 @@ static int bch2_check_discard_freespace_key(struct btree_trans *trans,
 	enum bch_data_type state = iter->btree_id == BTREE_ID_need_discard
 		? BCH_DATA_need_discard
 		: BCH_DATA_free;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	int ret;
 
 	freespace_k = bch2_btree_iter_peek(iter);
@@ -765,7 +765,7 @@ out:
 err:
 fsck_err:
 	bch2_trans_iter_exit(trans, &alloc_iter);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 	return ret;
 delete:
 	ret = bch2_btree_delete_extent_at(trans, iter,
@@ -832,8 +832,8 @@ static int bch2_check_alloc_to_lru_ref(struct btree_trans *trans,
 	struct btree_iter lru_iter;
 	struct bch_alloc_v4 a;
 	struct bkey_s_c alloc_k, k;
-	struct bch_printbuf buf = BCH_PRINTBUF;
-	struct bch_printbuf buf2 = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
+	struct printbuf buf2 = PRINTBUF;
 	int ret;
 
 	alloc_k = bch2_btree_iter_peek(alloc_iter);
@@ -860,14 +860,14 @@ static int bch2_check_alloc_to_lru_ref(struct btree_trans *trans,
 	if (fsck_err_on(!a.io_time[READ], c,
 			"cached bucket with read_time 0\n"
 			"  %s",
-		(bch2_printbuf_reset(&buf),
+		(printbuf_reset(&buf),
 		 bch2_bkey_val_to_text(&buf, c, alloc_k), buf.buf)) ||
 	    fsck_err_on(k.k->type != KEY_TYPE_lru ||
 			le64_to_cpu(bkey_s_c_to_lru(k).v->idx) != alloc_k.k->p.offset, c,
 			"incorrect/missing lru entry\n"
 			"  %s\n"
 			"  %s",
-			(bch2_printbuf_reset(&buf),
+			(printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, alloc_k), buf.buf),
 			(bch2_bkey_val_to_text(&buf2, c, k), buf2.buf))) {
 		u64 read_time = a.io_time[READ];
@@ -899,8 +899,8 @@ static int bch2_check_alloc_to_lru_ref(struct btree_trans *trans,
 err:
 fsck_err:
 	bch2_trans_iter_exit(trans, &lru_iter);
-	bch2_printbuf_exit(&buf2);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf2);
+	printbuf_exit(&buf);
 	return ret;
 }
 
@@ -935,7 +935,7 @@ static int bch2_clear_need_discard(struct btree_trans *trans, struct bpos pos,
 	struct btree_iter iter;
 	struct bkey_s_c k;
 	struct bkey_i_alloc_v4 *a;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	int ret;
 
 	bch2_trans_iter_init(trans, &iter, BTREE_ID_alloc, pos,
@@ -997,7 +997,7 @@ write:
 	ret = bch2_trans_update(trans, &iter, &a->k_i, 0);
 out:
 	bch2_trans_iter_exit(trans, &iter);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 	return ret;
 }
 
@@ -1083,7 +1083,7 @@ static int invalidate_one_bucket(struct btree_trans *trans, struct bch_dev *ca)
 	struct bkey_s_c k;
 	struct bkey_i_alloc_v4 *a;
 	u64 bucket, idx;
-	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct printbuf buf = PRINTBUF;
 	int ret;
 
 	bch2_trans_iter_init(trans, &lru_iter, BTREE_ID_lru,
@@ -1098,7 +1098,7 @@ next_lru:
 		goto out;
 
 	if (k.k->type != KEY_TYPE_lru) {
-		pr_buf(&buf, "non lru key in lru btree:\n  ");
+		prt_printf(&buf, "non lru key in lru btree:\n  ");
 		bch2_bkey_val_to_text(&buf, c, k);
 
 		if (!test_bit(BCH_FS_CHECK_LRUS_DONE, &c->flags)) {
@@ -1122,9 +1122,9 @@ next_lru:
 		goto out;
 
 	if (idx != alloc_lru_idx(a->v)) {
-		pr_buf(&buf, "alloc key does not point back to lru entry when invalidating bucket:\n  ");
+		prt_printf(&buf, "alloc key does not point back to lru entry when invalidating bucket:\n  ");
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&a->k_i));
-		pr_buf(&buf, "\n  ");
+		prt_printf(&buf, "\n  ");
 		bch2_bkey_val_to_text(&buf, c, k);
 
 		if (!test_bit(BCH_FS_CHECK_LRUS_DONE, &c->flags)) {
@@ -1155,7 +1155,7 @@ next_lru:
 out:
 	bch2_trans_iter_exit(trans, &alloc_iter);
 	bch2_trans_iter_exit(trans, &lru_iter);
-	bch2_printbuf_exit(&buf);
+	printbuf_exit(&buf);
 	return ret;
 }
 

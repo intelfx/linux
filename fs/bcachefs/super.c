@@ -53,6 +53,7 @@
 #include <linux/idr.h>
 #include <linux/module.h>
 #include <linux/percpu.h>
+#include <linux/pretty-printers.h>
 #include <linux/random.h>
 #include <linux/sysfs.h>
 #include <crypto/hash.h>
@@ -605,6 +606,7 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 {
 	struct bch_sb_field_members *mi;
 	struct bch_fs *c;
+	struct printbuf name = PRINTBUF;
 	unsigned i, iter_size;
 	int ret = 0;
 
@@ -708,7 +710,13 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts opts)
 	if (ret)
 		goto err;
 
-	uuid_unparse_lower(c->sb.user_uuid.b, c->name);
+	pr_uuid(&name, c->sb.user_uuid.b);
+	strlcpy(c->name, name.buf, sizeof(c->name));
+	printbuf_exit(&name);
+
+	ret = name.allocation_failure ? -ENOMEM : 0;
+	if (ret)
+		goto err;
 
 	/* Compat: */
 	if (sb->version <= bcachefs_metadata_version_inode_v2 &&
@@ -826,11 +834,11 @@ noinline_for_stack
 static void print_mount_opts(struct bch_fs *c)
 {
 	enum bch_opt_id i;
-	struct bch_printbuf p = BCH_PRINTBUF;
+	struct printbuf p = PRINTBUF;
 	bool first = true;
 
 	if (c->opts.read_only) {
-		pr_buf(&p, "ro");
+		prt_printf(&p, "ro");
 		first = false;
 	}
 
@@ -845,16 +853,16 @@ static void print_mount_opts(struct bch_fs *c)
 			continue;
 
 		if (!first)
-			pr_buf(&p, ",");
+			prt_printf(&p, ",");
 		first = false;
 		bch2_opt_to_text(&p, c, c->disk_sb.sb, opt, v, OPT_SHOW_MOUNT_STYLE);
 	}
 
 	if (!p.pos)
-		pr_buf(&p, "(null)");
+		prt_printf(&p, "(null)");
 
 	bch_info(c, "mounted version=%s opts=%s", bch2_metadata_versions[c->sb.version], p.buf);
-	bch2_printbuf_exit(&p);
+	printbuf_exit(&p);
 }
 
 int bch2_fs_start(struct bch_fs *c)
@@ -1482,11 +1490,11 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags)
 
 	data = bch2_dev_has_data(c, ca);
 	if (data) {
-		struct bch_printbuf data_has = BCH_PRINTBUF;
+		struct printbuf data_has = PRINTBUF;
 
-		bch2_flags_to_text(&data_has, bch2_data_types, data);
+		prt_bitflags(&data_has, bch2_data_types, data);
 		bch_err(ca, "Remove failed, still has data (%s)", data_has.buf);
-		bch2_printbuf_exit(&data_has);
+		printbuf_exit(&data_has);
 		ret = -EBUSY;
 		goto err;
 	}
@@ -1535,7 +1543,7 @@ int bch2_dev_add(struct bch_fs *c, const char *path)
 	struct bch_sb_field_members *mi;
 	struct bch_member dev_mi;
 	unsigned dev_idx, nr_devices, u64s;
-	struct bch_printbuf errbuf = BCH_PRINTBUF;
+	struct printbuf errbuf = PRINTBUF;
 	int ret;
 
 	ret = bch2_read_super(path, &opts, &sb);
@@ -1658,7 +1666,7 @@ err:
 	if (ca)
 		bch2_dev_free(ca);
 	bch2_free_super(&sb);
-	bch2_printbuf_exit(&errbuf);
+	printbuf_exit(&errbuf);
 	return ret;
 err_late:
 	up_write(&c->state_lock);
@@ -1820,7 +1828,7 @@ struct bch_fs *bch2_fs_open(char * const *devices, unsigned nr_devices,
 	struct bch_sb_field_members *mi;
 	unsigned i, best_sb = 0;
 	const char *err;
-	struct bch_printbuf errbuf = BCH_PRINTBUF;
+	struct printbuf errbuf = PRINTBUF;
 	int ret = 0;
 
 	if (!try_module_get(THIS_MODULE))
@@ -1896,7 +1904,7 @@ struct bch_fs *bch2_fs_open(char * const *devices, unsigned nr_devices,
 	}
 out:
 	kfree(sb);
-	bch2_printbuf_exit(&errbuf);
+	printbuf_exit(&errbuf);
 	module_put(THIS_MODULE);
 	pr_verbose_init(opts, "ret %i", PTR_ERR_OR_ZERO(c));
 	return c;

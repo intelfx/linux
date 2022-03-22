@@ -103,28 +103,28 @@ struct ec_bio {
 /* Stripes btree keys: */
 
 int bch2_stripe_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			int rw, struct bch_printbuf *err)
+			int rw, struct printbuf *err)
 {
 	const struct bch_stripe *s = bkey_s_c_to_stripe(k).v;
 
 	if (!bkey_cmp(k.k->p, POS_MIN)) {
-		pr_buf(err, "stripe at POS_MIN");
+		prt_printf(err, "stripe at POS_MIN");
 		return -EINVAL;
 	}
 
 	if (k.k->p.inode) {
-		pr_buf(err, "nonzero inode field");
+		prt_printf(err, "nonzero inode field");
 		return -EINVAL;
 	}
 
 	if (bkey_val_bytes(k.k) < sizeof(*s)) {
-		pr_buf(err, "incorrect value size (%zu < %zu)",
+		prt_printf(err, "incorrect value size (%zu < %zu)",
 		       bkey_val_bytes(k.k), sizeof(*s));
 		return -EINVAL;
 	}
 
 	if (bkey_val_u64s(k.k) < stripe_val_u64s(s)) {
-		pr_buf(err, "incorrect value size (%zu < %u)",
+		prt_printf(err, "incorrect value size (%zu < %u)",
 		       bkey_val_u64s(k.k), stripe_val_u64s(s));
 		return -EINVAL;
 	}
@@ -132,13 +132,13 @@ int bch2_stripe_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return bch2_bkey_ptrs_invalid(c, k, rw, err);
 }
 
-void bch2_stripe_to_text(struct bch_printbuf *out, struct bch_fs *c,
+void bch2_stripe_to_text(struct printbuf *out, struct bch_fs *c,
 			 struct bkey_s_c k)
 {
 	const struct bch_stripe *s = bkey_s_c_to_stripe(k).v;
 	unsigned i;
 
-	pr_buf(out, "algo %u sectors %u blocks %u:%u csum %u gran %u",
+	prt_printf(out, "algo %u sectors %u blocks %u:%u csum %u gran %u",
 	       s->algorithm,
 	       le16_to_cpu(s->sectors),
 	       s->nr_blocks - s->nr_redundant,
@@ -147,7 +147,7 @@ void bch2_stripe_to_text(struct bch_printbuf *out, struct bch_fs *c,
 	       1U << s->csum_granularity_bits);
 
 	for (i = 0; i < s->nr_blocks; i++)
-		pr_buf(out, " %u:%llu:%u", s->ptrs[i].dev,
+		prt_printf(out, " %u:%llu:%u", s->ptrs[i].dev,
 		       (u64) s->ptrs[i].offset,
 		       stripe_blockcount_get(s, i));
 }
@@ -296,7 +296,7 @@ static void ec_validate_checksums(struct bch_fs *c, struct ec_stripe_buf *buf)
 			struct bch_csum got = ec_block_checksum(buf, i, offset);
 
 			if (bch2_crc_cmp(want, got)) {
-				struct bch_printbuf buf2 = BCH_PRINTBUF;
+				struct printbuf buf2 = PRINTBUF;
 
 				bch2_bkey_val_to_text(&buf2, c, bkey_i_to_s_c(&buf->key.k_i));
 
@@ -304,7 +304,7 @@ static void ec_validate_checksums(struct bch_fs *c, struct ec_stripe_buf *buf)
 					"stripe checksum error for %ps at %u:%u: csum type %u, expected %llx got %llx\n%s",
 					(void *) _RET_IP_, i, j, v->csum_type,
 					want.lo, got.lo, buf2.buf);
-				bch2_printbuf_exit(&buf2);
+				printbuf_exit(&buf2);
 				clear_bit(i, buf->valid);
 				break;
 			}
@@ -1612,7 +1612,7 @@ int bch2_stripes_read(struct bch_fs *c)
 	return ret;
 }
 
-void bch2_stripes_heap_to_text(struct bch_printbuf *out, struct bch_fs *c)
+void bch2_stripes_heap_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	ec_stripes_heap *h = &c->ec_stripes_heap;
 	struct stripe *m;
@@ -1622,7 +1622,7 @@ void bch2_stripes_heap_to_text(struct bch_printbuf *out, struct bch_fs *c)
 	for (i = 0; i < min_t(size_t, h->used, 20); i++) {
 		m = genradix_ptr(&c->stripes, h->data[i].idx);
 
-		pr_buf(out, "%zu %u/%u+%u\n", h->data[i].idx,
+		prt_printf(out, "%zu %u/%u+%u\n", h->data[i].idx,
 		       h->data[i].blocks_nonempty,
 		       m->nr_blocks - m->nr_redundant,
 		       m->nr_redundant);
@@ -1630,18 +1630,18 @@ void bch2_stripes_heap_to_text(struct bch_printbuf *out, struct bch_fs *c)
 	spin_unlock(&c->ec_stripes_heap_lock);
 }
 
-void bch2_new_stripes_to_text(struct bch_printbuf *out, struct bch_fs *c)
+void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct ec_stripe_head *h;
 	struct ec_stripe_new *s;
 
 	mutex_lock(&c->ec_stripe_head_lock);
 	list_for_each_entry(h, &c->ec_stripe_head_list, list) {
-		pr_buf(out, "target %u algo %u redundancy %u:\n",
+		prt_printf(out, "target %u algo %u redundancy %u:\n",
 		       h->target, h->algo, h->redundancy);
 
 		if (h->s)
-			pr_buf(out, "\tpending: blocks %u+%u allocated %u\n",
+			prt_printf(out, "\tpending: blocks %u+%u allocated %u\n",
 			       h->s->nr_data, h->s->nr_parity,
 			       bitmap_weight(h->s->blocks_allocated,
 					     h->s->nr_data));
@@ -1650,7 +1650,7 @@ void bch2_new_stripes_to_text(struct bch_printbuf *out, struct bch_fs *c)
 
 	mutex_lock(&c->ec_stripe_new_lock);
 	list_for_each_entry(s, &c->ec_stripe_new_list, list) {
-		pr_buf(out, "\tin flight: blocks %u+%u pin %u\n",
+		prt_printf(out, "\tin flight: blocks %u+%u pin %u\n",
 		       s->nr_data, s->nr_parity,
 		       atomic_read(&s->pin));
 	}

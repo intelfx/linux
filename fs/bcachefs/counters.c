@@ -22,12 +22,12 @@ static size_t bch2_sb_counter_nr_entries(struct bch_sb_field_counters *ctrs)
 
 static int bch2_sb_counters_validate(struct bch_sb *sb,
 				     struct bch_sb_field *f,
-				     struct bch_printbuf *err)
+				     struct printbuf *err)
 {
 	return 0;
 };
 
-void bch2_sb_counters_to_text(struct bch_printbuf *out, struct bch_sb *sb,
+void bch2_sb_counters_to_text(struct printbuf *out, struct bch_sb *sb,
 			      struct bch_sb_field *f)
 {
 	struct bch_sb_field_counters *ctrs = field_to_type(f, counters);
@@ -36,13 +36,13 @@ void bch2_sb_counters_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 
 	for (i = 0; i < nr; i++) {
 		if (i < BCH_COUNTER_NR)
-			pr_buf(out, "%s", bch2_counter_names[i]);
+			prt_printf(out, "%s", bch2_counter_names[i]);
 		else
-			pr_buf(out, "(unknown)");
+			prt_printf(out, "(unknown)");
 
-		pr_tab(out);
-		pr_buf(out, "%llu", le64_to_cpu(ctrs->d[i]));
-		pr_newline(out);
+		prt_tab(out);
+		prt_printf(out, "%llu", le64_to_cpu(ctrs->d[i]));
+		prt_newline(out);
 	};
 };
 

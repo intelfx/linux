@@ -9,6 +9,8 @@
 #include "super-io.h"
 #include "util.h"
 
+#include <linux/pretty-printers.h>
+
 #define x(t, n) [n] = #t,
 
 const char * const bch2_metadata_versions[] = {
@@ -224,32 +226,32 @@ static int bch2_mount_opt_lookup(const char *name)
 	return bch2_opt_lookup(name);
 }
 
-int bch2_opt_validate(const struct bch_option *opt, u64 v, struct bch_printbuf *err)
+int bch2_opt_validate(const struct bch_option *opt, u64 v, struct printbuf *err)
 {
 	if (v < opt->min) {
 		if (err)
-			pr_buf(err, "%s: too small (min %llu)",
+			prt_printf(err, "%s: too small (min %llu)",
 			       opt->attr.name, opt->min);
 		return -ERANGE;
 	}
 
 	if (opt->max && v >= opt->max) {
 		if (err)
-			pr_buf(err, "%s: too big (max %llu)",
+			prt_printf(err, "%s: too big (max %llu)",
 			       opt->attr.name, opt->max);
 		return -ERANGE;
 	}
 
 	if ((opt->flags & OPT_SB_FIELD_SECTORS) && (v & 511)) {
 		if (err)
-			pr_buf(err, "%s: not a multiple of 512",
+			prt_printf(err, "%s: not a multiple of 512",
 			       opt->attr.name);
 		return -EINVAL;
 	}
 
 	if ((opt->flags & OPT_MUST_BE_POW_2) && !is_power_of_2(v)) {
 		if (err)
-			pr_buf(err, "%s: must be a power of two",
+			prt_printf(err, "%s: must be a power of two",
 			       opt->attr.name);
 		return -EINVAL;
 	}
@@ -260,7 +262,7 @@ int bch2_opt_validate(const struct bch_option *opt, u64 v, struct bch_printbuf *
 int bch2_opt_parse(struct bch_fs *c,
 		   const struct bch_option *opt,
 		   const char *val, u64 *res,
-		   struct bch_printbuf *err)
+		   struct printbuf *err)
 {
 	ssize_t ret;
 
@@ -269,8 +271,8 @@ int bch2_opt_parse(struct bch_fs *c,
 		ret = kstrtou64(val, 10, res);
 		if (ret < 0 || (*res != 0 && *res != 1)) {
 			if (err)
-				pr_buf(err, "%s: must be bool",
-				       opt->attr.name);
+				prt_printf(err, "%s: must be bool",
+					   opt->attr.name);
 			return ret;
 		}
 		break;
@@ -280,8 +282,8 @@ int bch2_opt_parse(struct bch_fs *c,
 			: kstrtou64(val, 10, res);
 		if (ret < 0) {
 			if (err)
-				pr_buf(err, "%s: must be a number",
-				       opt->attr.name);
+				prt_printf(err, "%s: must be a number",
+					   opt->attr.name);
 			return ret;
 		}
 		break;
@@ -289,8 +291,8 @@ int bch2_opt_parse(struct bch_fs *c,
 		ret = match_string(opt->choices, -1, val);
 		if (ret < 0) {
 			if (err)
-				pr_buf(err, "%s: invalid selection",
-				       opt->attr.name);
+				prt_printf(err, "%s: invalid selection",
+					   opt->attr.name);
 			return ret;
 		}
 
@@ -303,8 +305,8 @@ int bch2_opt_parse(struct bch_fs *c,
 		ret = opt->parse(c, val, res);
 		if (ret < 0) {
 			if (err)
-				pr_buf(err, "%s: parse error",
-				       opt->attr.name);
+				prt_printf(err, "%s: parse error",
+					   opt->attr.name);
 			return ret;
 		}
 	}
@@ -312,35 +314,35 @@ int bch2_opt_parse(struct bch_fs *c,
 	return bch2_opt_validate(opt, *res, err);
 }
 
-void bch2_opt_to_text(struct bch_printbuf *out,
+void bch2_opt_to_text(struct printbuf *out,
 		      struct bch_fs *c, struct bch_sb *sb,
 		      const struct bch_option *opt, u64 v,
 		      unsigned flags)
 {
 	if (flags & OPT_SHOW_MOUNT_STYLE) {
 		if (opt->type == BCH_OPT_BOOL) {
-			pr_buf(out, "%s%s",
+			prt_printf(out, "%s%s",
 			       v ? "" : "no",
 			       opt->attr.name);
 			return;
 		}
 
-		pr_buf(out, "%s=", opt->attr.name);
+		prt_printf(out, "%s=", opt->attr.name);
 	}
 
 	switch (opt->type) {
 	case BCH_OPT_BOOL:
 	case BCH_OPT_UINT:
 		if (opt->flags & OPT_HUMAN_READABLE)
-			bch2_hprint(out, v);
+			prt_human_readable_u64(out, v);
 		else
-			pr_buf(out, "%lli", v);
+			prt_printf(out, "%lli", v);
 		break;
 	case BCH_OPT_STR:
 		if (flags & OPT_SHOW_FULL_LIST)
-			bch2_string_opt_to_text(out, opt->choices, v);
+			prt_string_option(out, opt->choices, v);
 		else
-			pr_buf(out, "%s", opt->choices[v]);
+			prt_printf(out, "%s", opt->choices[v]);
 		break;
 	case BCH_OPT_FN:
 		opt->to_text(out, c, sb, v);
@@ -389,7 +391,7 @@ int bch2_parse_mount_opts(struct bch_fs *c, struct bch_opts *opts,
 	char *copied_opts, *copied_opts_start;
 	char *opt, *name, *val;
 	int ret, id;
-	struct bch_printbuf err = BCH_PRINTBUF;
+	struct printbuf err = PRINTBUF;
 	u64 v;
 
 	if (!options)
@@ -461,7 +463,7 @@ no_val:
 	goto out;
 out:
 	kfree(copied_opts_start);
-	bch2_printbuf_exit(&err);
+	printbuf_exit(&err);
 	return ret;
 }
 
