@@ -64,7 +64,7 @@ MODULE_PARM_DESC(shared_mem,
 		 "enable amd-pstate on processors with shared memory solution (false = disabled (default), true = enabled)");
 
 #if defined(CONFIG_X86_ACPI_CPUFREQ) || defined(CONFIG_X86_ACPI_CPUFREQ_MODULE)
-static bool replace = false;
+static bool replace = true;
 module_param(replace, bool, 0444);
 MODULE_PARM_DESC(replace,
 		  "replace acpi-cpufreq driver upon init if necessary");
