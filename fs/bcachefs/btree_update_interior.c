@@ -508,18 +508,6 @@ static void btree_update_add_key(struct btree_update *as,
 	bch2_keylist_push(keys);
 }
 
-static void btree_update_will_delete_key(struct btree_update *as,
-					 struct btree *b)
-{
-	btree_update_add_key(as, &as->old_keys, b);
-}
-
-static void btree_update_will_add_key(struct btree_update *as,
-				      struct btree *b)
-{
-	btree_update_add_key(as, &as->new_keys, b);
-}
-
 /*
  * The transactional part of an interior btree node update, where we journal the
  * update we did to the interior node and update alloc info:
@@ -541,18 +529,18 @@ static int btree_update_nodes_written_trans(struct btree_trans *trans,
 
 	trans->journal_pin = &as->journal;
 
-	for_each_keylist_key(&as->new_keys, k) {
-		unsigned level = bkey_i_to_btree_ptr_v2(k)->v.mem_ptr;
-
-		ret = bch2_trans_mark_new(trans, as->btree_id, level, k, 0);
-		if (ret)
-			return ret;
-	}
-
 	for_each_keylist_key(&as->old_keys, k) {
 		unsigned level = bkey_i_to_btree_ptr_v2(k)->v.mem_ptr;
 
 		ret = bch2_trans_mark_old(trans, as->btree_id, level, bkey_i_to_s_c(k), 0);
+		if (ret)
+			return ret;
+	}
+
+	for_each_keylist_key(&as->new_keys, k) {
+		unsigned level = bkey_i_to_btree_ptr_v2(k)->v.mem_ptr;
+
+		ret = bch2_trans_mark_new(trans, as->btree_id, level, k, 0);
 		if (ret)
 			return ret;
 	}
@@ -824,7 +812,7 @@ static void bch2_btree_update_add_new_node(struct btree_update *as, struct btree
 
 	mutex_unlock(&c->btree_interior_update_lock);
 
-	btree_update_will_add_key(as, b);
+	btree_update_add_key(as, &as->new_keys, b);
 }
 
 /*
@@ -941,7 +929,7 @@ static void bch2_btree_interior_update_will_free_node(struct btree_update *as,
 	 */
 	btree_update_drop_new_node(c, b);
 
-	btree_update_will_delete_key(as, b);
+	btree_update_add_key(as, &as->old_keys, b);
 
 	as->old_nodes[as->nr_old_nodes] = b;
 	as->old_nodes_seq[as->nr_old_nodes] = b->data->keys.seq;
@@ -1271,12 +1259,13 @@ static struct btree *__btree_split_node(struct btree_update *as,
 	struct bpos n1_pos;
 
 	n2 = bch2_btree_node_alloc(as, n1->c.level);
-	bch2_btree_update_add_new_node(as, n2);
 
 	n2->data->max_key	= n1->data->max_key;
 	n2->data->format	= n1->format;
 	SET_BTREE_NODE_SEQ(n2->data, BTREE_NODE_SEQ(n1->data));
 	n2->key.k.p = n1->key.k.p;
+
+	bch2_btree_update_add_new_node(as, n2);
 
 	set1 = btree_bset_first(n1);
 	set2 = btree_bset_first(n2);
@@ -1434,7 +1423,6 @@ static void btree_split(struct btree_update *as, struct btree_trans *trans,
 	bch2_btree_interior_update_will_free_node(as, b);
 
 	n1 = bch2_btree_node_alloc_replacement(as, b);
-	bch2_btree_update_add_new_node(as, n1);
 
 	if (keys)
 		btree_split_insert_keys(as, trans, path, n1, keys);
@@ -1448,6 +1436,8 @@ static void btree_split(struct btree_update *as, struct btree_trans *trans,
 		bch2_btree_build_aux_trees(n1);
 		six_unlock_write(&n2->c.lock);
 		six_unlock_write(&n1->c.lock);
+
+		bch2_btree_update_add_new_node(as, n1);
 
 		bch2_btree_node_write(c, n1, SIX_LOCK_intent, 0);
 		bch2_btree_node_write(c, n2, SIX_LOCK_intent, 0);
@@ -1476,6 +1466,8 @@ static void btree_split(struct btree_update *as, struct btree_trans *trans,
 
 		bch2_btree_build_aux_trees(n1);
 		six_unlock_write(&n1->c.lock);
+
+		bch2_btree_update_add_new_node(as, n1);
 
 		bch2_btree_node_write(c, n1, SIX_LOCK_intent, 0);
 
@@ -1745,7 +1737,6 @@ int __bch2_foreground_maybe_merge(struct btree_trans *trans,
 	bch2_btree_interior_update_will_free_node(as, m);
 
 	n = bch2_btree_node_alloc(as, b->c.level);
-	bch2_btree_update_add_new_node(as, n);
 
 	SET_BTREE_NODE_SEQ(n->data,
 			   max(BTREE_NODE_SEQ(b->data),
@@ -1753,8 +1744,10 @@ int __bch2_foreground_maybe_merge(struct btree_trans *trans,
 
 	btree_set_min(n, prev->data->min_key);
 	btree_set_max(n, next->data->max_key);
-	n->data->format		= new_f;
 
+	bch2_btree_update_add_new_node(as, n);
+
+	n->data->format	 = new_f;
 	btree_node_set_format(n, new_f);
 
 	bch2_btree_sort_into(c, n, prev);
@@ -1937,13 +1930,13 @@ static int __bch2_btree_node_update_key(struct btree_trans *trans,
 	int ret;
 
 	if (!skip_triggers) {
-		ret = bch2_trans_mark_new(trans, b->c.btree_id, b->c.level + 1,
-					  new_key, 0);
+		ret = bch2_trans_mark_old(trans, b->c.btree_id, b->c.level + 1,
+					  bkey_i_to_s_c(&b->key), 0);
 		if (ret)
 			return ret;
 
-		ret = bch2_trans_mark_old(trans, b->c.btree_id, b->c.level + 1,
-					  bkey_i_to_s_c(&b->key), 0);
+		ret = bch2_trans_mark_new(trans, b->c.btree_id, b->c.level + 1,
+					  new_key, 0);
 		if (ret)
 			return ret;
 	}
