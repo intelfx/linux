@@ -1037,7 +1037,7 @@ static int __init acpi_cpufreq_init(void)
 	return ret;
 }
 
-static void __exit acpi_cpufreq_exit(void)
+void acpi_cpufreq_exit(void)
 {
 	pr_debug("%s\n", __func__);
 
@@ -1047,6 +1047,12 @@ static void __exit acpi_cpufreq_exit(void)
 
 	free_acpi_perf_data();
 }
+EXPORT_SYMBOL_GPL(acpi_cpufreq_exit);
+
+void __exit acpi_cpufreq_module_exit(void)
+{
+	acpi_cpufreq_exit();
+}
 
 module_param(acpi_pstate_strict, uint, 0644);
 MODULE_PARM_DESC(acpi_pstate_strict,
@@ -1054,7 +1060,7 @@ MODULE_PARM_DESC(acpi_pstate_strict,
 	"performed during frequency changes.");
 
 late_initcall(acpi_cpufreq_init);
-module_exit(acpi_cpufreq_exit);
+module_exit(acpi_cpufreq_module_exit);
 
 static const struct x86_cpu_id __maybe_unused acpi_cpufreq_ids[] = {
 	X86_MATCH_FEATURE(X86_FEATURE_ACPI, NULL),

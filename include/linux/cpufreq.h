@@ -273,6 +273,9 @@ static inline void cpufreq_stats_record_transition(struct cpufreq_policy *policy
 						   unsigned int new_freq) { }
 #endif /* CONFIG_CPU_FREQ_STAT */
 
+#if defined(CONFIG_X86_ACPI_CPUFREQ) || defined(CONFIG_X86_ACPI_CPUFREQ_MODULE)
+void acpi_cpufreq_exit(void);
+#endif
 /*********************************************************************
  *                      CPUFREQ DRIVER INTERFACE                     *
  *********************************************************************/
