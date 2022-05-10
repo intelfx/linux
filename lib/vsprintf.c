@@ -515,35 +515,35 @@ void number(struct printbuf *out, unsigned long long num,
 	/* leading space padding */
 	field_width = max(0, field_width - precision);
 	if (!(spec.flags & (ZEROPAD | LEFT)) && field_width) {
-		__prt_chars(out, ' ', field_width);
+		__prt_chars_reserved(out, ' ', field_width);
 		field_width = 0;
 	}
 	/* sign */
 	if (sign)
-		__prt_char(out, sign);
+		__prt_char_reserved(out, sign);
 	/* "0x" / "0" prefix */
 	if (need_pfx) {
 		if (spec.base == 16 || !is_zero)
-			__prt_char(out, '0');
+			__prt_char_reserved(out, '0');
 		if (spec.base == 16)
-			__prt_char(out, 'X' | locase);
+			__prt_char_reserved(out, 'X' | locase);
 	}
 	/* zero or space padding */
 	if (!(spec.flags & LEFT) && field_width) {
 		char c = ' ' + (spec.flags & ZEROPAD);
 
-		__prt_chars(out, c, field_width);
+		__prt_chars_reserved(out, c, field_width);
 		field_width = 0;
 	}
 	/* hmm even more zero padding? */
 	if (precision > i)
-		__prt_chars(out, '0', precision - i);
+		__prt_chars_reserved(out, '0', precision - i);
 	/* actual digits of result */
 	while (--i >= 0)
-		__prt_char(out, tmp[i]);
+		__prt_char_reserved(out, tmp[i]);
 	/* trailing space padding */
 	if (field_width)
-		__prt_chars(out, ' ', field_width);
+		__prt_chars_reserved(out, ' ', field_width);
 
 	printbuf_nul_terminate(out);
 }
