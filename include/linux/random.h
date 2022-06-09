@@ -73,7 +73,11 @@ static inline unsigned long get_random_canary(void)
 	return get_random_long() & CANARY_MASK;
 }
 
+#ifdef CONFIG_RANDOM_DEFAULT_IMPL
 int __init random_init(const char *command_line);
+#else
+static inline int random_init(const char *command_line) { return 0; }
+#endif
 bool rng_is_initialized(void);
 int wait_for_random_bytes(void);
 int register_random_ready_notifier(struct notifier_block *nb);
