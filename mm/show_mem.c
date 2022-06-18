@@ -11,11 +11,13 @@
 
 #include "slab.h"
 
+static DEFINE_MUTEX(show_mem_buf_lock);
+static char show_mem_buf[4096];
+
 void show_mem(unsigned int filter, nodemask_t *nodemask)
 {
 	pg_data_t *pgdat;
 	unsigned long total = 0, reserved = 0, highmem = 0;
-	struct printbuf buf = PRINTBUF;
 
 	printk("Mem-Info:\n");
 	show_free_areas(filter, nodemask);
@@ -45,14 +47,16 @@ void show_mem(unsigned int filter, nodemask_t *nodemask)
 #ifdef CONFIG_MEMORY_FAILURE
 	printk("%lu pages hwpoisoned\n", atomic_long_read(&num_poisoned_pages));
 #endif
+	if (mutex_trylock(&show_mem_buf_lock)) {
+		struct printbuf buf = PRINTBUF_EXTERN(show_mem_buf, sizeof(show_mem_buf));
 
-	pr_info("Unreclaimable slab info:\n");
-	dump_unreclaimable_slab(&buf);
-	printk("%s", printbuf_str(&buf));
-	printbuf_reset(&buf);
+		pr_info("Unreclaimable slab info:\n");
+		dump_unreclaimable_slab(&buf);
+		printk("%s", printbuf_str(&buf));
+		printbuf_reset(&buf);
 
-	printk("Shrinkers:\n");
-	shrinkers_to_text(&buf);
-	printk("%s", printbuf_str(&buf));
-	printbuf_exit(&buf);
+		printk("Shrinkers:\n");
+		shrinkers_to_text(&buf);
+		printk("%s", printbuf_str(&buf));
+	}
 }
