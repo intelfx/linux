@@ -218,23 +218,29 @@ free_and_return:
 	return ret;
 }
 
-static int p9_fcall_init(struct p9_client *c, struct p9_fcall *fc,
-			 int alloc_msize)
+static void p9_fcall_init(struct p9_client *c, struct p9_fcall *fc,
+			  int fc_idx, unsigned alloc_msize)
 {
-	if (likely(c->fcall_cache) && alloc_msize == c->msize) {
-		fc->sdata = kmem_cache_alloc(c->fcall_cache, GFP_NOFS);
-		fc->cache = c->fcall_cache;
-	} else {
-		fc->sdata = kmalloc(alloc_msize, GFP_NOFS);
-		fc->cache = NULL;
-	}
-	if (!fc->sdata)
-		return -ENOMEM;
+	gfp_t gfp = GFP_NOFS|__GFP_NOWARN;
+
+	BUG_ON(alloc_msize > c->msize);
+
+	fc->sdata = NULL;
+	fc->used_mempool = false;
 	fc->capacity = alloc_msize;
-	return 0;
+
+	if (alloc_msize < c->msize)
+		fc->sdata = kmalloc(alloc_msize, gfp);
+
+	if (!fc->sdata) {
+		fc->sdata = mempool_alloc(&c->pools[fc_idx], gfp);
+		fc->used_mempool = true;
+		fc->capacity = c->msize;
+	}
 }
 
-void p9_fcall_fini(struct p9_fcall *fc)
+void p9_fcall_fini(struct p9_client *c, struct p9_fcall *fc,
+		   int fc_idx)
 {
 	/* sdata can be NULL for interrupted requests in trans_rdma,
 	 * and kmem_cache_free does not do NULL-check for us
@@ -242,8 +248,8 @@ void p9_fcall_fini(struct p9_fcall *fc)
 	if (unlikely(!fc->sdata))
 		return;
 
-	if (fc->cache)
-		kmem_cache_free(fc->cache, fc->sdata);
+	if (fc->used_mempool)
+		mempool_free(fc->sdata, &c->pools[fc_idx]);
 	else
 		kfree(fc->sdata);
 }
@@ -270,10 +276,8 @@ p9_tag_alloc(struct p9_client *c, int8_t type, unsigned int max_size)
 	if (!req)
 		return ERR_PTR(-ENOMEM);
 
-	if (p9_fcall_init(c, &req->tc, alloc_msize))
-		goto free_req;
-	if (p9_fcall_init(c, &req->rc, alloc_msize))
-		goto free;
+	p9_fcall_init(c, &req->tc, 0, alloc_msize);
+	p9_fcall_init(c, &req->rc, 1, alloc_msize);
 
 	p9pdu_reset(&req->tc);
 	p9pdu_reset(&req->rc);
@@ -305,14 +309,13 @@ p9_tag_alloc(struct p9_client *c, int8_t type, unsigned int max_size)
 	 * callback), so p9_client_cb eats the second ref there
 	 * as the pointer is duplicated directly by virtqueue_add_sgs()
 	 */
-	refcount_set(&req->refcount.refcount, 2);
+	refcount_set(&req->refcount, 2);
 
 	return req;
 
 free:
-	p9_fcall_fini(&req->tc);
-	p9_fcall_fini(&req->rc);
-free_req:
+	p9_fcall_fini(c, &req->tc, 0);
+	p9_fcall_fini(c, &req->rc, 1);
 	kmem_cache_free(p9_req_cache, req);
 	return ERR_PTR(-ENOMEM);
 }
@@ -341,7 +344,7 @@ again:
 		if (!p9_req_try_get(req))
 			goto again;
 		if (req->tc.tag != tag) {
-			p9_req_put(req);
+			p9_req_put(c, req);
 			goto again;
 		}
 	}
@@ -367,21 +370,18 @@ static int p9_tag_remove(struct p9_client *c, struct p9_req_t *r)
 	spin_lock_irqsave(&c->lock, flags);
 	idr_remove(&c->reqs, tag);
 	spin_unlock_irqrestore(&c->lock, flags);
-	return p9_req_put(r);
+	return p9_req_put(c, r);
 }
 
-static void p9_req_free(struct kref *ref)
+int p9_req_put(struct p9_client *c, struct p9_req_t *r)
 {
-	struct p9_req_t *r = container_of(ref, struct p9_req_t, refcount);
-
-	p9_fcall_fini(&r->tc);
-	p9_fcall_fini(&r->rc);
-	kmem_cache_free(p9_req_cache, r);
-}
-
-int p9_req_put(struct p9_req_t *r)
-{
-	return kref_put(&r->refcount, p9_req_free);
+	if (refcount_dec_and_test(&r->refcount)) {
+		p9_fcall_fini(c, &r->tc, 0);
+		p9_fcall_fini(c, &r->rc, 1);
+		kmem_cache_free(p9_req_cache, r);
+		return 1;
+	}
+	return 0;
 }
 EXPORT_SYMBOL(p9_req_put);
 
@@ -426,7 +426,7 @@ void p9_client_cb(struct p9_client *c, struct p9_req_t *req, int status)
 
 	wake_up(&req->wq);
 	p9_debug(P9_DEBUG_MUX, "wakeup: %d\n", req->tc.tag);
-	p9_req_put(req);
+	p9_req_put(c, req);
 }
 EXPORT_SYMBOL(p9_client_cb);
 
@@ -709,7 +709,7 @@ static struct p9_req_t *p9_client_prepare_req(struct p9_client *c,
 reterr:
 	p9_tag_remove(c, req);
 	/* We have to put also the 2nd reference as it won't be used */
-	p9_req_put(req);
+	p9_req_put(c, req);
 	return ERR_PTR(err);
 }
 
@@ -746,7 +746,7 @@ p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
 	err = c->trans_mod->request(c, req);
 	if (err < 0) {
 		/* write won't happen */
-		p9_req_put(req);
+		p9_req_put(c, req);
 		if (err != -ERESTARTSYS && err != -EFAULT)
 			c->status = Disconnected;
 		goto recalc_sigpending;
@@ -1002,7 +1002,7 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 	char *client_id;
 
 	err = 0;
-	clnt = kmalloc(sizeof(*clnt), GFP_KERNEL);
+	clnt = kzalloc(sizeof(*clnt), GFP_KERNEL);
 	if (!clnt)
 		return ERR_PTR(-ENOMEM);
 
@@ -1053,10 +1053,6 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 		goto close_trans;
 	}
 
-	err = p9_client_version(clnt);
-	if (err)
-		goto close_trans;
-
 	/* P9_HDRSZ + 4 is the smallest packet header we can have that is
 	 * followed by data accessed from userspace by read
 	 */
@@ -1066,6 +1062,15 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 					   clnt->msize - (P9_HDRSZ + 4),
 					   NULL);
 
+	err =   mempool_init_slab_pool(&clnt->pools[0], 4, clnt->fcall_cache) ?:
+		mempool_init_slab_pool(&clnt->pools[1], 4, clnt->fcall_cache);
+	if (err)
+		goto close_trans;
+
+	err = p9_client_version(clnt);
+	if (err)
+		goto close_trans;
+
 	return clnt;
 
 close_trans:
@@ -1073,6 +1078,8 @@ close_trans:
 put_trans:
 	v9fs_put_trans(clnt->trans_mod);
 free_client:
+	mempool_exit(&clnt->pools[1]);
+	mempool_exit(&clnt->pools[0]);
 	kfree(clnt);
 	return ERR_PTR(err);
 }
@@ -1097,6 +1104,8 @@ void p9_client_destroy(struct p9_client *clnt)
 
 	p9_tag_cleanup(clnt);
 
+	mempool_exit(&clnt->pools[1]);
+	mempool_exit(&clnt->pools[0]);
 	kmem_cache_destroy(clnt->fcall_cache);
 	kfree(clnt);
 }
