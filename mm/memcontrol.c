@@ -1514,9 +1514,9 @@ static char *memory_stat_format(struct mem_cgroup *memcg)
 	       memcg_events(memcg, PGLAZYFREED));
 
 #if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
-	seq_buf_printf(&s, "%s %lu\n", vm_event_name(ZSWPIN),
+	prt_printf(&buf, "%s %lu\n", vm_event_name(ZSWPIN),
 		       memcg_events(memcg, ZSWPIN));
-	seq_buf_printf(&s, "%s %lu\n", vm_event_name(ZSWPOUT),
+	prt_printf(&buf, "%s %lu\n", vm_event_name(ZSWPOUT),
 		       memcg_events(memcg, ZSWPOUT));
 #endif
 
