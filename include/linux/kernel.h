@@ -202,10 +202,16 @@ static inline void might_fault(void) { }
 
 void do_exit(long error_code) __noreturn;
 
+struct printbuf;
+extern void prt_u64_minwidth(struct printbuf *out, u64 num, unsigned width);
+extern void prt_u64(struct printbuf *out, u64 num);
 extern int num_to_str(char *buf, int size,
 		      unsigned long long num, unsigned int width);
 
 /* lib/printf utilities */
+
+extern __printf(2, 3) void prt_printf(struct printbuf *out, const char *fmt, ...);
+extern __printf(2, 0) void prt_vprintf(struct printbuf *out, const char *fmt, va_list);
 
 extern __printf(2, 3) int sprintf(char *buf, const char * fmt, ...);
 extern __printf(2, 0) int vsprintf(char *buf, const char *, va_list);
@@ -288,6 +294,12 @@ static inline char *hex_byte_pack_upper(char *buf, u8 byte)
 extern int hex_to_bin(unsigned char ch);
 extern int __must_check hex2bin(u8 *dst, const char *src, size_t count);
 extern char *bin2hex(char *dst, const void *src, size_t count);
+
+struct printbuf;
+void prt_hex_bytes(struct printbuf *, const void *, unsigned, unsigned, unsigned);
+void prt_hex_line(struct printbuf *, const void *, size_t, int, int, bool);
+void prt_hex_dump(struct printbuf *, const void *, size_t,
+		  const char *, int, unsigned, unsigned, bool);
 
 bool mac_pton(const char *s, u8 *mac);
 
