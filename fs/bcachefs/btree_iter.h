@@ -195,20 +195,6 @@ static inline int btree_trans_restart(struct btree_trans *trans, int err)
 bool bch2_btree_node_upgrade(struct btree_trans *,
 			     struct btree_path *, unsigned);
 
-bool __bch2_btree_path_upgrade(struct btree_trans *,
-			       struct btree_path *, unsigned);
-
-static inline bool bch2_btree_path_upgrade(struct btree_trans *trans,
-					   struct btree_path *path,
-					   unsigned new_locks_want)
-{
-	new_locks_want = min(new_locks_want, BTREE_MAX_DEPTH);
-
-	return path->locks_want < new_locks_want
-		? __bch2_btree_path_upgrade(trans, path, new_locks_want)
-		: path->uptodate == BTREE_ITER_UPTODATE;
-}
-
 void __bch2_btree_path_downgrade(struct btree_trans *, struct btree_path *, unsigned);
 
 static inline void bch2_btree_path_downgrade(struct btree_trans *trans,
