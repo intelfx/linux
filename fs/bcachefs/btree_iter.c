@@ -358,7 +358,7 @@ void bch2_assert_pos_locked(struct btree_trans *trans, enum btree_id id,
 		if (cmp < 0)
 			continue;
 
-		if (!(path->nodes_locked & 1) ||
+		if (!btree_node_locked(path, 0) ||
 		    !path->should_be_locked)
 			continue;
 
