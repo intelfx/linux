@@ -20,15 +20,19 @@ struct six_lock_count bch2_btree_node_lock_counts(struct btree_trans *trans,
 						  unsigned level)
 {
 	struct btree_path *path;
-	struct six_lock_count ret = { 0, 0 };
+	struct six_lock_count ret;
+
+	memset(&ret, 0, sizeof(ret));
 
 	if (IS_ERR_OR_NULL(b))
 		return ret;
 
 	trans_for_each_path(trans, path)
 		if (path != skip && path->l[level].b == b) {
-			ret.read += btree_node_read_locked(path, level);
-			ret.intent += btree_node_intent_locked(path, level);
+			int t = btree_node_locked_type(path, level);
+
+			if (t != BTREE_NODE_UNLOCKED)
+				ret.n[t]++;
 		}
 
 	return ret;
@@ -44,7 +48,7 @@ static inline void six_lock_readers_add(struct six_lock *lock, int nr)
 
 void __bch2_btree_node_lock_write(struct btree_trans *trans, struct btree *b)
 {
-	int readers = bch2_btree_node_lock_counts(trans, NULL, b, b->c.level).read;
+	int readers = bch2_btree_node_lock_counts(trans, NULL, b, b->c.level).n[SIX_LOCK_read];
 
 	/*
 	 * Must drop our read locks before calling six_lock_write() -
