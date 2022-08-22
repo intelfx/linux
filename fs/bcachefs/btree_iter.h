@@ -145,12 +145,10 @@ struct bkey_i *bch2_btree_journal_peek_slot(struct btree_trans *,
 
 #ifdef CONFIG_BCACHEFS_DEBUG
 void bch2_trans_verify_paths(struct btree_trans *);
-void bch2_trans_verify_locks(struct btree_trans *);
 void bch2_assert_pos_locked(struct btree_trans *, enum btree_id,
 			    struct bpos, bool);
 #else
 static inline void bch2_trans_verify_paths(struct btree_trans *trans) {}
-static inline void bch2_trans_verify_locks(struct btree_trans *trans) {}
 static inline void bch2_assert_pos_locked(struct btree_trans *trans, enum btree_id id,
 					  struct bpos pos, bool key_cache) {}
 #endif
