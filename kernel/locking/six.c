@@ -407,7 +407,7 @@ static inline bool six_optimistic_spin(struct six_lock *lock,
 
 #else /* CONFIG_LOCK_SPIN_ON_OWNER */
 
-static inline void six_optimistic_spin(struct six_lock *lock,
+static inline bool six_optimistic_spin(struct six_lock *lock,
 				       struct six_lock_waiter *wait)
 {
 	return false;
