@@ -181,13 +181,21 @@ bkey_cached_alloc(struct btree_trans *trans,
 	}
 
 	if (ck) {
-		int ret =
-			btree_node_lock_nopath(trans, &ck->c, SIX_LOCK_intent) ?:
-			btree_node_lock_nopath(trans, &ck->c, SIX_LOCK_write);
+		int ret;
+
+		ret = btree_node_lock_nopath(trans, &ck->c, SIX_LOCK_intent);
 		if (unlikely(ret)) {
 			bkey_cached_move_to_freelist(c, ck);
 			return ERR_PTR(ret);
 		}
+
+		ret = btree_node_lock_nopath(trans, &ck->c, SIX_LOCK_write);
+		if (unlikely(ret)) {
+			six_unlock_intent(&ck->c.lock);
+			bkey_cached_move_to_freelist(c, ck);
+			return ERR_PTR(ret);
+		}
+
 		return ck;
 	}
 
