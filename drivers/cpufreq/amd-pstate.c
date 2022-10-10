@@ -66,6 +66,10 @@ MODULE_PARM_DESC(replace,
 		  "replace acpi-cpufreq driver upon init if necessary");
 #endif
 
+static bool epp = false;
+module_param(epp, bool, 0444);
+MODULE_PARM_DESC(epp, "Enable energy performance preference (EPP) control");
+
 static struct cpufreq_driver amd_pstate_driver;
 
 /**
