@@ -138,12 +138,25 @@ static inline int pstate_enable(bool enable)
 
 static int cppc_enable(bool enable)
 {
+	struct cppc_perf_ctrls perf_ctrls;
 	int cpu, ret = 0;
 
 	for_each_present_cpu(cpu) {
 		ret = cppc_set_enable(cpu, enable);
 		if (ret)
 			return ret;
+		if (epp) {
+			/* Enable autonomous mode for EPP */
+			ret = cppc_set_auto_epp(cpu, enable);
+			if (ret)
+				return ret;
+
+			/* Set desired perf as zero to allow EPP firmware control */
+			perf_ctrls.desired_perf = 0;
+			ret = cppc_set_perf(cpu, &perf_ctrls);
+			if (ret)
+				return ret;
+		}
 	}
 
 	return ret;
