@@ -3309,6 +3309,10 @@ err:
 	return bch2_err_class(ret);
 }
 
+/*
+ * Take a quota reservation for unallocated blocks in a given file range
+ * Does not check pagecache
+ */
 static int quota_reserve_range(struct bch_inode_info *inode,
 			       struct quota_res *res,
 			       u64 start, u64 end)
