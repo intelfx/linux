@@ -793,6 +793,7 @@ The uvc function provides these attributes in its function directory:
 	streaming_maxpacket maximum packet size this endpoint is capable of
 			    sending or receiving when this configuration is
 			    selected
+	streaming_transfer  specify data transmission mode (isoc/bulk)
 	function_name       name of the interface
 	=================== ================================================
 

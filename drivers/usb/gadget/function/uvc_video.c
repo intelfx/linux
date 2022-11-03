@@ -271,8 +271,10 @@ uvc_video_complete(struct usb_ep *ep, struct usb_request *req)
 		break;
 
 	default:
-		uvcg_warn(&video->uvc->func,
-			  "VS request completed with status %d.\n",
+		if (uvc->state == UVC_STATE_BULK_WAITING ||
+			uvc->state == UVC_STATE_BULK_SETTING)
+			break;
+		uvcg_warn(&uvc->func, "VS request completed with status %d.\n",
 			  req->status);
 		uvcg_queue_cancel(queue, 0);
 	}
@@ -328,9 +330,13 @@ uvc_video_alloc_requests(struct uvc_video *video)
 
 	BUG_ON(video->req_size);
 
-	req_size = video->ep->maxpacket
-		 * max_t(unsigned int, video->ep->maxburst, 1)
-		 * (video->ep->mult);
+	/* Bulk mode uses max_payload_size as req_size */
+	if (video->max_payload_size)
+		req_size = video->max_payload_size;
+	else
+		req_size = video->ep->maxpacket
+			 * max_t(unsigned int, video->ep->maxburst, 1)
+			 * (video->ep->mult);
 
 	video->ureq = kcalloc(video->uvc_num_requests, sizeof(struct uvc_request), GFP_KERNEL);
 	if (video->ureq == NULL)

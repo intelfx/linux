@@ -54,9 +54,13 @@ static int uvc_queue_setup(struct vb2_queue *vq,
 
 	sizes[0] = video->imagesize;
 
-	req_size = video->ep->maxpacket
-		 * max_t(unsigned int, video->ep->maxburst, 1)
-		 * (video->ep->mult);
+	/* Bulk mode uses max_payload_size as req_size */
+	if (video->max_payload_size)
+		req_size = video->max_payload_size;
+	else
+		req_size = video->ep->maxpacket
+			 * max_t(unsigned int, video->ep->maxburst, 1)
+			 * (video->ep->mult);
 
 	/* We divide by two, to increase the chance to run
 	 * into fewer requests for smaller framesizes.
@@ -143,7 +147,9 @@ int uvcg_queue_init(struct uvc_video_queue *queue, struct device *dev, enum v4l2
 	queue->queue.buf_struct_size = sizeof(struct uvc_buffer);
 	queue->queue.ops = &uvc_queue_qops;
 	queue->queue.lock = lock;
-	if (cdev->gadget->sg_supported) {
+
+	/* UDC supports scatter gather and transfer mode isn't bulk. */
+	if (cdev->gadget->sg_supported && !video->max_payload_size) {
 		queue->queue.mem_ops = &vb2_dma_sg_memops;
 		queue->use_sg = 1;
 	} else {
