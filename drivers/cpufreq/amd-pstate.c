@@ -55,10 +55,7 @@
  * we disable it by default to go acpi-cpufreq on these processors and add a
  * module parameter to be able to enable it manually for debugging.
  */
-static bool shared_mem = false;
-module_param(shared_mem, bool, 0444);
-MODULE_PARM_DESC(shared_mem,
-		 "enable amd-pstate on processors with shared memory solution (false = disabled (default), true = enabled)");
+static bool shared_mem __read_mostly;
 
 static struct cpufreq_driver amd_pstate_driver;
 
@@ -649,16 +646,24 @@ static int __init amd_pstate_init(void)
 
 	return ret;
 }
+device_initcall(amd_pstate_init);
 
-static void __exit amd_pstate_exit(void)
+static int __init amd_pstate_param(char *str)
 {
-	cpufreq_unregister_driver(&amd_pstate_driver);
+	if (!str)
+		return -EINVAL;
 
-	amd_pstate_enable(false);
+	/*
+	 * support shared memory type CPPC which has no MSR function.
+	 * enable amd-pstate on processors with shared memory solution
+	 * (amd-pstate=legacy_cppc enabled), it is disabled by default.
+	 */
+	if (!strcmp(str, "legacy_cppc"))
+		shared_mem = true;
+
+	return 0;
 }
-
-module_init(amd_pstate_init);
-module_exit(amd_pstate_exit);
+early_param("amd-pstate", amd_pstate_param);
 
 MODULE_AUTHOR("Huang Rui <ray.huang@amd.com>");
 MODULE_DESCRIPTION("AMD Processor P-state Frequency Driver");
