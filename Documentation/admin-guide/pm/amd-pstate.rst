@@ -302,11 +302,11 @@ efficiency frequency management method on AMD processors.
 Kernel Module Options for ``amd-pstate``
 =========================================
 
-.. _shared_mem:
+.. legacy_cppc:
 
-``shared_mem``
-Use a module param (shared_mem) to enable related processors manually with
-**amd_pstate.shared_mem=1**.
+``legacy_cppc``
+Use a module param (legacy_cppc) to enable related processors manually with
+**amd_pstate=legacy_cppc**.
 Due to the performance issue on the processors with `Shared Memory Support
 <perf_cap_>`_, we disable it presently and will re-enable this by default
 once we address performance issue with this solution.
@@ -319,6 +319,45 @@ or `Shared Memory Support <perf_cap_>`_ : ::
 
 If the CPU flags have ``cppc``, then this processor supports `Full MSR Support
 <perf_cap_>`_. Otherwise, it supports `Shared Memory Support <perf_cap_>`_.
+
+
+AMD Pstae Driver Operation Modes
+=================================
+
+``amd-pstate`` CPPC has two operation modes: CPPC Autonomous(active) mode and
+CPPC non-autonomous(passive) mode.
+active mode and passive mode can be choosed by whith different kernel parameters.
+When in Autonomous mode, CPPC ignores requests done in the Desired Performance 
+Target register and takes into account only the values set to the Minimum requested
+performance, Maximum requested performance, and Energy Performance Preference
+registers. When Autonomous is disabled, it only considers the Desired Performance Target.
+
+Active Mode
+------------
+
+``amd-pstate-epp``
+
+This is the low-level firmware control mode which is implemented by ``amd-pstate-epp``
+driver with ``amd-pstate=active`` passed to the kernel in the command line.
+In this mode, ``amd-pstate-epp`` driver provides a hint to the hardware if software
+wants to bias toward performance (0x0) or energy efficiency (0xff) to the CPPC firmware.
+then CPPC power algorithm will calculate the runtime workload and adjust the realtime
+cores frequency according to the power supply and thermal, core voltage and some other
+hardware conditions.
+
+Passive Mode
+------------
+
+``amd-pstate``
+
+It will be enabled if the ``amd_pstate=passive`` is passed to the kernel in the command line.
+In this mode, ``amd-pstate``driver software specifies a desired QoS target in the CPPC
+performance scale as a relative number. This can be expressed as percentage of nominal
+performance (infrastructure max). Below the nominal sustained performance level,
+desired performance expresses the average performance level of the processor subject
+to the Performance Reduction Tolerance register. Above the nominal performance level,
+processor must provide at least nominal performance requested and go higher if current
+operating conditions allow.
 
 
 ``cpupower`` tool support for ``amd-pstate``
