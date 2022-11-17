@@ -1364,9 +1364,9 @@ static int vfio_device_fops_release(struct inode *inode, struct file *filep)
 
 	mutex_lock(&device->dev_set->lock);
 	vfio_assert_device_open(device);
-	down_read(&device->group->group_rwsem);
 	if (device->open_count == 1 && device->ops->close_device)
 		device->ops->close_device(device);
+	down_read(&device->group->group_rwsem);
 
 	iommu_driver = device->group->container->iommu_driver;
 	if (iommu_driver && iommu_driver->ops->unregister_device)
