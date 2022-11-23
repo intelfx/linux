@@ -9,6 +9,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/printk.h>
+#include <linux/printbuf.h>
 #include <linux/random.h>
 #include <linux/rtc.h>
 #include <linux/slab.h>
@@ -80,12 +81,6 @@ do_test(int bufsize, const char *expect, int elen,
 	written = min(bufsize-1, elen);
 	if (test_buffer[written]) {
 		pr_warn("vsnprintf(buf, %d, \"%s\", ...) did not nul-terminate buffer\n",
-			bufsize, fmt);
-		return 1;
-	}
-
-	if (memchr_inv(test_buffer + written + 1, FILL_CHAR, bufsize - (written + 1))) {
-		pr_warn("vsnprintf(buf, %d, \"%s\", ...) wrote beyond the nul-terminator\n",
 			bufsize, fmt);
 		return 1;
 	}
@@ -796,6 +791,31 @@ test_pointer(void)
 	fourcc_pointer();
 }
 
+static void printf_test_fn_0(struct printbuf *out)
+{
+	prt_str(out, "0");
+}
+
+static void printf_test_fn_1(struct printbuf *out, void *p)
+{
+	int *i = p;
+
+	prt_printf(out, "%i", *i);
+}
+
+static void __init
+test_fn(void)
+{
+	int i = 1;
+
+	test("0", "%pf()",   CALL_PP(printf_test_fn_0));
+	test("1", "%pf(%p)", CALL_PP(printf_test_fn_1, &i));
+	/*
+	 * Not tested, so we don't fail the build with -Werror:
+	 */
+	//test("1", "%(%p)", printf_test_fn, &i);
+}
+
 static void __init selftest(void)
 {
 	alloced_buffer = kmalloc(BUF_SIZE + 2*PAD_SIZE, GFP_KERNEL);
@@ -807,6 +827,7 @@ static void __init selftest(void)
 	test_number();
 	test_string();
 	test_pointer();
+	test_fn();
 
 	kfree(alloced_buffer);
 }
