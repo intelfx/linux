@@ -2594,9 +2594,14 @@ static inline void btree_path_list_remove(struct btree_trans *trans,
 	unsigned i;
 
 	EBUG_ON(path->sorted_idx >= trans->nr_sorted);
-
+#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+	trans->nr_sorted--;
+	memmove_u64s_down_small(trans->sorted + path->sorted_idx,
+				trans->sorted + path->sorted_idx + 1,
+				DIV_ROUND_UP(trans->nr_sorted - path->sorted_idx, 8));
+#else
 	array_remove_item(trans->sorted, trans->nr_sorted, path->sorted_idx);
-
+#endif
 	for (i = path->sorted_idx; i < trans->nr_sorted; i++)
 		trans->paths[trans->sorted[i]].sorted_idx = i;
 
@@ -2620,7 +2625,15 @@ static inline void btree_path_list_add(struct btree_trans *trans,
 	    trans->traverse_all_idx >= path->sorted_idx)
 		trans->traverse_all_idx++;
 
+#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+	memmove_u64s_up_small(trans->sorted + path->sorted_idx + 1,
+			      trans->sorted + path->sorted_idx,
+			      DIV_ROUND_UP(trans->nr_sorted - path->sorted_idx, 8));
+	trans->nr_sorted++;
+	trans->sorted[path->sorted_idx] = path->idx;
+#else
 	array_insert_item(trans->sorted, trans->nr_sorted, path->sorted_idx, path->idx);
+#endif
 
 	for (i = path->sorted_idx; i < trans->nr_sorted; i++)
 		trans->paths[trans->sorted[i]].sorted_idx = i;
