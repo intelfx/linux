@@ -846,8 +846,8 @@ int bch2_subvolume_get_snapshot(struct btree_trans *trans, u32 subvol,
 					 BTREE_ITER_CACHED|
 					 BTREE_ITER_WITH_UPDATES,
 					 &s);
-
-	*snapid = le32_to_cpu(s.snapshot);
+	if (!ret)
+		*snapid = le32_to_cpu(s.snapshot);
 	return ret;
 }
 
