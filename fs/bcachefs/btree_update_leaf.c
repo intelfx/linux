@@ -762,6 +762,7 @@ static noinline void bch2_drop_overwrites_from_journal(struct btree_trans *trans
 		bch2_journal_key_overwritten(trans->c, i->btree_id, i->level, i->k->k.p);
 }
 
+#ifdef CONFIG_BCACHEFS_DEBUG
 static noinline int bch2_trans_commit_bkey_invalid(struct btree_trans *trans,
 						   struct btree_insert_entry *i,
 						   struct printbuf *err)
@@ -788,6 +789,7 @@ static noinline int bch2_trans_commit_bkey_invalid(struct btree_trans *trans,
 
 	return -EINVAL;
 }
+#endif
 
 /*
  * Get journal reservation, take write locks, and attempt to do btree update(s):
@@ -800,10 +802,11 @@ static inline int do_bch2_trans_commit(struct btree_trans *trans,
 	struct btree_insert_entry *i;
 	struct printbuf buf = PRINTBUF;
 	int ret, u64s_delta = 0;
-	int rw = (trans->flags & BTREE_INSERT_JOURNAL_REPLAY) ? READ : WRITE;
 
 #ifdef CONFIG_BCACHEFS_DEBUG
 	trans_for_each_update(trans, i) {
+		int rw = (trans->flags & BTREE_INSERT_JOURNAL_REPLAY) ? READ : WRITE;
+
 		if (unlikely(bch2_bkey_invalid(c, bkey_i_to_s_c(i->k),
 					       i->bkey_type, rw, &buf)))
 			return bch2_trans_commit_bkey_invalid(trans, i, &buf);
