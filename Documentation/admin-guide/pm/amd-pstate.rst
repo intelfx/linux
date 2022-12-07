@@ -265,6 +265,17 @@ This attribute is read-only.
 Other performance and frequency values can be read back from
 ``/sys/devices/system/cpu/cpuX/acpi_cppc/``, see :ref:`cppc_sysfs`.
 
+``state``
+
+``amd_pstate`` also exposes a sysfs interface to view and control the driver state.
+The driver state can be one of the following:
+``disable``     : indicates driver is in unloaded state.
+``passive``     : indicates driver is loaded and currently in passive mode.
+``guided`` : indicates driver is loaded and currenlty in guided autonomous mode.
+This file can be found here: ``/sys/devices/system/cpu/amd_pstate/state``.
+
+To switch to passive mode: ``echo passive > /sys/devices/system/cpu/amd_pstate/state``
+To switch to guided mode: ``echo guided > /sys/devices/system/cpu/amd_pstate/state``
 
 ``amd-pstate`` vs ``acpi-cpufreq``
 ======================================
