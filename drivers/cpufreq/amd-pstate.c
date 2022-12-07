@@ -46,6 +46,8 @@
 #define AMD_PSTATE_TRANSITION_LATENCY	20000
 #define AMD_PSTATE_TRANSITION_DELAY	1000
 
+typedef int (*cppc_mode_transition_fn)(int);
+
 enum amd_pstate_mode {
 	CPPC_DISABLE = 0,
 	CPPC_PASSIVE,
@@ -82,6 +84,8 @@ static inline int get_mode_idx_from_str(const char *str, size_t size)
 	}
 	return -EINVAL;
 }
+
+static DEFINE_MUTEX(amd_pstate_driver_lock);
 
 static inline int pstate_enable(bool enable)
 {
@@ -619,6 +623,124 @@ static ssize_t show_amd_pstate_highest_perf(struct cpufreq_policy *policy,
 	return sprintf(&buf[0], "%u\n", perf);
 }
 
+static int amd_pstate_driver_cleanup(void)
+{
+	amd_pstate_enable(false);
+	cppc_state = CPPC_DISABLE;
+	return 0;
+}
+
+static int amd_pstate_register_driver(int mode)
+{
+	int ret;
+
+	ret = cpufreq_register_driver(&amd_pstate_driver);
+	if (ret) {
+		amd_pstate_driver_cleanup();
+		return ret;
+	}
+
+	cppc_state = mode;
+	return 0;
+}
+
+static int amd_pstate_unregister_driver(int dummy)
+{
+	int ret;
+
+	ret = cpufreq_unregister_driver(&amd_pstate_driver);
+
+	if (ret)
+		return ret;
+
+	amd_pstate_driver_cleanup();
+	return 0;
+}
+
+static int amd_pstate_change_driver_mode(int mode)
+{
+	cppc_state = mode;
+	return 0;
+}
+
+/* Mode transition table */
+cppc_mode_transition_fn mode_state_machine[CPPC_MODE_MAX][CPPC_MODE_MAX] = {
+	[CPPC_DISABLE]         = {
+		[CPPC_DISABLE]     = NULL,
+		[CPPC_PASSIVE]     = amd_pstate_register_driver,
+		[CPPC_GUIDED]      = amd_pstate_register_driver,
+	},
+	[CPPC_PASSIVE]         = {
+		[CPPC_DISABLE]     = amd_pstate_unregister_driver,
+		[CPPC_PASSIVE]     = NULL,
+		[CPPC_GUIDED]      = amd_pstate_change_driver_mode,
+	},
+	[CPPC_GUIDED]          = {
+		[CPPC_DISABLE]     = amd_pstate_unregister_driver,
+		[CPPC_PASSIVE]     = amd_pstate_change_driver_mode,
+		[CPPC_GUIDED]      = NULL,
+	},
+};
+
+static int amd_pstate_update_status(const char *buf, size_t size)
+{
+	int mode_req = 0;
+
+	mode_req = get_mode_idx_from_str(buf, size);
+
+	if (mode_req < 0 || mode_req >= CPPC_MODE_MAX)
+		return -EINVAL;
+
+	if (mode_state_machine[cppc_state][mode_req])
+		return mode_state_machine[cppc_state][mode_req](mode_req);
+	return -EBUSY;
+}
+
+static ssize_t amd_pstate_show_status(char *buf)
+{
+	int i, j = 0;
+
+	for (i = 0; i < CPPC_MODE_MAX; ++i) {
+		if (i == cppc_state)
+			j += sprintf(buf + j, "[%s] ", amd_pstate_mode_string[i]);
+		else
+			j += sprintf(buf + j, "%s ", amd_pstate_mode_string[i]);
+	}
+	j += sprintf(buf + j, "\n");
+	return j;
+}
+
+static ssize_t state_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	ssize_t ret = 0;
+	char *p = memchr(buf, '\n', count);
+
+	mutex_lock(&amd_pstate_driver_lock);
+	ret = amd_pstate_update_status(buf, p ? p - buf : count);
+	mutex_unlock(&amd_pstate_driver_lock);
+
+	return ret < 0 ? ret : count;
+}
+static ssize_t state_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int ret;
+
+	mutex_lock(&amd_pstate_driver_lock);
+	ret = amd_pstate_show_status(buf);
+	mutex_unlock(&amd_pstate_driver_lock);
+	return ret;
+}
+
+static struct kobj_attribute state_attr = __ATTR_RW(state);
+static struct attribute *amd_pstate_attrs[] = {
+	&state_attr.attr,
+	NULL,
+};
+
+ATTRIBUTE_GROUPS(amd_pstate);
+
 cpufreq_freq_attr_ro(amd_pstate_max_freq);
 cpufreq_freq_attr_ro(amd_pstate_lowest_nonlinear_freq);
 
@@ -643,6 +765,25 @@ static struct cpufreq_driver amd_pstate_driver = {
 	.name		= "amd-pstate",
 	.attr		= amd_pstate_attr,
 };
+
+static struct kobject *amd_pstate_kobject;
+
+static void __init amd_pstate_sysfs_expose_param(void)
+{
+	int ret = 0;
+
+	amd_pstate_kobject = kobject_create_and_add("amd_pstate",
+		&cpu_subsys.dev_root->kobj);
+
+	if (WARN_ON(!amd_pstate_kobject))
+		return;
+
+	ret = sysfs_create_groups(amd_pstate_kobject, amd_pstate_groups);
+	if (ret) {
+		pr_err("sysfs group creation failed (%d)", ret);
+		return;
+	}
+}
 
 static int __init amd_pstate_init(void)
 {
@@ -691,6 +832,7 @@ static int __init amd_pstate_init(void)
 	if (ret)
 		pr_err("failed to register amd_pstate_driver with return %d\n",
 		       ret);
+	amd_pstate_sysfs_expose_param();
 
 	return ret;
 }
