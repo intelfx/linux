@@ -6953,3 +6953,7 @@
 			  management firmware translates the requests into actual
 			  hardware states (core frequency, data fabric and memory
 			  clocks etc.)
+			guided
+			  Activate guided autonomous mode. Driver requests minimum
+			  performance and maximum performance and the PMFW autonomously
+			  selects frequencies in this range.

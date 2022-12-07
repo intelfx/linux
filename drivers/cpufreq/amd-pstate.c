@@ -46,6 +46,20 @@
 #define AMD_PSTATE_TRANSITION_LATENCY	20000
 #define AMD_PSTATE_TRANSITION_DELAY	1000
 
+enum amd_pstate_mode {
+	CPPC_DISABLE = 0,
+	CPPC_PASSIVE,
+	CPPC_GUIDED,
+	CPPC_MODE_MAX,
+};
+
+static const char * const amd_pstate_mode_string[] = {
+	[CPPC_DISABLE]     = "disable",
+	[CPPC_PASSIVE]     = "passive",
+	[CPPC_GUIDED]      = "guided",
+	NULL,
+};
+
 /*
  * TODO: We need more time to fine tune processors with shared memory solution
  * with community together.
@@ -56,7 +70,18 @@
  * module parameter to be able to enable it manually for debugging.
  */
 static struct cpufreq_driver amd_pstate_driver;
-static int cppc_load __initdata;
+static int cppc_state = CPPC_DISABLE;
+
+static inline int get_mode_idx_from_str(const char *str, size_t size)
+{
+	int i = 0;
+
+	for (; i < CPPC_MODE_MAX; ++i) {
+		if (!strncmp(str, amd_pstate_mode_string[i], size))
+			return i;
+	}
+	return -EINVAL;
+}
 
 static inline int pstate_enable(bool enable)
 {
@@ -208,12 +233,18 @@ static inline bool amd_pstate_sample(struct amd_cpudata *cpudata)
 }
 
 static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
-			      u32 des_perf, u32 max_perf, bool fast_switch)
+			      u32 des_perf, u32 max_perf, bool fast_switch, int flags)
 {
 	u64 prev = READ_ONCE(cpudata->cppc_req_cached);
 	u64 value = prev;
 
 	des_perf = clamp_t(unsigned long, des_perf, min_perf, max_perf);
+
+	if (cppc_state == CPPC_GUIDED && flags & CPUFREQ_GOV_DYNAMIC_SWITCHING) {
+		min_perf = des_perf;
+		des_perf = 0;
+	}
+
 	value &= ~AMD_CPPC_MIN_PERF(~0L);
 	value |= AMD_CPPC_MIN_PERF(min_perf);
 
@@ -268,7 +299,7 @@ static int amd_pstate_target(struct cpufreq_policy *policy,
 
 	cpufreq_freq_transition_begin(policy, &freqs);
 	amd_pstate_update(cpudata, min_perf, des_perf,
-			  max_perf, false);
+			  max_perf, false, policy->governor->flags);
 	cpufreq_freq_transition_end(policy, &freqs, false);
 
 	return 0;
@@ -302,7 +333,8 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
 	if (max_perf < min_perf)
 		max_perf = min_perf;
 
-	amd_pstate_update(cpudata, min_perf, des_perf, max_perf, true);
+	amd_pstate_update(cpudata, min_perf, des_perf, max_perf, true,
+			policy->governor->flags);
 }
 
 static int amd_get_min_freq(struct amd_cpudata *cpudata)
@@ -623,7 +655,7 @@ static int __init amd_pstate_init(void)
 	 * enable the amd_pstate passive mode driver explicitly
 	 * with amd_pstate=passive in kernel command line
 	 */
-	if (!cppc_load) {
+	if (cppc_state == CPPC_DISABLE) {
 		pr_debug("driver load is disabled, boot with amd_pstate=passive to enable this\n");
 		return -ENODEV;
 	}
@@ -666,16 +698,22 @@ device_initcall(amd_pstate_init);
 
 static int __init amd_pstate_param(char *str)
 {
+	int size, mode_idx;
+
 	if (!str)
 		return -EINVAL;
 
-	if (!strcmp(str, "disable")) {
-		cppc_load = 0;
-		pr_info("driver is explicitly disabled\n");
-	} else if (!strcmp(str, "passive"))
-		cppc_load = 1;
+	size = strlen(str);
+	mode_idx = get_mode_idx_from_str(str, size);
 
-	return 0;
+	if (mode_idx >= CPPC_DISABLE && mode_idx < CPPC_MODE_MAX) {
+		cppc_state = mode_idx;
+		if (cppc_state == CPPC_DISABLE)
+			pr_info("driver is explicitly disabled\n");
+		return 0;
+	}
+
+	return -EINVAL;
 }
 early_param("amd_pstate", amd_pstate_param);
 
