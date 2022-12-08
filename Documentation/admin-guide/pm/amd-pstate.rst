@@ -339,6 +339,44 @@ processor must provide at least nominal performance requested and go higher if c
 operating conditions allow.
 
 
+User Space Interface in ``sysfs``
+=================================
+
+Global Attributes
+-----------------
+
+``amd-pstate`` exposes several global attributes (files) in ``sysfs`` to
+control its functionality at the system level.  They are located in the
+``/sys/devices/system/cpu/amd-pstate/`` directory and affect all CPUs.
+
+``status``
+	Operation mode of the driver: "active", "passive" or "off".
+
+	"active"
+		The driver is functional and in the ``active mode``
+
+	"passive"
+		The driver is functional and in the ``passive mode``
+
+	"off"
+		The driver is unregistered and not functional now.
+
+	This attribute can be written to in order to change the driver's
+	operation mode or to unregister it.  The string written to it must be
+	one of the possible values of it and, if successful, the write will
+	cause the driver to switch over to the operation mode represented by
+	that string - or to be unregistered in the "off" case.
+
+``cppc_dynamic_boost``
+	This attribute is only present if ``amd-pstate`` works in the
+	`active mode` in the processor.  If set to 1, it will cause 
+        the minimum P-state limit to be increased dynamically for a short time
+        whenever a task previously waiting on I/O is selected to run on a given
+        logical CPU (the purpose of this mechanism is to improve performance).
+        when the I/O wait flag cleared, the increased pstate will be restored
+        to previous state.
+
+
 ``cpupower`` tool support for ``amd-pstate``
 ===============================================
 
