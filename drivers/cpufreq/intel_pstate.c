@@ -26,6 +26,7 @@
 #include <linux/vmalloc.h>
 #include <linux/pm_qos.h>
 #include <trace/events/power.h>
+#include <linux/cpufreq_common.h>
 
 #include <asm/cpu.h>
 #include <asm/div64.h>
@@ -626,42 +627,6 @@ static int intel_pstate_set_epb(int cpu, s16 pref)
 
 	return 0;
 }
-
-/*
- * EPP/EPB display strings corresponding to EPP index in the
- * energy_perf_strings[]
- *	index		String
- *-------------------------------------
- *	0		default
- *	1		performance
- *	2		balance_performance
- *	3		balance_power
- *	4		power
- */
-
-enum energy_perf_value_index {
-	EPP_INDEX_DEFAULT = 0,
-	EPP_INDEX_PERFORMANCE,
-	EPP_INDEX_BALANCE_PERFORMANCE,
-	EPP_INDEX_BALANCE_POWERSAVE,
-	EPP_INDEX_POWERSAVE,
-};
-
-static const char * const energy_perf_strings[] = {
-	[EPP_INDEX_DEFAULT] = "default",
-	[EPP_INDEX_PERFORMANCE] = "performance",
-	[EPP_INDEX_BALANCE_PERFORMANCE] = "balance_performance",
-	[EPP_INDEX_BALANCE_POWERSAVE] = "balance_power",
-	[EPP_INDEX_POWERSAVE] = "power",
-	NULL
-};
-static unsigned int epp_values[] = {
-	[EPP_INDEX_DEFAULT] = 0, /* Unused index */
-	[EPP_INDEX_PERFORMANCE] = HWP_EPP_PERFORMANCE,
-	[EPP_INDEX_BALANCE_PERFORMANCE] = HWP_EPP_BALANCE_PERFORMANCE,
-	[EPP_INDEX_BALANCE_POWERSAVE] = HWP_EPP_BALANCE_POWERSAVE,
-	[EPP_INDEX_POWERSAVE] = HWP_EPP_POWERSAVE,
-};
 
 static int intel_pstate_get_energy_pref_index(struct cpudata *cpu_data, int *raw_epp)
 {
