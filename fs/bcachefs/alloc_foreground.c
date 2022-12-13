@@ -1250,7 +1250,7 @@ err:
 	if (bch2_err_matches(ret, BCH_ERR_open_buckets_empty) ||
 	    bch2_err_matches(ret, BCH_ERR_freelist_empty))
 		return cl
-			? -EAGAIN
+			? -BCH_ERR_bucket_alloc_blocked
 			: -BCH_ERR_ENOSPC_bucket_alloc;
 
 	return ret;
