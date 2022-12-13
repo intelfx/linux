@@ -303,14 +303,12 @@ static int amd_energy_probe(struct platform_device *pdev)
 	return PTR_ERR_OR_ZERO(data->wrap_accumulate);
 }
 
-static int amd_energy_remove(struct platform_device *pdev)
+static void amd_energy_remove(struct platform_device *pdev)
 {
 	struct amd_energy_data *data = dev_get_drvdata(&pdev->dev);
 
 	if (data && data->wrap_accumulate)
 		kthread_stop(data->wrap_accumulate);
-
-	return 0;
 }
 
 static const struct platform_device_id amd_energy_ids[] = {
