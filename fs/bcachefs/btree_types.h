@@ -334,6 +334,7 @@ struct bkey_cached {
 
 	struct journal_preres	res;
 	struct journal_entry_pin journal;
+	u64			seq;
 
 	struct bkey_i		*k;
 };
