@@ -41,7 +41,7 @@ static void btree_node_interior_verify(struct bch_fs *c, struct btree *b)
 	struct bkey_s_c k;
 	struct bkey_s_c_btree_ptr_v2 bp;
 	struct bkey unpacked;
-	struct printbuf buf1 = PRINTBUF, buf2 = PRINTBUF;
+	struct bch_printbuf buf1 = BCH_PRINTBUF, buf2 = BCH_PRINTBUF;
 
 	BUG_ON(!b->c.level);
 
@@ -1177,7 +1177,7 @@ static void bch2_insert_fixup_btree_ptr(struct btree_update *as,
 {
 	struct bch_fs *c = as->c;
 	struct bkey_packed *k;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 
 	BUG_ON(insert->k.type == KEY_TYPE_btree_ptr_v2 &&
 	       !btree_ptr_sectors_written(insert));
@@ -1188,7 +1188,7 @@ static void bch2_insert_fixup_btree_ptr(struct btree_update *as,
 	if (bch2_bkey_invalid(c, bkey_i_to_s_c(insert),
 			      btree_node_type(b), WRITE, &buf) ?:
 	    bch2_bkey_in_btree_node(b, bkey_i_to_s_c(insert), &buf)) {
-		printbuf_reset(&buf);
+		bch2_printbuf_reset(&buf);
 		pr_buf(&buf, "inserting invalid bkey\n  ");
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(insert));
 		pr_buf(&buf, "\n  ");
@@ -1217,7 +1217,7 @@ static void bch2_insert_fixup_btree_ptr(struct btree_update *as,
 	set_btree_node_dirty_acct(c, b);
 	set_btree_node_need_write(b);
 
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 }
 
 static void
@@ -1683,7 +1683,7 @@ int __bch2_foreground_maybe_merge(struct btree_trans *trans,
 	}
 
 	if (bkey_cmp(bpos_successor(prev->data->max_key), next->data->min_key)) {
-		struct printbuf buf1 = PRINTBUF, buf2 = PRINTBUF;
+		struct bch_printbuf buf1 = BCH_PRINTBUF, buf2 = BCH_PRINTBUF;
 
 		bch2_bpos_to_text(&buf1, prev->data->max_key);
 		bch2_bpos_to_text(&buf2, next->data->min_key);
@@ -1692,8 +1692,8 @@ int __bch2_foreground_maybe_merge(struct btree_trans *trans,
 			"  prev ends at   %s\n"
 			"  next starts at %s",
 			buf1.buf, buf2.buf);
-		printbuf_exit(&buf1);
-		printbuf_exit(&buf2);
+		bch2_printbuf_exit(&buf1);
+		bch2_printbuf_exit(&buf2);
 		bch2_topology_error(c);
 		ret = -EIO;
 		goto err;
@@ -2157,7 +2157,7 @@ void bch2_btree_root_alloc(struct bch_fs *c, enum btree_id id)
 	six_unlock_intent(&b->c.lock);
 }
 
-void bch2_btree_updates_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_btree_updates_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	struct btree_update *as;
 

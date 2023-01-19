@@ -46,10 +46,10 @@ static inline struct jset_entry *__jset_entry_type_next(struct jset *jset,
 
 int bch2_journal_entry_validate(struct bch_fs *, const char *,
 				struct jset_entry *, unsigned, int, int);
-void bch2_journal_entry_to_text(struct printbuf *, struct bch_fs *,
+void bch2_journal_entry_to_text(struct bch_printbuf *, struct bch_fs *,
 				struct jset_entry *);
 
-void bch2_journal_ptrs_to_text(struct printbuf *, struct bch_fs *,
+void bch2_journal_ptrs_to_text(struct bch_printbuf *, struct bch_fs *,
 			       struct journal_replay *);
 
 int bch2_journal_read(struct bch_fs *, u64 *, u64 *);

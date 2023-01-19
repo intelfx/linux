@@ -12,7 +12,7 @@
 static void bch2_delete_dead_snapshots_work(struct work_struct *);
 static void bch2_delete_dead_snapshots(struct bch_fs *);
 
-void bch2_snapshot_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_snapshot_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			   struct bkey_s_c k)
 {
 	struct bkey_s_c_snapshot s = bkey_s_c_to_snapshot(k);
@@ -27,7 +27,7 @@ void bch2_snapshot_to_text(struct printbuf *out, struct bch_fs *c,
 }
 
 int bch2_snapshot_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct printbuf *err)
+			  int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_snapshot s;
 	u32 i, id;
@@ -746,7 +746,7 @@ static int bch2_delete_dead_snapshots_hook(struct btree_trans *trans,
 /* Subvolumes: */
 
 int bch2_subvolume_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			   int rw, struct printbuf *err)
+			   int rw, struct bch_printbuf *err)
 {
 	if (bkey_cmp(k.k->p, SUBVOL_POS_MIN) < 0 ||
 	    bkey_cmp(k.k->p, SUBVOL_POS_MAX) > 0) {
@@ -763,7 +763,7 @@ int bch2_subvolume_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_subvolume_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_subvolume_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_s_c_subvolume s = bkey_s_c_to_subvolume(k);

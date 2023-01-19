@@ -870,8 +870,8 @@ int bch2_btree_perf_test(struct bch_fs *c, const char *testname,
 {
 	struct test_job j = { .c = c, .nr = nr, .nr_threads = nr_threads };
 	char name_buf[20];
-	struct printbuf nr_buf = PRINTBUF;
-	struct printbuf per_sec_buf = PRINTBUF;
+	struct bch_printbuf nr_buf = BCH_PRINTBUF;
+	struct bch_printbuf per_sec_buf = BCH_PRINTBUF;
 	unsigned i;
 	u64 time;
 
@@ -939,8 +939,8 @@ int bch2_btree_perf_test(struct bch_fs *c, const char *testname,
 		div_u64(time, NSEC_PER_SEC),
 		div_u64(time * nr_threads, nr),
 		per_sec_buf.buf);
-	printbuf_exit(&per_sec_buf);
-	printbuf_exit(&nr_buf);
+	bch2_printbuf_exit(&per_sec_buf);
+	bch2_printbuf_exit(&nr_buf);
 	return j.ret;
 }
 

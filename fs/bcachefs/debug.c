@@ -169,11 +169,11 @@ void __bch2_btree_verify(struct bch_fs *c, struct btree *b)
 		failed |= bch2_btree_verify_replica(c, b, p);
 
 	if (failed) {
-		struct printbuf buf = PRINTBUF;
+		struct bch_printbuf buf = BCH_PRINTBUF;
 
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&b->key));
 		bch2_fs_fatal_error(c, "btree node verify failed for : %s\n", buf.buf);
-		printbuf_exit(&buf);
+		bch2_printbuf_exit(&buf);
 	}
 out:
 	mutex_unlock(&c->verify_lock);
@@ -190,7 +190,7 @@ struct dump_iter {
 	struct bpos		from;
 	u64			iter;
 
-	struct printbuf		buf;
+	struct bch_printbuf		buf;
 
 	char __user		*ubuf;	/* destination user buffer */
 	size_t			size;	/* size of requested read */
@@ -230,7 +230,7 @@ static int bch2_dump_open(struct inode *inode, struct file *file)
 	i->iter	= 0;
 	i->c	= container_of(bd, struct bch_fs, btree_debug[bd->id]);
 	i->id	= bd->id;
-	i->buf	= PRINTBUF;
+	i->buf	= BCH_PRINTBUF;
 
 	return 0;
 }
@@ -239,7 +239,7 @@ static int bch2_dump_release(struct inode *inode, struct file *file)
 {
 	struct dump_iter *i = file->private_data;
 
-	printbuf_exit(&i->buf);
+	bch2_printbuf_exit(&i->buf);
 	kfree(i);
 	return 0;
 }
@@ -422,7 +422,7 @@ static const struct file_operations bfloat_failed_debug_ops = {
 	.read		= bch2_read_bfloat_failed,
 };
 
-static void bch2_cached_btree_node_to_text(struct printbuf *out, struct bch_fs *c,
+static void bch2_cached_btree_node_to_text(struct bch_printbuf *out, struct bch_fs *c,
 					   struct btree *b)
 {
 	out->tabstops[0] = 32;

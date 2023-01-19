@@ -99,7 +99,7 @@ STRTO_H(strtoll, long long)
 STRTO_H(strtoull, unsigned long long)
 STRTO_H(strtou64, u64)
 
-static int bch2_printbuf_realloc(struct printbuf *out, unsigned extra)
+static int bch2_printbuf_realloc(struct bch_printbuf *out, unsigned extra)
 {
 	unsigned new_size;
 	char *buf;
@@ -120,24 +120,24 @@ static int bch2_printbuf_realloc(struct printbuf *out, unsigned extra)
 	return 0;
 }
 
-void bch2_pr_buf(struct printbuf *out, const char *fmt, ...)
+void bch2_pr_buf(struct bch_printbuf *out, const char *fmt, ...)
 {
 	va_list args;
 	int len;
 
 	do {
 		va_start(args, fmt);
-		len = vsnprintf(out->buf + out->pos, printbuf_remaining(out), fmt, args);
+		len = vsnprintf(out->buf + out->pos, bch2_printbuf_remaining(out), fmt, args);
 		va_end(args);
-	} while (len + 1 >= printbuf_remaining(out) &&
+	} while (len + 1 >= bch2_printbuf_remaining(out) &&
 		 !bch2_printbuf_realloc(out, len + 1));
 
 	len = min_t(size_t, len,
-		  printbuf_remaining(out) ? printbuf_remaining(out) - 1 : 0);
+		  bch2_printbuf_remaining(out) ? bch2_printbuf_remaining(out) - 1 : 0);
 	out->pos += len;
 }
 
-void bch2_pr_tab_rjust(struct printbuf *buf)
+void bch2_pr_tab_rjust(struct bch_printbuf *buf)
 {
 	BUG_ON(buf->tabstop > ARRAY_SIZE(buf->tabstops));
 
@@ -164,7 +164,7 @@ void bch2_pr_tab_rjust(struct printbuf *buf)
 	buf->tabstop++;
 }
 
-void bch2_hprint(struct printbuf *buf, s64 v)
+void bch2_hprint(struct bch_printbuf *buf, s64 v)
 {
 	int u, t = 0;
 
@@ -185,7 +185,7 @@ void bch2_hprint(struct printbuf *buf, s64 v)
 		pr_char(buf, si_units[u]);
 }
 
-void bch2_pr_units(struct printbuf *out, s64 raw, s64 bytes)
+void bch2_pr_units(struct bch_printbuf *out, s64 raw, s64 bytes)
 {
 	switch (out->units) {
 	case PRINTBUF_UNITS_RAW:
@@ -200,7 +200,7 @@ void bch2_pr_units(struct printbuf *out, s64 raw, s64 bytes)
 	}
 }
 
-void bch2_string_opt_to_text(struct printbuf *out,
+void bch2_string_opt_to_text(struct bch_printbuf *out,
 			     const char * const list[],
 			     size_t selected)
 {
@@ -210,7 +210,7 @@ void bch2_string_opt_to_text(struct printbuf *out,
 		pr_buf(out, i == selected ? "[%s] " : "%s ", list[i]);
 }
 
-void bch2_flags_to_text(struct printbuf *out,
+void bch2_flags_to_text(struct bch_printbuf *out,
 			const char * const list[], u64 flags)
 {
 	unsigned bit, nr = 0;
@@ -390,14 +390,14 @@ static const struct time_unit *pick_time_units(u64 ns)
 	return u;
 }
 
-void bch2_pr_time_units(struct printbuf *out, u64 ns)
+void bch2_pr_time_units(struct bch_printbuf *out, u64 ns)
 {
 	const struct time_unit *u = pick_time_units(ns);
 
 	pr_buf(out, "%llu %s", div_u64(ns, u->nsecs), u->name);
 }
 
-void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats)
+void bch2_time_stats_to_text(struct bch_printbuf *out, struct bch2_time_stats *stats)
 {
 	const struct time_unit *u;
 	u64 freq = READ_ONCE(stats->average_frequency);
@@ -546,7 +546,7 @@ void bch2_pd_controller_init(struct bch_pd_controller *pd)
 	pd->backpressure	= 1;
 }
 
-void bch2_pd_controller_debug_to_text(struct printbuf *out, struct bch_pd_controller *pd)
+void bch2_pd_controller_debug_to_text(struct bch_printbuf *out, struct bch_pd_controller *pd)
 {
 	out->tabstops[0] = 20;
 

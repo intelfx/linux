@@ -410,7 +410,7 @@ unlock:
 	    !can_discard &&
 	    !nr_unwritten_journal_entries(j) &&
 	    (flags & JOURNAL_WATERMARK_MASK) == JOURNAL_WATERMARK_reserved) {
-		struct printbuf buf = PRINTBUF;
+		struct bch_printbuf buf = BCH_PRINTBUF;
 
 		bch_err(c, "Journal stuck! Hava a pre-reservation but journal full (ret %s)",
 			bch2_journal_errors[ret]);
@@ -418,11 +418,11 @@ unlock:
 		bch2_journal_debug_to_text(&buf, j);
 		bch_err(c, "%s", buf.buf);
 
-		printbuf_reset(&buf);
+		bch2_printbuf_reset(&buf);
 		bch2_journal_pins_to_text(&buf, j);
 		bch_err(c, "Journal pins:\n%s", buf.buf);
 
-		printbuf_exit(&buf);
+		bch2_printbuf_exit(&buf);
 		bch2_fatal_error(c);
 		dump_stack();
 	}
@@ -1246,7 +1246,7 @@ out:
 
 /* debug: */
 
-void __bch2_journal_debug_to_text(struct printbuf *out, struct journal *j)
+void __bch2_journal_debug_to_text(struct bch_printbuf *out, struct journal *j)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	union journal_res_state s;
@@ -1367,14 +1367,14 @@ void __bch2_journal_debug_to_text(struct printbuf *out, struct journal *j)
 	--out->atomic;
 }
 
-void bch2_journal_debug_to_text(struct printbuf *out, struct journal *j)
+void bch2_journal_debug_to_text(struct bch_printbuf *out, struct journal *j)
 {
 	spin_lock(&j->lock);
 	__bch2_journal_debug_to_text(out, j);
 	spin_unlock(&j->lock);
 }
 
-bool bch2_journal_seq_pins_to_text(struct printbuf *out, struct journal *j, u64 *seq)
+bool bch2_journal_seq_pins_to_text(struct bch_printbuf *out, struct journal *j, u64 *seq)
 {
 	struct journal_entry_pin_list *pin_list;
 	struct journal_entry_pin *pin;
@@ -1423,7 +1423,7 @@ bool bch2_journal_seq_pins_to_text(struct printbuf *out, struct journal *j, u64 
 	return false;
 }
 
-void bch2_journal_pins_to_text(struct printbuf *out, struct journal *j)
+void bch2_journal_pins_to_text(struct bch_printbuf *out, struct journal *j)
 {
 	u64 seq = 0;
 

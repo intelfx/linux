@@ -39,7 +39,7 @@ void bch2_fs_btree_key_cache_exit(struct btree_key_cache *);
 void bch2_fs_btree_key_cache_init_early(struct btree_key_cache *);
 int bch2_fs_btree_key_cache_init(struct btree_key_cache *);
 
-void bch2_btree_key_cache_to_text(struct printbuf *, struct btree_key_cache *);
+void bch2_btree_key_cache_to_text(struct bch_printbuf *, struct btree_key_cache *);
 
 void bch2_btree_key_cache_exit(void);
 int __init bch2_btree_key_cache_init(void);

@@ -590,9 +590,9 @@ static void bch2_btree_path_verify_level(struct btree_trans *trans,
 	struct btree_node_iter tmp;
 	bool locked;
 	struct bkey_packed *p, *k;
-	struct printbuf buf1 = PRINTBUF;
-	struct printbuf buf2 = PRINTBUF;
-	struct printbuf buf3 = PRINTBUF;
+	struct bch_printbuf buf1 = BCH_PRINTBUF;
+	struct bch_printbuf buf2 = BCH_PRINTBUF;
+	struct bch_printbuf buf3 = BCH_PRINTBUF;
 	const char *msg;
 
 	if (!bch2_debug_check_iterators)
@@ -758,7 +758,7 @@ static int bch2_btree_iter_verify_ret(struct btree_iter *iter, struct bkey_s_c k
 	if (!bkey_cmp(prev.k->p, k.k->p) &&
 	    bch2_snapshot_is_ancestor(trans->c, iter->snapshot,
 				      prev.k->p.snapshot) > 0) {
-		struct printbuf buf1 = PRINTBUF, buf2 = PRINTBUF;
+		struct bch_printbuf buf1 = BCH_PRINTBUF, buf2 = BCH_PRINTBUF;
 
 		bch2_bkey_to_text(&buf1, k.k);
 		bch2_bkey_to_text(&buf2, prev.k);
@@ -779,7 +779,7 @@ void bch2_assert_pos_locked(struct btree_trans *trans, enum btree_id id,
 {
 	struct btree_path *path;
 	unsigned idx;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 
 	trans_for_each_path_inorder(trans, path, idx) {
 		int cmp = cmp_int(path->btree_id, id) ?:
@@ -1091,10 +1091,10 @@ static void btree_path_verify_new_node(struct btree_trans *trans,
 	if (!k ||
 	    bkey_deleted(k) ||
 	    bkey_cmp_left_packed(l->b, k, &b->key.k.p)) {
-		struct printbuf buf1 = PRINTBUF;
-		struct printbuf buf2 = PRINTBUF;
-		struct printbuf buf3 = PRINTBUF;
-		struct printbuf buf4 = PRINTBUF;
+		struct bch_printbuf buf1 = BCH_PRINTBUF;
+		struct bch_printbuf buf2 = BCH_PRINTBUF;
+		struct bch_printbuf buf3 = BCH_PRINTBUF;
+		struct bch_printbuf buf4 = BCH_PRINTBUF;
 		struct bkey uk = bkey_unpack_key(b, k);
 
 		bch2_dump_btree_node(c, l->b);
@@ -1824,7 +1824,7 @@ free:
 	__bch2_path_free(trans, path);
 }
 
-void bch2_trans_updates_to_text(struct printbuf *buf, struct btree_trans *trans)
+void bch2_trans_updates_to_text(struct bch_printbuf *buf, struct btree_trans *trans)
 {
 	struct btree_insert_entry *i;
 
@@ -1857,24 +1857,24 @@ void bch2_trans_updates_to_text(struct printbuf *buf, struct btree_trans *trans)
 noinline __cold
 void bch2_dump_trans_updates(struct btree_trans *trans)
 {
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 
 	bch2_trans_updates_to_text(&buf, trans);
 	bch_err(trans->c, "%s", buf.buf);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 }
 
 noinline __cold
 void bch2_dump_trans_paths_updates(struct btree_trans *trans)
 {
 	struct btree_path *path;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	unsigned idx;
 
 	btree_trans_sort_paths(trans);
 
 	trans_for_each_path_inorder(trans, path, idx) {
-		printbuf_reset(&buf);
+		bch2_printbuf_reset(&buf);
 
 		bch2_bpos_to_text(&buf, path->pos);
 
@@ -1894,7 +1894,7 @@ void bch2_dump_trans_paths_updates(struct btree_trans *trans)
 		       );
 	}
 
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 
 	bch2_dump_trans_updates(trans);
 }
@@ -3370,7 +3370,7 @@ void bch2_trans_exit(struct btree_trans *trans)
 }
 
 static void __maybe_unused
-bch2_btree_path_node_to_text(struct printbuf *out,
+bch2_btree_path_node_to_text(struct bch_printbuf *out,
 			     struct btree_bkey_cached_common *_b,
 			     bool cached)
 {
@@ -3391,7 +3391,7 @@ static bool trans_has_locks(struct btree_trans *trans)
 }
 #endif
 
-void bch2_btree_trans_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_btree_trans_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 #ifdef CONFIG_BCACHEFS_DEBUG_TRANSACTIONS
 	struct btree_trans *trans;

@@ -745,7 +745,7 @@ int bch2_fs_btree_key_cache_init(struct btree_key_cache *bc)
 	return register_shrinker(&bc->shrink, "%s/btree_key_cache", c->name);
 }
 
-void bch2_btree_key_cache_to_text(struct printbuf *out, struct btree_key_cache *c)
+void bch2_btree_key_cache_to_text(struct bch_printbuf *out, struct btree_key_cache *c)
 {
 	pr_buf(out, "nr_freed:\t%zu\n",	c->nr_freed);
 	pr_buf(out, "nr_keys:\t%lu\n",	atomic_long_read(&c->nr_keys));

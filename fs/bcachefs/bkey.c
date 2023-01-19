@@ -57,8 +57,8 @@ static void bch2_bkey_pack_verify(const struct bkey_packed *packed,
 	tmp = __bch2_bkey_unpack_key(format, packed);
 
 	if (memcmp(&tmp, unpacked, sizeof(struct bkey))) {
-		struct printbuf buf1 = PRINTBUF;
-		struct printbuf buf2 = PRINTBUF;
+		struct bch_printbuf buf1 = BCH_PRINTBUF;
+		struct bch_printbuf buf2 = BCH_PRINTBUF;
 		char buf3[160], buf4[160];
 
 		bch2_bkey_to_text(&buf1, unpacked);

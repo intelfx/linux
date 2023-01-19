@@ -84,7 +84,7 @@ const struct bch_hash_desc bch2_dirent_hash_desc = {
 };
 
 int bch2_dirent_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			int rw, struct printbuf *err)
+			int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_dirent d = bkey_s_c_to_dirent(k);
 	unsigned len;
@@ -137,7 +137,7 @@ int bch2_dirent_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_dirent_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_dirent_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			 struct bkey_s_c k)
 {
 	struct bkey_s_c_dirent d = bkey_s_c_to_dirent(k);

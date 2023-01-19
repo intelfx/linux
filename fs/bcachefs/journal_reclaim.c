@@ -210,11 +210,11 @@ void bch2_journal_space_available(struct journal *j)
 
 	if (!clean_ondisk &&
 	    journal_cur_seq(j) == j->seq_ondisk) {
-		struct printbuf buf = PRINTBUF;
+		struct bch_printbuf buf = BCH_PRINTBUF;
 
 		__bch2_journal_debug_to_text(&buf, j);
 		bch_err(c, "journal stuck\n%s", buf.buf);
-		printbuf_exit(&buf);
+		bch2_printbuf_exit(&buf);
 
 		/*
 		 * Hack: bch2_fatal_error() calls bch2_journal_halt() which

@@ -294,7 +294,7 @@ static unsigned bch_alloc_v1_val_u64s(const struct bch_alloc *a)
 }
 
 int bch2_alloc_v1_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct printbuf *err)
+			  int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_alloc a = bkey_s_c_to_alloc(k);
 
@@ -309,7 +309,7 @@ int bch2_alloc_v1_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_alloc_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct printbuf *err)
+			  int rw, struct bch_printbuf *err)
 {
 	struct bkey_alloc_unpacked u;
 
@@ -322,7 +322,7 @@ int bch2_alloc_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_alloc_v3_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct printbuf *err)
+			  int rw, struct bch_printbuf *err)
 {
 	struct bkey_alloc_unpacked u;
 
@@ -335,7 +335,7 @@ int bch2_alloc_v3_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_alloc_v4_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct printbuf *err)
+			  int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_alloc_v4 a = bkey_s_c_to_alloc_v4(k);
 
@@ -415,7 +415,7 @@ void bch2_alloc_v4_swab(struct bkey_s k)
 	a->nr_external_backpointers = swab32(a->nr_external_backpointers);
 }
 
-void bch2_alloc_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+void bch2_alloc_to_text(struct bch_printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bch_alloc_v4 a;
 
@@ -484,7 +484,7 @@ static int bch2_bucket_do_index(struct btree_trans *trans,
 	enum btree_id btree;
 	enum bch_bkey_type old_type = !set ? KEY_TYPE_set : KEY_TYPE_deleted;
 	enum bch_bkey_type new_type =  set ? KEY_TYPE_set : KEY_TYPE_deleted;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret;
 
 	if (a->data_type != BCH_DATA_free &&
@@ -536,7 +536,7 @@ static int bch2_bucket_do_index(struct btree_trans *trans,
 	ret = bch2_trans_update(trans, &iter, k, 0);
 err:
 	bch2_trans_iter_exit(trans, &iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -614,8 +614,8 @@ static int bch2_check_alloc_key(struct btree_trans *trans,
 	struct bch_alloc_v4 a;
 	unsigned discard_key_type, freespace_key_type;
 	struct bkey_s_c alloc_k, k;
-	struct printbuf buf = PRINTBUF;
-	struct printbuf buf2 = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct bch_printbuf buf2 = BCH_PRINTBUF;
 	int ret;
 
 	alloc_k = bch2_btree_iter_peek(alloc_iter);
@@ -684,7 +684,7 @@ static int bch2_check_alloc_key(struct btree_trans *trans,
 			"  %s",
 			bch2_bkey_types[k.k->type],
 			bch2_bkey_types[freespace_key_type],
-			(printbuf_reset(&buf),
+			(bch2_printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, alloc_k), buf.buf))) {
 		struct bkey_i *update =
 			bch2_trans_kmalloc(trans, sizeof(*update));
@@ -706,8 +706,8 @@ err:
 fsck_err:
 	bch2_trans_iter_exit(trans, &freespace_iter);
 	bch2_trans_iter_exit(trans, &discard_iter);
-	printbuf_exit(&buf2);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf2);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -723,7 +723,7 @@ static int bch2_check_discard_freespace_key(struct btree_trans *trans,
 	enum bch_data_type state = iter->btree_id == BTREE_ID_need_discard
 		? BCH_DATA_need_discard
 		: BCH_DATA_free;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret;
 
 	freespace_k = bch2_btree_iter_peek(iter);
@@ -765,7 +765,7 @@ out:
 err:
 fsck_err:
 	bch2_trans_iter_exit(trans, &alloc_iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 delete:
 	ret = bch2_btree_delete_extent_at(trans, iter,
@@ -832,8 +832,8 @@ static int bch2_check_alloc_to_lru_ref(struct btree_trans *trans,
 	struct btree_iter lru_iter;
 	struct bch_alloc_v4 a;
 	struct bkey_s_c alloc_k, k;
-	struct printbuf buf = PRINTBUF;
-	struct printbuf buf2 = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
+	struct bch_printbuf buf2 = BCH_PRINTBUF;
 	int ret;
 
 	alloc_k = bch2_btree_iter_peek(alloc_iter);
@@ -860,14 +860,14 @@ static int bch2_check_alloc_to_lru_ref(struct btree_trans *trans,
 	if (fsck_err_on(!a.io_time[READ], c,
 			"cached bucket with read_time 0\n"
 			"  %s",
-		(printbuf_reset(&buf),
+		(bch2_printbuf_reset(&buf),
 		 bch2_bkey_val_to_text(&buf, c, alloc_k), buf.buf)) ||
 	    fsck_err_on(k.k->type != KEY_TYPE_lru ||
 			le64_to_cpu(bkey_s_c_to_lru(k).v->idx) != alloc_k.k->p.offset, c,
 			"incorrect/missing lru entry\n"
 			"  %s\n"
 			"  %s",
-			(printbuf_reset(&buf),
+			(bch2_printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, alloc_k), buf.buf),
 			(bch2_bkey_val_to_text(&buf2, c, k), buf2.buf))) {
 		u64 read_time = a.io_time[READ];
@@ -899,8 +899,8 @@ static int bch2_check_alloc_to_lru_ref(struct btree_trans *trans,
 err:
 fsck_err:
 	bch2_trans_iter_exit(trans, &lru_iter);
-	printbuf_exit(&buf2);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf2);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -935,7 +935,7 @@ static int bch2_clear_need_discard(struct btree_trans *trans, struct bpos pos,
 	struct btree_iter iter;
 	struct bkey_s_c k;
 	struct bkey_i_alloc_v4 *a;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret;
 
 	bch2_trans_iter_init(trans, &iter, BTREE_ID_alloc, pos,
@@ -997,7 +997,7 @@ write:
 	ret = bch2_trans_update(trans, &iter, &a->k_i, 0);
 out:
 	bch2_trans_iter_exit(trans, &iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -1083,7 +1083,7 @@ static int invalidate_one_bucket(struct btree_trans *trans, struct bch_dev *ca)
 	struct bkey_s_c k;
 	struct bkey_i_alloc_v4 *a;
 	u64 bucket, idx;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret;
 
 	bch2_trans_iter_init(trans, &lru_iter, BTREE_ID_lru,
@@ -1155,7 +1155,7 @@ next_lru:
 out:
 	bch2_trans_iter_exit(trans, &alloc_iter);
 	bch2_trans_iter_exit(trans, &lru_iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 

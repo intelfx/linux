@@ -5,9 +5,9 @@
 #include "darray.h"
 #include "subvolume_types.h"
 
-void bch2_snapshot_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
+void bch2_snapshot_to_text(struct bch_printbuf *, struct bch_fs *, struct bkey_s_c);
 int bch2_snapshot_invalid(const struct bch_fs *, struct bkey_s_c,
-			  int rw, struct printbuf *);
+			  int rw, struct bch_printbuf *);
 
 #define bch2_bkey_ops_snapshot (struct bkey_ops) {		\
 	.key_invalid	= bch2_snapshot_invalid,		\
@@ -98,8 +98,8 @@ void bch2_fs_snapshots_exit(struct bch_fs *);
 int bch2_fs_snapshots_start(struct bch_fs *);
 
 int bch2_subvolume_invalid(const struct bch_fs *, struct bkey_s_c,
-			   int rw, struct printbuf *);
-void bch2_subvolume_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
+			   int rw, struct bch_printbuf *);
+void bch2_subvolume_to_text(struct bch_printbuf *, struct bch_fs *, struct bkey_s_c);
 
 #define bch2_bkey_ops_subvolume (struct bkey_ops) {		\
 	.key_invalid	= bch2_subvolume_invalid,		\

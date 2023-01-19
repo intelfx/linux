@@ -295,7 +295,7 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans, struct bc
 	struct bch_alloc_v4 a;
 	u64 b = free_entry & ~(~0ULL << 56);
 	unsigned genbits = free_entry >> 56;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret;
 
 	if (b < ca->mi.first_bucket || b >= ca->mi.nbuckets) {
@@ -351,7 +351,7 @@ static struct open_bucket *try_alloc_bucket(struct btree_trans *trans, struct bc
 		iter.path->preserve = false;
 err:
 	bch2_trans_iter_exit(trans, &iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ob;
 }
 
@@ -1372,7 +1372,7 @@ void bch2_fs_allocator_foreground_init(struct bch_fs *c)
 	}
 }
 
-void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_open_buckets_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	struct open_bucket *ob;
 
@@ -1398,7 +1398,7 @@ static const char * const bch2_write_point_states[] = {
 	NULL
 };
 
-void bch2_write_points_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_write_points_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	struct write_point *wp;
 	unsigned i;

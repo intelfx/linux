@@ -2090,7 +2090,7 @@ static noinline void read_from_stale_dirty_pointer(struct btree_trans *trans,
 	struct bch_fs *c = trans->c;
 	struct bch_dev *ca = bch_dev_bkey_exists(c, ptr.dev);
 	struct btree_iter iter;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret;
 
 	bch2_trans_iter_init(trans, &iter, BTREE_ID_alloc,
@@ -2115,7 +2115,7 @@ static noinline void read_from_stale_dirty_pointer(struct btree_trans *trans,
 	bch2_fs_inconsistent(c, "%s", buf.buf);
 
 	bch2_trans_iter_exit(trans, &iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 }
 
 int __bch2_read_extent(struct btree_trans *trans, struct bch_read_bio *orig,

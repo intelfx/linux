@@ -46,13 +46,13 @@ const struct sysfs_ops type ## _sysfs_ops = {					\
 }
 
 #define SHOW(fn)							\
-static ssize_t fn ## _to_text(struct printbuf *,			\
+static ssize_t fn ## _to_text(struct bch_printbuf *,			\
 			      struct kobject *, struct attribute *);\
 									\
 static ssize_t fn ## _show(struct kobject *kobj, struct attribute *attr,\
 			   char *buf)					\
 {									\
-	struct printbuf out = PRINTBUF;					\
+	struct bch_printbuf out = BCH_PRINTBUF;					\
 	ssize_t ret = fn ## _to_text(&out, kobj, attr);			\
 									\
 	if (out.pos && out.buf[out.pos - 1] != '\n')			\
@@ -65,11 +65,11 @@ static ssize_t fn ## _show(struct kobject *kobj, struct attribute *attr,\
 		ret = min_t(size_t, out.pos, PAGE_SIZE - 1);		\
 		memcpy(buf, out.buf, ret);				\
 	}								\
-	printbuf_exit(&out);						\
+	bch2_printbuf_exit(&out);						\
 	return ret;							\
 }									\
 									\
-static ssize_t fn ## _to_text(struct printbuf *out, struct kobject *kobj,\
+static ssize_t fn ## _to_text(struct bch_printbuf *out, struct kobject *kobj,\
 			      struct attribute *attr)
 
 #define STORE(fn)							\
@@ -253,7 +253,7 @@ static size_t bch2_btree_avg_write_size(struct bch_fs *c)
 	return nr ? div64_u64(sectors, nr) : 0;
 }
 
-static long data_progress_to_text(struct printbuf *out, struct bch_fs *c)
+static long data_progress_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	long ret = 0;
 	struct bch_move_stats *stats;
@@ -272,7 +272,7 @@ static long data_progress_to_text(struct printbuf *out, struct bch_fs *c)
 	return ret;
 }
 
-static int bch2_compression_stats_to_text(struct printbuf *out, struct bch_fs *c)
+static int bch2_compression_stats_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	struct btree_trans trans;
 	struct btree_iter iter;
@@ -361,7 +361,7 @@ static int bch2_compression_stats_to_text(struct printbuf *out, struct bch_fs *c
 	return 0;
 }
 
-static void bch2_gc_gens_pos_to_text(struct printbuf *out, struct bch_fs *c)
+static void bch2_gc_gens_pos_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	pr_buf(out, "%s: ", bch2_btree_ids[c->gc_gens_btree]);
 	bch2_bpos_to_text(out, c->gc_gens_pos);
@@ -760,7 +760,7 @@ struct attribute *bch2_fs_time_stats_files[] = {
 	NULL
 };
 
-static void dev_alloc_debug_to_text(struct printbuf *out, struct bch_dev *ca)
+static void dev_alloc_debug_to_text(struct bch_printbuf *out, struct bch_dev *ca)
 {
 	struct bch_fs *c = ca->fs;
 	struct bch_dev_usage stats = bch2_dev_usage_read(ca);
@@ -809,7 +809,7 @@ static const char * const bch2_rw[] = {
 	NULL
 };
 
-static void dev_iodone_to_text(struct printbuf *out, struct bch_dev *ca)
+static void dev_iodone_to_text(struct bch_printbuf *out, struct bch_dev *ca)
 {
 	int rw, i;
 

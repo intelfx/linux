@@ -253,7 +253,7 @@ static int bch2_rebalance_thread(void *arg)
 	return 0;
 }
 
-void bch2_rebalance_work_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_rebalance_work_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	struct bch_fs_rebalance *r = &c->rebalance;
 	struct rebalance_work w = rebalance_work(c);

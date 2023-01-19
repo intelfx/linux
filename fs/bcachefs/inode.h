@@ -6,9 +6,9 @@
 
 extern const char * const bch2_inode_opts[];
 
-int bch2_inode_invalid(const struct bch_fs *, struct bkey_s_c, int, struct printbuf *);
-int bch2_inode_v2_invalid(const struct bch_fs *, struct bkey_s_c, int, struct printbuf *);
-void bch2_inode_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
+int bch2_inode_invalid(const struct bch_fs *, struct bkey_s_c, int, struct bch_printbuf *);
+int bch2_inode_v2_invalid(const struct bch_fs *, struct bkey_s_c, int, struct bch_printbuf *);
+void bch2_inode_to_text(struct bch_printbuf *, struct bch_fs *, struct bkey_s_c);
 
 #define bch2_bkey_ops_inode (struct bkey_ops) {		\
 	.key_invalid	= bch2_inode_invalid,		\
@@ -31,8 +31,8 @@ static inline bool bkey_is_inode(const struct bkey *k)
 }
 
 int bch2_inode_generation_invalid(const struct bch_fs *, struct bkey_s_c,
-				  int, struct printbuf *);
-void bch2_inode_generation_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
+				  int, struct bch_printbuf *);
+void bch2_inode_generation_to_text(struct bch_printbuf *, struct bch_fs *, struct bkey_s_c);
 
 #define bch2_bkey_ops_inode_generation (struct bkey_ops) {	\
 	.key_invalid	= bch2_inode_generation_invalid,	\
@@ -71,7 +71,7 @@ void bch2_inode_pack(struct bch_fs *, struct bkey_inode_buf *,
 		     const struct bch_inode_unpacked *);
 int bch2_inode_unpack(struct bkey_s_c, struct bch_inode_unpacked *);
 
-void bch2_inode_unpacked_to_text(struct printbuf *, struct bch_inode_unpacked *);
+void bch2_inode_unpacked_to_text(struct bch_printbuf *, struct bch_inode_unpacked *);
 
 int bch2_inode_peek(struct btree_trans *, struct btree_iter *,
 		    struct bch_inode_unpacked *, subvol_inum, unsigned);

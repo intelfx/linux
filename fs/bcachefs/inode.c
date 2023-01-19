@@ -293,7 +293,7 @@ int bch2_inode_write(struct btree_trans *trans,
 	return bch2_trans_update(trans, iter, &inode_p->inode.k_i, 0);
 }
 
-static int __bch2_inode_invalid(struct bkey_s_c k, struct printbuf *err)
+static int __bch2_inode_invalid(struct bkey_s_c k, struct bch_printbuf *err)
 {
 	struct bch_inode_unpacked unpacked;
 
@@ -339,7 +339,7 @@ static int __bch2_inode_invalid(struct bkey_s_c k, struct printbuf *err)
 }
 
 int bch2_inode_invalid(const struct bch_fs *c, struct bkey_s_c k,
-		       int rw, struct printbuf *err)
+		       int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_inode inode = bkey_s_c_to_inode(k);
 
@@ -359,7 +359,7 @@ int bch2_inode_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 int bch2_inode_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct printbuf *err)
+			  int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_inode_v2 inode = bkey_s_c_to_inode_v2(k);
 
@@ -378,7 +378,7 @@ int bch2_inode_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return __bch2_inode_invalid(k, err);
 }
 
-static void __bch2_inode_unpacked_to_text(struct printbuf *out, struct bch_inode_unpacked *inode)
+static void __bch2_inode_unpacked_to_text(struct bch_printbuf *out, struct bch_inode_unpacked *inode)
 {
 	pr_buf(out, "mode %o flags %x journal_seq %llu",
 	       inode->bi_mode, inode->bi_flags,
@@ -390,13 +390,13 @@ static void __bch2_inode_unpacked_to_text(struct printbuf *out, struct bch_inode
 #undef  x
 }
 
-void bch2_inode_unpacked_to_text(struct printbuf *out, struct bch_inode_unpacked *inode)
+void bch2_inode_unpacked_to_text(struct bch_printbuf *out, struct bch_inode_unpacked *inode)
 {
 	pr_buf(out, "inum: %llu ", inode->bi_inum);
 	__bch2_inode_unpacked_to_text(out, inode);
 }
 
-void bch2_inode_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_inode_to_text(struct bch_printbuf *out, struct bch_fs *c,
 		       struct bkey_s_c k)
 {
 	struct bch_inode_unpacked inode;
@@ -410,7 +410,7 @@ void bch2_inode_to_text(struct printbuf *out, struct bch_fs *c,
 }
 
 int bch2_inode_generation_invalid(const struct bch_fs *c, struct bkey_s_c k,
-				  int rw, struct printbuf *err)
+				  int rw, struct bch_printbuf *err)
 {
 	if (k.k->p.inode) {
 		pr_buf(err, "nonzero k.p.inode");
@@ -426,7 +426,7 @@ int bch2_inode_generation_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_inode_generation_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_inode_generation_to_text(struct bch_printbuf *out, struct bch_fs *c,
 				   struct bkey_s_c k)
 {
 	struct bkey_s_c_inode_generation gen = bkey_s_c_to_inode_generation(k);

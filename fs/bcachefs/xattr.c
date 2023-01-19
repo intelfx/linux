@@ -70,7 +70,7 @@ const struct bch_hash_desc bch2_xattr_hash_desc = {
 };
 
 int bch2_xattr_invalid(const struct bch_fs *c, struct bkey_s_c k,
-		       int rw, struct printbuf *err)
+		       int rw, struct bch_printbuf *err)
 {
 	const struct xattr_handler *handler;
 	struct bkey_s_c_xattr xattr = bkey_s_c_to_xattr(k);
@@ -116,7 +116,7 @@ int bch2_xattr_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_xattr_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_xattr_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			struct bkey_s_c k)
 {
 	const struct xattr_handler *handler;
@@ -441,7 +441,7 @@ static int __bch2_xattr_bcachefs_get(const struct xattr_handler *handler,
 		bch2_inode_opts_to_opts(bch2_inode_opts_get(&inode->ei_inode));
 	const struct bch_option *opt;
 	int id, inode_opt_id;
-	struct printbuf out = PRINTBUF;
+	struct bch_printbuf out = BCH_PRINTBUF;
 	int ret;
 	u64 v;
 
@@ -476,7 +476,7 @@ static int __bch2_xattr_bcachefs_get(const struct xattr_handler *handler,
 			memcpy(buffer, out.buf, out.pos);
 	}
 
-	printbuf_exit(&out);
+	bch2_printbuf_exit(&out);
 	return ret;
 }
 

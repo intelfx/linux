@@ -26,7 +26,7 @@ static inline unsigned bkey_type_to_indirect(const struct bkey *k)
 /* reflink pointers */
 
 int bch2_reflink_p_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			   int rw, struct printbuf *err)
+			   int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_reflink_p p = bkey_s_c_to_reflink_p(k);
 
@@ -46,7 +46,7 @@ int bch2_reflink_p_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_reflink_p_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_reflink_p_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_s_c_reflink_p p = bkey_s_c_to_reflink_p(k);
@@ -78,7 +78,7 @@ bool bch2_reflink_p_merge(struct bch_fs *c, struct bkey_s _l, struct bkey_s_c _r
 /* indirect extents */
 
 int bch2_reflink_v_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			   int rw, struct printbuf *err)
+			   int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_reflink_v r = bkey_s_c_to_reflink_v(k);
 
@@ -91,7 +91,7 @@ int bch2_reflink_v_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return bch2_bkey_ptrs_invalid(c, k, rw, err);
 }
 
-void bch2_reflink_v_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_reflink_v_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_s_c_reflink_v r = bkey_s_c_to_reflink_v(k);
@@ -131,7 +131,7 @@ int bch2_trans_mark_reflink_v(struct btree_trans *trans,
 /* indirect inline data */
 
 int bch2_indirect_inline_data_invalid(const struct bch_fs *c, struct bkey_s_c k,
-				      int rw, struct printbuf *err)
+				      int rw, struct bch_printbuf *err)
 {
 	if (bkey_val_bytes(k.k) < sizeof(struct bch_indirect_inline_data)) {
 		pr_buf(err, "incorrect value size (%zu < %zu)",
@@ -142,7 +142,7 @@ int bch2_indirect_inline_data_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_indirect_inline_data_to_text(struct printbuf *out,
+void bch2_indirect_inline_data_to_text(struct bch_printbuf *out,
 					struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_indirect_inline_data d = bkey_s_c_to_indirect_inline_data(k);

@@ -70,7 +70,7 @@ static int bch2_gc_check_topology(struct bch_fs *c,
 	struct bpos expected_start = bkey_deleted(&prev->k->k)
 		? node_start
 		: bpos_successor(prev->k->k.p);
-	struct printbuf buf1 = PRINTBUF, buf2 = PRINTBUF;
+	struct bch_printbuf buf1 = BCH_PRINTBUF, buf2 = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (cur.k->k.type == KEY_TYPE_btree_ptr_v2) {
@@ -109,8 +109,8 @@ static int bch2_gc_check_topology(struct bch_fs *c,
 	if (is_last && bpos_cmp(cur.k->k.p, node_end)) {
 		bch2_topology_error(c);
 
-		printbuf_reset(&buf1);
-		printbuf_reset(&buf2);
+		bch2_printbuf_reset(&buf1);
+		bch2_printbuf_reset(&buf2);
 
 		bch2_bkey_val_to_text(&buf1, c, bkey_i_to_s_c(cur.k));
 		bch2_bpos_to_text(&buf2, node_end);
@@ -136,8 +136,8 @@ static int bch2_gc_check_topology(struct bch_fs *c,
 	bch2_bkey_buf_copy(prev, c, cur.k);
 err:
 fsck_err:
-	printbuf_exit(&buf2);
-	printbuf_exit(&buf1);
+	bch2_printbuf_exit(&buf2);
+	bch2_printbuf_exit(&buf1);
 	return ret;
 }
 
@@ -260,7 +260,7 @@ static int btree_repair_node_boundaries(struct bch_fs *c, struct btree *b,
 	struct bpos expected_start = !prev
 		? b->data->min_key
 		: bpos_successor(prev->key.k.p);
-	struct printbuf buf1 = PRINTBUF, buf2 = PRINTBUF;
+	struct bch_printbuf buf1 = BCH_PRINTBUF, buf2 = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (!prev) {
@@ -321,15 +321,15 @@ static int btree_repair_node_boundaries(struct bch_fs *c, struct btree *b,
 	}
 out:
 fsck_err:
-	printbuf_exit(&buf2);
-	printbuf_exit(&buf1);
+	bch2_printbuf_exit(&buf2);
+	bch2_printbuf_exit(&buf1);
 	return ret;
 }
 
 static int btree_repair_node_end(struct bch_fs *c, struct btree *b,
 				 struct btree *child)
 {
-	struct printbuf buf1 = PRINTBUF, buf2 = PRINTBUF;
+	struct bch_printbuf buf1 = BCH_PRINTBUF, buf2 = BCH_PRINTBUF;
 	int ret = 0;
 
 	bch2_bkey_val_to_text(&buf1, c, bkey_i_to_s_c(&child->key));
@@ -347,8 +347,8 @@ static int btree_repair_node_end(struct bch_fs *c, struct btree *b,
 	}
 err:
 fsck_err:
-	printbuf_exit(&buf2);
-	printbuf_exit(&buf1);
+	bch2_printbuf_exit(&buf2);
+	bch2_printbuf_exit(&buf1);
 	return ret;
 }
 
@@ -359,7 +359,7 @@ static int bch2_btree_repair_topology_recurse(struct bch_fs *c, struct btree *b)
 	struct bkey_buf prev_k, cur_k;
 	struct btree *prev = NULL, *cur = NULL;
 	bool have_child, dropped_children = false;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (!b->c.level)
@@ -383,7 +383,7 @@ again:
 					false);
 		ret = PTR_ERR_OR_ZERO(cur);
 
-		printbuf_reset(&buf);
+		bch2_printbuf_reset(&buf);
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(cur_k.k));
 
 		if (mustfix_fsck_err_on(ret == -EIO, c,
@@ -491,7 +491,7 @@ again:
 		have_child = true;
 	}
 
-	printbuf_reset(&buf);
+	bch2_printbuf_reset(&buf);
 	bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&b->key));
 
 	if (mustfix_fsck_err_on(!have_child, c,
@@ -514,7 +514,7 @@ fsck_err:
 	if (!ret && dropped_children)
 		goto again;
 
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -550,7 +550,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 	const union bch_extent_entry *entry;
 	struct extent_ptr_decoded p = { 0 };
 	bool do_update = false;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	/*
@@ -568,7 +568,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 				p.ptr.dev, PTR_BUCKET_NR(ca, &p.ptr),
 				bch2_data_types[ptr_data_type(k->k, &p.ptr)],
 				p.ptr.gen,
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, *k), buf.buf))) {
 			if (!p.ptr.cached) {
 				g->gen_valid		= true;
@@ -584,7 +584,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 				p.ptr.dev, PTR_BUCKET_NR(ca, &p.ptr),
 				bch2_data_types[ptr_data_type(k->k, &p.ptr)],
 				p.ptr.gen, g->gen,
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, *k), buf.buf))) {
 			if (!p.ptr.cached) {
 				g->gen_valid		= true;
@@ -604,7 +604,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 				p.ptr.dev, PTR_BUCKET_NR(ca, &p.ptr), g->gen,
 				bch2_data_types[ptr_data_type(k->k, &p.ptr)],
 				p.ptr.gen,
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, *k), buf.buf)))
 			do_update = true;
 
@@ -615,7 +615,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 				p.ptr.dev, PTR_BUCKET_NR(ca, &p.ptr),
 				bch2_data_types[ptr_data_type(k->k, &p.ptr)],
 				p.ptr.gen, g->gen,
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, *k), buf.buf)))
 			do_update = true;
 
@@ -629,7 +629,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 				p.ptr.dev, PTR_BUCKET_NR(ca, &p.ptr),
 				bch2_data_types[g->data_type],
 				bch2_data_types[data_type],
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, *k), buf.buf))) {
 			if (data_type == BCH_DATA_btree) {
 				g->data_type	= data_type;
@@ -646,7 +646,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 					"pointer to nonexistent stripe %llu\n"
 					"while marking %s",
 					(u64) p.ec.idx,
-					(printbuf_reset(&buf),
+					(bch2_printbuf_reset(&buf),
 					 bch2_bkey_val_to_text(&buf, c, *k), buf.buf)))
 				do_update = true;
 
@@ -654,7 +654,7 @@ static int bch2_check_fix_ptrs(struct bch_fs *c, enum btree_id btree_id,
 					"pointer does not match stripe %llu\n"
 					"while marking %s",
 					(u64) p.ec.idx,
-					(printbuf_reset(&buf),
+					(bch2_printbuf_reset(&buf),
 					 bch2_bkey_val_to_text(&buf, c, *k), buf.buf)))
 				do_update = true;
 		}
@@ -746,11 +746,11 @@ found:
 		if (level)
 			bch2_btree_node_update_key_early(c, btree_id, level - 1, *k, new);
 
-		printbuf_reset(&buf);
+		bch2_printbuf_reset(&buf);
 		bch2_bkey_val_to_text(&buf, c, *k);
 		bch_info(c, "updated %s", buf.buf);
 
-		printbuf_reset(&buf);
+		bch2_printbuf_reset(&buf);
 		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(new));
 		bch_info(c, "new key %s", buf.buf);
 
@@ -758,7 +758,7 @@ found:
 	}
 err:
 fsck_err:
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -893,7 +893,7 @@ static int bch2_gc_btree_init_recurse(struct btree_trans *trans, struct btree *b
 	struct btree_and_journal_iter iter;
 	struct bkey_s_c k;
 	struct bkey_buf cur, prev;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	bch2_btree_and_journal_iter_init_node_iter(&iter, c, b);
@@ -954,7 +954,7 @@ static int bch2_gc_btree_init_recurse(struct btree_trans *trans, struct btree *b
 					  "  %s",
 					  bch2_btree_ids[b->c.btree_id],
 					  b->c.level - 1,
-					  (printbuf_reset(&buf),
+					  (bch2_printbuf_reset(&buf),
 					   bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(cur.k)), buf.buf)) &&
 				    !test_bit(BCH_FS_TOPOLOGY_REPAIR_DONE, &c->flags)) {
 					ret = FSCK_ERR_START_TOPOLOGY_REPAIR;
@@ -985,7 +985,7 @@ fsck_err:
 	bch2_bkey_buf_exit(&cur, c);
 	bch2_bkey_buf_exit(&prev, c);
 	bch2_btree_and_journal_iter_exit(&iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -999,7 +999,7 @@ static int bch2_gc_btree_init(struct btree_trans *trans,
 		: bch2_expensive_debug_checks		? 0
 		: !btree_node_type_needs_gc(btree_id)	? 1
 		: 0;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	b = c->btree_roots[btree_id].b;
@@ -1008,7 +1008,7 @@ static int bch2_gc_btree_init(struct btree_trans *trans,
 		return 0;
 
 	six_lock_read(&b->c.lock, NULL, NULL);
-	printbuf_reset(&buf);
+	bch2_printbuf_reset(&buf);
 	bch2_bpos_to_text(&buf, b->data->min_key);
 	if (mustfix_fsck_err_on(bpos_cmp(b->data->min_key, POS_MIN), c,
 			"btree root with incorrect min_key: %s", buf.buf)) {
@@ -1017,7 +1017,7 @@ static int bch2_gc_btree_init(struct btree_trans *trans,
 		goto fsck_err;
 	}
 
-	printbuf_reset(&buf);
+	bch2_printbuf_reset(&buf);
 	bch2_bpos_to_text(&buf, b->data->max_key);
 	if (mustfix_fsck_err_on(bpos_cmp(b->data->max_key, SPOS_MAX), c,
 			"btree root with incorrect max_key: %s", buf.buf)) {
@@ -1040,7 +1040,7 @@ fsck_err:
 
 	if (ret < 0)
 		bch_err(c, "%s: ret %i", __func__, ret);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -1180,7 +1180,7 @@ static int bch2_gc_done(struct bch_fs *c,
 			bool initial, bool metadata_only)
 {
 	struct bch_dev *ca = NULL;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	bool verify = !metadata_only && (!initial ||
 		       (c->sb.compat & (1ULL << BCH_COMPAT_alloc_info)));
 	unsigned i, dev;
@@ -1256,7 +1256,7 @@ static int bch2_gc_done(struct bch_fs *c,
 			     e->data_type == BCH_DATA_cached))
 				continue;
 
-			printbuf_reset(&buf);
+			bch2_printbuf_reset(&buf);
 			bch2_replicas_entry_to_text(&buf, e);
 
 			copy_fs_field(replicas[i], "%s", buf.buf);
@@ -1274,7 +1274,7 @@ fsck_err:
 		bch_err(c, "%s: ret %i", __func__, ret);
 
 	percpu_up_write(&c->mark_lock);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -1547,7 +1547,7 @@ static int bch2_gc_reflink_done(struct bch_fs *c, bool metadata_only)
 	struct bkey_s_c k;
 	struct reflink_gc *r;
 	size_t idx = 0;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (metadata_only)
@@ -1575,7 +1575,7 @@ static int bch2_gc_reflink_done(struct bch_fs *c, bool metadata_only)
 				"reflink key has wrong refcount:\n"
 				"  %s\n"
 				"  should be %u",
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, k), buf.buf),
 				r->refcount)) {
 			struct bkey_i *new;
@@ -1605,7 +1605,7 @@ fsck_err:
 	bch2_trans_iter_exit(&trans, &iter);
 	c->reflink_gc_nr = 0;
 	bch2_trans_exit(&trans);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -1664,7 +1664,7 @@ static int bch2_gc_stripes_done(struct bch_fs *c, bool metadata_only)
 	struct bkey_s_c k;
 	struct gc_stripe *m;
 	const struct bch_stripe *s;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	unsigned i;
 	int ret = 0;
 
@@ -1690,7 +1690,7 @@ inconsistent:
 				"stripe has wrong block sector count %u:\n"
 				"  %s\n"
 				"  should be %u", i,
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, k), buf.buf),
 				m ? m->block_sectors[i] : 0)) {
 			struct bkey_i_stripe *new;
@@ -1716,7 +1716,7 @@ fsck_err:
 
 	bch2_trans_exit(&trans);
 
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 

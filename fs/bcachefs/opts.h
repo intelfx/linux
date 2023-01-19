@@ -439,7 +439,7 @@ enum bch_opt_id {
 };
 
 struct bch_fs;
-struct printbuf;
+struct bch_printbuf;
 
 struct bch_option {
 	struct attribute	attr;
@@ -451,7 +451,7 @@ struct bch_option {
 
 	const char * const *choices;
 	int (*parse)(struct bch_fs *, const char *, u64 *);
-	void (*to_text)(struct printbuf *, struct bch_fs *, struct bch_sb *, u64);
+	void (*to_text)(struct bch_printbuf *, struct bch_fs *, struct bch_sb *, u64);
 
 	const char		*hint;
 	const char		*help;
@@ -470,14 +470,14 @@ void __bch2_opt_set_sb(struct bch_sb *, const struct bch_option *, u64);
 void bch2_opt_set_sb(struct bch_fs *, const struct bch_option *, u64);
 
 int bch2_opt_lookup(const char *);
-int bch2_opt_validate(const struct bch_option *, u64, struct printbuf *);
+int bch2_opt_validate(const struct bch_option *, u64, struct bch_printbuf *);
 int bch2_opt_parse(struct bch_fs *, const struct bch_option *,
-		   const char *, u64 *, struct printbuf *);
+		   const char *, u64 *, struct bch_printbuf *);
 
 #define OPT_SHOW_FULL_LIST	(1 << 0)
 #define OPT_SHOW_MOUNT_STYLE	(1 << 1)
 
-void bch2_opt_to_text(struct printbuf *, struct bch_fs *, struct bch_sb *,
+void bch2_opt_to_text(struct bch_printbuf *, struct bch_fs *, struct bch_sb *,
 		      const struct bch_option *, u64, unsigned);
 
 int bch2_opt_check_may_set(struct bch_fs *, int, u64);

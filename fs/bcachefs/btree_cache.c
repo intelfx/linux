@@ -771,7 +771,7 @@ static int lock_node_check_fn(struct six_lock *lock, void *p)
 
 static noinline void btree_bad_header(struct bch_fs *c, struct btree *b)
 {
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 
 	if (!test_bit(BCH_FS_INITIAL_GC_DONE, &c->flags))
 		return;
@@ -793,7 +793,7 @@ static noinline void btree_bad_header(struct bch_fs *c, struct btree *b)
 	bch2_bpos_to_text(&buf, b->data->max_key);
 
 	bch2_fs_inconsistent(c, "%s", buf.buf);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 }
 
 static inline void btree_check_header(struct bch_fs *c, struct btree *b)
@@ -1102,7 +1102,7 @@ wait_on_io:
 	six_unlock_intent(&b->c.lock);
 }
 
-void bch2_btree_node_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_btree_node_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			     struct btree *b)
 {
 	const struct bkey_format *f = &b->format;
@@ -1148,7 +1148,7 @@ void bch2_btree_node_to_text(struct printbuf *out, struct bch_fs *c,
 	       stats.failed);
 }
 
-void bch2_btree_cache_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_btree_cache_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	pr_buf(out, "nr nodes:\t\t%u\n", c->btree_cache.used);
 	pr_buf(out, "nr dirty:\t\t%u\n", atomic_read(&c->btree_cache.dirty));

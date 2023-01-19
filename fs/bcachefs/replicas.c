@@ -36,7 +36,7 @@ static void bch2_cpu_replicas_sort(struct bch_replicas_cpu *r)
 	eytzinger0_sort(r->entries, r->nr, r->entry_size, memcmp, NULL);
 }
 
-void bch2_replicas_entry_v0_to_text(struct printbuf *out,
+void bch2_replicas_entry_v0_to_text(struct bch_printbuf *out,
 				    struct bch_replicas_entry_v0 *e)
 {
 	unsigned i;
@@ -52,7 +52,7 @@ void bch2_replicas_entry_v0_to_text(struct printbuf *out,
 	pr_buf(out, "]");
 }
 
-void bch2_replicas_entry_to_text(struct printbuf *out,
+void bch2_replicas_entry_to_text(struct bch_printbuf *out,
 				 struct bch_replicas_entry *e)
 {
 	unsigned i;
@@ -68,7 +68,7 @@ void bch2_replicas_entry_to_text(struct printbuf *out,
 	pr_buf(out, "]");
 }
 
-void bch2_cpu_replicas_to_text(struct printbuf *out,
+void bch2_cpu_replicas_to_text(struct bch_printbuf *out,
 			       struct bch_replicas_cpu *r)
 {
 	struct bch_replicas_entry *e;
@@ -826,7 +826,7 @@ static int bch2_cpu_replicas_to_sb_replicas(struct bch_fs *c,
 
 static int bch2_cpu_replicas_validate(struct bch_replicas_cpu *cpu_r,
 				      struct bch_sb *sb,
-				      struct printbuf *err)
+				      struct bch_printbuf *err)
 {
 	struct bch_sb_field_members *mi = bch2_sb_get_members(sb);
 	unsigned i, j;
@@ -884,7 +884,7 @@ static int bch2_cpu_replicas_validate(struct bch_replicas_cpu *cpu_r,
 }
 
 static int bch2_sb_replicas_validate(struct bch_sb *sb, struct bch_sb_field *f,
-				     struct printbuf *err)
+				     struct bch_printbuf *err)
 {
 	struct bch_sb_field_replicas *sb_r = field_to_type(f, replicas);
 	struct bch_replicas_cpu cpu_r;
@@ -898,7 +898,7 @@ static int bch2_sb_replicas_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return ret;
 }
 
-static void bch2_sb_replicas_to_text(struct printbuf *out,
+static void bch2_sb_replicas_to_text(struct bch_printbuf *out,
 				     struct bch_sb *sb,
 				     struct bch_sb_field *f)
 {
@@ -922,7 +922,7 @@ const struct bch_sb_field_ops bch_sb_field_ops_replicas = {
 };
 
 static int bch2_sb_replicas_v0_validate(struct bch_sb *sb, struct bch_sb_field *f,
-					struct printbuf *err)
+					struct bch_printbuf *err)
 {
 	struct bch_sb_field_replicas_v0 *sb_r = field_to_type(f, replicas_v0);
 	struct bch_replicas_cpu cpu_r;
@@ -936,7 +936,7 @@ static int bch2_sb_replicas_v0_validate(struct bch_sb *sb, struct bch_sb_field *
 	return ret;
 }
 
-static void bch2_sb_replicas_v0_to_text(struct printbuf *out,
+static void bch2_sb_replicas_v0_to_text(struct bch_printbuf *out,
 					struct bch_sb *sb,
 					struct bch_sb_field *f)
 {
@@ -997,12 +997,12 @@ bool bch2_have_enough_devs(struct bch_fs *c, struct bch_devs_mask devs,
 
 		if (dflags & ~flags) {
 			if (print) {
-				struct printbuf buf = PRINTBUF;
+				struct bch_printbuf buf = BCH_PRINTBUF;
 
 				bch2_replicas_entry_to_text(&buf, e);
 				bch_err(c, "insufficient devices online (%u) for replicas entry %s",
 					nr_online, buf.buf);
-				printbuf_exit(&buf);
+				bch2_printbuf_exit(&buf);
 			}
 			ret = false;
 			break;

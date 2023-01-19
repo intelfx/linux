@@ -675,7 +675,7 @@ static int check_key_has_snapshot(struct btree_trans *trans,
 				  struct bkey_s_c k)
 {
 	struct bch_fs *c = trans->c;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (mustfix_fsck_err_on(!snapshot_t(c, k.k->p.snapshot)->equiv, c,
@@ -684,7 +684,7 @@ static int check_key_has_snapshot(struct btree_trans *trans,
 		ret = bch2_btree_delete_at(trans, iter,
 					    BTREE_UPDATE_INTERNAL_SNAPSHOT_NODE) ?: 1;
 fsck_err:
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 
@@ -724,7 +724,7 @@ static int hash_check_key(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	struct btree_iter iter = { NULL };
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	struct bkey_s_c k;
 	u64 hash;
 	int ret = 0;
@@ -749,7 +749,7 @@ static int hash_check_key(struct btree_trans *trans,
 		if (fsck_err_on(k.k->type == desc.key_type &&
 				!desc.cmp_bkey(k, hash_k), c,
 				"duplicate hash table keys:\n%s",
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, hash_k),
 				 buf.buf))) {
 			ret = bch2_hash_delete_at(trans, desc, hash_info, k_iter, 0) ?: 1;
@@ -763,13 +763,13 @@ static int hash_check_key(struct btree_trans *trans,
 	}
 out:
 	bch2_trans_iter_exit(trans, &iter);
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 bad_hash:
 	if (fsck_err(c, "hash table key at wrong offset: btree %s inode %llu offset %llu, "
 		     "hashed to %llu\n%s",
 		     bch2_btree_ids[desc.btree_id], hash_k.k->p.inode, hash_k.k->p.offset, hash,
-		     (printbuf_reset(&buf),
+		     (bch2_printbuf_reset(&buf),
 		      bch2_bkey_val_to_text(&buf, c, hash_k), buf.buf)) == FSCK_ERR_IGNORE)
 		return 0;
 
@@ -1157,7 +1157,7 @@ static int check_extent(struct btree_trans *trans, struct btree_iter *iter,
 	struct bch_fs *c = trans->c;
 	struct bkey_s_c k;
 	struct inode_walker_entry *i;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 peek:
 	k = bch2_btree_iter_peek(iter);
@@ -1215,7 +1215,7 @@ peek:
 
 	if (fsck_err_on(ret == INT_MAX, c,
 			"extent in missing inode:\n  %s",
-			(printbuf_reset(&buf),
+			(bch2_printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
 		ret = bch2_btree_delete_at(trans, iter,
 					    BTREE_UPDATE_INTERNAL_SNAPSHOT_NODE);
@@ -1234,7 +1234,7 @@ peek:
 			!S_ISLNK(i->inode.bi_mode), c,
 			"extent in non regular inode mode %o:\n  %s",
 			i->inode.bi_mode,
-			(printbuf_reset(&buf),
+			(bch2_printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
 		ret = bch2_btree_delete_at(trans, iter,
 					    BTREE_UPDATE_INTERNAL_SNAPSHOT_NODE);
@@ -1269,7 +1269,7 @@ peek:
 out:
 err:
 fsck_err:
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 
 	if (ret && ret != -EINTR)
 		bch_err(c, "error %i from check_extent()", ret);
@@ -1374,7 +1374,7 @@ static int check_dirent_target(struct btree_trans *trans,
 	struct bch_fs *c = trans->c;
 	struct bkey_i_dirent *n;
 	bool backpointer_exists = true;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (!target->bi_dir &&
@@ -1437,7 +1437,7 @@ static int check_dirent_target(struct btree_trans *trans,
 			"incorrect d_type: got %s, should be %s:\n%s",
 			bch2_d_type_str(d.v->d_type),
 			bch2_d_type_str(inode_d_type(target)),
-			(printbuf_reset(&buf),
+			(bch2_printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, d.s_c), buf.buf))) {
 		n = bch2_trans_kmalloc(trans, bkey_bytes(d.k));
 		ret = PTR_ERR_OR_ZERO(n);
@@ -1477,7 +1477,7 @@ static int check_dirent_target(struct btree_trans *trans,
 out:
 err:
 fsck_err:
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 
 	if (ret && ret != -EINTR)
 		bch_err(c, "error %i from check_target()", ret);
@@ -1494,7 +1494,7 @@ static int check_dirent(struct btree_trans *trans, struct btree_iter *iter,
 	struct bkey_s_c k;
 	struct bkey_s_c_dirent d;
 	struct inode_walker_entry *i;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 peek:
 	k = bch2_btree_iter_peek(iter);
@@ -1535,7 +1535,7 @@ peek:
 
 	if (fsck_err_on(ret == INT_MAX, c,
 			"dirent in nonexisting directory:\n%s",
-			(printbuf_reset(&buf),
+			(bch2_printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
 		ret = bch2_btree_delete_at(trans, iter,
 				BTREE_UPDATE_INTERNAL_SNAPSHOT_NODE);
@@ -1553,7 +1553,7 @@ peek:
 	if (fsck_err_on(!S_ISDIR(i->inode.bi_mode), c,
 			"dirent in non directory inode type %s:\n%s",
 			bch2_d_type_str(inode_d_type(&i->inode)),
-			(printbuf_reset(&buf),
+			(bch2_printbuf_reset(&buf),
 			 bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
 		ret = bch2_btree_delete_at(trans, iter, 0);
 		goto out;
@@ -1630,7 +1630,7 @@ peek:
 
 		if (fsck_err_on(!target->inodes.nr, c,
 				"dirent points to missing inode:\n%s",
-				(printbuf_reset(&buf),
+				(bch2_printbuf_reset(&buf),
 				 bch2_bkey_val_to_text(&buf, c, k),
 				 buf.buf))) {
 			ret = __remove_dirent(trans, d.k->p);
@@ -1653,7 +1653,7 @@ peek:
 out:
 err:
 fsck_err:
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 
 	if (ret && ret != -EINTR)
 		bch_err(c, "error %i from check_dirent()", ret);

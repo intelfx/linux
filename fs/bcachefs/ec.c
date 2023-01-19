@@ -103,7 +103,7 @@ struct ec_bio {
 /* Stripes btree keys: */
 
 int bch2_stripe_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			int rw, struct printbuf *err)
+			int rw, struct bch_printbuf *err)
 {
 	const struct bch_stripe *s = bkey_s_c_to_stripe(k).v;
 
@@ -132,7 +132,7 @@ int bch2_stripe_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return bch2_bkey_ptrs_invalid(c, k, rw, err);
 }
 
-void bch2_stripe_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_stripe_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			 struct bkey_s_c k)
 {
 	const struct bch_stripe *s = bkey_s_c_to_stripe(k).v;
@@ -296,7 +296,7 @@ static void ec_validate_checksums(struct bch_fs *c, struct ec_stripe_buf *buf)
 			struct bch_csum got = ec_block_checksum(buf, i, offset);
 
 			if (bch2_crc_cmp(want, got)) {
-				struct printbuf buf2 = PRINTBUF;
+				struct bch_printbuf buf2 = BCH_PRINTBUF;
 
 				bch2_bkey_val_to_text(&buf2, c, bkey_i_to_s_c(&buf->key.k_i));
 
@@ -304,7 +304,7 @@ static void ec_validate_checksums(struct bch_fs *c, struct ec_stripe_buf *buf)
 					"stripe checksum error for %ps at %u:%u: csum type %u, expected %llx got %llx\n%s",
 					(void *) _RET_IP_, i, j, v->csum_type,
 					want.lo, got.lo, buf2.buf);
-				printbuf_exit(&buf2);
+				bch2_printbuf_exit(&buf2);
 				clear_bit(i, buf->valid);
 				break;
 			}
@@ -1612,7 +1612,7 @@ int bch2_stripes_read(struct bch_fs *c)
 	return ret;
 }
 
-void bch2_stripes_heap_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_stripes_heap_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	ec_stripes_heap *h = &c->ec_stripes_heap;
 	struct stripe *m;
@@ -1630,7 +1630,7 @@ void bch2_stripes_heap_to_text(struct printbuf *out, struct bch_fs *c)
 	spin_unlock(&c->ec_stripes_heap_lock);
 }
 
-void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
+void bch2_new_stripes_to_text(struct bch_printbuf *out, struct bch_fs *c)
 {
 	struct ec_stripe_head *h;
 	struct ec_stripe_new *s;

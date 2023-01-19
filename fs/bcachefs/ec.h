@@ -7,8 +7,8 @@
 #include "keylist_types.h"
 
 int bch2_stripe_invalid(const struct bch_fs *, struct bkey_s_c,
-			int rw, struct printbuf *);
-void bch2_stripe_to_text(struct printbuf *, struct bch_fs *,
+			int rw, struct bch_printbuf *);
+void bch2_stripe_to_text(struct bch_printbuf *, struct bch_fs *,
 			 struct bkey_s_c);
 
 #define bch2_bkey_ops_stripe (struct bkey_ops) {	\
@@ -220,8 +220,8 @@ void bch2_stripes_heap_start(struct bch_fs *);
 
 int bch2_stripes_read(struct bch_fs *);
 
-void bch2_stripes_heap_to_text(struct printbuf *, struct bch_fs *);
-void bch2_new_stripes_to_text(struct printbuf *, struct bch_fs *);
+void bch2_stripes_heap_to_text(struct bch_printbuf *, struct bch_fs *);
+void bch2_new_stripes_to_text(struct bch_printbuf *, struct bch_fs *);
 
 void bch2_fs_ec_exit(struct bch_fs *);
 void bch2_fs_ec_init_early(struct bch_fs *);

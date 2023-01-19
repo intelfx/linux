@@ -833,8 +833,8 @@ static int verify_superblock_clean(struct bch_fs *c,
 {
 	unsigned i;
 	struct bch_sb_field_clean *clean = *cleanp;
-	struct printbuf buf1 = PRINTBUF;
-	struct printbuf buf2 = PRINTBUF;
+	struct bch_printbuf buf1 = BCH_PRINTBUF;
+	struct bch_printbuf buf2 = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (mustfix_fsck_err_on(j->seq != clean->journal_seq, c,
@@ -856,8 +856,8 @@ static int verify_superblock_clean(struct bch_fs *c,
 		if (!k1 && !k2)
 			continue;
 
-		printbuf_reset(&buf1);
-		printbuf_reset(&buf2);
+		bch2_printbuf_reset(&buf1);
+		bch2_printbuf_reset(&buf2);
 
 		if (k1)
 			bch2_bkey_val_to_text(&buf1, c, bkey_i_to_s_c(k1));
@@ -882,8 +882,8 @@ static int verify_superblock_clean(struct bch_fs *c,
 			l2, buf2.buf);
 	}
 fsck_err:
-	printbuf_exit(&buf2);
-	printbuf_exit(&buf1);
+	bch2_printbuf_exit(&buf2);
+	bch2_printbuf_exit(&buf1);
 	return ret;
 }
 

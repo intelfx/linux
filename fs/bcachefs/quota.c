@@ -18,7 +18,7 @@ static const char * const bch2_quota_counters[] = {
 };
 
 static int bch2_sb_quota_validate(struct bch_sb *sb, struct bch_sb_field *f,
-				  struct printbuf *err)
+				  struct bch_printbuf *err)
 {
 	struct bch_sb_field_quota *q = field_to_type(f, quota);
 
@@ -31,7 +31,7 @@ static int bch2_sb_quota_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_quota_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_quota_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 				  struct bch_sb_field *f)
 {
 	struct bch_sb_field_quota *q = field_to_type(f, quota);
@@ -58,7 +58,7 @@ const struct bch_sb_field_ops bch_sb_field_ops_quota = {
 };
 
 int bch2_quota_invalid(const struct bch_fs *c, struct bkey_s_c k,
-		       int rw, struct printbuf *err)
+		       int rw, struct bch_printbuf *err)
 {
 	if (k.k->p.inode >= QTYP_NR) {
 		pr_buf(err, "invalid quota type (%llu >= %u)",
@@ -75,7 +75,7 @@ int bch2_quota_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_quota_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_quota_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			struct bkey_s_c k)
 {
 	struct bkey_s_c_quota dq = bkey_s_c_to_quota(k);

@@ -23,7 +23,7 @@ const char * const bch2_bkey_types[] = {
 };
 
 static int deleted_key_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			       int rw, struct printbuf *err)
+			       int rw, struct bch_printbuf *err)
 {
 	return 0;
 }
@@ -37,7 +37,7 @@ static int deleted_key_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 static int empty_val_key_invalid(const struct bch_fs *c, struct bkey_s_c k,
-				 int rw, struct printbuf *err)
+				 int rw, struct bch_printbuf *err)
 {
 	if (bkey_val_bytes(k.k)) {
 		pr_buf(err, "incorrect value size (%zu != 0)",
@@ -53,7 +53,7 @@ static int empty_val_key_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 static int key_type_cookie_invalid(const struct bch_fs *c, struct bkey_s_c k,
-				   int rw, struct printbuf *err)
+				   int rw, struct bch_printbuf *err)
 {
 	if (bkey_val_bytes(k.k) != sizeof(struct bch_cookie)) {
 		pr_buf(err, "incorrect value size (%zu != %zu)",
@@ -73,12 +73,12 @@ static int key_type_cookie_invalid(const struct bch_fs *c, struct bkey_s_c k,
 }
 
 static int key_type_inline_data_invalid(const struct bch_fs *c, struct bkey_s_c k,
-					int rw, struct printbuf *err)
+					int rw, struct bch_printbuf *err)
 {
 	return 0;
 }
 
-static void key_type_inline_data_to_text(struct printbuf *out, struct bch_fs *c,
+static void key_type_inline_data_to_text(struct bch_printbuf *out, struct bch_fs *c,
 					 struct bkey_s_c k)
 {
 	struct bkey_s_c_inline_data d = bkey_s_c_to_inline_data(k);
@@ -94,7 +94,7 @@ static void key_type_inline_data_to_text(struct printbuf *out, struct bch_fs *c,
 }
 
 static int key_type_set_invalid(const struct bch_fs *c, struct bkey_s_c k,
-				int rw, struct printbuf *err)
+				int rw, struct bch_printbuf *err)
 {
 	if (bkey_val_bytes(k.k)) {
 		pr_buf(err, "incorrect value size (%zu != %zu)",
@@ -123,7 +123,7 @@ const struct bkey_ops bch2_bkey_ops[] = {
 };
 
 int bch2_bkey_val_invalid(struct bch_fs *c, struct bkey_s_c k,
-			  int rw, struct printbuf *err)
+			  int rw, struct bch_printbuf *err)
 {
 	if (k.k->type >= KEY_TYPE_MAX) {
 		pr_buf(err, "invalid type (%u >= %u)", k.k->type, KEY_TYPE_MAX);
@@ -199,7 +199,7 @@ static unsigned bch2_key_types_allowed[] = {
 
 int __bch2_bkey_invalid(struct bch_fs *c, struct bkey_s_c k,
 			enum btree_node_type type,
-			int rw, struct printbuf *err)
+			int rw, struct bch_printbuf *err)
 {
 	if (k.k->u64s < BKEY_U64s) {
 		pr_buf(err, "u64s too small (%u < %zu)", k.k->u64s, BKEY_U64s);
@@ -255,14 +255,14 @@ int __bch2_bkey_invalid(struct bch_fs *c, struct bkey_s_c k,
 
 int bch2_bkey_invalid(struct bch_fs *c, struct bkey_s_c k,
 		      enum btree_node_type type,
-		      int rw, struct printbuf *err)
+		      int rw, struct bch_printbuf *err)
 {
 	return __bch2_bkey_invalid(c, k, type, rw, err) ?:
 		bch2_bkey_val_invalid(c, k, rw, err);
 }
 
 int bch2_bkey_in_btree_node(struct btree *b, struct bkey_s_c k,
-			    struct printbuf *err)
+			    struct bch_printbuf *err)
 {
 	if (bpos_cmp(k.k->p, b->data->min_key) < 0) {
 		pr_buf(err, "key before start of btree node");
@@ -277,7 +277,7 @@ int bch2_bkey_in_btree_node(struct btree *b, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_bpos_to_text(struct printbuf *out, struct bpos pos)
+void bch2_bpos_to_text(struct bch_printbuf *out, struct bpos pos)
 {
 	if (!bpos_cmp(pos, POS_MIN))
 		pr_buf(out, "POS_MIN");
@@ -303,7 +303,7 @@ void bch2_bpos_to_text(struct printbuf *out, struct bpos pos)
 	}
 }
 
-void bch2_bkey_to_text(struct printbuf *out, const struct bkey *k)
+void bch2_bkey_to_text(struct bch_printbuf *out, const struct bkey *k)
 {
 	if (k) {
 		pr_buf(out, "u64s %u type ", k->u64s);
@@ -321,7 +321,7 @@ void bch2_bkey_to_text(struct printbuf *out, const struct bkey *k)
 	}
 }
 
-void bch2_val_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_val_to_text(struct bch_printbuf *out, struct bch_fs *c,
 		      struct bkey_s_c k)
 {
 	if (k.k->type < KEY_TYPE_MAX) {
@@ -334,7 +334,7 @@ void bch2_val_to_text(struct printbuf *out, struct bch_fs *c,
 	}
 }
 
-void bch2_bkey_val_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_bkey_val_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			   struct bkey_s_c k)
 {
 	bch2_bkey_to_text(out, k.k);

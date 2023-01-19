@@ -1675,7 +1675,7 @@ static int bch2_show_options(struct seq_file *seq, struct dentry *root)
 {
 	struct bch_fs *c = root->d_sb->s_fs_info;
 	enum bch_opt_id i;
-	struct printbuf buf = PRINTBUF;
+	struct bch_printbuf buf = BCH_PRINTBUF;
 	int ret = 0;
 
 	for (i = 0; i < bch2_opts_nr; i++) {
@@ -1688,7 +1688,7 @@ static int bch2_show_options(struct seq_file *seq, struct dentry *root)
 		if (v == bch2_opt_get_by_id(&bch2_opts_default, i))
 			continue;
 
-		printbuf_reset(&buf);
+		bch2_printbuf_reset(&buf);
 		bch2_opt_to_text(&buf, c, c->disk_sb.sb, opt, v,
 				 OPT_SHOW_MOUNT_STYLE);
 		seq_putc(seq, ',');
@@ -1697,7 +1697,7 @@ static int bch2_show_options(struct seq_file *seq, struct dentry *root)
 
 	if (buf.allocation_failure)
 		ret = -ENOMEM;
-	printbuf_exit(&buf);
+	bch2_printbuf_exit(&buf);
 	return ret;
 }
 

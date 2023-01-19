@@ -190,7 +190,7 @@ int bch2_blacklist_table_initialize(struct bch_fs *c)
 
 static int bch2_sb_journal_seq_blacklist_validate(struct bch_sb *sb,
 						  struct bch_sb_field *f,
-						  struct printbuf *err)
+						  struct bch_printbuf *err)
 {
 	struct bch_sb_field_journal_seq_blacklist *bl =
 		field_to_type(f, journal_seq_blacklist);
@@ -218,7 +218,7 @@ static int bch2_sb_journal_seq_blacklist_validate(struct bch_sb *sb,
 	return 0;
 }
 
-static void bch2_sb_journal_seq_blacklist_to_text(struct printbuf *out,
+static void bch2_sb_journal_seq_blacklist_to_text(struct bch_printbuf *out,
 						  struct bch_sb *sb,
 						  struct bch_sb_field *f)
 {

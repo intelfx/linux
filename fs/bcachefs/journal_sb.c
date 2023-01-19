@@ -18,7 +18,7 @@ static int u64_cmp(const void *_l, const void *_r)
 
 static int bch2_sb_journal_validate(struct bch_sb *sb,
 				    struct bch_sb_field *f,
-				    struct printbuf *err)
+				    struct bch_printbuf *err)
 {
 	struct bch_sb_field_journal *journal = field_to_type(f, journal);
 	struct bch_member *m = bch2_sb_get_members(sb)->members + sb->dev_idx;
@@ -69,7 +69,7 @@ err:
 	return ret;
 }
 
-static void bch2_sb_journal_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_journal_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 				    struct bch_sb_field *f)
 {
 	struct bch_sb_field_journal *journal = field_to_type(f, journal);
@@ -101,7 +101,7 @@ static int u64_range_cmp(const void *_l, const void *_r)
 
 static int bch2_sb_journal_v2_validate(struct bch_sb *sb,
 				    struct bch_sb_field *f,
-				    struct printbuf *err)
+				    struct bch_printbuf *err)
 {
 	struct bch_sb_field_journal_v2 *journal = field_to_type(f, journal_v2);
 	struct bch_member *m = bch2_sb_get_members(sb)->members + sb->dev_idx;
@@ -156,7 +156,7 @@ err:
 	return ret;
 }
 
-static void bch2_sb_journal_v2_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_journal_v2_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 				    struct bch_sb_field *f)
 {
 	struct bch_sb_field_journal_v2 *journal = field_to_type(f, journal_v2);

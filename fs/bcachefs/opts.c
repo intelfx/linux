@@ -224,7 +224,7 @@ static int bch2_mount_opt_lookup(const char *name)
 	return bch2_opt_lookup(name);
 }
 
-int bch2_opt_validate(const struct bch_option *opt, u64 v, struct printbuf *err)
+int bch2_opt_validate(const struct bch_option *opt, u64 v, struct bch_printbuf *err)
 {
 	if (v < opt->min) {
 		if (err)
@@ -260,7 +260,7 @@ int bch2_opt_validate(const struct bch_option *opt, u64 v, struct printbuf *err)
 int bch2_opt_parse(struct bch_fs *c,
 		   const struct bch_option *opt,
 		   const char *val, u64 *res,
-		   struct printbuf *err)
+		   struct bch_printbuf *err)
 {
 	ssize_t ret;
 
@@ -312,7 +312,7 @@ int bch2_opt_parse(struct bch_fs *c,
 	return bch2_opt_validate(opt, *res, err);
 }
 
-void bch2_opt_to_text(struct printbuf *out,
+void bch2_opt_to_text(struct bch_printbuf *out,
 		      struct bch_fs *c, struct bch_sb *sb,
 		      const struct bch_option *opt, u64 v,
 		      unsigned flags)
@@ -389,7 +389,7 @@ int bch2_parse_mount_opts(struct bch_fs *c, struct bch_opts *opts,
 	char *copied_opts, *copied_opts_start;
 	char *opt, *name, *val;
 	int ret, id;
-	struct printbuf err = PRINTBUF;
+	struct bch_printbuf err = BCH_PRINTBUF;
 	u64 v;
 
 	if (!options)
@@ -461,7 +461,7 @@ no_val:
 	goto out;
 out:
 	kfree(copied_opts_start);
-	printbuf_exit(&err);
+	bch2_printbuf_exit(&err);
 	return ret;
 }
 

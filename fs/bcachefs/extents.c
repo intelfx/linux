@@ -157,7 +157,7 @@ int bch2_bkey_pick_read_device(struct bch_fs *c, struct bkey_s_c k,
 /* KEY_TYPE_btree_ptr: */
 
 int bch2_btree_ptr_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			   int rw, struct printbuf *err)
+			   int rw, struct bch_printbuf *err)
 {
 	if (bkey_val_u64s(k.k) > BCH_REPLICAS_MAX) {
 		pr_buf(err, "value too big (%zu > %u)",
@@ -168,14 +168,14 @@ int bch2_btree_ptr_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return bch2_bkey_ptrs_invalid(c, k, rw, err);
 }
 
-void bch2_btree_ptr_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_btree_ptr_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	bch2_bkey_ptrs_to_text(out, c, k);
 }
 
 int bch2_btree_ptr_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			      int rw, struct printbuf *err)
+			      int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_btree_ptr_v2 bp = bkey_s_c_to_btree_ptr_v2(k);
 
@@ -201,7 +201,7 @@ int bch2_btree_ptr_v2_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return bch2_bkey_ptrs_invalid(c, k, rw, err);
 }
 
-void bch2_btree_ptr_v2_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_btree_ptr_v2_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			       struct bkey_s_c k)
 {
 	struct bkey_s_c_btree_ptr_v2 bp = bkey_s_c_to_btree_ptr_v2(k);
@@ -379,7 +379,7 @@ bool bch2_extent_merge(struct bch_fs *c, struct bkey_s l, struct bkey_s_c r)
 /* KEY_TYPE_reservation: */
 
 int bch2_reservation_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			     int rw, struct printbuf *err)
+			     int rw, struct bch_printbuf *err)
 {
 	struct bkey_s_c_reservation r = bkey_s_c_to_reservation(k);
 
@@ -398,7 +398,7 @@ int bch2_reservation_invalid(const struct bch_fs *c, struct bkey_s_c k,
 	return 0;
 }
 
-void bch2_reservation_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_reservation_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			      struct bkey_s_c k)
 {
 	struct bkey_s_c_reservation r = bkey_s_c_to_reservation(k);
@@ -958,7 +958,7 @@ bool bch2_extent_normalize(struct bch_fs *c, struct bkey_s k)
 	return bkey_deleted(k.k);
 }
 
-void bch2_bkey_ptrs_to_text(struct printbuf *out, struct bch_fs *c,
+void bch2_bkey_ptrs_to_text(struct bch_printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
@@ -1028,7 +1028,7 @@ static int extent_ptr_invalid(const struct bch_fs *c,
 			      const struct bch_extent_ptr *ptr,
 			      unsigned size_ondisk,
 			      bool metadata,
-			      struct printbuf *err)
+			      struct bch_printbuf *err)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
 	const struct bch_extent_ptr *ptr2;
@@ -1072,7 +1072,7 @@ static int extent_ptr_invalid(const struct bch_fs *c,
 }
 
 int bch2_bkey_ptrs_invalid(const struct bch_fs *c, struct bkey_s_c k,
-			   int rw, struct printbuf *err)
+			   int rw, struct bch_printbuf *err)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
 	const union bch_extent_entry *entry;

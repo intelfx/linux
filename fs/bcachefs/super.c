@@ -826,7 +826,7 @@ noinline_for_stack
 static void print_mount_opts(struct bch_fs *c)
 {
 	enum bch_opt_id i;
-	struct printbuf p = PRINTBUF;
+	struct bch_printbuf p = BCH_PRINTBUF;
 	bool first = true;
 
 	if (c->opts.read_only) {
@@ -854,7 +854,7 @@ static void print_mount_opts(struct bch_fs *c)
 		pr_buf(&p, "(null)");
 
 	bch_info(c, "mounted version=%s opts=%s", bch2_metadata_versions[c->sb.version], p.buf);
-	printbuf_exit(&p);
+	bch2_printbuf_exit(&p);
 }
 
 int bch2_fs_start(struct bch_fs *c)
@@ -1482,11 +1482,11 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags)
 
 	data = bch2_dev_has_data(c, ca);
 	if (data) {
-		struct printbuf data_has = PRINTBUF;
+		struct bch_printbuf data_has = BCH_PRINTBUF;
 
 		bch2_flags_to_text(&data_has, bch2_data_types, data);
 		bch_err(ca, "Remove failed, still has data (%s)", data_has.buf);
-		printbuf_exit(&data_has);
+		bch2_printbuf_exit(&data_has);
 		ret = -EBUSY;
 		goto err;
 	}
@@ -1535,7 +1535,7 @@ int bch2_dev_add(struct bch_fs *c, const char *path)
 	struct bch_sb_field_members *mi;
 	struct bch_member dev_mi;
 	unsigned dev_idx, nr_devices, u64s;
-	struct printbuf errbuf = PRINTBUF;
+	struct bch_printbuf errbuf = BCH_PRINTBUF;
 	int ret;
 
 	ret = bch2_read_super(path, &opts, &sb);
@@ -1658,7 +1658,7 @@ err:
 	if (ca)
 		bch2_dev_free(ca);
 	bch2_free_super(&sb);
-	printbuf_exit(&errbuf);
+	bch2_printbuf_exit(&errbuf);
 	return ret;
 err_late:
 	up_write(&c->state_lock);
@@ -1820,7 +1820,7 @@ struct bch_fs *bch2_fs_open(char * const *devices, unsigned nr_devices,
 	struct bch_sb_field_members *mi;
 	unsigned i, best_sb = 0;
 	const char *err;
-	struct printbuf errbuf = PRINTBUF;
+	struct bch_printbuf errbuf = BCH_PRINTBUF;
 	int ret = 0;
 
 	if (!try_module_get(THIS_MODULE))
@@ -1896,7 +1896,7 @@ struct bch_fs *bch2_fs_open(char * const *devices, unsigned nr_devices,
 	}
 out:
 	kfree(sb);
-	printbuf_exit(&errbuf);
+	bch2_printbuf_exit(&errbuf);
 	module_put(THIS_MODULE);
 	pr_verbose_init(opts, "ret %i", PTR_ERR_OR_ZERO(c));
 	return c;

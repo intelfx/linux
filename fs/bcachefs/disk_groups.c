@@ -19,7 +19,7 @@ static int group_cmp(const void *_l, const void *_r)
 
 static int bch2_sb_disk_groups_validate(struct bch_sb *sb,
 					struct bch_sb_field *f,
-					struct printbuf *err)
+					struct bch_printbuf *err)
 {
 	struct bch_sb_field_disk_groups *groups =
 		field_to_type(f, disk_groups);
@@ -88,7 +88,7 @@ err:
 	return 0;
 }
 
-static void bch2_sb_disk_groups_to_text(struct printbuf *out,
+static void bch2_sb_disk_groups_to_text(struct bch_printbuf *out,
 					struct bch_sb *sb,
 					struct bch_sb_field *f)
 {
@@ -343,7 +343,7 @@ int bch2_disk_path_find_or_create(struct bch_sb_handle *sb, const char *name)
 	return v;
 }
 
-void bch2_disk_path_to_text(struct printbuf *out, struct bch_sb *sb, unsigned v)
+void bch2_disk_path_to_text(struct bch_printbuf *out, struct bch_sb *sb, unsigned v)
 {
 	struct bch_sb_field_disk_groups *groups =
 		bch2_sb_get_disk_groups(sb);
@@ -445,7 +445,7 @@ int bch2_opt_target_parse(struct bch_fs *c, const char *buf, u64 *v)
 	return -EINVAL;
 }
 
-void bch2_opt_target_to_text(struct printbuf *out,
+void bch2_opt_target_to_text(struct bch_printbuf *out,
 			     struct bch_fs *c,
 			     struct bch_sb *sb,
 			     u64 v)

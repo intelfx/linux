@@ -22,12 +22,12 @@ static size_t bch2_sb_counter_nr_entries(struct bch_sb_field_counters *ctrs)
 
 static int bch2_sb_counters_validate(struct bch_sb *sb,
 				     struct bch_sb_field *f,
-				     struct printbuf *err)
+				     struct bch_printbuf *err)
 {
 	return 0;
 };
 
-void bch2_sb_counters_to_text(struct printbuf *out, struct bch_sb *sb,
+void bch2_sb_counters_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 			      struct bch_sb_field *f)
 {
 	struct bch_sb_field_counters *ctrs = field_to_type(f, counters);

@@ -179,7 +179,7 @@ struct bch_fs_usage_online *bch2_fs_usage_read(struct bch_fs *);
 
 void bch2_fs_usage_acc_to_base(struct bch_fs *, unsigned);
 
-void bch2_fs_usage_to_text(struct printbuf *,
+void bch2_fs_usage_to_text(struct bch_printbuf *,
 			   struct bch_fs *, struct bch_fs_usage_online *);
 
 u64 bch2_fs_sectors_used(struct bch_fs *, struct bch_fs_usage_online *);

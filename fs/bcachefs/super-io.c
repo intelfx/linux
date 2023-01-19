@@ -32,7 +32,7 @@ const char * const bch2_sb_fields[] = {
 };
 
 static int bch2_sb_field_validate(struct bch_sb *, struct bch_sb_field *,
-				  struct printbuf *);
+				  struct bch_printbuf *);
 
 struct bch_sb_field *bch2_sb_field_get(struct bch_sb *sb,
 				      enum bch_sb_field_type type)
@@ -207,7 +207,7 @@ static inline void __bch2_sb_layout_size_assert(void)
 	BUILD_BUG_ON(sizeof(struct bch_sb_layout) != 512);
 }
 
-static int validate_sb_layout(struct bch_sb_layout *layout, struct printbuf *out)
+static int validate_sb_layout(struct bch_sb_layout *layout, struct bch_printbuf *out)
 {
 	u64 offset, prev_offset, max_sectors;
 	unsigned i;
@@ -253,7 +253,7 @@ static int validate_sb_layout(struct bch_sb_layout *layout, struct printbuf *out
 	return 0;
 }
 
-static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
+static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct bch_printbuf *out,
 			    int rw)
 {
 	struct bch_sb *sb = disk_sb->sb;
@@ -354,7 +354,7 @@ static int bch2_sb_validate(struct bch_sb_handle *disk_sb, struct printbuf *out,
 			if (ret)
 				return ret;
 
-			printbuf_reset(out);
+			bch2_printbuf_reset(out);
 		}
 	}
 
@@ -523,7 +523,7 @@ int bch2_sb_from_fs(struct bch_fs *c, struct bch_dev *ca)
 
 /* read superblock: */
 
-static int read_one_super(struct bch_sb_handle *sb, u64 offset, struct printbuf *err)
+static int read_one_super(struct bch_sb_handle *sb, u64 offset, struct bch_printbuf *err)
 {
 	struct bch_csum csum;
 	u32 version, version_min;
@@ -601,7 +601,7 @@ int bch2_read_super(const char *path, struct bch_opts *opts,
 {
 	u64 offset = opt_get(*opts, sb);
 	struct bch_sb_layout layout;
-	struct printbuf err = PRINTBUF;
+	struct bch_printbuf err = BCH_PRINTBUF;
 	__le64 *i;
 	int ret;
 
@@ -654,7 +654,7 @@ int bch2_read_super(const char *path, struct bch_opts *opts,
 
 	printk(KERN_ERR "bcachefs (%s): error reading default superblock: %s",
 	       path, err.buf);
-	printbuf_reset(&err);
+	bch2_printbuf_reset(&err);
 
 	/*
 	 * Error reading primary superblock - read location of backup
@@ -714,7 +714,7 @@ got_super:
 	}
 out:
 	pr_verbose_init(*opts, "ret %i", ret);
-	printbuf_exit(&err);
+	bch2_printbuf_exit(&err);
 	return ret;
 err:
 	printk(KERN_ERR "bcachefs (%s): error reading superblock: %s",
@@ -788,7 +788,7 @@ int bch2_write_super(struct bch_fs *c)
 {
 	struct closure *cl = &c->sb_write;
 	struct bch_dev *ca;
-	struct printbuf err = PRINTBUF;
+	struct bch_printbuf err = BCH_PRINTBUF;
 	unsigned i, sb = 0, nr_wrote;
 	struct bch_devs_mask sb_written;
 	bool wrote, can_mount_without_written, can_mount_with_written;
@@ -820,7 +820,7 @@ int bch2_write_super(struct bch_fs *c)
 		bch2_sb_from_fs(c, ca);
 
 	for_each_online_member(ca, c, i) {
-		printbuf_reset(&err);
+		bch2_printbuf_reset(&err);
 
 		ret = bch2_sb_validate(&ca->disk_sb, &err, WRITE);
 		if (ret) {
@@ -922,7 +922,7 @@ int bch2_write_super(struct bch_fs *c)
 out:
 	/* Make new options visible after they're persistent: */
 	bch2_sb_update(c);
-	printbuf_exit(&err);
+	bch2_printbuf_exit(&err);
 	return ret;
 }
 
@@ -941,7 +941,7 @@ void __bch2_check_set_feature(struct bch_fs *c, unsigned feat)
 
 static int bch2_sb_members_validate(struct bch_sb *sb,
 				    struct bch_sb_field *f,
-				    struct printbuf *err)
+				    struct bch_printbuf *err)
 {
 	struct bch_sb_field_members *mi = field_to_type(f, members);
 	unsigned i;
@@ -989,7 +989,7 @@ static int bch2_sb_members_validate(struct bch_sb *sb,
 	return 0;
 }
 
-static void bch2_sb_members_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_members_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 				    struct bch_sb_field *f)
 {
 	struct bch_sb_field_members *mi = field_to_type(f, members);
@@ -1108,7 +1108,7 @@ static const struct bch_sb_field_ops bch_sb_field_ops_members = {
 
 static int bch2_sb_crypt_validate(struct bch_sb *sb,
 				  struct bch_sb_field *f,
-				  struct printbuf *err)
+				  struct bch_printbuf *err)
 {
 	struct bch_sb_field_crypt *crypt = field_to_type(f, crypt);
 
@@ -1126,7 +1126,7 @@ static int bch2_sb_crypt_validate(struct bch_sb *sb,
 	return 0;
 }
 
-static void bch2_sb_crypt_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_crypt_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 				  struct bch_sb_field *f)
 {
 	struct bch_sb_field_crypt *crypt = field_to_type(f, crypt);
@@ -1350,7 +1350,7 @@ out:
 
 static int bch2_sb_clean_validate(struct bch_sb *sb,
 				  struct bch_sb_field *f,
-				  struct printbuf *err)
+				  struct bch_printbuf *err)
 {
 	struct bch_sb_field_clean *clean = field_to_type(f, clean);
 
@@ -1363,7 +1363,7 @@ static int bch2_sb_clean_validate(struct bch_sb *sb,
 	return 0;
 }
 
-static void bch2_sb_clean_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_clean_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 				  struct bch_sb_field *f)
 {
 	struct bch_sb_field_clean *clean = field_to_type(f, clean);
@@ -1399,10 +1399,10 @@ static const struct bch_sb_field_ops *bch2_sb_field_ops[] = {
 };
 
 static int bch2_sb_field_validate(struct bch_sb *sb, struct bch_sb_field *f,
-				  struct printbuf *err)
+				  struct bch_printbuf *err)
 {
 	unsigned type = le32_to_cpu(f->type);
-	struct printbuf field_err = PRINTBUF;
+	struct bch_printbuf field_err = BCH_PRINTBUF;
 	int ret;
 
 	if (type >= BCH_SB_FIELD_NR)
@@ -1417,11 +1417,11 @@ static int bch2_sb_field_validate(struct bch_sb *sb, struct bch_sb_field *f,
 		bch2_sb_field_to_text(err, sb, f);
 	}
 
-	printbuf_exit(&field_err);
+	bch2_printbuf_exit(&field_err);
 	return ret;
 }
 
-void bch2_sb_field_to_text(struct printbuf *out, struct bch_sb *sb,
+void bch2_sb_field_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 			   struct bch_sb_field *f)
 {
 	unsigned type = le32_to_cpu(f->type);
@@ -1446,7 +1446,7 @@ void bch2_sb_field_to_text(struct printbuf *out, struct bch_sb *sb,
 	}
 }
 
-void bch2_sb_layout_to_text(struct printbuf *out, struct bch_sb_layout *l)
+void bch2_sb_layout_to_text(struct bch_printbuf *out, struct bch_sb_layout *l)
 {
 	unsigned i;
 
@@ -1471,7 +1471,7 @@ void bch2_sb_layout_to_text(struct printbuf *out, struct bch_sb_layout *l)
 	pr_newline(out);
 }
 
-void bch2_sb_to_text(struct printbuf *out, struct bch_sb *sb,
+void bch2_sb_to_text(struct bch_printbuf *out, struct bch_sb *sb,
 		     bool print_layout, unsigned fields)
 {
 	struct bch_sb_field_members *mi;

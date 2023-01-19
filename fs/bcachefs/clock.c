@@ -152,7 +152,7 @@ void __bch2_increment_clock(struct io_clock *clock, unsigned sectors)
 		timer->fn(timer);
 }
 
-void bch2_io_timers_to_text(struct printbuf *out, struct io_clock *clock)
+void bch2_io_timers_to_text(struct bch_printbuf *out, struct io_clock *clock)
 {
 	unsigned long now;
 	unsigned i;
