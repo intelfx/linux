@@ -9,6 +9,7 @@
 #include <linux/cpumask.h>
 #include <linux/pfn.h>
 #include <linux/init.h>
+#include <linux/sched.h>
 
 #include <asm/percpu.h>
 
