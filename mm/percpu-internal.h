@@ -2,6 +2,7 @@
 #ifndef _MM_PERCPU_INTERNAL_H
 #define _MM_PERCPU_INTERNAL_H
 
+#include <linux/memcontrol.h>
 #include <linux/types.h>
 #include <linux/percpu.h>
 
