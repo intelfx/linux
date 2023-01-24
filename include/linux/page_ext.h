@@ -13,8 +13,6 @@ struct page_ext_operations {
 	void (*init)(void);
 };
 
-#include <linux/stackdepot.h>
-
 #ifdef CONFIG_PAGE_EXTENSION
 
 enum page_ext_flags {
