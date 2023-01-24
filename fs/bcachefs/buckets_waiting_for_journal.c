@@ -18,6 +18,7 @@ static void bucket_table_init(struct buckets_waiting_for_journal_table *t, size_
 	t->bits = bits;
 	for (i = 0; i < ARRAY_SIZE(t->hash_seeds); i++)
 		get_random_bytes(&t->hash_seeds[i], sizeof(t->hash_seeds[i]));
+	memset(t->d, 0, sizeof(t->d[0]) << t->bits);
 }
 
 bool bch2_bucket_needs_journal_commit(struct buckets_waiting_for_journal *b,
@@ -106,7 +107,7 @@ int bch2_set_bucket_needs_journal_commit(struct buckets_waiting_for_journal *b,
 
 	new_bits = t->bits + (nr_elements * 3 > size);
 
-	n = kvzalloc(sizeof(*n) + (sizeof(n->d[0]) << new_bits), GFP_KERNEL);
+	n = kvmalloc(sizeof(*n) + (sizeof(n->d[0]) << new_bits), GFP_KERNEL);
 	if (!n) {
 		ret = -ENOMEM;
 		goto out;
@@ -154,7 +155,7 @@ int bch2_fs_buckets_waiting_for_journal_init(struct bch_fs *c)
 
 	mutex_init(&b->lock);
 
-	b->t = kvzalloc(sizeof(*b->t) +
+	b->t = kvmalloc(sizeof(*b->t) +
 			(sizeof(b->t->d[0]) << INITIAL_TABLE_BITS), GFP_KERNEL);
 	if (!b->t)
 		return -ENOMEM;
