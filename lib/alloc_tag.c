@@ -8,6 +8,7 @@
 #include <linux/page_ext.h>
 #include <linux/sched/clock.h>
 #include <linux/seq_buf.h>
+#include <linux/stackdepot.h>
 #include <linux/uaccess.h>
 
 #define STACK_BUF_SIZE 1024
