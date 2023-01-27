@@ -44,6 +44,7 @@
 #ifdef CONFIG_BLOCK
 #include <linux/blkdev.h>
 #endif
+#include <linux/printbuf.h>
 
 #include "../mm/internal.h"	/* For the trace_print_flags arrays */
 
@@ -52,6 +53,7 @@
 #include <asm/unaligned.h>
 
 #include <linux/string_helpers.h>
+#include <linux/pretty-printers.h>
 #include "kstrtox.h"
 
 /* Disable pointer hashing if requested */
@@ -367,41 +369,52 @@ char *put_dec(char *buf, unsigned long long n)
 
 #endif
 
+/**
+ * prt_u64_minwidth - print a u64, in decimal, with zero padding
+ * @out: printbuf to output to
+ * @num: u64 to print
+ * @width: minimum width
+ */
+void prt_u64_minwidth(struct printbuf *out, u64 num, unsigned width)
+{
+	/* put_dec requires 2-byte alignment of the buffer. */
+	char tmp[sizeof(num) * 3] __aligned(2);
+	unsigned len = put_dec(tmp, num) - tmp;
+
+	printbuf_make_room(out, max(len, width));
+
+	if (width > len)
+		__prt_chars_reserved(out, ' ', width - len);
+
+	while (len)
+		__prt_char_reserved(out, tmp[--len]);
+	printbuf_nul_terminate(out);
+}
+
+/**
+ * prt_u64 - print a simple u64, in decimal
+ * @out: printbuf to output to
+ * @num: u64 to print
+ */
+void prt_u64(struct printbuf *out, u64 num)
+{
+	prt_u64_minwidth(out, num, 0);
+}
+EXPORT_SYMBOL_GPL(prt_u64);
+
 /*
  * Convert passed number to decimal string.
  * Returns the length of string.  On buffer overflow, returns 0.
  *
- * If speed is not important, use snprintf(). It's easy to read the code.
+ * Consider switching to printbufs and using prt_u64() or prt_u64_minwith()
+ * instead.
  */
 int num_to_str(char *buf, int size, unsigned long long num, unsigned int width)
 {
-	/* put_dec requires 2-byte alignment of the buffer. */
-	char tmp[sizeof(num) * 3] __aligned(2);
-	int idx, len;
+	struct printbuf out = PRINTBUF_EXTERN(buf, size);
 
-	/* put_dec() may work incorrectly for num = 0 (generate "", not "0") */
-	if (num <= 9) {
-		tmp[0] = '0' + num;
-		len = 1;
-	} else {
-		len = put_dec(tmp, num) - tmp;
-	}
-
-	if (len > size || width > size)
-		return 0;
-
-	if (width > len) {
-		width = width - len;
-		for (idx = 0; idx < width; idx++)
-			buf[idx] = ' ';
-	} else {
-		width = 0;
-	}
-
-	for (idx = 0; idx < len; ++idx)
-		buf[idx + width] = tmp[len - idx - 1];
-
-	return len + width;
+	prt_u64_minwidth(&out, num, width);
+	return out.pos;
 }
 
 #define SIGN	1		/* unsigned/signed, must be 1 */
@@ -435,7 +448,8 @@ enum format_type {
 	FORMAT_TYPE_UINT,
 	FORMAT_TYPE_INT,
 	FORMAT_TYPE_SIZE_T,
-	FORMAT_TYPE_PTRDIFF
+	FORMAT_TYPE_PTRDIFF,
+	FORMAT_TYPE_FN,
 };
 
 struct printf_spec {
@@ -451,128 +465,103 @@ static_assert(sizeof(struct printf_spec) == 8);
 #define PRECISION_MAX ((1 << 15) - 1)
 
 static noinline_for_stack
-char *number(char *buf, char *end, unsigned long long num,
-	     struct printf_spec spec)
+void number(struct printbuf *out, unsigned long long num,
+	    struct printf_spec spec)
 {
 	/* put_dec requires 2-byte alignment of the buffer. */
 	char tmp[3 * sizeof(num)] __aligned(2);
-	char sign;
-	char locase;
+	char sign = 0;
+	/* locase = 0 or 0x20. ORing digits or letters with 'locase'
+	 * produces same digits or (maybe lowercased) letters */
+	char locase = (spec.flags & SMALL);
 	int need_pfx = ((spec.flags & SPECIAL) && spec.base != 10);
-	int i;
 	bool is_zero = num == 0LL;
 	int field_width = spec.field_width;
 	int precision = spec.precision;
+	int nr_digits = 0;
+	int output_bytes = 0;
 
-	/* locase = 0 or 0x20. ORing digits or letters with 'locase'
-	 * produces same digits or (maybe lowercased) letters */
-	locase = (spec.flags & SMALL);
 	if (spec.flags & LEFT)
 		spec.flags &= ~ZEROPAD;
-	sign = 0;
 	if (spec.flags & SIGN) {
 		if ((signed long long)num < 0) {
 			sign = '-';
 			num = -(signed long long)num;
-			field_width--;
+			output_bytes++;
 		} else if (spec.flags & PLUS) {
 			sign = '+';
-			field_width--;
+			output_bytes++;
 		} else if (spec.flags & SPACE) {
 			sign = ' ';
-			field_width--;
+			output_bytes++;
 		}
 	}
 	if (need_pfx) {
 		if (spec.base == 16)
-			field_width -= 2;
+			output_bytes += 2;
 		else if (!is_zero)
-			field_width--;
+			output_bytes++;
 	}
 
 	/* generate full string in tmp[], in reverse order */
-	i = 0;
-	if (num < spec.base)
-		tmp[i++] = hex_asc_upper[num] | locase;
-	else if (spec.base != 10) { /* 8 or 16 */
+	if (spec.base == 10) {
+		nr_digits = put_dec(tmp, num) - tmp;
+	} else { /* 8 or 16 */
 		int mask = spec.base - 1;
-		int shift = 3;
+		int shift = ilog2((unsigned) spec.base);
 
-		if (spec.base == 16)
-			shift = 4;
 		do {
-			tmp[i++] = (hex_asc_upper[((unsigned char)num) & mask] | locase);
+			tmp[nr_digits++] = (hex_asc_upper[((unsigned char)num) & mask] | locase);
 			num >>= shift;
 		} while (num);
-	} else { /* base 10 */
-		i = put_dec(tmp, num) - tmp;
 	}
 
 	/* printing 100 using %2d gives "100", not "00" */
-	if (i > precision)
-		precision = i;
+	precision = max(nr_digits, precision);
+	output_bytes += precision;
+	field_width = max(0, field_width - output_bytes);
+
+	printbuf_make_room(out, field_width + output_bytes);
+
 	/* leading space padding */
-	field_width -= precision;
-	if (!(spec.flags & (ZEROPAD | LEFT))) {
-		while (--field_width >= 0) {
-			if (buf < end)
-				*buf = ' ';
-			++buf;
-		}
+	if (!(spec.flags & (ZEROPAD | LEFT)) && field_width) {
+		__prt_chars_reserved(out, ' ', field_width);
+		field_width = 0;
 	}
+
 	/* sign */
-	if (sign) {
-		if (buf < end)
-			*buf = sign;
-		++buf;
-	}
+	if (sign)
+		__prt_char_reserved(out, sign);
+
 	/* "0x" / "0" prefix */
 	if (need_pfx) {
-		if (spec.base == 16 || !is_zero) {
-			if (buf < end)
-				*buf = '0';
-			++buf;
-		}
-		if (spec.base == 16) {
-			if (buf < end)
-				*buf = ('X' | locase);
-			++buf;
-		}
+		if (spec.base == 16 || !is_zero)
+			__prt_char_reserved(out, '0');
+		if (spec.base == 16)
+			__prt_char_reserved(out, 'X' | locase);
 	}
-	/* zero or space padding */
-	if (!(spec.flags & LEFT)) {
-		char c = ' ' + (spec.flags & ZEROPAD);
 
-		while (--field_width >= 0) {
-			if (buf < end)
-				*buf = c;
-			++buf;
-		}
-	}
-	/* hmm even more zero padding? */
-	while (i <= --precision) {
-		if (buf < end)
-			*buf = '0';
-		++buf;
-	}
+	/* zero padding */
+	if (!(spec.flags & LEFT) && field_width)
+		__prt_chars_reserved(out, '0', field_width);
+
+	/* zero padding from precision */
+	if (precision > nr_digits)
+		__prt_chars_reserved(out, '0', precision - nr_digits);
+
 	/* actual digits of result */
-	while (--i >= 0) {
-		if (buf < end)
-			*buf = tmp[i];
-		++buf;
-	}
-	/* trailing space padding */
-	while (--field_width >= 0) {
-		if (buf < end)
-			*buf = ' ';
-		++buf;
-	}
+	while (--nr_digits >= 0)
+		__prt_char_reserved(out, tmp[nr_digits]);
 
-	return buf;
+	/* trailing space padding */
+	if ((spec.flags & LEFT) && field_width)
+		__prt_chars_reserved(out, ' ', field_width);
+
+	printbuf_nul_terminate(out);
 }
 
 static noinline_for_stack
-char *special_hex_number(char *buf, char *end, unsigned long long num, int size)
+void special_hex_number(struct printbuf *out, unsigned long long num, int size)
 {
 	struct printf_spec spec;
 
@@ -582,25 +571,28 @@ char *special_hex_number(char *buf, char *end, unsigned long long num, int size)
 	spec.base = 16;
 	spec.precision = -1;
 
-	return number(buf, end, num, spec);
+	number(out, num, spec);
 }
 
-static void move_right(char *buf, char *end, unsigned len, unsigned spaces)
+/*
+ * inserts @spaces spaces @len from the end of @out
+ */
+static void move_right(struct printbuf *out,
+		       unsigned len, unsigned spaces)
 {
-	size_t size;
-	if (buf >= end)	/* nowhere to put anything */
-		return;
-	size = end - buf;
-	if (size <= spaces) {
-		memset(buf, ' ', size);
-		return;
-	}
-	if (len) {
-		if (len > size - spaces)
-			len = size - spaces;
-		memmove(buf + spaces, buf, len);
-	}
-	memset(buf, ' ', spaces);
+	unsigned move_src = out->pos - len;
+	unsigned move_dst = move_src + spaces;
+	unsigned remaining_from_dst = move_dst < out->size ? out->size - move_dst : 0;
+	unsigned remaining_from_src = move_src < out->size ? out->size - move_src : 0;
+
+	BUG_ON(len > out->pos);
+
+	memmove(out->buf + move_dst,
+		out->buf + move_src,
+		min(remaining_from_dst, len));
+	memset(out->buf + move_src, ' ',
+	       min(remaining_from_src, spaces));
+	out->pos += spaces;
 }
 
 /*
@@ -612,67 +604,68 @@ static void move_right(char *buf, char *end, unsigned len, unsigned spaces)
  * Returns: new buffer position after padding.
  */
 static noinline_for_stack
-char *widen_string(char *buf, int n, char *end, struct printf_spec spec)
+void widen_string(struct printbuf *out, int n,
+		  struct printf_spec spec)
 {
 	unsigned spaces;
 
 	if (likely(n >= spec.field_width))
-		return buf;
+		return;
 	/* we want to pad the sucker */
 	spaces = spec.field_width - n;
-	if (!(spec.flags & LEFT)) {
-		move_right(buf - n, end, n, spaces);
-		return buf + spaces;
+	if (!(spec.flags & LEFT))
+		move_right(out, n, spaces);
+	else
+		prt_chars(out, ' ', spaces);
+}
+
+static void do_width_precision(struct printbuf *out, unsigned prev_pos,
+			       struct printf_spec spec)
+{
+	unsigned n = out->pos - prev_pos;
+
+	if (n > spec.precision) {
+		out->pos -= n - spec.precision;
+		n = spec.precision;
 	}
-	while (spaces--) {
-		if (buf < end)
-			*buf = ' ';
-		++buf;
-	}
-	return buf;
+
+	widen_string(out, n, spec);
 }
 
 /* Handle string from a well known address. */
-static char *string_nocheck(char *buf, char *end, const char *s,
-			    struct printf_spec spec)
+static void string_nocheck(struct printbuf *out,
+			   const char *s,
+			   struct printf_spec spec)
 {
-	int len = 0;
-	int lim = spec.precision;
+	int len = strnlen(s, spec.precision);
 
-	while (lim--) {
-		char c = *s++;
-		if (!c)
-			break;
-		if (buf < end)
-			*buf = c;
-		++buf;
-		++len;
-	}
-	return widen_string(buf, len, end, spec);
+	prt_bytes(out, s, len);
+	widen_string(out, len, spec);
 }
 
-static char *err_ptr(char *buf, char *end, void *ptr,
-		     struct printf_spec spec)
+static void err_ptr(struct printbuf *out, void *ptr,
+		    struct printf_spec spec)
 {
 	int err = PTR_ERR(ptr);
 	const char *sym = errname(err);
 
-	if (sym)
-		return string_nocheck(buf, end, sym, spec);
-
-	/*
-	 * Somebody passed ERR_PTR(-1234) or some other non-existing
-	 * Efoo - or perhaps CONFIG_SYMBOLIC_ERRNAME=n. Fall back to
-	 * printing it as its decimal representation.
-	 */
-	spec.flags |= SIGN;
-	spec.base = 10;
-	return number(buf, end, err, spec);
+	if (sym) {
+		string_nocheck(out, sym, spec);
+	} else {
+		/*
+		 * Somebody passed ERR_PTR(-1234) or some other non-existing
+		 * Efoo - or perhaps CONFIG_SYMBOLIC_ERRNAME=n. Fall back to
+		 * printing it as its decimal representation.
+		 */
+		spec.flags |= SIGN;
+		spec.base = 10;
+		number(out, err, spec);
+	}
 }
 
 /* Be careful: error messages must fit into the given buffer. */
-static char *error_string(char *buf, char *end, const char *s,
-			  struct printf_spec spec)
+static void error_string_spec(struct printbuf *out, const char *s,
+			 struct printf_spec spec)
 {
 	/*
 	 * Hard limit to avoid a completely insane messages. It actually
@@ -682,7 +675,7 @@ static char *error_string(char *buf, char *end, const char *s,
 	if (spec.precision == -1)
 		spec.precision = 2 * sizeof(void *);
 
-	return string_nocheck(buf, end, s, spec);
+	string_nocheck(out, s, spec);
 }
 
 /*
@@ -701,14 +694,15 @@ static const char *check_pointer_msg(const void *ptr)
 	return NULL;
 }
 
-static int check_pointer(char **buf, char *end, const void *ptr,
+static int check_pointer_spec(struct printbuf *out,
+			 const void *ptr,
 			 struct printf_spec spec)
 {
 	const char *err_msg;
 
 	err_msg = check_pointer_msg(ptr);
 	if (err_msg) {
-		*buf = error_string(*buf, end, err_msg, spec);
+		error_string_spec(out, err_msg, spec);
 		return -EFAULT;
 	}
 
@@ -716,18 +710,50 @@ static int check_pointer(char **buf, char *end, const void *ptr,
 }
 
 static noinline_for_stack
-char *string(char *buf, char *end, const char *s,
-	     struct printf_spec spec)
+void string_spec(struct printbuf *out,
+	    const char *s,
+	    struct printf_spec spec)
 {
-	if (check_pointer(&buf, end, s, spec))
-		return buf;
+	if (check_pointer_spec(out, s, spec))
+		return;
 
-	return string_nocheck(buf, end, s, spec);
+	string_nocheck(out, s, spec);
 }
 
-static char *pointer_string(char *buf, char *end,
-			    const void *ptr,
-			    struct printf_spec spec)
+static void error_string(struct printbuf *out, const char *s)
+{
+	/*
+	 * Hard limit to avoid a completely insane messages. It actually
+	 * works pretty well because most error messages are in
+	 * the many pointer format modifiers.
+	 */
+	prt_bytes(out, s, min(strlen(s), 2 * sizeof(void *)));
+}
+
+static int check_pointer(struct printbuf *out, const void *ptr)
+{
+	const char *err_msg;
+
+	err_msg = check_pointer_msg(ptr);
+	if (err_msg) {
+		error_string(out, err_msg);
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static void string(struct printbuf *out, const char *s)
+{
+	if (check_pointer(out, s))
+		return;
+
+	prt_str(out, s);
+}
+
+static void pointer_string(struct printbuf *out,
+			   const void *ptr,
+			   struct printf_spec spec)
 {
 	spec.base = 16;
 	spec.flags |= SMALL;
@@ -736,7 +762,7 @@ static char *pointer_string(char *buf, char *end,
 		spec.flags |= ZEROPAD;
 	}
 
-	return number(buf, end, (unsigned long int)ptr, spec);
+	number(out, (unsigned long int)ptr, spec);
 }
 
 /* Make pointers available for printing early in the boot sequence. */
@@ -806,8 +832,9 @@ int ptr_to_hashval(const void *ptr, unsigned long *hashval_out)
 	return __ptr_to_hashval(ptr, hashval_out);
 }
 
-static char *ptr_to_id(char *buf, char *end, const void *ptr,
-		       struct printf_spec spec)
+static void ptr_to_id(struct printbuf *out,
+		      const void *ptr,
+		      struct printf_spec spec)
 {
 	const char *str = sizeof(ptr) == 8 ? "(____ptrval____)" : "(ptrval)";
 	unsigned long hashval;
@@ -818,47 +845,49 @@ static char *ptr_to_id(char *buf, char *end, const void *ptr,
 	 * as they are not actual addresses.
 	 */
 	if (IS_ERR_OR_NULL(ptr))
-		return pointer_string(buf, end, ptr, spec);
+		return pointer_string(out, ptr, spec);
 
 	/* When debugging early boot use non-cryptographically secure hash. */
 	if (unlikely(debug_boot_weak_hash)) {
 		hashval = hash_long((unsigned long)ptr, 32);
-		return pointer_string(buf, end, (const void *)hashval, spec);
+		return pointer_string(out, (const void *)hashval, spec);
 	}
 
 	ret = __ptr_to_hashval(ptr, &hashval);
 	if (ret) {
 		spec.field_width = 2 * sizeof(ptr);
 		/* string length must be less than default_width */
-		return error_string(buf, end, str, spec);
+		return error_string_spec(out, str, spec);
 	}
 
-	return pointer_string(buf, end, (const void *)hashval, spec);
+	pointer_string(out, (const void *)hashval, spec);
 }
 
-static char *default_pointer(char *buf, char *end, const void *ptr,
-			     struct printf_spec spec)
+static void default_pointer(struct printbuf *out,
+			    const void *ptr,
+			    struct printf_spec spec)
 {
 	/*
 	 * default is to _not_ leak addresses, so hash before printing,
 	 * unless no_hash_pointers is specified on the command line.
 	 */
 	if (unlikely(no_hash_pointers))
-		return pointer_string(buf, end, ptr, spec);
+		return pointer_string(out, ptr, spec);
 
-	return ptr_to_id(buf, end, ptr, spec);
+	return ptr_to_id(out, ptr, spec);
 }
 
 int kptr_restrict __read_mostly;
 
 static noinline_for_stack
-char *restricted_pointer(char *buf, char *end, const void *ptr,
-			 struct printf_spec spec)
+void restricted_pointer(struct printbuf *out,
+			const void *ptr,
+			struct printf_spec spec)
 {
 	switch (kptr_restrict) {
 	case 0:
 		/* Handle as %p, hash and do _not_ leak addresses. */
-		return default_pointer(buf, end, ptr, spec);
+		return default_pointer(out, ptr, spec);
 	case 1: {
 		const struct cred *cred;
 
@@ -869,7 +898,7 @@ char *restricted_pointer(char *buf, char *end, const void *ptr,
 		if (in_irq() || in_serving_softirq() || in_nmi()) {
 			if (spec.field_width == -1)
 				spec.field_width = 2 * sizeof(ptr);
-			return error_string(buf, end, "pK-error", spec);
+			return error_string_spec(out, "pK-error", spec);
 		}
 
 		/*
@@ -895,17 +924,16 @@ char *restricted_pointer(char *buf, char *end, const void *ptr,
 		break;
 	}
 
-	return pointer_string(buf, end, ptr, spec);
+	return pointer_string(out, ptr, spec);
 }
 
 static noinline_for_stack
-char *dentry_name(char *buf, char *end, const struct dentry *d, struct printf_spec spec,
-		  const char *fmt)
+void dentry_name(struct printbuf *out, const struct dentry *d,
+		 const char *fmt)
 {
-	const char *array[4], *s;
+	const char *array[4];
 	const struct dentry *p;
-	int depth;
-	int i, n;
+	int i, depth;
 
 	switch (fmt[1]) {
 		case '2': case '3': case '4':
@@ -917,9 +945,9 @@ char *dentry_name(char *buf, char *end, const struct dentry *d, struct printf_sp
 
 	rcu_read_lock();
 	for (i = 0; i < depth; i++, d = p) {
-		if (check_pointer(&buf, end, d, spec)) {
+		if (check_pointer(out, d)) {
 			rcu_read_unlock();
-			return buf;
+			return;
 		}
 
 		p = READ_ONCE(d->d_parent);
@@ -931,58 +959,46 @@ char *dentry_name(char *buf, char *end, const struct dentry *d, struct printf_sp
 			break;
 		}
 	}
-	s = array[--i];
-	for (n = 0; n != spec.precision; n++, buf++) {
-		char c = *s++;
-		if (!c) {
-			if (!i)
-				break;
-			c = '/';
-			s = array[--i];
-		}
-		if (buf < end)
-			*buf = c;
+	while (1) {
+		prt_str(out, array[--i]);
+		if (!i)
+			break;
+		prt_char(out, '/');
 	}
 	rcu_read_unlock();
-	return widen_string(buf, n, end, spec);
 }
 
 static noinline_for_stack
-char *file_dentry_name(char *buf, char *end, const struct file *f,
-			struct printf_spec spec, const char *fmt)
+void file_dentry_name(struct printbuf *out, const struct file *f,
+		      const char *fmt)
 {
-	if (check_pointer(&buf, end, f, spec))
-		return buf;
+	if (check_pointer(out, f))
+		return;
 
-	return dentry_name(buf, end, f->f_path.dentry, spec, fmt);
+	return dentry_name(out, f->f_path.dentry, fmt);
 }
 #ifdef CONFIG_BLOCK
 static noinline_for_stack
-char *bdev_name(char *buf, char *end, struct block_device *bdev,
-		struct printf_spec spec, const char *fmt)
+void bdev_name(struct printbuf *out, struct block_device *bdev)
 {
 	struct gendisk *hd;
 
-	if (check_pointer(&buf, end, bdev, spec))
-		return buf;
+	if (check_pointer(out, bdev))
+		return;
 
 	hd = bdev->bd_disk;
-	buf = string(buf, end, hd->disk_name, spec);
+	string(out, hd->disk_name);
 	if (bdev->bd_partno) {
-		if (isdigit(hd->disk_name[strlen(hd->disk_name)-1])) {
-			if (buf < end)
-				*buf = 'p';
-			buf++;
-		}
-		buf = number(buf, end, bdev->bd_partno, spec);
+		if (isdigit(hd->disk_name[strlen(hd->disk_name)-1]))
+			prt_char(out, 'p');
+		prt_u64(out, bdev->bd_partno);
 	}
-	return buf;
 }
 #endif
 
 static noinline_for_stack
-char *symbol_string(char *buf, char *end, void *ptr,
-		    struct printf_spec spec, const char *fmt)
+void symbol_string(struct printbuf *out, void *ptr,
+		   const char *fmt)
 {
 	unsigned long value;
 #ifdef CONFIG_KALLSYMS
@@ -1005,16 +1021,11 @@ char *symbol_string(char *buf, char *end, void *ptr,
 	else
 		sprint_symbol_no_offset(sym, value);
 
-	return string_nocheck(buf, end, sym, spec);
+	prt_str(out, sym);
 #else
-	return special_hex_number(buf, end, value, sizeof(void *));
+	special_hex_number(out, value, sizeof(void *));
 #endif
 }
-
-static const struct printf_spec default_str_spec = {
-	.field_width = -1,
-	.precision = -1,
-};
 
 static const struct printf_spec default_flag_spec = {
 	.base = 16,
@@ -1027,23 +1038,9 @@ static const struct printf_spec default_dec_spec = {
 	.precision = -1,
 };
 
-static const struct printf_spec default_dec02_spec = {
-	.base = 10,
-	.field_width = 2,
-	.precision = -1,
-	.flags = ZEROPAD,
-};
-
-static const struct printf_spec default_dec04_spec = {
-	.base = 10,
-	.field_width = 4,
-	.precision = -1,
-	.flags = ZEROPAD,
-};
-
 static noinline_for_stack
-char *resource_string(char *buf, char *end, struct resource *res,
-		      struct printf_spec spec, const char *fmt)
+void resource_string(struct printbuf *out, struct resource *res,
+		     int decode)
 {
 #ifndef IO_RSRC_PRINTK_SIZE
 #define IO_RSRC_PRINTK_SIZE	6
@@ -1082,80 +1079,79 @@ char *resource_string(char *buf, char *end, struct resource *res,
 #define FLAG_BUF_SIZE		(2 * sizeof(res->flags))
 #define DECODED_BUF_SIZE	sizeof("[mem - 64bit pref window disabled]")
 #define RAW_BUF_SIZE		sizeof("[mem - flags 0x]")
-	char sym[max(2*RSRC_BUF_SIZE + DECODED_BUF_SIZE,
-		     2*RSRC_BUF_SIZE + FLAG_BUF_SIZE + RAW_BUF_SIZE)];
-
-	char *p = sym, *pend = sym + sizeof(sym);
-	int decode = (fmt[0] == 'R') ? 1 : 0;
 	const struct printf_spec *specp;
 
-	if (check_pointer(&buf, end, res, spec))
-		return buf;
+	if (check_pointer(out, res))
+		return;
 
-	*p++ = '[';
+	prt_char(out, '[');
 	if (res->flags & IORESOURCE_IO) {
-		p = string_nocheck(p, pend, "io  ", str_spec);
+		string_nocheck(out, "io  ", str_spec);
 		specp = &io_spec;
 	} else if (res->flags & IORESOURCE_MEM) {
-		p = string_nocheck(p, pend, "mem ", str_spec);
+		string_nocheck(out, "mem ", str_spec);
 		specp = &mem_spec;
 	} else if (res->flags & IORESOURCE_IRQ) {
-		p = string_nocheck(p, pend, "irq ", str_spec);
+		string_nocheck(out, "irq ", str_spec);
 		specp = &default_dec_spec;
 	} else if (res->flags & IORESOURCE_DMA) {
-		p = string_nocheck(p, pend, "dma ", str_spec);
+		string_nocheck(out, "dma ", str_spec);
 		specp = &default_dec_spec;
 	} else if (res->flags & IORESOURCE_BUS) {
-		p = string_nocheck(p, pend, "bus ", str_spec);
+		string_nocheck(out, "bus ", str_spec);
 		specp = &bus_spec;
 	} else {
-		p = string_nocheck(p, pend, "??? ", str_spec);
+		string_nocheck(out, "??? ", str_spec);
 		specp = &mem_spec;
 		decode = 0;
 	}
 	if (decode && res->flags & IORESOURCE_UNSET) {
-		p = string_nocheck(p, pend, "size ", str_spec);
-		p = number(p, pend, resource_size(res), *specp);
+		string_nocheck(out, "size ", str_spec);
+		number(out, resource_size(res), *specp);
 	} else {
-		p = number(p, pend, res->start, *specp);
+		number(out, res->start, *specp);
 		if (res->start != res->end) {
-			*p++ = '-';
-			p = number(p, pend, res->end, *specp);
+			prt_char(out, '-');
+			number(out, res->end, *specp);
 		}
 	}
 	if (decode) {
 		if (res->flags & IORESOURCE_MEM_64)
-			p = string_nocheck(p, pend, " 64bit", str_spec);
+			string_nocheck(out, " 64bit", str_spec);
 		if (res->flags & IORESOURCE_PREFETCH)
-			p = string_nocheck(p, pend, " pref", str_spec);
+			string_nocheck(out, " pref", str_spec);
 		if (res->flags & IORESOURCE_WINDOW)
-			p = string_nocheck(p, pend, " window", str_spec);
+			string_nocheck(out, " window", str_spec);
 		if (res->flags & IORESOURCE_DISABLED)
-			p = string_nocheck(p, pend, " disabled", str_spec);
+			string_nocheck(out, " disabled", str_spec);
 	} else {
-		p = string_nocheck(p, pend, " flags ", str_spec);
-		p = number(p, pend, res->flags, default_flag_spec);
+		string_nocheck(out, " flags ", str_spec);
+		number(out, res->flags, default_flag_spec);
 	}
-	*p++ = ']';
-	*p = '\0';
+	prt_char(out, ']');
 
-	return string_nocheck(buf, end, sym, spec);
+	printbuf_nul_terminate(out);
 }
 
 static noinline_for_stack
-char *hex_string(char *buf, char *end, u8 *addr, struct printf_spec spec,
-		 const char *fmt)
+void hex_string(struct printbuf *out, const u8 *addr,
+		int len, const char *fmt)
 {
-	int i, len = 1;		/* if we pass '%ph[CDN]', field width remains
-				   negative value, fallback to the default */
 	char separator;
 
-	if (spec.field_width == 0)
-		/* nothing to print */
-		return buf;
+	/* nothing to print */
+	if (len == 0)
+		return;
 
-	if (check_pointer(&buf, end, addr, spec))
-		return buf;
+	/* if we pass '%ph[CDN]', field width remains
+	   negative value, fallback to the default */
+	if (len < 0)
+		len = 1;
+
+	len = min(len, 64);
+
+	if (check_pointer(out, addr))
+		return;
 
 	switch (fmt[1]) {
 	case 'C':
@@ -1172,41 +1168,21 @@ char *hex_string(char *buf, char *end, u8 *addr, struct printf_spec spec,
 		break;
 	}
 
-	if (spec.field_width > 0)
-		len = min_t(int, spec.field_width, 64);
-
-	for (i = 0; i < len; ++i) {
-		if (buf < end)
-			*buf = hex_asc_hi(addr[i]);
-		++buf;
-		if (buf < end)
-			*buf = hex_asc_lo(addr[i]);
-		++buf;
-
-		if (separator && i != len - 1) {
-			if (buf < end)
-				*buf = separator;
-			++buf;
-		}
-	}
-
-	return buf;
+	prt_hex_bytes(out, addr, len, 1, separator);
 }
 
 static noinline_for_stack
-char *bitmap_string(char *buf, char *end, const unsigned long *bitmap,
-		    struct printf_spec spec, const char *fmt)
+void bitmap_string(struct printbuf *out, const unsigned long *bitmap, int nr_bits)
 {
+	struct printf_spec spec = { .flags = SMALL | ZEROPAD, .base = 16 };
 	const int CHUNKSZ = 32;
-	int nr_bits = max_t(int, spec.field_width, 0);
 	int i, chunksz;
 	bool first = true;
 
-	if (check_pointer(&buf, end, bitmap, spec))
-		return buf;
+	nr_bits = max(nr_bits, 0);
 
-	/* reused to print numbers */
-	spec = (struct printf_spec){ .flags = SMALL | ZEROPAD, .base = 16 };
+	if (check_pointer(out, bitmap))
+		return;
 
 	chunksz = nr_bits & (CHUNKSZ - 1);
 	if (chunksz == 0)
@@ -1222,63 +1198,53 @@ char *bitmap_string(char *buf, char *end, const unsigned long *bitmap,
 		bit = i % BITS_PER_LONG;
 		val = (bitmap[word] >> bit) & chunkmask;
 
-		if (!first) {
-			if (buf < end)
-				*buf = ',';
-			buf++;
-		}
+		if (!first)
+			prt_char(out, ',');
 		first = false;
 
 		spec.field_width = DIV_ROUND_UP(chunksz, 4);
-		buf = number(buf, end, val, spec);
+		number(out, val, spec);
 
 		chunksz = CHUNKSZ;
 	}
-	return buf;
 }
 
 static noinline_for_stack
-char *bitmap_list_string(char *buf, char *end, const unsigned long *bitmap,
-			 struct printf_spec spec, const char *fmt)
+void bitmap_list_string(struct printbuf *out, const unsigned long *bitmap,
+			int nr_bits)
 {
-	int nr_bits = max_t(int, spec.field_width, 0);
 	bool first = true;
 	int rbot, rtop;
 
-	if (check_pointer(&buf, end, bitmap, spec))
-		return buf;
+	nr_bits = max(nr_bits, 0);
+
+	if (check_pointer(out, bitmap))
+		return ;
 
 	for_each_set_bitrange(rbot, rtop, bitmap, nr_bits) {
-		if (!first) {
-			if (buf < end)
-				*buf = ',';
-			buf++;
-		}
+		if (!first)
+			prt_char(out, ',');
 		first = false;
 
-		buf = number(buf, end, rbot, default_dec_spec);
+		prt_u64(out, rbot);
 		if (rtop == rbot + 1)
 			continue;
 
-		if (buf < end)
-			*buf = '-';
-		buf = number(++buf, end, rtop - 1, default_dec_spec);
+		prt_char(out, '-');
+		prt_u64(out, rtop - 1);
 	}
-	return buf;
 }
 
 static noinline_for_stack
-char *mac_address_string(char *buf, char *end, u8 *addr,
-			 struct printf_spec spec, const char *fmt)
+void mac_address_string(struct printbuf *out, u8 *addr,
+			const char *fmt)
 {
-	char mac_addr[sizeof("xx:xx:xx:xx:xx:xx")];
-	char *p = mac_addr;
 	int i;
 	char separator;
 	bool reversed = false;
 
-	if (check_pointer(&buf, end, addr, spec))
-		return buf;
+	if (check_pointer(out, addr))
+		return;
 
 	switch (fmt[1]) {
 	case 'F':
@@ -1296,25 +1262,23 @@ char *mac_address_string(char *buf, char *end, u8 *addr,
 
 	for (i = 0; i < 6; i++) {
 		if (reversed)
-			p = hex_byte_pack(p, addr[5 - i]);
+			prt_hex_byte(out, addr[5 - i]);
 		else
-			p = hex_byte_pack(p, addr[i]);
+			prt_hex_byte(out, addr[i]);
 
 		if (fmt[0] == 'M' && i != 5)
-			*p++ = separator;
+			prt_char(out, separator);
 	}
-	*p = '\0';
-
-	return string_nocheck(buf, end, mac_addr, spec);
 }
 
 static noinline_for_stack
-char *ip4_string(char *p, const u8 *addr, const char *fmt)
+void ip4_string(struct printbuf *out, const u8 *addr, const char *fmt)
 {
-	int i;
-	bool leading_zeros = (fmt[0] == 'i');
-	int index;
-	int step;
+	struct printf_spec spec = default_dec_spec;
+	int i, index, step;
+
+	if (fmt[0] == 'i')
+		spec.precision = 3;
 
 	switch (fmt[2]) {
 	case 'h':
@@ -1338,28 +1302,15 @@ char *ip4_string(char *p, const u8 *addr, const char *fmt)
 		break;
 	}
 	for (i = 0; i < 4; i++) {
-		char temp[4] __aligned(2);	/* hold each IP quad in reverse order */
-		int digits = put_dec_trunc8(temp, addr[index]) - temp;
-		if (leading_zeros) {
-			if (digits < 3)
-				*p++ = '0';
-			if (digits < 2)
-				*p++ = '0';
-		}
-		/* reverse the digits in the quad */
-		while (digits--)
-			*p++ = temp[digits];
-		if (i < 3)
-			*p++ = '.';
+		if (i)
+			prt_char(out, '.');
+		number(out, addr[index], spec);
 		index += step;
 	}
-	*p = '\0';
-
-	return p;
 }
 
 static noinline_for_stack
-char *ip6_compressed_string(char *p, const char *addr)
+void ip6_compressed_string(struct printbuf *out, const char *addr)
 {
 	int i, j, range;
 	unsigned char zerolength[8];
@@ -1403,14 +1354,14 @@ char *ip6_compressed_string(char *p, const char *addr)
 	for (i = 0; i < range; i++) {
 		if (i == colonpos) {
 			if (needcolon || i == 0)
-				*p++ = ':';
-			*p++ = ':';
+				__prt_char(out, ':');
+			__prt_char(out, ':');
 			needcolon = false;
 			i += longest - 1;
 			continue;
 		}
 		if (needcolon) {
-			*p++ = ':';
+			__prt_char(out, ':');
 			needcolon = false;
 		}
 		/* hex u16 without leading 0s */
@@ -1419,81 +1370,56 @@ char *ip6_compressed_string(char *p, const char *addr)
 		lo = word & 0xff;
 		if (hi) {
 			if (hi > 0x0f)
-				p = hex_byte_pack(p, hi);
+				prt_hex_byte(out, hi);
 			else
-				*p++ = hex_asc_lo(hi);
-			p = hex_byte_pack(p, lo);
+				__prt_char(out, hex_asc_lo(hi));
+			prt_hex_byte(out, lo);
 		}
 		else if (lo > 0x0f)
-			p = hex_byte_pack(p, lo);
+			prt_hex_byte(out, lo);
 		else
-			*p++ = hex_asc_lo(lo);
+			__prt_char(out, hex_asc_lo(lo));
 		needcolon = true;
 	}
 
 	if (useIPv4) {
 		if (needcolon)
-			*p++ = ':';
-		p = ip4_string(p, &in6.s6_addr[12], "I4");
+			__prt_char(out, ':');
+		ip4_string(out, &in6.s6_addr[12], "I4");
 	}
-	*p = '\0';
-
-	return p;
 }
 
 static noinline_for_stack
-char *ip6_string(char *p, const char *addr, const char *fmt)
+void ip6_string(struct printbuf *out, const char *addr, const char *fmt)
 {
 	int i;
 
 	for (i = 0; i < 8; i++) {
-		p = hex_byte_pack(p, *addr++);
-		p = hex_byte_pack(p, *addr++);
+		prt_hex_byte(out, *addr++);
+		prt_hex_byte(out, *addr++);
 		if (fmt[0] == 'I' && i != 7)
-			*p++ = ':';
+			prt_char(out, ':');
 	}
-	*p = '\0';
-
-	return p;
 }
 
 static noinline_for_stack
-char *ip6_addr_string(char *buf, char *end, const u8 *addr,
-		      struct printf_spec spec, const char *fmt)
+void ip6_addr_string(struct printbuf *out, const u8 *addr,
+		     const char *fmt)
 {
-	char ip6_addr[sizeof("xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:255.255.255.255")];
-
 	if (fmt[0] == 'I' && fmt[2] == 'c')
-		ip6_compressed_string(ip6_addr, addr);
+		ip6_compressed_string(out, addr);
 	else
-		ip6_string(ip6_addr, addr, fmt);
-
-	return string_nocheck(buf, end, ip6_addr, spec);
+		ip6_string(out, addr, fmt);
 }
 
 static noinline_for_stack
-char *ip4_addr_string(char *buf, char *end, const u8 *addr,
-		      struct printf_spec spec, const char *fmt)
-{
-	char ip4_addr[sizeof("255.255.255.255")];
-
-	ip4_string(ip4_addr, addr, fmt);
-
-	return string_nocheck(buf, end, ip4_addr, spec);
-}
-
-static noinline_for_stack
-char *ip6_addr_string_sa(char *buf, char *end, const struct sockaddr_in6 *sa,
-			 struct printf_spec spec, const char *fmt)
+void ip6_addr_string_sa(struct printbuf *out,
+			const struct sockaddr_in6 *sa,
+			const char *fmt)
 {
 	bool have_p = false, have_s = false, have_f = false, have_c = false;
-	char ip6_addr[sizeof("[xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:255.255.255.255]") +
-		      sizeof(":12345") + sizeof("/123456789") +
-		      sizeof("%1234567890")];
-	char *p = ip6_addr, *pend = ip6_addr + sizeof(ip6_addr);
 	const u8 *addr = (const u8 *) &sa->sin6_addr;
 	char fmt6[2] = { fmt[0], '6' };
-	u8 off = 0;
 
 	fmt++;
 	while (isalpha(*++fmt)) {
@@ -1513,44 +1439,36 @@ char *ip6_addr_string_sa(char *buf, char *end, const struct sockaddr_in6 *sa,
 		}
 	}
 
-	if (have_p || have_s || have_f) {
-		*p = '[';
-		off = 1;
-	}
+	if (have_p || have_s || have_f)
+		prt_char(out, '[');
 
 	if (fmt6[0] == 'I' && have_c)
-		p = ip6_compressed_string(ip6_addr + off, addr);
+		ip6_compressed_string(out, addr);
 	else
-		p = ip6_string(ip6_addr + off, addr, fmt6);
+		ip6_string(out, addr, fmt6);
 
 	if (have_p || have_s || have_f)
-		*p++ = ']';
+		prt_char(out, ']');
 
 	if (have_p) {
-		*p++ = ':';
-		p = number(p, pend, ntohs(sa->sin6_port), spec);
+		prt_char(out, ':');
+		prt_u64(out, ntohs(sa->sin6_port));
 	}
 	if (have_f) {
-		*p++ = '/';
-		p = number(p, pend, ntohl(sa->sin6_flowinfo &
-					  IPV6_FLOWINFO_MASK), spec);
+		prt_char(out, '/');
+		prt_u64(out, ntohl(sa->sin6_flowinfo & IPV6_FLOWINFO_MASK));
 	}
 	if (have_s) {
-		*p++ = '%';
-		p = number(p, pend, sa->sin6_scope_id, spec);
+		prt_char(out, '%');
+		prt_u64(out, sa->sin6_scope_id);
 	}
-	*p = '\0';
-
-	return string_nocheck(buf, end, ip6_addr, spec);
 }
 
 static noinline_for_stack
-char *ip4_addr_string_sa(char *buf, char *end, const struct sockaddr_in *sa,
-			 struct printf_spec spec, const char *fmt)
+void ip4_addr_string_sa(struct printbuf *out, const struct sockaddr_in *sa,
+			const char *fmt)
 {
 	bool have_p = false;
-	char *p, ip4_addr[sizeof("255.255.255.255") + sizeof(":12345")];
-	char *pend = ip4_addr + sizeof(ip4_addr);
 	const u8 *addr = (const u8 *) &sa->sin_addr.s_addr;
 	char fmt4[3] = { fmt[0], '4', 0 };
 
@@ -1569,30 +1487,27 @@ char *ip4_addr_string_sa(char *buf, char *end, const struct sockaddr_in *sa,
 		}
 	}
 
-	p = ip4_string(ip4_addr, addr, fmt4);
+	ip4_string(out, addr, fmt4);
 	if (have_p) {
-		*p++ = ':';
-		p = number(p, pend, ntohs(sa->sin_port), spec);
+		prt_char(out, ':');
+		prt_u64(out, ntohs(sa->sin_port));
 	}
-	*p = '\0';
-
-	return string_nocheck(buf, end, ip4_addr, spec);
 }
 
 static noinline_for_stack
-char *ip_addr_string(char *buf, char *end, const void *ptr,
-		     struct printf_spec spec, const char *fmt)
+void ip_addr_string(struct printbuf *out, const void *ptr,
+		    const char *fmt)
 {
 	char *err_fmt_msg;
 
-	if (check_pointer(&buf, end, ptr, spec))
-		return buf;
+	if (check_pointer(out, ptr))
+		return;
 
 	switch (fmt[1]) {
 	case '6':
-		return ip6_addr_string(buf, end, ptr, spec, fmt);
+		return ip6_addr_string(out, ptr, fmt);
 	case '4':
-		return ip4_addr_string(buf, end, ptr, spec, fmt);
+		return ip4_string(out, ptr, fmt);
 	case 'S': {
 		const union {
 			struct sockaddr		raw;
@@ -1602,21 +1517,21 @@ char *ip_addr_string(char *buf, char *end, const void *ptr,
 
 		switch (sa->raw.sa_family) {
 		case AF_INET:
-			return ip4_addr_string_sa(buf, end, &sa->v4, spec, fmt);
+			return ip4_addr_string_sa(out, &sa->v4, fmt);
 		case AF_INET6:
-			return ip6_addr_string_sa(buf, end, &sa->v6, spec, fmt);
+			return ip6_addr_string_sa(out, &sa->v6, fmt);
 		default:
-			return error_string(buf, end, "(einval)", spec);
+			return error_string(out, "(einval)");
 		}}
 	}
 
 	err_fmt_msg = fmt[0] == 'i' ? "(%pi?)" : "(%pI?)";
-	return error_string(buf, end, err_fmt_msg, spec);
+	error_string(out, err_fmt_msg);
 }
 
 static noinline_for_stack
-char *escaped_string(char *buf, char *end, u8 *addr, struct printf_spec spec,
-		     const char *fmt)
+void escaped_string(struct printbuf *out, u8 *addr,
+		    struct printf_spec spec, const char *fmt)
 {
 	bool found = true;
 	int count = 1;
@@ -1624,10 +1539,10 @@ char *escaped_string(char *buf, char *end, u8 *addr, struct printf_spec spec,
 	int len;
 
 	if (spec.field_width == 0)
-		return buf;				/* nothing to print */
+		return;				/* nothing to print */
 
-	if (check_pointer(&buf, end, addr, spec))
-		return buf;
+	if (check_pointer_spec(out, addr, spec))
+		return;
 
 	do {
 		switch (fmt[count++]) {
@@ -1662,44 +1577,32 @@ char *escaped_string(char *buf, char *end, u8 *addr, struct printf_spec spec,
 		flags = ESCAPE_ANY_NP;
 
 	len = spec.field_width < 0 ? 1 : spec.field_width;
-
-	/*
-	 * string_escape_mem() writes as many characters as it can to
-	 * the given buffer, and returns the total size of the output
-	 * had the buffer been big enough.
-	 */
-	buf += string_escape_mem(addr, len, buf, buf < end ? end - buf : 0, flags, NULL);
-
-	return buf;
+	prt_escaped_string(out, addr, len, flags, NULL);
 }
 
-static char *va_format(char *buf, char *end, struct va_format *va_fmt,
-		       struct printf_spec spec, const char *fmt)
+static void va_format(struct printbuf *out,
+		      struct va_format *va_fmt,
+		      struct printf_spec spec, const char *fmt)
 {
 	va_list va;
 
-	if (check_pointer(&buf, end, va_fmt, spec))
-		return buf;
+	if (check_pointer_spec(out, va_fmt, spec))
+		return;
 
 	va_copy(va, *va_fmt->va);
-	buf += vsnprintf(buf, end > buf ? end - buf : 0, va_fmt->fmt, va);
+	prt_vprintf(out, va_fmt->fmt, va);
 	va_end(va);
-
-	return buf;
 }
 
 static noinline_for_stack
-char *uuid_string(char *buf, char *end, const u8 *addr,
-		  struct printf_spec spec, const char *fmt)
+void uuid_string(struct printbuf *out, const u8 *addr, const char *fmt)
 {
-	char uuid[UUID_STRING_LEN + 1];
-	char *p = uuid;
 	int i;
 	const u8 *index = uuid_index;
 	bool uc = false;
 
-	if (check_pointer(&buf, end, addr, spec))
-		return buf;
+	if (check_pointer(out, addr))
+		return;
 
 	switch (*(++fmt)) {
 	case 'L':
@@ -1715,60 +1618,54 @@ char *uuid_string(char *buf, char *end, const u8 *addr,
 
 	for (i = 0; i < 16; i++) {
 		if (uc)
-			p = hex_byte_pack_upper(p, addr[index[i]]);
+			prt_hex_byte_upper(out, addr[index[i]]);
 		else
-			p = hex_byte_pack(p, addr[index[i]]);
+			prt_hex_byte(out, addr[index[i]]);
 		switch (i) {
 		case 3:
 		case 5:
 		case 7:
 		case 9:
-			*p++ = '-';
+			prt_char(out, '-');
 			break;
 		}
 	}
-
-	*p = 0;
-
-	return string_nocheck(buf, end, uuid, spec);
 }
 
 static noinline_for_stack
-char *netdev_bits(char *buf, char *end, const void *addr,
-		  struct printf_spec spec,  const char *fmt)
+void netdev_bits(struct printbuf *out, const void *addr,
+		 const char *fmt)
 {
 	unsigned long long num;
 	int size;
 
-	if (check_pointer(&buf, end, addr, spec))
-		return buf;
+	if (check_pointer(out, addr))
+		return;
 
 	switch (fmt[1]) {
 	case 'F':
 		num = *(const netdev_features_t *)addr;
 		size = sizeof(netdev_features_t);
+		special_hex_number(out, num, size);
 		break;
 	default:
-		return error_string(buf, end, "(%pN?)", spec);
+		error_string(out, "(%pN?)");
+		break;
 	}
-
-	return special_hex_number(buf, end, num, size);
 }
 
 static noinline_for_stack
-char *fourcc_string(char *buf, char *end, const u32 *fourcc,
-		    struct printf_spec spec, const char *fmt)
+void fourcc_string(struct printbuf *out, const u32 *fourcc,
+		   const char *fmt)
 {
-	char output[sizeof("0123 little-endian (0x01234567)")];
-	char *p = output;
 	unsigned int i;
 	u32 orig, val;
 
 	if (fmt[1] != 'c' || fmt[2] != 'c')
-		return error_string(buf, end, "(%p4?)", spec);
+		return error_string(out, "(%p4?)");
 
-	if (check_pointer(&buf, end, fourcc, spec))
-		return buf;
+	if (check_pointer(out, fourcc))
+		return;
 
 	orig = get_unaligned(fourcc);
 	val = orig & ~BIT(31);
@@ -1777,31 +1674,27 @@ char *fourcc_string(char *buf, char *end, const u32 *fourcc,
 		unsigned char c = val >> (i * 8);
 
 		/* Print non-control ASCII characters as-is, dot otherwise */
-		*p++ = isascii(c) && isprint(c) ? c : '.';
+		prt_char(out, isascii(c) && isprint(c) ? c : '.');
 	}
 
-	*p++ = ' ';
-	strcpy(p, orig & BIT(31) ? "big-endian" : "little-endian");
-	p += strlen(p);
+	prt_char(out, ' ');
+	prt_str(out, orig & BIT(31) ? "big-endian" : "little-endian");
 
-	*p++ = ' ';
-	*p++ = '(';
-	p = special_hex_number(p, output + sizeof(output) - 2, orig, sizeof(u32));
-	*p++ = ')';
-	*p = '\0';
-
-	return string(buf, end, output, spec);
+	prt_char(out, ' ');
+	prt_char(out, '(');
+	special_hex_number(out, orig, sizeof(u32));
+	prt_char(out, ')');
 }
 
 static noinline_for_stack
-char *address_val(char *buf, char *end, const void *addr,
-		  struct printf_spec spec, const char *fmt)
+void address_val(struct printbuf *out, const void *addr,
+		 const char *fmt)
 {
 	unsigned long long num;
 	int size;
 
-	if (check_pointer(&buf, end, addr, spec))
-		return buf;
+	if (check_pointer(out, addr))
+		return;
 
 	switch (fmt[1]) {
 	case 'd':
@@ -1815,55 +1708,44 @@ char *address_val(char *buf, char *end, const void *addr,
 		break;
 	}
 
-	return special_hex_number(buf, end, num, size);
+	special_hex_number(out, num, size);
 }
 
 static noinline_for_stack
-char *date_str(char *buf, char *end, const struct rtc_time *tm, bool r)
+void date_str(struct printbuf *out,
+	      const struct rtc_time *tm, bool r)
 {
 	int year = tm->tm_year + (r ? 0 : 1900);
 	int mon = tm->tm_mon + (r ? 0 : 1);
 
-	buf = number(buf, end, year, default_dec04_spec);
-	if (buf < end)
-		*buf = '-';
-	buf++;
-
-	buf = number(buf, end, mon, default_dec02_spec);
-	if (buf < end)
-		*buf = '-';
-	buf++;
-
-	return number(buf, end, tm->tm_mday, default_dec02_spec);
+	prt_u64_minwidth(out, year, 4);
+	prt_char(out, '-');
+	prt_u64_minwidth(out, mon, 2);
+	prt_char(out, '-');
+	prt_u64_minwidth(out, tm->tm_mday, 2);
 }
 
 static noinline_for_stack
-char *time_str(char *buf, char *end, const struct rtc_time *tm, bool r)
+void time_str(struct printbuf *out, const struct rtc_time *tm, bool r)
 {
-	buf = number(buf, end, tm->tm_hour, default_dec02_spec);
-	if (buf < end)
-		*buf = ':';
-	buf++;
-
-	buf = number(buf, end, tm->tm_min, default_dec02_spec);
-	if (buf < end)
-		*buf = ':';
-	buf++;
-
-	return number(buf, end, tm->tm_sec, default_dec02_spec);
+	prt_u64_minwidth(out, tm->tm_hour, 2);
+	prt_char(out, ':');
+	prt_u64_minwidth(out, tm->tm_min, 2);
+	prt_char(out, ':');
+	prt_u64_minwidth(out, tm->tm_sec, 2);
 }
 
 static noinline_for_stack
-char *rtc_str(char *buf, char *end, const struct rtc_time *tm,
-	      struct printf_spec spec, const char *fmt)
+void rtc_str(struct printbuf *out, const struct rtc_time *tm,
+	     const char *fmt)
 {
 	bool have_t = true, have_d = true;
 	bool raw = false, iso8601_separator = true;
 	bool found = true;
 	int count = 2;
 
-	if (check_pointer(&buf, end, tm, spec))
-		return buf;
+	if (check_pointer(out, tm))
+		return;
 
 	switch (fmt[count]) {
 	case 'd':
@@ -1891,21 +1773,16 @@ char *rtc_str(char *buf, char *end, const struct rtc_time *tm,
 	} while (found);
 
 	if (have_d)
-		buf = date_str(buf, end, tm, raw);
-	if (have_d && have_t) {
-		if (buf < end)
-			*buf = iso8601_separator ? 'T' : ' ';
-		buf++;
-	}
+		date_str(out, tm, raw);
+	if (have_d && have_t)
+		prt_char(out, iso8601_separator ? 'T' : ' ');
 	if (have_t)
-		buf = time_str(buf, end, tm, raw);
-
-	return buf;
+		time_str(out, tm, raw);
 }
 
 static noinline_for_stack
-char *time64_str(char *buf, char *end, const time64_t time,
-		 struct printf_spec spec, const char *fmt)
+void time64_str(struct printbuf *out, const time64_t time,
+		const char *fmt)
 {
 	struct rtc_time rtc_time;
 	struct tm tm;
@@ -1923,47 +1800,47 @@ char *time64_str(char *buf, char *end, const time64_t time,
 
 	rtc_time.tm_isdst = 0;
 
-	return rtc_str(buf, end, &rtc_time, spec, fmt);
+	rtc_str(out, &rtc_time, fmt);
 }
 
 static noinline_for_stack
-char *time_and_date(char *buf, char *end, void *ptr, struct printf_spec spec,
-		    const char *fmt)
+void time_and_date(struct printbuf *out, void *ptr,
+		   const char *fmt)
 {
 	switch (fmt[1]) {
 	case 'R':
-		return rtc_str(buf, end, (const struct rtc_time *)ptr, spec, fmt);
+		return rtc_str(out, (const struct rtc_time *)ptr, fmt);
 	case 'T':
-		return time64_str(buf, end, *(const time64_t *)ptr, spec, fmt);
+		return time64_str(out, *(const time64_t *)ptr, fmt);
 	default:
-		return error_string(buf, end, "(%pt?)", spec);
+		return error_string(out, "(%pt?)");
 	}
 }
 
 static noinline_for_stack
-char *clock(char *buf, char *end, struct clk *clk, struct printf_spec spec,
-	    const char *fmt)
+void clock(struct printbuf *out, struct clk *clk,
+	   struct printf_spec spec, const char *fmt)
 {
 	if (!IS_ENABLED(CONFIG_HAVE_CLK))
-		return error_string(buf, end, "(%pC?)", spec);
+		return error_string_spec(out, "(%pC?)", spec);
 
-	if (check_pointer(&buf, end, clk, spec))
-		return buf;
+	if (check_pointer_spec(out, clk, spec))
+		return;
 
 	switch (fmt[1]) {
 	case 'n':
 	default:
 #ifdef CONFIG_COMMON_CLK
-		return string(buf, end, __clk_get_name(clk), spec);
+		return string_spec(out, __clk_get_name(clk), spec);
 #else
-		return ptr_to_id(buf, end, clk, spec);
+		return ptr_to_id(out, clk, spec);
 #endif
 	}
 }
 
 static
-char *format_flags(char *buf, char *end, unsigned long flags,
-					const struct trace_print_flags *names)
+void format_flags(struct printbuf *out, unsigned long flags,
+		  const struct trace_print_flags *names)
 {
 	unsigned long mask;
 
@@ -1972,20 +1849,15 @@ char *format_flags(char *buf, char *end, unsigned long flags,
 		if ((flags & mask) != mask)
 			continue;
 
-		buf = string(buf, end, names->name, default_str_spec);
+		string(out, names->name);
 
 		flags &= ~mask;
-		if (flags) {
-			if (buf < end)
-				*buf = '|';
-			buf++;
-		}
+		if (flags)
+			prt_char(out, '|');
 	}
 
 	if (flags)
-		buf = number(buf, end, flags, default_flag_spec);
-
-	return buf;
+		number(out, flags, default_flag_spec);
 }
 
 struct page_flags_fields {
@@ -2010,20 +1882,18 @@ static const struct page_flags_fields pff[] = {
 };
 
 static
-char *format_page_flags(char *buf, char *end, unsigned long flags)
+void format_page_flags(struct printbuf *out, unsigned long flags)
 {
 	unsigned long main_flags = flags & PAGEFLAGS_MASK;
 	bool append = false;
 	int i;
 
-	buf = number(buf, end, flags, default_flag_spec);
-	if (buf < end)
-		*buf = '(';
-	buf++;
+	number(out, flags, default_flag_spec);
+	prt_char(out, '(');
 
 	/* Page flags from the main area. */
 	if (main_flags) {
-		buf = format_flags(buf, end, main_flags, pageflag_names);
+		format_flags(out, main_flags, pageflag_names);
 		append = true;
 	}
 
@@ -2034,41 +1904,31 @@ char *format_page_flags(char *buf, char *end, unsigned long flags)
 			continue;
 
 		/* Format: Flag Name + '=' (equals sign) + Number + '|' (separator) */
-		if (append) {
-			if (buf < end)
-				*buf = '|';
-			buf++;
-		}
+		if (append)
+			prt_char(out, '|');
 
-		buf = string(buf, end, pff[i].name, default_str_spec);
-		if (buf < end)
-			*buf = '=';
-		buf++;
-		buf = number(buf, end, (flags >> pff[i].shift) & pff[i].mask,
-			     *pff[i].spec);
+		string(out, pff[i].name);
+		prt_char(out, '=');
+		number(out, (flags >> pff[i].shift) & pff[i].mask, *pff[i].spec);
 
 		append = true;
 	}
-	if (buf < end)
-		*buf = ')';
-	buf++;
-
-	return buf;
+	prt_char(out, ')');
 }
 
 static noinline_for_stack
-char *flags_string(char *buf, char *end, void *flags_ptr,
-		   struct printf_spec spec, const char *fmt)
+void flags_string(struct printbuf *out, void *flags_ptr,
+		  const char *fmt)
 {
 	unsigned long flags;
 	const struct trace_print_flags *names;
 
-	if (check_pointer(&buf, end, flags_ptr, spec))
-		return buf;
+	if (check_pointer(out, flags_ptr))
+		return;
 
 	switch (fmt[1]) {
 	case 'p':
-		return format_page_flags(buf, end, *(unsigned long *)flags_ptr);
+		return format_page_flags(out, *(unsigned long *)flags_ptr);
 	case 'v':
 		flags = *(unsigned long *)flags_ptr;
 		names = vmaflag_names;
@@ -2078,15 +1938,15 @@ char *flags_string(char *buf, char *end, void *flags_ptr,
 		names = gfpflag_names;
 		break;
 	default:
-		return error_string(buf, end, "(%pG?)", spec);
+		return error_string(out, "(%pG?)");
 	}
 
-	return format_flags(buf, end, flags, names);
+	return format_flags(out, flags, names);
 }
 
 static noinline_for_stack
-char *fwnode_full_name_string(struct fwnode_handle *fwnode, char *buf,
-			      char *end)
+void fwnode_full_name_string(struct printbuf *out,
+			     struct fwnode_handle *fwnode)
 {
 	int depth;
 
@@ -2095,39 +1955,30 @@ char *fwnode_full_name_string(struct fwnode_handle *fwnode, char *buf,
 		struct fwnode_handle *__fwnode =
 			fwnode_get_nth_parent(fwnode, depth);
 
-		buf = string(buf, end, fwnode_get_name_prefix(__fwnode),
-			     default_str_spec);
-		buf = string(buf, end, fwnode_get_name(__fwnode),
-			     default_str_spec);
+		string(out, fwnode_get_name_prefix(__fwnode));
+		string(out, fwnode_get_name(__fwnode));
 
 		fwnode_handle_put(__fwnode);
 	}
-
-	return buf;
 }
 
 static noinline_for_stack
-char *device_node_string(char *buf, char *end, struct device_node *dn,
-			 struct printf_spec spec, const char *fmt)
+void device_node_string(struct printbuf *out, struct device_node *dn,
+			const char *fmt)
 {
-	char tbuf[sizeof("xxxx") + 1];
 	const char *p;
 	int ret;
-	char *buf_start = buf;
 	struct property *prop;
 	bool has_mult, pass;
 
-	struct printf_spec str_spec = spec;
-	str_spec.field_width = -1;
-
 	if (fmt[0] != 'F')
-		return error_string(buf, end, "(%pO?)", spec);
+		return error_string(out, "(%pO?)");
 
 	if (!IS_ENABLED(CONFIG_OF))
-		return error_string(buf, end, "(%pOF?)", spec);
+		return error_string(out, "(%pOF?)");
 
-	if (check_pointer(&buf, end, dn, spec))
-		return buf;
+	if (check_pointer(out, dn))
+		return;
 
 	/* simple case without anything any more format specifiers */
 	fmt++;
@@ -2135,55 +1986,48 @@ char *device_node_string(char *buf, char *end, struct device_node *dn,
 		fmt = "f";
 
 	for (pass = false; strspn(fmt,"fnpPFcC"); fmt++, pass = true) {
-		int precision;
-		if (pass) {
-			if (buf < end)
-				*buf = ':';
-			buf++;
-		}
+		if (pass)
+			prt_char(out, ':');
 
 		switch (*fmt) {
 		case 'f':	/* full_name */
-			buf = fwnode_full_name_string(of_fwnode_handle(dn), buf,
-						      end);
+			fwnode_full_name_string(out, of_fwnode_handle(dn));
 			break;
-		case 'n':	/* name */
-			p = fwnode_get_name(of_fwnode_handle(dn));
-			precision = str_spec.precision;
-			str_spec.precision = strchrnul(p, '@') - p;
-			buf = string(buf, end, p, str_spec);
-			str_spec.precision = precision;
+		case 'n': {	/* name */
+			const char *name = fwnode_get_name(of_fwnode_handle(dn));
+			unsigned len = strchrnul(name, '@') - name;
+
+			prt_bytes(out, name, len);
 			break;
+		}
 		case 'p':	/* phandle */
-			buf = number(buf, end, (unsigned int)dn->phandle, default_dec_spec);
+			prt_u64(out, dn->phandle);
 			break;
 		case 'P':	/* path-spec */
 			p = fwnode_get_name(of_fwnode_handle(dn));
 			if (!p[1])
 				p = "/";
-			buf = string(buf, end, p, str_spec);
+			string(out, p);
 			break;
 		case 'F':	/* flags */
-			tbuf[0] = of_node_check_flag(dn, OF_DYNAMIC) ? 'D' : '-';
-			tbuf[1] = of_node_check_flag(dn, OF_DETACHED) ? 'd' : '-';
-			tbuf[2] = of_node_check_flag(dn, OF_POPULATED) ? 'P' : '-';
-			tbuf[3] = of_node_check_flag(dn, OF_POPULATED_BUS) ? 'B' : '-';
-			tbuf[4] = 0;
-			buf = string_nocheck(buf, end, tbuf, str_spec);
+			prt_char(out, of_node_check_flag(dn, OF_DYNAMIC) ? 'D' : '-');
+			prt_char(out, of_node_check_flag(dn, OF_DETACHED) ? 'd' : '-');
+			prt_char(out, of_node_check_flag(dn, OF_POPULATED) ? 'P' : '-');
+			prt_char(out, of_node_check_flag(dn, OF_POPULATED_BUS) ? 'B' : '-');
 			break;
-		case 'c':	/* major compatible string */
+		case 'c':	/* major compatible string_spec */
 			ret = of_property_read_string(dn, "compatible", &p);
 			if (!ret)
-				buf = string(buf, end, p, str_spec);
+				string(out, p);
 			break;
-		case 'C':	/* full compatible string */
+		case 'C':	/* full compatible string_spec */
 			has_mult = false;
 			of_property_for_each_string(dn, "compatible", prop, p) {
 				if (has_mult)
-					buf = string_nocheck(buf, end, ",", str_spec);
-				buf = string_nocheck(buf, end, "\"", str_spec);
-				buf = string(buf, end, p, str_spec);
-				buf = string_nocheck(buf, end, "\"", str_spec);
+					prt_char(out, ',');
+				prt_char(out, '\"');
+				string(out, p);
+				prt_char(out, '\"');
 
 				has_mult = true;
 			}
@@ -2192,38 +2036,30 @@ char *device_node_string(char *buf, char *end, struct device_node *dn,
 			break;
 		}
 	}
-
-	return widen_string(buf, buf - buf_start, end, spec);
 }
 
 static noinline_for_stack
-char *fwnode_string(char *buf, char *end, struct fwnode_handle *fwnode,
-		    struct printf_spec spec, const char *fmt)
+void fwnode_string(struct printbuf *out,
+		   struct fwnode_handle *fwnode,
+		   const char *fmt)
 {
-	struct printf_spec str_spec = spec;
-	char *buf_start = buf;
-
-	str_spec.field_width = -1;
-
 	if (*fmt != 'w')
-		return error_string(buf, end, "(%pf?)", spec);
+		return error_string(out, "(%pf?)");
 
-	if (check_pointer(&buf, end, fwnode, spec))
-		return buf;
+	if (check_pointer(out, fwnode))
+		return;
 
 	fmt++;
 
 	switch (*fmt) {
 	case 'P':	/* name */
-		buf = string(buf, end, fwnode_get_name(fwnode), str_spec);
+		string(out, fwnode_get_name(fwnode));
 		break;
 	case 'f':	/* full_name */
 	default:
-		buf = fwnode_full_name_string(fwnode, buf, end);
+		fwnode_full_name_string(out, fwnode);
 		break;
 	}
-
-	return widen_string(buf, buf - buf_start, end, spec);
 }
 
 int __init no_hash_pointers_enable(char *str)
@@ -2386,33 +2222,40 @@ char *rust_fmt_argument(char *buf, char *end, void *ptr);
  * See rust/kernel/print.rs for details.
  */
 static noinline_for_stack
-char *pointer(const char *fmt, char *buf, char *end, void *ptr,
-	      struct printf_spec spec)
+void pointer(struct printbuf *out, const char *fmt,
+	     void *ptr, struct printf_spec spec)
 {
+	unsigned prev_pos = out->pos;
+
 	switch (*fmt) {
 	case 'S':
 	case 's':
 		ptr = dereference_symbol_descriptor(ptr);
 		fallthrough;
 	case 'B':
-		return symbol_string(buf, end, ptr, spec, fmt);
+		symbol_string(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'R':
 	case 'r':
-		return resource_string(buf, end, ptr, spec, fmt);
+		resource_string(out, ptr, fmt[0] == 'R');
+		return do_width_precision(out, prev_pos, spec);
 	case 'h':
-		return hex_string(buf, end, ptr, spec, fmt);
+		/* Uses field_width but _not_ as field size */
+		return hex_string(out, ptr, spec.field_width, fmt);
 	case 'b':
+		/* Uses field_width but _not_ as field size */
 		switch (fmt[1]) {
 		case 'l':
-			return bitmap_list_string(buf, end, ptr, spec, fmt);
+			return bitmap_list_string(out, ptr, spec.field_width);
 		default:
-			return bitmap_string(buf, end, ptr, spec, fmt);
+			return bitmap_string(out, ptr, spec.field_width);
 		}
 	case 'M':			/* Colon separated: 00:01:02:03:04:05 */
 	case 'm':			/* Contiguous: 000102030405 */
 					/* [mM]F (FDDI) */
 					/* [mM]R (Reverse order; Bluetooth) */
-		return mac_address_string(buf, end, ptr, spec, fmt);
+		mac_address_string(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'I':			/* Formatted IP supported
 					 * 4:	1.2.3.4
 					 * 6:	0001:0203:...:0708
@@ -2422,63 +2265,79 @@ char *pointer(const char *fmt, char *buf, char *end, void *ptr,
 					 * 4:	001.002.003.004
 					 * 6:   000102...0f
 					 */
-		return ip_addr_string(buf, end, ptr, spec, fmt);
+		ip_addr_string(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'E':
-		return escaped_string(buf, end, ptr, spec, fmt);
+		return escaped_string(out, ptr, spec, fmt);
 	case 'U':
-		return uuid_string(buf, end, ptr, spec, fmt);
+		uuid_string(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'V':
-		return va_format(buf, end, ptr, spec, fmt);
+		return va_format(out, ptr, spec, fmt);
 	case 'K':
-		return restricted_pointer(buf, end, ptr, spec);
+		return restricted_pointer(out, ptr, spec);
 	case 'N':
-		return netdev_bits(buf, end, ptr, spec, fmt);
+		netdev_bits(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case '4':
-		return fourcc_string(buf, end, ptr, spec, fmt);
+		fourcc_string(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'a':
-		return address_val(buf, end, ptr, spec, fmt);
+		address_val(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'd':
-		return dentry_name(buf, end, ptr, spec, fmt);
+		dentry_name(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 't':
-		return time_and_date(buf, end, ptr, spec, fmt);
+		time_and_date(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'C':
-		return clock(buf, end, ptr, spec, fmt);
+		return clock(out, ptr, spec, fmt);
 	case 'D':
-		return file_dentry_name(buf, end, ptr, spec, fmt);
+		file_dentry_name(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 #ifdef CONFIG_BLOCK
 	case 'g':
-		return bdev_name(buf, end, ptr, spec, fmt);
+		bdev_name(out, ptr);
+		return do_width_precision(out, prev_pos, spec);
 #endif
 
 	case 'G':
-		return flags_string(buf, end, ptr, spec, fmt);
+		flags_string(out, ptr, fmt);
+		return do_width_precision(out, prev_pos, spec);
 	case 'O':
-		return device_node_string(buf, end, ptr, spec, fmt + 1);
+		device_node_string(out, ptr, fmt + 1);
+		return do_width_precision(out, prev_pos, spec);
 	case 'f':
-		return fwnode_string(buf, end, ptr, spec, fmt + 1);
+		fwnode_string(out, ptr, fmt + 1);
+		return do_width_precision(out, prev_pos, spec);
 	case 'A':
 		if (!IS_ENABLED(CONFIG_RUST)) {
 			WARN_ONCE(1, "Please remove %%pA from non-Rust code\n");
-			return error_string(buf, end, "(%pA?)", spec);
+			error_string(out, "(%pA?)");
+			return do_width_precision(out, prev_pos, spec);
 		}
-		return rust_fmt_argument(buf, end, ptr);
+		out->pos += rust_fmt_argument(out->buf + out->pos,
+					      out->buf + out->size, ptr) -
+			(out->buf + out->pos);
+		return do_width_precision(out, prev_pos, spec);
 	case 'x':
-		return pointer_string(buf, end, ptr, spec);
+		return pointer_string(out, ptr, spec);
 	case 'e':
 		/* %pe with a non-ERR_PTR gets treated as plain %p */
 		if (!IS_ERR(ptr))
-			return default_pointer(buf, end, ptr, spec);
-		return err_ptr(buf, end, ptr, spec);
+			return default_pointer(out, ptr, spec);
+		return err_ptr(out, ptr, spec);
 	case 'u':
 	case 'k':
 		switch (fmt[1]) {
 		case 's':
-			return string(buf, end, ptr, spec);
+			return string_spec(out, ptr, spec);
 		default:
-			return error_string(buf, end, "(einval)", spec);
+			return error_string_spec(out, "(einval)", spec);
 		}
 	default:
-		return default_pointer(buf, end, ptr, spec);
+		return default_pointer(out, ptr, spec);
 	}
 }
 
@@ -2617,8 +2476,14 @@ qualifier:
 		return ++fmt - start;
 
 	case 'p':
-		spec->type = FORMAT_TYPE_PTR;
-		return ++fmt - start;
+		fmt++;
+		if (fmt[0] == 'f' &&
+		    fmt[1] == '(') {
+			fmt += 2;
+			spec->type = FORMAT_TYPE_FN;
+		} else
+			spec->type = FORMAT_TYPE_PTR;
+		return fmt - start;
 
 	case '%':
 		spec->type = FORMAT_TYPE_PERCENT_CHAR;
@@ -2699,53 +2564,89 @@ set_precision(struct printf_spec *spec, int prec)
 	}
 }
 
+static void call_prt_fn(struct printbuf *out, struct call_pp *call_pp, void **fn_args, unsigned nr_args)
+{
+	typedef void (*printf_fn_0)(struct printbuf *);
+	typedef void (*printf_fn_1)(struct printbuf *, void *);
+	typedef void (*printf_fn_2)(struct printbuf *, void *, void *);
+	typedef void (*printf_fn_3)(struct printbuf *, void *, void *, void *);
+	typedef void (*printf_fn_4)(struct printbuf *, void *, void *, void *, void *);
+	typedef void (*printf_fn_5)(struct printbuf *, void *, void *, void *, void *, void *);
+	typedef void (*printf_fn_6)(struct printbuf *, void *, void *, void *, void *, void *, void *);
+	typedef void (*printf_fn_7)(struct printbuf *, void *, void *, void *, void *, void *, void *, void *);
+	typedef void (*printf_fn_8)(struct printbuf *, void *, void *, void *, void *, void *, void *, void *, void *);
+	void *fn;
+	unsigned i;
+
+	if (check_pointer(out, call_pp))
+		return;
+
+	if (call_pp->magic != CALL_PP_MAGIC) {
+		error_string(out, "bad pretty-printer magic");
+		return;
+	}
+
+	fn = call_pp->fn;
+	if (check_pointer(out, fn))
+		return;
+
+	for (i = 0; i < nr_args; i++)
+		if (check_pointer(out, fn_args[i]))
+			return;
+
+	switch (nr_args) {
+	case 0:
+		((printf_fn_0)fn)(out);
+		break;
+	case 1:
+		((printf_fn_1)fn)(out, fn_args[0]);
+		break;
+	case 2:
+		((printf_fn_2)fn)(out, fn_args[0], fn_args[1]);
+		break;
+	case 3:
+		((printf_fn_3)fn)(out, fn_args[0], fn_args[1], fn_args[2]);
+		break;
+	case 4:
+		((printf_fn_4)fn)(out, fn_args[0], fn_args[1], fn_args[2], fn_args[3]);
+		break;
+	case 5:
+		((printf_fn_5)fn)(out, fn_args[0], fn_args[1], fn_args[2], fn_args[3], fn_args[4]);
+		break;
+	case 6:
+		((printf_fn_6)fn)(out, fn_args[0], fn_args[1], fn_args[2], fn_args[3], fn_args[4], fn_args[5]);
+		break;
+	case 7:
+		((printf_fn_7)fn)(out, fn_args[0], fn_args[1], fn_args[2], fn_args[3], fn_args[4], fn_args[5], fn_args[6]);
+		break;
+	case 8:
+		((printf_fn_8)fn)(out, fn_args[0], fn_args[1], fn_args[2], fn_args[3], fn_args[4], fn_args[5], fn_args[6], fn_args[7]);
+		break;
+	}
+}
+
 /**
- * vsnprintf - Format a string and place it in a buffer
- * @buf: The buffer to place the result into
- * @size: The size of the buffer, including the trailing null space
+ * prt_vprintf - Format a string, outputting to a printbuf
+ * @out: The printbuf to output to
  * @fmt: The format string to use
  * @args: Arguments for the format string
  *
- * This function generally follows C99 vsnprintf, but has some
- * extensions and a few limitations:
+ * prt_vprintf works much like the traditional vsnprintf(), but outputs to a
+ * printbuf instead of raw pointer/size.
  *
- *  - ``%n`` is unsupported
- *  - ``%p*`` is handled by pointer()
+ * If you're not already dealing with a va_list consider using prt_printf().
  *
- * See pointer() or Documentation/core-api/printk-formats.rst for more
- * extensive description.
- *
- * **Please update the documentation in both places when making changes**
- *
- * The return value is the number of characters which would
- * be generated for the given input, excluding the trailing
- * '\0', as per ISO C99. If you want to have the exact
- * number of characters written into @buf as return value
- * (not including the trailing '\0'), use vscnprintf(). If the
- * return is greater than or equal to @size, the resulting
- * string is truncated.
- *
- * If you're not already dealing with a va_list consider using snprintf().
+ * See the vsnprintf() documentation for format string extensions over C99.
  */
-int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+void prt_vprintf(struct printbuf *out, const char *fmt, va_list args)
 {
 	unsigned long long num;
-	char *str, *end;
 	struct printf_spec spec = {0};
 
 	/* Reject out-of-range values early.  Large positive sizes are
 	   used for unknown buffer sizes. */
-	if (WARN_ON_ONCE(size > INT_MAX))
-		return 0;
-
-	str = buf;
-	end = buf + size;
-
-	/* Make sure end is always >= buf */
-	if (end < buf) {
-		end = ((void *)-1);
-		size = end - buf;
-	}
+	if (WARN_ON_ONCE(out->size > INT_MAX))
+		return;
 
 	while (*fmt) {
 		const char *old_fmt = fmt;
@@ -2754,16 +2655,9 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 		fmt += read;
 
 		switch (spec.type) {
-		case FORMAT_TYPE_NONE: {
-			int copy = read;
-			if (str < end) {
-				if (copy > end - str)
-					copy = end - str;
-				memcpy(str, old_fmt, copy);
-			}
-			str += read;
+		case FORMAT_TYPE_NONE:
+			prt_bytes(out, old_fmt, read);
 			break;
-		}
 
 		case FORMAT_TYPE_WIDTH:
 			set_field_width(&spec, va_arg(args, int));
@@ -2773,44 +2667,60 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 			set_precision(&spec, va_arg(args, int));
 			break;
 
-		case FORMAT_TYPE_CHAR: {
-			char c;
+		case FORMAT_TYPE_CHAR:
+			if (spec.field_width > 0 && !(spec.flags & LEFT))
+				prt_chars(out, spec.field_width, ' ');
 
-			if (!(spec.flags & LEFT)) {
-				while (--spec.field_width > 0) {
-					if (str < end)
-						*str = ' ';
-					++str;
+			__prt_char(out, (unsigned char) va_arg(args, int));
 
-				}
-			}
-			c = (unsigned char) va_arg(args, int);
-			if (str < end)
-				*str = c;
-			++str;
-			while (--spec.field_width > 0) {
-				if (str < end)
-					*str = ' ';
-				++str;
-			}
+			if (spec.field_width > 0 && (spec.flags & LEFT))
+				prt_chars(out, spec.field_width, ' ');
+			spec.field_width = 0;
 			break;
-		}
 
 		case FORMAT_TYPE_STR:
-			str = string(str, end, va_arg(args, char *), spec);
+			/*
+			 * we can't use string() then do_width_precision
+			 * afterwards: people use the field width for passing
+			 * non nul terminated strings
+			 */
+			string_spec(out, va_arg(args, char *), spec);
 			break;
 
 		case FORMAT_TYPE_PTR:
-			str = pointer(fmt, str, end, va_arg(args, void *),
-				      spec);
+			pointer(out, fmt, va_arg(args, void *), spec);
 			while (isalnum(*fmt))
 				fmt++;
 			break;
 
+		case FORMAT_TYPE_FN: {
+			unsigned nr_args = 0;
+			void *fn_args[8];
+			void *fn = va_arg(args, void *);
+
+			while (*fmt != ')') {
+				if (nr_args) {
+					if (fmt[0] != ',')
+						goto out;
+					fmt++;
+				}
+
+				if (fmt[0] != '%' || fmt[1] != 'p')
+					goto out;
+				fmt += 2;
+
+				if (WARN_ON_ONCE(nr_args == ARRAY_SIZE(fn_args)))
+					goto out;
+				fn_args[nr_args++] = va_arg(args, void *);
+			}
+
+			call_prt_fn(out, fn, fn_args, nr_args);
+			fmt++; /* past trailing ) */
+			break;
+		}
+
 		case FORMAT_TYPE_PERCENT_CHAR:
-			if (str < end)
-				*str = '%';
-			++str;
+			__prt_char(out, '%');
 			break;
 
 		case FORMAT_TYPE_INVALID:
@@ -2863,21 +2773,70 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 				num = va_arg(args, unsigned int);
 			}
 
-			str = number(str, end, num, spec);
+			number(out, num, spec);
 		}
 	}
-
 out:
-	if (size > 0) {
-		if (str < end)
-			*str = '\0';
-		else
-			end[-1] = '\0';
-	}
+	printbuf_nul_terminate(out);
+}
+EXPORT_SYMBOL(prt_vprintf);
 
-	/* the trailing null byte doesn't count towards the total */
-	return str-buf;
+/**
+ * prt_printf - Format a string, outputting to a printbuf
+ * @out: The printbuf to output to
+ * @fmt: The format string to use
+ * @args: Arguments for the format string
+ *
+ *
+ * prt_printf works much like the traditional sprintf(), but outputs to a
+ * printbuf instead of raw pointer/size.
+ *
+ * See the vsnprintf() documentation for format string extensions over C99.
+ */
+void prt_printf(struct printbuf *out, const char *fmt, ...)
+{
+	va_list args;
 
+	va_start(args, fmt);
+	prt_vprintf(out, fmt, args);
+	va_end(args);
+}
+EXPORT_SYMBOL(prt_printf);
+
+/**
+ * vsnprintf - Format a string and place it in a buffer
+ * @buf: The buffer to place the result into
+ * @size: The size of the buffer, including the trailing null space
+ * @fmt: The format string to use
+ * @args: Arguments for the format string
+ *
+ * This function generally follows C99 vsnprintf, but has some
+ * extensions and a few limitations:
+ *
+ *  - ``%n`` is unsupported
+ *  - ``%p*`` is handled by pointer()
+ *
+ * See pointer() or Documentation/core-api/printk-formats.rst for more
+ * extensive description.
+ *
+ * **Please update the documentation in both places when making changes**
+ *
+ * The return value is the number of characters which would
+ * be generated for the given input, excluding the trailing
+ * '\0', as per ISO C99. If you want to have the exact
+ * number of characters written into @buf as return value
+ * (not including the trailing '\0'), use vscnprintf(). If the
+ * return is greater than or equal to @size, the resulting
+ * string is truncated.
+ *
+ * If you're not already dealing with a va_list consider using snprintf().
+ */
+int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
+{
+	struct printbuf out = PRINTBUF_EXTERN(buf, size);
+
+	prt_vprintf(&out, fmt, args);
+	return out.pos;
 }
 EXPORT_SYMBOL(vsnprintf);
 
@@ -3015,53 +2974,46 @@ EXPORT_SYMBOL(sprintf);
  * bstr_printf() - Binary data to text string
  */
 
+static inline void printbuf_align(struct printbuf *out, unsigned align)
+{
+	/* Assumes output buffer is correctly aligned: */
+	out->pos += align - 1;
+	out->pos &= ~(align - 1);
+}
+
 /**
- * vbin_printf - Parse a format string and place args' binary value in a buffer
- * @bin_buf: The buffer to place args' binary value
- * @size: The size of the buffer(by words(32bits), not characters)
+ * prt_vbinprintf - Parse a format string and place args' binary value in a buffer
+ * @out: The buffer to place args' binary value
  * @fmt: The format string to use
  * @args: Arguments for the format string
  *
  * The format follows C99 vsnprintf, except %n is ignored, and its argument
  * is skipped.
  *
- * The return value is the number of words(32bits) which would be generated for
- * the given input.
- *
  * NOTE:
  * If the return value is greater than @size, the resulting bin_buf is NOT
  * valid for bstr_printf().
  */
-int vbin_printf(u32 *bin_buf, size_t size, const char *fmt, va_list args)
+void prt_vbinprintf(struct printbuf *out, const char *fmt, va_list args)
 {
 	struct printf_spec spec = {0};
-	char *str, *end;
 	int width;
-
-	str = (char *)bin_buf;
-	end = (char *)(bin_buf + size);
 
 #define save_arg(type)							\
 ({									\
 	unsigned long long value;					\
 	if (sizeof(type) == 8) {					\
-		unsigned long long val8;				\
-		str = PTR_ALIGN(str, sizeof(u32));			\
-		val8 = va_arg(args, unsigned long long);		\
-		if (str + sizeof(type) <= end) {			\
-			*(u32 *)str = *(u32 *)&val8;			\
-			*(u32 *)(str + 4) = *((u32 *)&val8 + 1);	\
-		}							\
+		u64 val8 = va_arg(args, u64);				\
+		printbuf_align(out, sizeof(u32));			\
+		prt_bytes(out, (u32 *) &val8, 4);			\
+		prt_bytes(out, ((u32 *) &val8) + 1, 4);			\
 		value = val8;						\
 	} else {							\
-		unsigned int val4;					\
-		str = PTR_ALIGN(str, sizeof(type));			\
-		val4 = va_arg(args, int);				\
-		if (str + sizeof(type) <= end)				\
-			*(typeof(type) *)str = (type)(long)val4;	\
+		u32 val4 = va_arg(args, u32);				\
+		printbuf_align(out, sizeof(type));			\
+		prt_bytes(out, &val4, sizeof(type));			\
 		value = (unsigned long long)val4;			\
 	}								\
-	str += sizeof(type);						\
 	value;								\
 })
 
@@ -3092,16 +3044,12 @@ int vbin_printf(u32 *bin_buf, size_t size, const char *fmt, va_list args)
 		case FORMAT_TYPE_STR: {
 			const char *save_str = va_arg(args, char *);
 			const char *err_msg;
-			size_t len;
 
 			err_msg = check_pointer_msg(save_str);
 			if (err_msg)
 				save_str = err_msg;
 
-			len = strlen(save_str) + 1;
-			if (str + len < end)
-				memcpy(str, save_str, len);
-			str += len;
+			prt_str(out, save_str);
 			break;
 		}
 
@@ -3121,12 +3069,7 @@ int vbin_printf(u32 *bin_buf, size_t size, const char *fmt, va_list args)
 					save_arg(void *);
 					break;
 				}
-				str = pointer(fmt, str, end, va_arg(args, void *),
-					      spec);
-				if (str + 1 < end)
-					*str++ = '\0';
-				else
-					end[-1] = '\0'; /* Must be nul terminated */
+				pointer(out, fmt, va_arg(args, void *), spec);
 			}
 			/* skip all alphanumeric pointer suffixes */
 			while (isalnum(*fmt))
@@ -3164,15 +3107,15 @@ int vbin_printf(u32 *bin_buf, size_t size, const char *fmt, va_list args)
 	}
 
 out:
-	return (u32 *)(PTR_ALIGN(str, sizeof(u32))) - bin_buf;
+	printbuf_nul_terminate(out);
+	printbuf_align(out, 4);
 #undef save_arg
 }
-EXPORT_SYMBOL_GPL(vbin_printf);
+EXPORT_SYMBOL_GPL(prt_vbinprintf);
 
 /**
- * bstr_printf - Format a string from binary arguments and place it in a buffer
+ * prt_bstrprintf - Format a string from binary arguments and place it in a buffer
  * @buf: The buffer to place the result into
- * @size: The size of the buffer, including the trailing null space
  * @fmt: The format string to use
  * @bin_buf: Binary arguments for the format string
  *
@@ -3182,26 +3125,14 @@ EXPORT_SYMBOL_GPL(vbin_printf);
  *
  * The format follows C99 vsnprintf, but has some extensions:
  *  see vsnprintf comment for details.
- *
- * The return value is the number of characters which would
- * be generated for the given input, excluding the trailing
- * '\0', as per ISO C99. If you want to have the exact
- * number of characters written into @buf as return value
- * (not including the trailing '\0'), use vscnprintf(). If the
- * return is greater than or equal to @size, the resulting
- * string is truncated.
  */
-int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
+void prt_bstrprintf(struct printbuf *out, const char *fmt, const u32 *bin_buf)
 {
 	struct printf_spec spec = {0};
-	char *str, *end;
 	const char *args = (const char *)bin_buf;
 
-	if (WARN_ON_ONCE(size > INT_MAX))
-		return 0;
-
-	str = buf;
-	end = buf + size;
+	if (WARN_ON_ONCE(out->size > INT_MAX))
+		return;
 
 #define get_arg(type)							\
 ({									\
@@ -3218,12 +3149,6 @@ int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
 	value;								\
 })
 
-	/* Make sure end is always >= buf */
-	if (end < buf) {
-		end = ((void *)-1);
-		size = end - buf;
-	}
-
 	while (*fmt) {
 		const char *old_fmt = fmt;
 		int read = format_decode(fmt, &spec);
@@ -3231,16 +3156,9 @@ int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
 		fmt += read;
 
 		switch (spec.type) {
-		case FORMAT_TYPE_NONE: {
-			int copy = read;
-			if (str < end) {
-				if (copy > end - str)
-					copy = end - str;
-				memcpy(str, old_fmt, copy);
-			}
-			str += read;
+		case FORMAT_TYPE_NONE:
+			prt_bytes(out, old_fmt, read);
 			break;
-		}
 
 		case FORMAT_TYPE_WIDTH:
 			set_field_width(&spec, get_arg(int));
@@ -3250,38 +3168,24 @@ int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
 			set_precision(&spec, get_arg(int));
 			break;
 
-		case FORMAT_TYPE_CHAR: {
-			char c;
-
-			if (!(spec.flags & LEFT)) {
-				while (--spec.field_width > 0) {
-					if (str < end)
-						*str = ' ';
-					++str;
-				}
-			}
-			c = (unsigned char) get_arg(char);
-			if (str < end)
-				*str = c;
-			++str;
-			while (--spec.field_width > 0) {
-				if (str < end)
-					*str = ' ';
-				++str;
-			}
+		case FORMAT_TYPE_CHAR:
+			if (!(spec.flags & LEFT))
+				prt_chars(out, spec.field_width, ' ');
+			__prt_char(out, (unsigned char) get_arg(char));
+			if ((spec.flags & LEFT))
+				prt_chars(out, spec.field_width, ' ');
 			break;
-		}
 
 		case FORMAT_TYPE_STR: {
 			const char *str_arg = args;
 			args += strlen(str_arg) + 1;
-			str = string(str, end, (char *)str_arg, spec);
+			string_spec(out, (char *)str_arg, spec);
 			break;
 		}
 
 		case FORMAT_TYPE_PTR: {
 			bool process = false;
-			int copy, len;
+			int len;
 			/* Non function dereferences were already done */
 			switch (*fmt) {
 			case 'S':
@@ -3297,17 +3201,12 @@ int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
 					break;
 				}
 				/* Pointer dereference was already processed */
-				if (str < end) {
-					len = copy = strlen(args);
-					if (copy > end - str)
-						copy = end - str;
-					memcpy(str, args, copy);
-					str += len;
-					args += len + 1;
-				}
+				len = strlen(args);
+				prt_bytes(out, args, len);
+				args += len + 1;
 			}
 			if (process)
-				str = pointer(fmt, str, end, get_arg(void *), spec);
+				pointer(out, fmt, get_arg(void *), spec);
 
 			while (isalnum(*fmt))
 				fmt++;
@@ -3315,9 +3214,7 @@ int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
 		}
 
 		case FORMAT_TYPE_PERCENT_CHAR:
-			if (str < end)
-				*str = '%';
-			++str;
+			__prt_char(out, '%');
 			break;
 
 		case FORMAT_TYPE_INVALID:
@@ -3360,23 +3257,87 @@ int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
 				num = get_arg(int);
 			}
 
-			str = number(str, end, num, spec);
+			number(out, num, spec);
 		} /* default: */
 		} /* switch(spec.type) */
 	} /* while(*fmt) */
 
 out:
-	if (size > 0) {
-		if (str < end)
-			*str = '\0';
-		else
-			end[-1] = '\0';
-	}
-
 #undef get_arg
+	printbuf_nul_terminate(out);
+}
+EXPORT_SYMBOL_GPL(prt_bstrprintf);
 
-	/* the trailing null byte doesn't count towards the total */
-	return str - buf;
+/**
+ * prt_bprintf - Parse a format string and place args' binary value in a buffer
+ * @out: The buffer to place args' binary value
+ * @fmt: The format string to use
+ * @...: Arguments for the format string
+ */
+void prt_bprintf(struct printbuf *out, const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	prt_vbinprintf(out, fmt, args);
+	va_end(args);
+}
+EXPORT_SYMBOL_GPL(prt_bprintf);
+
+/**
+ * vbin_printf - Parse a format string and place args' binary value in a buffer
+ * @bin_buf: The buffer to place args' binary value
+ * @size: The size of the buffer(by words(32bits), not characters)
+ * @fmt: The format string to use
+ * @args: Arguments for the format string
+ *
+ * The format follows C99 vsnprintf, except %n is ignored, and its argument
+ * is skipped.
+ *
+ * The return value is the number of words(32bits) which would be generated for
+ * the given input.
+ *
+ * NOTE:
+ * If the return value is greater than @size, the resulting bin_buf is NOT
+ * valid for bstr_printf().
+ */
+int vbin_printf(u32 *bin_buf, size_t size, const char *fmt, va_list args)
+{
+	struct printbuf out = PRINTBUF_EXTERN((char *) bin_buf, size);
+
+	prt_vbinprintf(&out, fmt, args);
+	return out.pos;
+}
+EXPORT_SYMBOL_GPL(vbin_printf);
+
+/**
+ * bstr_printf - Format a string from binary arguments and place it in a buffer
+ * @buf: The buffer to place the result into
+ * @size: The size of the buffer, including the trailing null space
+ * @fmt: The format string to use
+ * @bin_buf: Binary arguments for the format string
+ *
+ * This function like C99 vsnprintf, but the difference is that vsnprintf gets
+ * arguments from stack, and bstr_printf gets arguments from @bin_buf which is
+ * a binary buffer that generated by vbin_printf.
+ *
+ * The format follows C99 vsnprintf, but has some extensions:
+ *  see vsnprintf comment for details.
+ *
+ * The return value is the number of characters which would
+ * be generated for the given input, excluding the trailing
+ * '\0', as per ISO C99. If you want to have the exact
+ * number of characters written into @buf as return value
+ * (not including the trailing '\0'), use vscnprintf(). If the
+ * return is greater than or equal to @size, the resulting
+ * string is truncated.
+ */
+int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf)
+{
+	struct printbuf out = PRINTBUF_EXTERN(buf, size);
+
+	prt_bstrprintf(&out, fmt, bin_buf);
+	return out.pos;
 }
 EXPORT_SYMBOL_GPL(bstr_printf);
 

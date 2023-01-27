@@ -53,6 +53,7 @@
 #include <linux/bsearch.h>
 #include <linux/dynamic_debug.h>
 #include <linux/audit.h>
+#include <linux/codetag.h>
 #include <linux/cfi.h>
 #include <uapi/linux/module.h>
 #include "internal.h"
@@ -1150,6 +1151,7 @@ static void free_module(struct module *mod)
 {
 	trace_module_free(mod);
 
+	codetag_unload_module(mod);
 	mod_sysfs_teardown(mod);
 
 	/*
@@ -1609,9 +1611,7 @@ static void dynamic_debug_remove(struct module *mod, struct _ddebug_info *dyndbg
 
 void * __weak module_alloc(unsigned long size)
 {
-	return __vmalloc_node_range(size, 1, VMALLOC_START, VMALLOC_END,
-			GFP_KERNEL, PAGE_KERNEL_EXEC, VM_FLUSH_RESET_PERMS,
-			NUMA_NO_NODE, __builtin_return_address(0));
+	return vmalloc_exec(size, GFP_KERNEL);
 }
 
 bool __weak module_init_section(const char *name)
@@ -2842,6 +2842,8 @@ static int load_module(struct load_info *info, const char __user *uargs,
 
 	/* Get rid of temporary copy. */
 	free_copy(info, flags);
+
+	codetag_load_module(mod);
 
 	/* Done! */
 	trace_module_load(mod);

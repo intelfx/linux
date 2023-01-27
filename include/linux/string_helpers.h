@@ -10,6 +10,7 @@
 struct device;
 struct file;
 struct task_struct;
+struct printbuf;
 
 /* Descriptions of the types of units to
  * print in */
@@ -18,8 +19,8 @@ enum string_size_units {
 	STRING_UNITS_2,		/* use binary powers of 2^10 */
 };
 
-void string_get_size(u64 size, u64 blk_size, enum string_size_units units,
-		     char *buf, int len);
+int string_get_size(u64 size, u64 blk_size, enum string_size_units units,
+		    char *buf, int len);
 
 int parse_int_array_user(const char __user *from, size_t count, int **array);
 
@@ -64,6 +65,8 @@ static inline int string_unescape_any_inplace(char *buf)
 
 #define ESCAPE_ALL_MASK		GENMASK(8, 0)
 
+void prt_escaped_string(struct printbuf *out, const char *src, size_t isz,
+			unsigned int flags, const char *only);
 int string_escape_mem(const char *src, size_t isz, char *dst, size_t osz,
 		unsigned int flags, const char *only);
 
@@ -72,6 +75,7 @@ static inline int string_escape_mem_any_np(const char *src, size_t isz,
 {
 	return string_escape_mem(src, isz, dst, osz, ESCAPE_ANY_NP, only);
 }
+
 
 static inline int string_escape_str(const char *src, char *dst, size_t sz,
 		unsigned int flags, const char *only)

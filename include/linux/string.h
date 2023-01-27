@@ -96,6 +96,7 @@ extern char * strpbrk(const char *,const char *);
 #ifndef __HAVE_ARCH_STRSEP
 extern char * strsep(char **,const char *);
 #endif
+extern char *strsep_no_empty(char **, const char *);
 #ifndef __HAVE_ARCH_STRSPN
 extern __kernel_size_t strspn(const char *,const char *);
 #endif
@@ -195,7 +196,12 @@ int __sysfs_match_string(const char * const *array, size_t n, const char *s);
  */
 #define sysfs_match_string(_a, _s) __sysfs_match_string(_a, ARRAY_SIZE(_a), _s)
 
+struct printbuf;
+
 #ifdef CONFIG_BINARY_PRINTF
+void prt_vbinprintf(struct printbuf *out, const char *fmt, va_list args);
+void prt_bstrprintf(struct printbuf *out, const char *fmt, const u32 *bin_buf);
+void prt_bprintf(struct printbuf *out, const char *fmt, ...) __printf(2, 3);
 int vbin_printf(u32 *bin_buf, size_t size, const char *fmt, va_list args);
 int bstr_printf(char *buf, size_t size, const char *fmt, const u32 *bin_buf);
 int bprintf(u32 *bin_buf, size_t size, const char *fmt, ...) __printf(3, 4);
