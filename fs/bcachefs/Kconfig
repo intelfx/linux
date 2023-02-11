@@ -68,12 +68,6 @@ config BCACHEFS_LOCK_TIME_STATS
        help
        Expose statistics for how long we held a lock in debugfs
 
-config BCACHEFS_NO_IO
-	bool "disable data IO calls"
-	depends on BCACHEFS_FS
-	help
-	This disables low level reads and writes for user data, only for performance testing
-
 config BCACHEFS_NO_LATENCY_ACCT
 	bool "disable latency accounting and time stats"
 	depends on BCACHEFS_FS

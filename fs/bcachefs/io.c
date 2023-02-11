@@ -684,7 +684,7 @@ void bch2_submit_wbio_replicas(struct bch_write_bio *wbio, struct bch_fs *c,
 
 			bio_set_dev(&n->bio, ca->disk_sb.bdev);
 
-			if (IS_ENABLED(CONFIG_BCACHEFS_NO_IO) && type != BCH_DATA_btree) {
+			if (type != BCH_DATA_btree && unlikely(c->opts.no_data_io)) {
 				bio_endio(&n->bio);
 				continue;
 			}
@@ -2356,8 +2356,7 @@ static void __bch2_read_endio(struct work_struct *work)
 	}
 
 	csum = bch2_checksum_bio(c, crc.csum_type, nonce, src);
-	if (bch2_crc_cmp(csum, rbio->pick.crc.csum) &&
-	    !IS_ENABLED(CONFIG_BCACHEFS_NO_IO))
+	if (bch2_crc_cmp(csum, rbio->pick.crc.csum) && !c->opts.no_data_io)
 		goto csum_err;
 
 	/*
@@ -2808,7 +2807,7 @@ get_bio:
 			     bio_sectors(&rbio->bio));
 		bio_set_dev(&rbio->bio, ca->disk_sb.bdev);
 
-		if (IS_ENABLED(CONFIG_BCACHEFS_NO_IO)) {
+		if (unlikely(c->opts.no_data_io)) {
 			if (likely(!(flags & BCH_READ_IN_RETRY)))
 				bio_endio(&rbio->bio);
 		} else {

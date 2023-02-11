@@ -404,6 +404,12 @@ enum opt_type {
 	  NULL,		"Nocow mode: Writes will be done in place when possible.\n"\
 			"Snapshots and reflink will still caused writes to be COW\n"\
 			"Implicitly disables data checksumming, compression and encryption")\
+	x(no_data_io,			u8,				\
+	  OPT_FS|OPT_MOUNT,						\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,			false,			\
+	  NULL,		"Skip submit_bio() for data reads and writes, "	\
+			"for performance testing purposes")		\
 	x(fs_size,			u64,				\
 	  OPT_DEVICE,							\
 	  OPT_UINT(0, S64_MAX),						\
