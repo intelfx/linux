@@ -111,8 +111,8 @@ struct vc_data {
 	unsigned int	vc_screenbuf_size;
 	unsigned char	vc_mode;		/* KD_TEXT, ... */
 	/* attributes for all characters on screen */
-	unsigned char	vc_attr;		/* Current attributes */
-	unsigned char	vc_def_color;		/* Default colors */
+	unsigned short	vc_attr;		/* Current attributes */
+	unsigned short	vc_def_color;		/* Default colors */
 	unsigned char	vc_ulcolor;		/* Color for underline mode */
 	unsigned char   vc_itcolor;
 	unsigned char	vc_halfcolor;		/* Color for half intensity mode */

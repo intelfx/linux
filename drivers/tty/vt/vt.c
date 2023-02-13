@@ -698,7 +698,7 @@ void update_region(struct vc_data *vc, unsigned long start, int count)
 
 /* Structure of attributes is hardware-dependent */
 
-static u8 build_attr(struct vc_data *vc, u8 _color,
+static u16 build_attr(struct vc_data *vc, u8 _color,
 		enum vc_intensity _intensity, bool _blink, bool _underline,
 		bool _reverse, bool _italic)
 {
@@ -1817,6 +1817,8 @@ static void csi_m(struct vc_data *vc)
 			if (vc->vc_par[i] >= 90 && vc->vc_par[i] <= 107) {
 				if (vc->vc_par[i] < 100)
 					vc->state.intensity = VCI_BOLD;
+				else
+					vc->state.blink = true;
 				vc->vc_par[i] -= 60;
 			}
 			if (vc->vc_par[i] >= 30 && vc->vc_par[i] <= 37)
