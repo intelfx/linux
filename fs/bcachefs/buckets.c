@@ -727,7 +727,7 @@ static int check_bucket_ref(struct btree_trans *trans,
 
 	if (b_gen != ptr->gen) {
 		ret = 1;
-		goto err;
+		goto out;
 	}
 
 	if (!data_type_is_empty(bucket_data_type) &&
