@@ -647,7 +647,7 @@ static void bch2_stripe_close(struct bch_fs *c, struct ec_stripe_new *s)
 	BUG_ON(!s->idx);
 
 	spin_lock(&c->ec_stripes_new_lock);
-	hlist_del(&s->hash);
+	hlist_del_init(&s->hash);
 	spin_unlock(&c->ec_stripes_new_lock);
 
 	s->idx = 0;
