@@ -1378,6 +1378,20 @@ void bch2_fs_allocator_foreground_init(struct bch_fs *c)
 	}
 }
 
+static void bch2_open_bucket_to_text(struct printbuf *out, struct bch_fs *c, struct open_bucket *ob)
+{
+	unsigned data_type = ob->data_type;
+	barrier(); /* READ_ONCE() doesn't work on bitfields */
+
+	prt_printf(out, "%zu ref %u %s%s%s %u:%llu gen %u\n",
+		   ob - c->open_buckets,
+		   atomic_read(&ob->pin),
+		   data_type < BCH_DATA_NR ? bch2_data_types[data_type] : "invalid data type",
+		   ob->ec ? " ec" : "",
+		   ob->on_partial_list ? " partial" : "",
+		   ob->dev, ob->bucket, ob->gen);
+}
+
 void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct open_bucket *ob;
@@ -1386,13 +1400,8 @@ void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 	     ob < c->open_buckets + ARRAY_SIZE(c->open_buckets);
 	     ob++) {
 		spin_lock(&ob->lock);
-		if (ob->valid && !ob->on_partial_list) {
-			prt_printf(out, "%zu ref %u type %s %u:%llu:%u\n",
-			       ob - c->open_buckets,
-			       atomic_read(&ob->pin),
-			       bch2_data_types[ob->data_type],
-			       ob->dev, ob->bucket, ob->gen);
-		}
+		if (ob->valid && !ob->on_partial_list)
+			bch2_open_bucket_to_text(out, c, ob);
 		spin_unlock(&ob->lock);
 	}
 }
@@ -1402,16 +1411,9 @@ void bch2_open_buckets_partial_to_text(struct printbuf *out, struct bch_fs *c)
 	unsigned i;
 
 	spin_lock(&c->freelist_lock);
-	for (i = 0; i < c->open_buckets_partial_nr; i++) {
-		struct open_bucket *ob = c->open_buckets + c->open_buckets_partial[i];
-
-		prt_printf(out, "%zu ref %u type %s ec %u %u:%llu:%u\n",
-			   ob - c->open_buckets,
-			   atomic_read(&ob->pin),
-			   bch2_data_types[ob->data_type],
-			   ob->ec != NULL,
-			   ob->dev, ob->bucket, ob->gen);
-	}
+	for (i = 0; i < c->open_buckets_partial_nr; i++)
+		bch2_open_bucket_to_text(out, c,
+				c->open_buckets + c->open_buckets_partial[i]);
 	spin_unlock(&c->freelist_lock);
 }
 
