@@ -4,6 +4,7 @@
 /*
  * Linux wait queue related types and methods
  */
+#include <linux/codetag_time_stats.h>
 #include <linux/list.h>
 #include <linux/stddef.h>
 #include <linux/spinlock.h>
@@ -32,6 +33,9 @@ struct wait_queue_entry {
 	void			*private;
 	wait_queue_func_t	func;
 	struct list_head	entry;
+#ifdef CONFIG_CODETAG_TIME_STATS
+	u64			start_time;
+#endif
 };
 
 struct wait_queue_head {
@@ -79,20 +83,47 @@ extern void __init_waitqueue_head(struct wait_queue_head *wq_head, const char *n
 # define DECLARE_WAIT_QUEUE_HEAD_ONSTACK(name) DECLARE_WAIT_QUEUE_HEAD(name)
 #endif
 
-static inline void init_waitqueue_entry(struct wait_queue_entry *wq_entry, struct task_struct *p)
-{
-	wq_entry->flags		= 0;
-	wq_entry->private	= p;
-	wq_entry->func		= default_wake_function;
+#ifdef CONFIG_CODETAG_TIME_STATS
+#define WAIT_QUEUE_ENTRY_START_TIME_INITIALIZER	.start_time = ktime_get_ns(),
+#else
+#define WAIT_QUEUE_ENTRY_START_TIME_INITIALIZER
+#endif
+
+#define WAIT_FUNC_INITIALIZER(name, function) {					\
+	.private	= current,						\
+	.func		= function,						\
+	.entry		= LIST_HEAD_INIT((name).entry),				\
+	WAIT_QUEUE_ENTRY_START_TIME_INITIALIZER					\
 }
 
+#define DEFINE_WAIT_FUNC(name, function)					\
+	struct wait_queue_entry name = WAIT_FUNC_INITIALIZER(name, function)
+
+#define DEFINE_WAIT(name) DEFINE_WAIT_FUNC(name, autoremove_wake_function)
+
 static inline void
-init_waitqueue_func_entry(struct wait_queue_entry *wq_entry, wait_queue_func_t func)
+__init_waitqueue_entry(struct wait_queue_entry *wq_entry, unsigned int flags,
+		       void *private, wait_queue_func_t func)
 {
-	wq_entry->flags		= 0;
-	wq_entry->private	= NULL;
+	wq_entry->flags		= flags;
+	wq_entry->private	= private;
 	wq_entry->func		= func;
+	INIT_LIST_HEAD(&wq_entry->entry);
+#ifdef CONFIG_CODETAG_TIME_STATS
+	wq_entry->start_time	= ktime_get_ns();
+#endif
 }
+
+#define init_waitqueue_func_entry(_wq_entry, _func)			\
+	__init_waitqueue_entry(_wq_entry, 0, NULL, _func)
+
+#define init_waitqueue_entry(_wq_entry, _task)				\
+	__init_waitqueue_entry(_wq_entry, 0, _task, default_wake_function)
+
+#define init_wait_entry(_wq_entry, _flags)				\
+	__init_waitqueue_entry(_wq_entry, _flags, current, autoremove_wake_function)
+
+#define init_wait(wait)		init_wait_entry(wait, 0)
 
 /**
  * waitqueue_active -- locklessly test for waiters on the queue
@@ -282,8 +313,6 @@ static inline void wake_up_pollfree(struct wait_queue_head *wq_head)
 #define ___wait_is_interruptible(state)						\
 	(!__builtin_constant_p(state) ||					\
 	 (state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL)))
-
-extern void init_wait_entry(struct wait_queue_entry *wq_entry, int flags);
 
 /*
  * The below macro ___wait_event() has an explicit shadow of the __ret
@@ -1193,27 +1222,16 @@ do {										\
 void prepare_to_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state);
 bool prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state);
 long prepare_to_wait_event(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry, int state);
-void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
+void __finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry);
 long wait_woken(struct wait_queue_entry *wq_entry, unsigned mode, long timeout);
 int woken_wake_function(struct wait_queue_entry *wq_entry, unsigned mode, int sync, void *key);
 int autoremove_wake_function(struct wait_queue_entry *wq_entry, unsigned mode, int sync, void *key);
 
-#define DEFINE_WAIT_FUNC(name, function)					\
-	struct wait_queue_entry name = {					\
-		.private	= current,					\
-		.func		= function,					\
-		.entry		= LIST_HEAD_INIT((name).entry),			\
-	}
-
-#define DEFINE_WAIT(name) DEFINE_WAIT_FUNC(name, autoremove_wake_function)
-
-#define init_wait(wait)								\
-	do {									\
-		(wait)->private = current;					\
-		(wait)->func = autoremove_wake_function;			\
-		INIT_LIST_HEAD(&(wait)->entry);					\
-		(wait)->flags = 0;						\
-	} while (0)
+#define finish_wait(_wq_head, _wq_entry)					\
+do {										\
+	codetag_time_stats_finish((_wq_entry)->start_time);			\
+	__finish_wait(_wq_head, _wq_entry);					\
+} while (0)
 
 typedef int (*task_call_f)(struct task_struct *p, void *arg);
 extern int task_call_func(struct task_struct *p, task_call_f func, void *arg);

@@ -499,6 +499,12 @@ config ASSOCIATIVE_ARRAY
 
 	  for more information.
 
+config CLOSURES
+	bool
+
+config LAZY_PERCPU_COUNTER
+	bool
+
 config HAS_IOMEM
 	bool
 	depends on !NO_IOMEM
@@ -751,3 +757,6 @@ config ASN1_ENCODER
 
 config POLYNOMIAL
        tristate
+
+config TIME_STATS
+	bool
