@@ -80,7 +80,7 @@ static inline void dec_wb_stat(struct bdi_writeback *wb, enum wb_stat_item item)
 
 static inline s64 wb_stat(struct bdi_writeback *wb, enum wb_stat_item item)
 {
-	return percpu_counter_read_positive(&wb->stat[item]);
+	return percpu_counter_sum_positive(&wb->stat[item]);
 }
 
 static inline s64 wb_stat_sum(struct bdi_writeback *wb, enum wb_stat_item item)
