@@ -89,13 +89,13 @@ static int bdi_debug_stats_show(struct seq_file *m, void *v)
 		   "b_dirty_time:       %10lu\n"
 		   "bdi_list:           %10u\n"
 		   "state:              %10lx\n",
-		   (unsigned long) K(wb_stat(wb, WB_WRITEBACK)),
-		   (unsigned long) K(wb_stat(wb, WB_RECLAIMABLE)),
+		   (unsigned long) K(wb_stat_sum(wb, WB_WRITEBACK)),
+		   (unsigned long) K(wb_stat_sum(wb, WB_RECLAIMABLE)),
 		   K(wb_thresh),
 		   K(dirty_thresh),
 		   K(background_thresh),
-		   (unsigned long) K(wb_stat(wb, WB_DIRTIED)),
-		   (unsigned long) K(wb_stat(wb, WB_WRITTEN)),
+		   (unsigned long) K(wb_stat_sum(wb, WB_DIRTIED)),
+		   (unsigned long) K(wb_stat_sum(wb, WB_WRITTEN)),
 		   (unsigned long) K(wb->write_bandwidth),
 		   nr_dirty,
 		   nr_io,
