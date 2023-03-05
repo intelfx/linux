@@ -1458,8 +1458,8 @@ static void __wb_update_bandwidth(struct dirty_throttle_control *gdtc,
 	 * division errors.
 	 */
 	elapsed = max(now - wb->bw_time_stamp, 1UL);
-	dirtied = percpu_counter_read(&wb->stat[WB_DIRTIED]);
-	written = percpu_counter_read(&wb->stat[WB_WRITTEN]);
+	dirtied = wb_stat(wb, WB_DIRTIED);
+	written = wb_stat(wb, WB_WRITTEN);
 
 	if (update_ratelimit) {
 		domain_update_dirty_limit(gdtc, now);
