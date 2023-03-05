@@ -269,7 +269,7 @@ _alloc_pages_node2(int nid, gfp_t gfp_mask, unsigned int order)
 	VM_BUG_ON(nid < 0 || nid >= MAX_NUMNODES);
 	warn_if_node_offline(nid, gfp_mask);
 
-	return __alloc_pages(gfp_mask, order, nid, NULL);
+	return _alloc_pages2(gfp_mask, order, nid, NULL);
 }
 
 #define  __alloc_pages_node(_nid, _gfp_mask, _order) \

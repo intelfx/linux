@@ -5600,7 +5600,7 @@ EXPORT_SYMBOL(_alloc_pages2);
 struct folio *_folio_alloc2(gfp_t gfp, unsigned int order, int preferred_nid,
 		nodemask_t *nodemask)
 {
-	struct page *page = __alloc_pages(gfp | __GFP_COMP, order,
+	struct page *page = _alloc_pages2(gfp | __GFP_COMP, order,
 			preferred_nid, nodemask);
 
 	if (page && order > 1)
