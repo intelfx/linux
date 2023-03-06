@@ -1396,6 +1396,8 @@ void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct open_bucket *ob;
 
+	out->atomic++;
+
 	for (ob = c->open_buckets;
 	     ob < c->open_buckets + ARRAY_SIZE(c->open_buckets);
 	     ob++) {
@@ -1404,17 +1406,23 @@ void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 			bch2_open_bucket_to_text(out, c, ob);
 		spin_unlock(&ob->lock);
 	}
+
+	--out->atomic;
 }
 
 void bch2_open_buckets_partial_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	unsigned i;
 
+	out->atomic++;
 	spin_lock(&c->freelist_lock);
+
 	for (i = 0; i < c->open_buckets_partial_nr; i++)
 		bch2_open_bucket_to_text(out, c,
 				c->open_buckets + c->open_buckets_partial[i]);
+
 	spin_unlock(&c->freelist_lock);
+	--out->atomic;
 }
 
 static const char * const bch2_write_point_states[] = {
