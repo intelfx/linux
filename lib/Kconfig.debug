@@ -981,6 +981,32 @@ config DEBUG_STACKOVERFLOW
 
 	  If in doubt, say "N".
 
+config CODE_TAGGING
+	bool
+	select KALLSYMS
+
+config ALLOC_TAGGING
+	bool "Enable allocation tagging"
+	default n
+	depends on DEBUG_FS
+	select CODE_TAGGING
+	select LAZY_PERCPU_COUNTER
+	select PAGE_EXTENSION
+	select SLAB_OBJ_EXT
+	select STACKDEPOT
+	help
+	  Track allocation source code and record total allocation size
+	  initiated at that code location. The mechanism can be used to track
+	  memory leaks with a low performance impact.
+
+config ALLOC_TAGGING_DEBUG
+	bool "Alloc tagging debugging"
+	default n
+	depends on ALLOC_TAGGING
+	help
+	  Adds warnings with helpful error messages for memory allocation
+	  profiling.
+
 source "lib/Kconfig.kasan"
 source "lib/Kconfig.kfence"
 source "lib/Kconfig.kmsan"
@@ -1638,6 +1664,15 @@ config DEBUG_NOTIFIERS
 	  This is a relatively cheap check but if you care about maximum
 	  performance, say N.
 
+config DEBUG_CLOSURES
+	bool "Debug closures (bcache async widgits)"
+	depends on CLOSURES
+	select DEBUG_FS
+	help
+	Keeps all active closures in a linked list and provides a debugfs
+	interface to list them, which makes it possible to see asynchronous
+	operations that get stuck.
+
 config BUG_ON_DATA_CORRUPTION
 	bool "Trigger a BUG when data corruption is detected"
 	select DEBUG_LIST
@@ -1716,6 +1751,14 @@ config LATENCYTOP
 	help
 	  Enable this option if you want to use the LatencyTOP tool
 	  to find out which userspace is blocking on what kernel operations.
+
+config CODETAG_TIME_STATS
+	bool "Code tagging based latency measuring"
+	depends on DEBUG_FS
+	select TIME_STATS
+	select CODE_TAGGING
+	help
+	  Enabling this option makes latency statistics available in debugfs
 
 source "kernel/trace/Kconfig"
 
@@ -2066,6 +2109,15 @@ config CPUMASK_KUNIT_TEST
 	  For more information on KUnit and unit tests in general, please refer
 	  to the KUnit documentation in Documentation/dev-tools/kunit/.
 
+	  If unsure, say N.
+
+config MEAN_AND_VARIANCE_UNIT_TEST
+	tristate "mean_and_variance unit tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select MEAN_AND_VARIANCE
+	default KUNIT_ALL_TESTS
+	help
+	  This option enables the kunit tests for mean_and_variance module.
 	  If unsure, say N.
 
 config TEST_LIST_SORT
