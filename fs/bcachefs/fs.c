@@ -1500,7 +1500,6 @@ again:
 			DEFINE_WAIT_BIT(wait, &inode->v.i_state, __I_NEW);
 
 			prepare_to_wait(wq, &wait.wq_entry, TASK_UNINTERRUPTIBLE);
-			spin_unlock(&inode->v.i_lock);
 			mutex_unlock(&c->vfs_inodes_lock);
 
 			schedule();
