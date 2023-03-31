@@ -627,7 +627,7 @@ void bch2_verify_bucket_evacuated(struct btree_trans *trans, struct bpos bucket,
 	struct bkey_s_c k;
 	struct printbuf buf = PRINTBUF;
 	struct bch_backpointer bp;
-	u64 bp_offset = 0;
+	struct bpos bp_pos = POS_MIN;
 	unsigned nr_bps = 0;
 	int ret;
 
@@ -669,17 +669,16 @@ failed_to_evacuate:
 		bch2_trans_begin(trans);
 
 		ret = bch2_get_next_backpointer(trans, bucket, gen,
-						&bp_offset, &bp,
+						&bp_pos, &bp,
 						BTREE_ITER_CACHED);
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			continue;
 		if (ret)
 			break;
-		if (bp_offset == U64_MAX)
+		if (bkey_eq(bp_pos, POS_MAX))
 			break;
 
-		k = bch2_backpointer_get_key(trans, &iter,
-					     bucket, bp_offset, bp, 0);
+		k = bch2_backpointer_get_key(trans, &iter, bp_pos, bp, 0);
 		ret = bkey_err(k);
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			continue;
@@ -693,7 +692,7 @@ failed_to_evacuate:
 
 		if (++nr_bps > 10)
 			break;
-		bp_offset++;
+		bp_pos = bpos_nosnap_successor(bp_pos);
 	}
 
 	bch2_print_string_as_lines(KERN_ERR, buf.buf);
@@ -717,7 +716,8 @@ int __bch2_evacuate_bucket(struct btree_trans *trans,
 	struct data_update_opts data_opts;
 	unsigned dirty_sectors, bucket_size;
 	u64 fragmentation;
-	u64 bp_offset = 0, cur_inum = U64_MAX;
+	u64 cur_inum = U64_MAX;
+	struct bpos bp_pos = POS_MIN;
 	int ret = 0;
 
 	bch2_bkey_buf_init(&sk);
@@ -753,13 +753,13 @@ int __bch2_evacuate_bucket(struct btree_trans *trans,
 		bch2_trans_begin(trans);
 
 		ret = bch2_get_next_backpointer(trans, bucket, gen,
-						&bp_offset, &bp,
+						&bp_pos, &bp,
 						BTREE_ITER_CACHED);
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			continue;
 		if (ret)
 			goto err;
-		if (bp_offset == U64_MAX)
+		if (bkey_eq(bp_pos, POS_MAX))
 			break;
 
 		if (!bp.level) {
@@ -767,8 +767,7 @@ int __bch2_evacuate_bucket(struct btree_trans *trans,
 			struct bkey_s_c k;
 			unsigned i = 0;
 
-			k = bch2_backpointer_get_key(trans, &iter,
-						bucket, bp_offset, bp, 0);
+			k = bch2_backpointer_get_key(trans, &iter, bp_pos, bp, 0);
 			ret = bkey_err(k);
 			if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 				continue;
@@ -823,8 +822,7 @@ int __bch2_evacuate_bucket(struct btree_trans *trans,
 		} else {
 			struct btree *b;
 
-			b = bch2_backpointer_get_node(trans, &iter,
-						bucket, bp_offset, bp);
+			b = bch2_backpointer_get_node(trans, &iter, bp_pos, bp);
 			ret = PTR_ERR_OR_ZERO(b);
 			if (ret == -BCH_ERR_backpointer_to_overwritten_btree_node)
 				continue;
@@ -852,7 +850,7 @@ int __bch2_evacuate_bucket(struct btree_trans *trans,
 			}
 		}
 next:
-		bp_offset++;
+		bp_pos = bpos_nosnap_successor(bp_pos);
 	}
 
 	trace_evacuate_bucket(c, &bucket, dirty_sectors, bucket_size, fragmentation, ret);
