@@ -75,6 +75,9 @@ enum ask_yn {
 #ifdef __KERNEL__
 #define bch2_fsck_ask_yn()	YN_NO
 #else
+
+#include "tools-util.h"
+
 enum ask_yn bch2_fsck_ask_yn(void)
 {
 	char *buf = NULL;
@@ -106,6 +109,7 @@ enum ask_yn bch2_fsck_ask_yn(void)
 	free(buf);
 	return ret;
 }
+
 #endif
 
 static struct fsck_err_state *fsck_err_get(struct bch_fs *c, const char *fmt)
