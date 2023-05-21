@@ -252,7 +252,7 @@ bkey_cached_alloc(struct btree_trans *trans, struct btree_path *path,
 		}
 
 		path->l[0].b = (void *) ck;
-		path->l[0].lock_seq = ck->c.lock.state.seq;
+		path->l[0].lock_seq = six_lock_seq(&ck->c.lock);
 		mark_btree_node_locked(trans, path, 0, SIX_LOCK_intent);
 
 		ret = bch2_btree_node_lock_write(trans, path, &ck->c);
@@ -507,7 +507,7 @@ retry:
 		mark_btree_node_locked(trans, path, 0, lock_want);
 	}
 
-	path->l[0].lock_seq	= ck->c.lock.state.seq;
+	path->l[0].lock_seq	= six_lock_seq(&ck->c.lock);
 	path->l[0].b		= (void *) ck;
 fill:
 	path->uptodate = BTREE_ITER_UPTODATE;
@@ -589,7 +589,7 @@ retry:
 		mark_btree_node_locked(trans, path, 0, lock_want);
 	}
 
-	path->l[0].lock_seq	= ck->c.lock.state.seq;
+	path->l[0].lock_seq	= six_lock_seq(&ck->c.lock);
 	path->l[0].b		= (void *) ck;
 fill:
 	if (!ck->valid)
