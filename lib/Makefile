@@ -30,7 +30,7 @@ endif
 lib-y := ctype.o string.o vsprintf.o cmdline.o \
 	 rbtree.o radix-tree.o timerqueue.o xarray.o \
 	 maple_tree.o idr.o extable.o irq_regs.o argv_split.o \
-	 flex_proportions.o ratelimit.o show_mem.o \
+	 flex_proportions.o ratelimit.o \
 	 is_single_threaded.o plist.o decompress.o kobject_uevent.o \
 	 earlycpio.o seq_buf.o siphash.o dec_and_lock.o \
 	 nmi_backtrace.o win_minmax.o memcat_p.o \
@@ -244,6 +244,8 @@ obj-$(CONFIG_GENERIC_ATOMIC64) += atomic64.o
 obj-$(CONFIG_ATOMIC64_SELFTEST) += atomic64_test.o
 
 obj-$(CONFIG_CPU_RMAP) += cpu_rmap.o
+
+obj-$(CONFIG_CLOSURES) += closure.o
 
 obj-$(CONFIG_DQL) += dynamic_queue_limits.o
 
