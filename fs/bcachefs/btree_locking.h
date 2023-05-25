@@ -14,7 +14,7 @@
 
 #include "btree_iter.h"
 
-void bch2_btree_lock_init(struct btree_bkey_cached_common *);
+void bch2_btree_lock_init(struct btree_bkey_cached_common *, enum six_lock_init_flags);
 
 #ifdef CONFIG_LOCKDEP
 void bch2_assert_btree_nodes_not_locked(void);
@@ -176,13 +176,13 @@ bch2_btree_node_unlock_write_inlined(struct btree_trans *trans, struct btree_pat
 	struct btree_path *linked;
 
 	EBUG_ON(path->l[b->c.level].b != b);
-	EBUG_ON(path->l[b->c.level].lock_seq + 1 != b->c.lock.state.seq);
+	EBUG_ON(path->l[b->c.level].lock_seq != six_lock_seq(&b->c.lock));
 	EBUG_ON(btree_node_locked_type(path, b->c.level) != SIX_LOCK_write);
 
 	mark_btree_node_locked_noreset(path, b->c.level, SIX_LOCK_intent);
 
 	trans_for_each_path_with_node(trans, b, linked)
-		linked->l[b->c.level].lock_seq += 2;
+		linked->l[b->c.level].lock_seq++;
 
 	six_unlock_write(&b->c.lock);
 }
@@ -206,8 +206,8 @@ static inline int __btree_node_lock_nopath(struct btree_trans *trans,
 	trans->lock_must_abort	= false;
 	trans->locking		= b;
 
-	ret = six_lock_type_ip_waiter(&b->lock, type, &trans->locking_wait,
-				   bch2_six_check_for_deadlock, trans, ip);
+	ret = six_lock_ip_waiter(&b->lock, type, &trans->locking_wait,
+				 bch2_six_check_for_deadlock, trans, ip);
 	WRITE_ONCE(trans->locking, NULL);
 	WRITE_ONCE(trans->locking_wait.start_time, 0);
 	return ret;
@@ -284,7 +284,7 @@ static inline int __btree_node_lock_write(struct btree_trans *trans,
 					  bool lock_may_not_fail)
 {
 	EBUG_ON(&path->l[b->level].b->c != b);
-	EBUG_ON(path->l[b->level].lock_seq != b->lock.state.seq);
+	EBUG_ON(path->l[b->level].lock_seq != six_lock_seq(&b->lock));
 	EBUG_ON(!btree_node_intent_locked(path, b->level));
 
 	/*

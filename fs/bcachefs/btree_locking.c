@@ -6,9 +6,10 @@
 
 static struct lock_class_key bch2_btree_node_lock_key;
 
-void bch2_btree_lock_init(struct btree_bkey_cached_common *b)
+void bch2_btree_lock_init(struct btree_bkey_cached_common *b,
+			  enum six_lock_init_flags flags)
 {
-	__six_lock_init(&b->lock, "b->c.lock", &bch2_btree_node_lock_key);
+	__six_lock_init(&b->lock, "b->c.lock", &bch2_btree_node_lock_key, flags);
 }
 
 #ifdef CONFIG_LOCKDEP
@@ -19,16 +20,6 @@ void bch2_assert_btree_nodes_not_locked(void)
 #endif
 
 /* Btree node locking: */
-
-static inline void six_lock_readers_add(struct six_lock *lock, int nr)
-{
-	if (lock->readers)
-		this_cpu_add(*lock->readers, nr);
-	else if (nr > 0)
-		atomic64_add(__SIX_VAL(read_lock, nr), &lock->state.counter);
-	else
-		atomic64_sub(__SIX_VAL(read_lock, -nr), &lock->state.counter);
-}
 
 struct six_lock_count bch2_btree_node_lock_counts(struct btree_trans *trans,
 						  struct btree_path *skip,
