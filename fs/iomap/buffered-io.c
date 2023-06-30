@@ -187,10 +187,11 @@ static void iomap_finish_folio_read(struct folio *folio, size_t offset,
 static void iomap_read_end_io(struct bio *bio)
 {
 	int error = blk_status_to_errno(bio->bi_status);
-	struct folio_iter fi;
+	struct bvec_iter_all iter;
+	struct folio_vec fv;
 
-	bio_for_each_folio_all(fi, bio)
-		iomap_finish_folio_read(fi.folio, fi.offset, fi.length, error);
+	bio_for_each_folio_all(fv, bio, iter)
+		iomap_finish_folio_read(fv.fv_folio, fv.fv_offset, fv.fv_len, error);
 	bio_put(bio);
 }
 
@@ -292,8 +293,12 @@ static loff_t iomap_readpage_iter(const struct iomap_iter *iter,
 		gfp_t orig_gfp = gfp;
 		unsigned int nr_vecs = DIV_ROUND_UP(length, PAGE_SIZE);
 
-		if (ctx->bio)
-			submit_bio(ctx->bio);
+		if (ctx->bio) {
+			if (iomap->flags & IOMAP_F_NOSUBMIT)
+				bio_endio(ctx->bio);
+			else
+				submit_bio(ctx->bio);
+		}
 
 		if (ctx->rac) /* same as readahead_gfp_mask */
 			gfp |= __GFP_NORETRY | __GFP_NOWARN;
@@ -346,7 +351,10 @@ int iomap_read_folio(struct folio *folio, const struct iomap_ops *ops)
 		folio_set_error(folio);
 
 	if (ctx.bio) {
-		submit_bio(ctx.bio);
+		if (iter.iomap.flags & IOMAP_F_NOSUBMIT)
+			bio_endio(ctx.bio);
+		else
+			submit_bio(ctx.bio);
 		WARN_ON_ONCE(!ctx.cur_folio_in_bio);
 	} else {
 		WARN_ON_ONCE(ctx.cur_folio_in_bio);
@@ -418,8 +426,12 @@ void iomap_readahead(struct readahead_control *rac, const struct iomap_ops *ops)
 	while (iomap_iter(&iter, ops) > 0)
 		iter.processed = iomap_readahead_iter(&iter, &ctx);
 
-	if (ctx.bio)
-		submit_bio(ctx.bio);
+	if (ctx.bio) {
+		if (iter.iomap.flags & IOMAP_F_NOSUBMIT)
+			bio_endio(ctx.bio);
+		else
+			submit_bio(ctx.bio);
+	}
 	if (ctx.cur_folio) {
 		if (!ctx.cur_folio_in_bio)
 			folio_unlock(ctx.cur_folio);
@@ -516,11 +528,17 @@ static int iomap_read_folio_sync(loff_t block_start, struct folio *folio,
 {
 	struct bio_vec bvec;
 	struct bio bio;
+	int ret = 0;
 
 	bio_init(&bio, iomap->bdev, &bvec, 1, REQ_OP_READ);
 	bio.bi_iter.bi_sector = iomap_sector(iomap, block_start);
 	bio_add_folio(&bio, folio, plen, poff);
-	return submit_bio_wait(&bio);
+
+	if (iomap->flags & IOMAP_F_NOSUBMIT)
+		bio_endio(&bio);
+	else
+		ret = submit_bio_wait(&bio);
+	return ret;
 }
 
 static int __iomap_write_begin(const struct iomap_iter *iter, loff_t pos,
@@ -1299,7 +1317,8 @@ iomap_finish_ioend(struct iomap_ioend *ioend, int error)
 	u32 folio_count = 0;
 
 	for (bio = &ioend->io_inline_bio; bio; bio = next) {
-		struct folio_iter fi;
+		struct bvec_iter_all iter;
+		struct folio_vec fv;
 
 		/*
 		 * For the last bio, bi_private points to the ioend, so we
@@ -1311,8 +1330,8 @@ iomap_finish_ioend(struct iomap_ioend *ioend, int error)
 			next = bio->bi_private;
 
 		/* walk all folios in bio, ending page IO on them */
-		bio_for_each_folio_all(fi, bio) {
-			iomap_finish_folio_write(inode, fi.folio, fi.length,
+		bio_for_each_folio_all(fv, bio, iter) {
+			iomap_finish_folio_write(inode, fv.fv_folio, fv.fv_len,
 					error);
 			folio_count++;
 		}
@@ -1464,7 +1483,10 @@ iomap_submit_ioend(struct iomap_writepage_ctx *wpc, struct iomap_ioend *ioend,
 		return error;
 	}
 
-	submit_bio(ioend->io_bio);
+	if (wpc->iomap.flags & IOMAP_F_NOSUBMIT)
+		bio_endio(ioend->io_bio);
+	else
+		submit_bio(ioend->io_bio);
 	return 0;
 }
 
@@ -1502,8 +1524,9 @@ iomap_alloc_ioend(struct inode *inode, struct iomap_writepage_ctx *wpc,
  * traversal in iomap_finish_ioend().
  */
 static struct bio *
-iomap_chain_bio(struct bio *prev)
+iomap_chain_bio(struct iomap_writepage_ctx *wpc)
 {
+	struct bio *prev = wpc->ioend->io_bio;
 	struct bio *new;
 
 	new = bio_alloc(prev->bi_bdev, BIO_MAX_VECS, prev->bi_opf, GFP_NOFS);
@@ -1512,7 +1535,11 @@ iomap_chain_bio(struct bio *prev)
 
 	bio_chain(prev, new);
 	bio_get(prev);		/* for iomap_finish_ioend */
-	submit_bio(prev);
+
+	if (wpc->iomap.flags & IOMAP_F_NOSUBMIT)
+		bio_endio(prev);
+	else
+		submit_bio(prev);
 	return new;
 }
 
@@ -1559,7 +1586,7 @@ iomap_add_to_ioend(struct inode *inode, loff_t pos, struct folio *folio,
 	}
 
 	if (!bio_add_folio(wpc->ioend->io_bio, folio, len, poff)) {
-		wpc->ioend->io_bio = iomap_chain_bio(wpc->ioend->io_bio);
+		wpc->ioend->io_bio = iomap_chain_bio(wpc);
 		bio_add_folio(wpc->ioend->io_bio, folio, len, poff);
 	}
 
