@@ -220,7 +220,6 @@ iwl_parse_nvm_sections(struct iwl_mvm *mvm)
 	struct iwl_nvm_section *sections = mvm->nvm_sections;
 	const __be16 *hw;
 	const __le16 *sw, *calib, *regulatory, *mac_override, *phy_sku;
-	bool lar_enabled;
 	int regulatory_type;
 
 	/* Checking for required sections */
@@ -271,14 +270,9 @@ iwl_parse_nvm_sections(struct iwl_mvm *mvm)
 		(const __le16 *)sections[NVM_SECTION_TYPE_REGULATORY_SDP].data :
 		(const __le16 *)sections[NVM_SECTION_TYPE_REGULATORY].data;
 
-	lar_enabled = !iwlwifi_mod_params.lar_disable &&
-		      fw_has_capa(&mvm->fw->ucode_capa,
-				  IWL_UCODE_TLV_CAPA_LAR_SUPPORT);
-
 	return iwl_parse_nvm_data(mvm->trans, mvm->cfg, mvm->fw, hw, sw, calib,
 				  regulatory, mac_override, phy_sku,
-				  mvm->fw->valid_tx_ant, mvm->fw->valid_rx_ant,
-				  lar_enabled);
+				  mvm->fw->valid_tx_ant, mvm->fw->valid_rx_ant);
 }
 
 /* Loads the NVM data stored in mvm->nvm_sections into the NIC */
@@ -559,7 +553,7 @@ int iwl_mvm_init_mcc(struct iwl_mvm *mvm)
 		nvm_lar = mvm->nvm_data->lar_enabled;
 		if (tlv_lar != nvm_lar)
 			IWL_INFO(mvm,
-				 "Conflict between TLV & NVM regarding enabling LAR (TLV = %s NVM =%s)\n",
+				 "Conflict between TLV & NVM regarding enabling LAR (TLV = %s NVM = %s)\n",
 				 tlv_lar ? "enabled" : "disabled",
 				 nvm_lar ? "enabled" : "disabled");
 	}
