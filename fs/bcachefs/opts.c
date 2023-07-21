@@ -95,8 +95,8 @@ const char * const bch2_fs_usage_types[] = {
 
 #undef x
 
-int bch2_opt_fix_errors_parse(struct bch_fs *c, const char *val, u64 *res,
-			      struct printbuf *err)
+static int bch2_opt_fix_errors_parse(struct bch_fs *c, const char *val, u64 *res,
+				     struct printbuf *err)
 {
 	if (!val) {
 		*res = FSCK_FIX_yes;
@@ -113,10 +113,10 @@ int bch2_opt_fix_errors_parse(struct bch_fs *c, const char *val, u64 *res,
 	return 0;
 }
 
-void bch2_opt_fix_errors_to_text(struct printbuf *out,
-				 struct bch_fs *c,
-				 struct bch_sb *sb,
-				 u64 v)
+static void bch2_opt_fix_errors_to_text(struct printbuf *out,
+					struct bch_fs *c,
+					struct bch_sb *sb,
+					u64 v)
 {
 	prt_str(out, bch2_fsck_fix_opts[v]);
 }
