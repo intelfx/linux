@@ -698,6 +698,11 @@ err:
 	return ret;
 }
 
+static int cmp_le32(__le32 l, __le32 r)
+{
+	return cmp_int(le32_to_cpu(l), le32_to_cpu(r));
+}
+
 static int check_snapshot(struct btree_trans *trans,
 			  struct btree_iter *iter,
 			  struct bkey_s_c k)
@@ -830,7 +835,7 @@ static int check_snapshot(struct btree_trans *trans,
 		for (i = 0; i < ARRAY_SIZE(u->v.skip); i++)
 			u->v.skip[i] = cpu_to_le32(snapshot_skiplist_get(c, parent_id));
 
-		bubble_sort(u->v.skip, ARRAY_SIZE(u->v.skip), cmp_int);
+		bubble_sort(u->v.skip, ARRAY_SIZE(u->v.skip), cmp_le32);
 		s = u->v;
 	}
 	ret = 0;
@@ -1123,7 +1128,7 @@ static int create_snapids(struct btree_trans *trans, u32 parent, u32 tree,
 		for (j = 0; j < ARRAY_SIZE(n->v.skip); j++)
 			n->v.skip[j] = cpu_to_le32(snapshot_skiplist_get(c, parent));
 
-		bubble_sort(n->v.skip, ARRAY_SIZE(n->v.skip), cmp_int);
+		bubble_sort(n->v.skip, ARRAY_SIZE(n->v.skip), cmp_le32);
 		SET_BCH_SNAPSHOT_SUBVOL(&n->v, true);
 
 		ret = bch2_mark_snapshot(trans, BTREE_ID_snapshots, 0,
