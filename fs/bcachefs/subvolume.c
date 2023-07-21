@@ -83,7 +83,7 @@ static noinline struct snapshot_t *__snapshot_t_mut(struct bch_fs *c, u32 id)
 	if (!new)
 		return NULL;
 
-	old = c->snapshots;
+	old = rcu_dereference_protected(c->snapshots, true);
 	if (old)
 		memcpy(new->s,
 		       rcu_dereference_protected(c->snapshots, true)->s,
@@ -951,7 +951,7 @@ int bch2_check_subvols(struct bch_fs *c)
 
 void bch2_fs_snapshots_exit(struct bch_fs *c)
 {
-	kfree(c->snapshots);
+	kfree(rcu_dereference_protected(c->snapshots, true));
 }
 
 int bch2_snapshots_read(struct bch_fs *c)
