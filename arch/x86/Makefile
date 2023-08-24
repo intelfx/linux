@@ -154,6 +154,9 @@ else
         cflags-$(CONFIG_MPSC)		+= -march=nocona
         cflags-$(CONFIG_MCORE2)		+= -march=core2
         cflags-$(CONFIG_MATOM)		+= -march=atom
+        cflags-$(CONFIG_GENERIC_CPU2) 	+= -march=x86-64-v2
+        cflags-$(CONFIG_GENERIC_CPU3) 	+= -march=x86-64-v3
+        cflags-$(CONFIG_GENERIC_CPU4) 	+= -march=x86-64-v4
         cflags-$(CONFIG_GENERIC_CPU)	+= -mtune=generic
         KBUILD_CFLAGS += $(cflags-y)
 
