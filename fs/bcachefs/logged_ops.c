@@ -6,6 +6,7 @@
 #include "error.h"
 #include "io_misc.h"
 #include "logged_ops.h"
+#include "super.h"
 
 struct bch_logged_op_fn {
 	u8		type;
@@ -44,7 +45,8 @@ static int resume_logged_op(struct btree_trans *trans, struct btree_iter *iter,
 	bch2_bkey_buf_init(&sk);
 	bch2_bkey_buf_reassemble(&sk, c, k);
 
-	ret = fn->resume(trans, sk.k) ?: trans_was_restarted(trans, restart_count);
+	ret =   drop_locks_do(trans, (bch2_fs_lazy_rw(c), 0)) ?:
+		fn->resume(trans, sk.k) ?: trans_was_restarted(trans, restart_count);
 
 	bch2_bkey_buf_exit(&sk, c);
 	return ret;
