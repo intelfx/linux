@@ -1839,7 +1839,7 @@ static int bch2_dev_freespace_init(struct bch_fs *c, struct bch_dev *ca,
 	struct bkey_s_c k;
 	struct bkey hole;
 	struct bpos end = POS(ca->dev_idx, ca->mi.nbuckets);
-	struct bch_member *m;
+	struct bch_member m;
 	int ret;
 
 	bch2_trans_iter_init(trans, &iter, BTREE_ID_alloc,
@@ -1922,8 +1922,8 @@ bkey_err:
 	}
 
 	mutex_lock(&c->sb_lock);
-	m = bch2_sb_get_members(c->disk_sb.sb)->members + ca->dev_idx;
-	SET_BCH_MEMBER_FREESPACE_INITIALIZED(m, true);
+	m = bch2_sb_member_get(c->disk_sb.sb, ca->dev_idx);
+	SET_BCH_MEMBER_FREESPACE_INITIALIZED(&m, true);
 	mutex_unlock(&c->sb_lock);
 
 	return 0;
