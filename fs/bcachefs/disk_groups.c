@@ -151,14 +151,14 @@ const struct bch_sb_field_ops bch_sb_field_ops_disk_groups = {
 
 int bch2_sb_disk_groups_to_cpu(struct bch_fs *c)
 {
-	struct bch_sb_field_members *mi;
+	struct bch_sb_field_members_v1 *mi;
 	struct bch_sb_field_disk_groups *groups;
 	struct bch_disk_groups_cpu *cpu_g, *old_g;
 	unsigned i, g, nr_groups;
 
 	lockdep_assert_held(&c->sb_lock);
 
-	mi		= bch2_sb_get_members(c->disk_sb.sb);
+	mi		= bch2_sb_get_members_v1(c->disk_sb.sb);
 	groups		= bch2_sb_get_disk_groups(c->disk_sb.sb);
 	nr_groups	= disk_groups_nr(groups);
 
