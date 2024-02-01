@@ -3567,7 +3567,8 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 	set_bit(BTRFS_FS_OPEN, &fs_info->flags);
 
 	/* Kick the cleaner thread so it'll start deleting snapshots. */
-	if (test_bit(BTRFS_FS_UNFINISHED_DROPS, &fs_info->flags))
+	if (test_bit(BTRFS_FS_UNFINISHED_DROPS, &fs_info->flags) ||
+	    !list_empty(&fs_info->unused_bgs))
 		wake_up_process(fs_info->cleaner_kthread);
 
 clear_oneshot:

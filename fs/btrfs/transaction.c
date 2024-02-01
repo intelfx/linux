@@ -1104,6 +1104,9 @@ static int __btrfs_end_transaction(struct btrfs_trans_handle *trans,
 
 	btrfs_trans_release_chunk_metadata(trans);
 
+	if (!test_bit(BTRFS_FS_CLEANER_RUNNING, &info->flags))
+		wake_up_process(info->cleaner_kthread);
+
 	if (trans->type & __TRANS_FREEZABLE)
 		sb_end_intwrite(info->sb);
 
@@ -2552,7 +2555,8 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
 	btrfs_trans_state_lockdep_release(fs_info, BTRFS_LOCKDEP_TRANS_UNBLOCKED);
 
 	/* If we have features changed, wake up the cleaner to update sysfs. */
-	if (test_bit(BTRFS_FS_FEATURE_CHANGED, &fs_info->flags) &&
+	if ((test_bit(BTRFS_FS_FEATURE_CHANGED, &fs_info->flags) ||
+	     !list_empty(&fs_info->unused_bgs)) &&
 	    fs_info->cleaner_kthread)
 		wake_up_process(fs_info->cleaner_kthread);
 
