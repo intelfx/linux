@@ -717,7 +717,7 @@ retry:
 
 	if (IS_ERR(sb->bdev)) {
 		ret = PTR_ERR(sb->bdev);
-		goto out;
+		goto err;
 	}
 
 	ret = bch2_sb_realloc(sb, 0);
