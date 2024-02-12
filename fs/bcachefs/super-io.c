@@ -717,6 +717,7 @@ retry:
 
 	if (IS_ERR(sb->bdev)) {
 		ret = PTR_ERR(sb->bdev);
+		prt_printf(&err, "error opening %s: %s", path, bch2_err_str(ret));
 		goto err;
 	}
 
@@ -742,9 +743,9 @@ retry:
 	prt_printf(&err2, "bcachefs (%s): error reading default superblock: %s\n",
 	       path, err.buf);
 	if (ret == -BCH_ERR_invalid_sb_magic && ignore_notbchfs_msg)
-		printk(KERN_INFO "%s", err2.buf);
+		bch2_print_opts(opts, KERN_INFO "%s", err2.buf);
 	else
-		printk(KERN_ERR "%s", err2.buf);
+		bch2_print_opts(opts, KERN_ERR "%s", err2.buf);
 
 	printbuf_exit(&err2);
 	printbuf_reset(&err);
@@ -807,16 +808,16 @@ got_super:
 
 	ret = bch2_sb_validate(sb, &err, READ);
 	if (ret) {
-		printk(KERN_ERR "bcachefs (%s): error validating superblock: %s\n",
-		       path, err.buf);
+		bch2_print_opts(opts, KERN_ERR "bcachefs (%s): error validating superblock: %s\n",
+				path, err.buf);
 		goto err_no_print;
 	}
 out:
 	printbuf_exit(&err);
 	return ret;
 err:
-	printk(KERN_ERR "bcachefs (%s): error reading superblock: %s\n",
-	       path, err.buf);
+	bch2_print_opts(opts, KERN_ERR "bcachefs (%s): error reading superblock: %s\n",
+			path, err.buf);
 err_no_print:
 	bch2_free_super(sb);
 	goto out;
