@@ -1832,8 +1832,7 @@ static void read_symbols(const char *modname)
 	check_sec_ref(modname, &info);
 
 	if (!mod->is_vmlinux) {
-		version = get_modinfo(&info, "version");
-		if (version || all_versions)
+		if (all_versions)
 			get_src_version(mod->name, mod->srcversion,
 					sizeof(mod->srcversion) - 1);
 	}
