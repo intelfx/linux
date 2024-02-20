@@ -164,7 +164,10 @@ else
         rustflags-$(CONFIG_MPSC)	+= -Ctarget-cpu=nocona
         rustflags-$(CONFIG_MCORE2)	+= -Ctarget-cpu=core2
         rustflags-$(CONFIG_MATOM)	+= -Ctarget-cpu=atom
-        rustflags-$(CONFIG_GENERIC_CPU)	+= -Ztune-cpu=generic
+        rustflags-$(CONFIG_GENERIC_CPU2)        += -Ctarget-cpu=x86-64-v2
+        rustflags-$(CONFIG_GENERIC_CPU3)        += -Ctarget-cpu=x86-64-v3
+        rustflags-$(CONFIG_GENERIC_CPU4)        += -Ctarget-cpu=x86-64-v4
+        rustflags-$(CONFIG_GENERIC_CPU) += -Ctarget-cpu=x86-64 -Ztune-cpu=generic
         KBUILD_RUSTFLAGS += $(rustflags-y)
 
         KBUILD_CFLAGS += -mno-red-zone
