@@ -694,6 +694,16 @@ static int btrfs_open_one_device(struct btrfs_fs_devices *fs_devices,
 	device->bdev = bdev_handle->bdev;
 	clear_bit(BTRFS_DEV_STATE_IN_FS_METADATA, &device->dev_state);
 
+	if (device->devt != device->bdev->bd_dev) {
+		btrfs_warn(NULL,
+			   "device %s maj:min changed from %d:%d to %d:%d",
+			   device->name->str, MAJOR(device->devt),
+			   MINOR(device->devt), MAJOR(device->bdev->bd_dev),
+			   MINOR(device->bdev->bd_dev));
+
+		device->devt = device->bdev->bd_dev;
+	}
+
 	fs_devices->open_devices++;
 	if (test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) &&
 	    device->devid != BTRFS_DEV_REPLACE_DEVID) {
@@ -3430,7 +3440,17 @@ again:
 			mutex_unlock(&fs_info->reclaim_bgs_lock);
 			goto error;
 		}
-		BUG_ON(ret == 0); /* Corruption */
+		if (ret == 0) {
+			/*
+			 * On the first search we would find chunk tree with
+			 * offset -1, which is not possible. On subsequent
+			 * loops this would find an existing item on an invalid
+			 * offset (one less than the previous one, wrong
+			 * alignment and size).
+			 */
+			ret = -EUCLEAN;
+			goto error;
+		}
 
 		ret = btrfs_previous_item(chunk_root, path, key.objectid,
 					  key.type);
