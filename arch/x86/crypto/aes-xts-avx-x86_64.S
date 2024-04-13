@@ -82,16 +82,19 @@
 
 // Function parameters
 .set	KEY,		%rdi	// Initially points to crypto_aes_ctx, then is
-				// advanced to point directly to 7th round key
+				// advanced to point to 7th-from-last round key
 .set	SRC,		%rsi	// Pointer to next source data
 .set	DST,		%rdx	// Pointer to next destination data
-.set	LEN,		%rcx	// Remaining length in bytes
+.set	LEN,		%ecx	// Remaining length in bytes
+.set	LEN8,		%cl
+.set	LEN64,		%rcx
 .set	TWEAK,		%r8	// Pointer to next tweak
 
-// %r9d holds the AES key length in bytes.
-.set	KEYLEN,		%r9d
+// %rax holds the AES key length in bytes.
+.set	KEYLEN,		%eax
+.set	KEYLEN64,	%rax
 
-// %rax and %r10-r11 are available as temporaries.
+// %r9-r11 are available as temporaries.
 
 .macro	_define_Vi	i
 .if VL == 16
@@ -165,12 +168,18 @@
 	.set	GF_POLY_XMM,	%xmm14
 	.set	GF_POLY,	V14
 
-	// V15 holds the first AES round key, copied to all 128-bit lanes.
+	// V15 holds the key for AES "round 0", copied to all 128-bit lanes.
 	.set	KEY0_XMM,	%xmm15
 	.set	KEY0,		V15
 
 	// If 32 SIMD registers are available, then V16-V29 hold the remaining
 	// AES round keys, copied to all 128-bit lanes.
+	//
+	// AES-128, AES-192, and AES-256 use different numbers of round keys.
+	// To allow handling all three variants efficiently, we align the round
+	// keys to the *end* of this register range.  I.e., AES-128 uses
+	// KEY5-KEY14, AES-192 uses KEY3-KEY14, and AES-256 uses KEY1-KEY14.
+	// (All also use KEY0 for the XOR-only "round" at the beginning.)
 .if USE_AVX10
 	.set	KEY1_XMM,	%xmm16
 	.set	KEY1,		V16
@@ -340,15 +349,15 @@
 	.set PREV_TWEAK, NEXT_TWEAK2
 	.set NEXT_TWEAK, NEXT_TWEAK3
 .endif
-.if \i < 20 && \i % 5 == 0
+.if \i >= 0 && \i < 20 && \i % 5 == 0
 	vpshufd		$0x13, PREV_TWEAK, V5
-.elseif \i < 20 && \i % 5 == 1
+.elseif \i >= 0 && \i < 20 && \i % 5 == 1
 	vpaddq		PREV_TWEAK, PREV_TWEAK, NEXT_TWEAK
-.elseif \i < 20 && \i % 5 == 2
+.elseif \i >= 0 && \i < 20 && \i % 5 == 2
 	vpsrad		$31, V5, V5
-.elseif \i < 20 && \i % 5 == 3
+.elseif \i >= 0 && \i < 20 && \i % 5 == 3
 	vpand		GF_POLY, V5, V5
-.elseif \i < 20 && \i % 5 == 4
+.elseif \i >= 0 && \i < 20 && \i % 5 == 4
 	vpxor		V5, NEXT_TWEAK, NEXT_TWEAK
 .elseif \i == 1000
 	vmovdqa		NEXT_TWEAK0, TWEAK0
@@ -364,21 +373,21 @@
 // when VL > 16 (which it is here), the needed shift amounts are byte-aligned,
 // which allows the use of vpsrldq and vpslldq to do 128-bit wide shifts.
 .macro	_tweak_step_pclmul	i
-.if \i == 2
+.if \i == 0
 	vpsrldq		$(128 - 4*VL/16) / 8, TWEAK0, NEXT_TWEAK0
-.elseif \i == 4
+.elseif \i == 2
 	vpsrldq		$(128 - 4*VL/16) / 8, TWEAK1, NEXT_TWEAK1
-.elseif \i == 6
+.elseif \i == 4
 	vpsrldq		$(128 - 4*VL/16) / 8, TWEAK2, NEXT_TWEAK2
-.elseif \i == 8
+.elseif \i == 6
 	vpsrldq		$(128 - 4*VL/16) / 8, TWEAK3, NEXT_TWEAK3
-.elseif \i == 10
+.elseif \i == 8
 	vpclmulqdq	$0x00, GF_POLY, NEXT_TWEAK0, NEXT_TWEAK0
-.elseif \i == 12
+.elseif \i == 10
 	vpclmulqdq	$0x00, GF_POLY, NEXT_TWEAK1, NEXT_TWEAK1
-.elseif \i == 14
+.elseif \i == 12
 	vpclmulqdq	$0x00, GF_POLY, NEXT_TWEAK2, NEXT_TWEAK2
-.elseif \i == 16
+.elseif \i == 14
 	vpclmulqdq	$0x00, GF_POLY, NEXT_TWEAK3, NEXT_TWEAK3
 .elseif \i == 1000
 	vpslldq		$(4*VL/16) / 8, TWEAK0, TWEAK0
@@ -393,8 +402,8 @@
 .endm
 
 // _tweak_step does one step of the computation of the next set of tweaks from
-// TWEAK[0-3].  To complete all steps, this must be invoked with \i values 0
-// through at least 19, then 1000 which signals the last step.
+// TWEAK[0-3].  To complete all steps, this is invoked with increasing values of
+// \i that include at least 0 through 19, then 1000 which signals the last step.
 //
 // This is used to interleave the computation of the next set of tweaks with the
 // AES en/decryptions, which increases performance in some cases.
@@ -406,22 +415,56 @@
 .endif
 .endm
 
-// Load the round keys: just the first one if !USE_AVX10, otherwise all of them.
-.macro	_load_round_keys
-	_vbroadcast128	-7*16(KEY), KEY0
+.macro	_setup_round_keys	enc
+
+	// Select either the encryption round keys or the decryption round keys.
+.if \enc
+	.set	OFFS, 0
+.else
+	.set	OFFS, 240
+.endif
+
+	// Load the round key for "round 0".
+	_vbroadcast128	OFFS(KEY), KEY0
+
+	// Increment KEY to make it so that 7*16(KEY) is the last round key.
+	// For AES-128, increment by 3*16, resulting in the 10 round keys (not
+	// counting the zero-th round key which was just loaded into KEY0) being
+	// -2*16(KEY) through 7*16(KEY).  For AES-192, increment by 5*16 and use
+	// 12 round keys -4*16(KEY) through 7*16(KEY).  For AES-256, increment
+	// by 7*16 and use 14 round keys -6*16(KEY) through 7*16(KEY).
+	//
+	// This rebasing provides two benefits.  First, it makes the offset to
+	// any round key be in the range [-96, 112], fitting in a signed byte.
+	// This shortens VEX-encoded instructions that access the later round
+	// keys which otherwise would need 4-byte offsets.  Second, it makes it
+	// easy to do AES-128 and AES-192 by skipping irrelevant rounds at the
+	// beginning.  Skipping rounds at the end doesn't work as well because
+	// the last round needs different instructions.
+	//
+	// An alternative approach would be to roll up all the round loops.  We
+	// don't do that because it isn't compatible with caching the round keys
+	// in registers which we do when possible (see below), and also because
+	// it seems unwise to rely *too* heavily on the CPU's branch predictor.
+	lea		OFFS-16(KEY, KEYLEN64, 4), KEY
+
+	// If all 32 SIMD registers are available, cache all the round keys.
 .if USE_AVX10
+	cmp		$24, KEYLEN
+	jl		.Laes128\@
+	je		.Laes192\@
 	_vbroadcast128	-6*16(KEY), KEY1
 	_vbroadcast128	-5*16(KEY), KEY2
+.Laes192\@:
 	_vbroadcast128	-4*16(KEY), KEY3
 	_vbroadcast128	-3*16(KEY), KEY4
+.Laes128\@:
 	_vbroadcast128	-2*16(KEY), KEY5
 	_vbroadcast128	-1*16(KEY), KEY6
 	_vbroadcast128	0*16(KEY), KEY7
 	_vbroadcast128	1*16(KEY), KEY8
 	_vbroadcast128	2*16(KEY), KEY9
 	_vbroadcast128	3*16(KEY), KEY10
-	// Note: if it's AES-128 or AES-192, the last several round keys won't
-	// be used.  We do the loads anyway to save a conditional jump.
 	_vbroadcast128	4*16(KEY), KEY11
 	_vbroadcast128	5*16(KEY), KEY12
 	_vbroadcast128	6*16(KEY), KEY13
@@ -466,22 +509,22 @@
 
 // Do a single round of AES en/decryption on the blocks in registers V0-V3,
 // using the same key for all blocks.  The round key is loaded from the
-// appropriate register or memory location for round \i.  In addition, does step
-// \i of the computation of the next set of tweaks.  May clobber V4.
+// appropriate register or memory location for round \i.  In addition, does two
+// steps of the computation of the next set of tweaks.  May clobber V4.
 .macro	_vaes_4x	enc, last, i
 .if USE_AVX10
-	_tweak_step	(2*(\i-1))
+	_tweak_step	(2*(\i-5))
 	_vaes		\enc, \last, KEY\i, V0
 	_vaes		\enc, \last, KEY\i, V1
-	_tweak_step	(2*(\i-1) + 1)
+	_tweak_step	(2*(\i-5) + 1)
 	_vaes		\enc, \last, KEY\i, V2
 	_vaes		\enc, \last, KEY\i, V3
 .else
 	_vbroadcast128	(\i-7)*16(KEY), V4
-	_tweak_step	(2*(\i-1))
+	_tweak_step	(2*(\i-5))
 	_vaes		\enc, \last, V4, V0
 	_vaes		\enc, \last, V4, V1
-	_tweak_step	(2*(\i-1) + 1)
+	_tweak_step	(2*(\i-5) + 1)
 	_vaes		\enc, \last, V4, V2
 	_vaes		\enc, \last, V4, V3
 .endif
@@ -493,59 +536,47 @@
 // length VL, use V* registers and leave \xmm_suffix empty.  May clobber V4.
 .macro	_aes_crypt	enc, xmm_suffix, tweak, data
 	_xor3		KEY0\xmm_suffix, \tweak, \data
+	cmp		$24, KEYLEN
+	jl		.Laes128\@
+	je		.Laes192\@
 	_vaes_1x	\enc, 0, 1, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 2, \xmm_suffix, \data
+.Laes192\@:
 	_vaes_1x	\enc, 0, 3, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 4, \xmm_suffix, \data
+.Laes128\@:
 	_vaes_1x	\enc, 0, 5, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 6, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 7, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 8, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 9, \xmm_suffix, \data
-	cmp		$24, KEYLEN
-	jle		.Laes_128_or_192\@
 	_vaes_1x	\enc, 0, 10, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 11, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 12, \xmm_suffix, \data
 	_vaes_1x	\enc, 0, 13, \xmm_suffix, \data
 	_vaes_1x	\enc, 1, 14, \xmm_suffix, \data
-	jmp		.Laes_done\@
-.Laes_128_or_192\@:
-	je		.Laes_192\@
-	_vaes_1x	\enc, 1, 10, \xmm_suffix, \data
-	jmp		.Laes_done\@
-.Laes_192\@:
-	_vaes_1x	\enc, 0, 10, \xmm_suffix, \data
-	_vaes_1x	\enc, 0, 11, \xmm_suffix, \data
-	_vaes_1x	\enc, 1, 12, \xmm_suffix, \data
-.Laes_done\@:
 	_vpxor		\tweak, \data, \data
 .endm
 
 .macro	_aes_xts_crypt	enc
 	_define_aliases
 
+.if !\enc
+	// When decrypting a message whose length isn't a multiple of the AES
+	// block length, exclude the last full block from the main loop by
+	// subtracting 16 from LEN.  This is needed because ciphertext stealing
+	// decryption uses the last two tweaks in reverse order.  We'll handle
+	// the last full block and the partial block specially at the end.
+	lea		-16(LEN), %eax
+	test		$15, LEN8
+	cmovnz		%eax, LEN
+.endif
+
 	// Load the AES key length: 16 (AES-128), 24 (AES-192), or 32 (AES-256).
 	movl		480(KEY), KEYLEN
 
-	// Advance KEY to point to the 7th encryption round key (if encrypting)
-	// or the 7th decryption round key (if decrypting).  This makes the
-	// offset to any round key be in the range [-112, 112], fitting in a
-	// signed byte.  This shortens VEX-encoded instructions that access the
-	// 8th and later round keys which otherwise would need 4-byte offsets.
-.if \enc
-	add		$7*16, KEY
-.else
-	add		$(15+7)*16, KEY
-.endif
-
-	// Check whether the data length is a multiple of the AES block length.
-	test		$15, LEN
-	jnz		.Lneed_cts\@
-.Lxts_init\@:
-
-	// Cache as many round keys as possible.
-	_load_round_keys
+	// Setup the pointer to the round keys and cache as many as possible.
+	_setup_round_keys	\enc
 
 	// Compute the first set of tweaks TWEAK[0-3].
 	_compute_first_set_of_tweaks
@@ -556,7 +587,7 @@
 .Lmain_loop\@:
 	// This is the main loop, en/decrypting 4*VL bytes per iteration.
 
-	// XOR each source block with its tweak and the first round key.
+	// XOR each source block with its tweak and the zero-th round key.
 .if USE_AVX10
 	vmovdqu8	0*VL(SRC), V0
 	vmovdqu8	1*VL(SRC), V1
@@ -576,27 +607,27 @@
 	vpxor		TWEAK2, V2, V2
 	vpxor		TWEAK3, V3, V3
 .endif
+	cmp		$24, KEYLEN
+	jl		.Laes128\@
+	je		.Laes192\@
 	// Do all the AES rounds on the data blocks, interleaved with
 	// the computation of the next set of tweaks.
 	_vaes_4x	\enc, 0, 1
 	_vaes_4x	\enc, 0, 2
+.Laes192\@:
 	_vaes_4x	\enc, 0, 3
 	_vaes_4x	\enc, 0, 4
+.Laes128\@:
 	_vaes_4x	\enc, 0, 5
 	_vaes_4x	\enc, 0, 6
 	_vaes_4x	\enc, 0, 7
 	_vaes_4x	\enc, 0, 8
 	_vaes_4x	\enc, 0, 9
-	// Try to optimize for AES-256 by keeping the code for AES-128 and
-	// AES-192 out-of-line.
-	cmp		$24, KEYLEN
-	jle		.Lencrypt_4x_aes_128_or_192\@
 	_vaes_4x	\enc, 0, 10
 	_vaes_4x	\enc, 0, 11
 	_vaes_4x	\enc, 0, 12
 	_vaes_4x	\enc, 0, 13
 	_vaes_4x	\enc, 1, 14
-.Lencrypt_4x_done\@:
 
 	// XOR in the tweaks again.
 	_vpxor		TWEAK0, V0, V0
@@ -621,7 +652,7 @@
 	// Check for the uncommon case where the data length isn't a multiple of
 	// 4*VL.  Handle it out-of-line in order to optimize for the common
 	// case.  In the common case, just fall through to the ret.
-	test		$4*VL-1, LEN
+	test		$4*VL-1, LEN8
 	jnz		.Lhandle_remainder\@
 .Ldone\@:
 	// Store the next tweak back to *TWEAK to support continuation calls.
@@ -632,11 +663,10 @@
 	RET
 
 .Lhandle_remainder\@:
-	add		$4*VL, LEN	// Undo the extra sub from earlier.
 
 	// En/decrypt any remaining full blocks, one vector at a time.
 .if VL > 16
-	sub		$VL, LEN
+	add		$3*VL, LEN	// Undo extra sub of 4*VL, then sub VL.
 	jl		.Lvec_at_a_time_done\@
 .Lvec_at_a_time\@:
 	_vmovdqu	(SRC), V0
@@ -648,9 +678,9 @@
 	sub		$VL, LEN
 	jge		.Lvec_at_a_time\@
 .Lvec_at_a_time_done\@:
-	add		$VL-16, LEN	// Undo the extra sub from earlier.
+	add		$VL-16, LEN	// Undo extra sub of VL, then sub 16.
 .else
-	sub		$16, LEN
+	add		$4*VL-16, LEN	// Undo extra sub of 4*VL, then sub 16.
 .endif
 
 	// En/decrypt any remaining full blocks, one at a time.
@@ -665,82 +695,60 @@
 	sub		$16, LEN
 	jge		.Lblock_at_a_time\@
 .Lblock_at_a_time_done\@:
-	add		$16, LEN	// Undo the extra sub from earlier.
+	add		$16, LEN	// Undo the extra sub of 16.
+	// Now 0 <= LEN <= 15.  If LEN is zero, we're done.
+	jz		.Ldone\@
 
-.Lfull_blocks_done\@:
-	// Now 0 <= LEN <= 15.  If LEN is nonzero, do ciphertext stealing to
-	// process the last 16 + LEN bytes.  If LEN is zero, we're done.
-	test		LEN, LEN
-	jnz		.Lcts\@
-	jmp		.Ldone\@
+	// Otherwise 1 <= LEN <= 15, but the real remaining length is 16 + LEN.
+	// Do ciphertext stealing to process the last 16 + LEN bytes.
 
-	// Out-of-line handling of AES-128 and AES-192
-.Lencrypt_4x_aes_128_or_192\@:
-	jz		.Lencrypt_4x_aes_192\@
-	_vaes_4x	\enc, 1, 10
-	jmp		.Lencrypt_4x_done\@
-.Lencrypt_4x_aes_192\@:
-	_vaes_4x	\enc, 0, 10
-	_vaes_4x	\enc, 0, 11
-	_vaes_4x	\enc, 1, 12
-	jmp		.Lencrypt_4x_done\@
-
-.Lneed_cts\@:
-	// The data length isn't a multiple of the AES block length, so
-	// ciphertext stealing (CTS) will be needed.  Subtract one block from
-	// LEN so that the main loop doesn't process the last full block.  The
-	// CTS step will process it specially along with the partial block.
-	sub		$16, LEN
-	jmp		.Lxts_init\@
-
-.Lcts\@:
-	// Do ciphertext stealing (CTS) to en/decrypt the last full block and
-	// the partial block.  CTS needs two tweaks.  TWEAK0_XMM contains the
-	// next tweak; compute the one after that.  Decryption uses these two
-	// tweaks in reverse order, so also define aliases to handle that.
-	_next_tweak	TWEAK0_XMM, %xmm0, TWEAK1_XMM
 .if \enc
-	.set		CTS_TWEAK0,	TWEAK0_XMM
-	.set		CTS_TWEAK1,	TWEAK1_XMM
+	// If encrypting, the main loop already encrypted the last full block to
+	// create the CTS intermediate ciphertext.  Prepare for the rest of CTS
+	// by rewinding the pointers and loading the intermediate ciphertext.
+	sub		$16, SRC
+	sub		$16, DST
+	vmovdqu		(DST), %xmm0
 .else
-	.set		CTS_TWEAK0,	TWEAK1_XMM
-	.set		CTS_TWEAK1,	TWEAK0_XMM
-.endif
-
-	// En/decrypt the last full block.
+	// If decrypting, the main loop didn't decrypt the last full block
+	// because CTS decryption uses the last two tweaks in reverse order.
+	// Do it now by advancing the tweak and decrypting the last full block.
+	_next_tweak	TWEAK0_XMM, %xmm0, TWEAK1_XMM
 	vmovdqu		(SRC), %xmm0
-	_aes_crypt	\enc, _XMM, CTS_TWEAK0, %xmm0
+	_aes_crypt	\enc, _XMM, TWEAK1_XMM, %xmm0
+.endif
 
 .if USE_AVX10
 	// Create a mask that has the first LEN bits set.
-	mov		$-1, %rax
-	bzhi		LEN, %rax, %rax
-	kmovq		%rax, %k1
+	mov		$-1, %r9d
+	bzhi		LEN, %r9d, %r9d
+	kmovd		%r9d, %k1
 
-	// Swap the first LEN bytes of the above result with the partial block.
-	// Note that to support in-place en/decryption, the load from the src
-	// partial block must happen before the store to the dst partial block.
+	// Swap the first LEN bytes of the en/decryption of the last full block
+	// with the partial block.  Note that to support in-place en/decryption,
+	// the load from the src partial block must happen before the store to
+	// the dst partial block.
 	vmovdqa		%xmm0, %xmm1
 	vmovdqu8	16(SRC), %xmm0{%k1}
 	vmovdqu8	%xmm1, 16(DST){%k1}
 .else
-	lea		.Lcts_permute_table(%rip), %rax
+	lea		.Lcts_permute_table(%rip), %r9
 
 	// Load the src partial block, left-aligned.  Note that to support
 	// in-place en/decryption, this must happen before the store to the dst
 	// partial block.
-	vmovdqu		(SRC, LEN, 1), %xmm1
+	vmovdqu		(SRC, LEN64, 1), %xmm1
 
 	// Shift the first LEN bytes of the en/decryption of the last full block
 	// to the end of a register, then store it to DST+LEN.  This stores the
 	// dst partial block.  It also writes to the second part of the dst last
 	// full block, but that part is overwritten later.
-	vpshufb		(%rax, LEN, 1), %xmm0, %xmm2
-	vmovdqu		%xmm2, (DST, LEN, 1)
+	vpshufb		(%r9, LEN64, 1), %xmm0, %xmm2
+	vmovdqu		%xmm2, (DST, LEN64, 1)
 
 	// Make xmm3 contain [16-LEN,16-LEN+1,...,14,15,0x80,0x80,...].
-	sub		LEN, %rax
-	vmovdqu		32(%rax), %xmm3
+	sub		LEN64, %r9
+	vmovdqu		32(%r9), %xmm3
 
 	// Shift the src partial block to the beginning of its register.
 	vpshufb		%xmm3, %xmm1, %xmm1
@@ -750,7 +758,7 @@
 	vpblendvb	%xmm3, %xmm0, %xmm1, %xmm0
 .endif
 	// En/decrypt again and store the last full block.
-	_aes_crypt	\enc, _XMM, CTS_TWEAK1, %xmm0
+	_aes_crypt	\enc, _XMM, TWEAK0_XMM, %xmm0
 	vmovdqu		%xmm0, (DST)
 	jmp		.Ldone\@
 .endm
@@ -759,45 +767,37 @@
 //			   u8 iv[AES_BLOCK_SIZE]);
 SYM_TYPED_FUNC_START(aes_xts_encrypt_iv)
 	vmovdqu		(%rsi), %xmm0
-	add		$7*16, %rdi
-	vpxor		-7*16(%rdi), %xmm0, %xmm0
+	vpxor		(%rdi), %xmm0, %xmm0
+	movl		480(%rdi), %eax		// AES key length
+	lea		-16(%rdi, %rax, 4), %rdi
+	cmp		$24, %eax
+	jl		.Lencrypt_iv_aes128
+	je		.Lencrypt_iv_aes192
 	vaesenc		-6*16(%rdi), %xmm0, %xmm0
 	vaesenc		-5*16(%rdi), %xmm0, %xmm0
+.Lencrypt_iv_aes192:
 	vaesenc		-4*16(%rdi), %xmm0, %xmm0
 	vaesenc		-3*16(%rdi), %xmm0, %xmm0
+.Lencrypt_iv_aes128:
 	vaesenc		-2*16(%rdi), %xmm0, %xmm0
 	vaesenc		-1*16(%rdi), %xmm0, %xmm0
 	vaesenc		0*16(%rdi), %xmm0, %xmm0
 	vaesenc		1*16(%rdi), %xmm0, %xmm0
 	vaesenc		2*16(%rdi), %xmm0, %xmm0
-	cmpl		$24, 480-(7*16)(%rdi)
-	jle		.Lencrypt_iv_aes_128_or_192
 	vaesenc		3*16(%rdi), %xmm0, %xmm0
 	vaesenc		4*16(%rdi), %xmm0, %xmm0
 	vaesenc		5*16(%rdi), %xmm0, %xmm0
 	vaesenc		6*16(%rdi), %xmm0, %xmm0
 	vaesenclast	7*16(%rdi), %xmm0, %xmm0
-.Lencrypt_iv_done:
 	vmovdqu		%xmm0, (%rsi)
 	RET
-
-	// Out-of-line handling of AES-128 and AES-192
-.Lencrypt_iv_aes_128_or_192:
-	jz		.Lencrypt_iv_aes_192
-	vaesenclast	3*16(%rdi), %xmm0, %xmm0
-	jmp		.Lencrypt_iv_done
-.Lencrypt_iv_aes_192:
-	vaesenc		3*16(%rdi), %xmm0, %xmm0
-	vaesenc		4*16(%rdi), %xmm0, %xmm0
-	vaesenclast	5*16(%rdi), %xmm0, %xmm0
-	jmp		.Lencrypt_iv_done
 SYM_FUNC_END(aes_xts_encrypt_iv)
 
 // Below are the actual AES-XTS encryption and decryption functions,
 // instantiated from the above macro.  They all have the following prototype:
 //
 // void (*xts_asm_func)(const struct crypto_aes_ctx *key,
-//			const u8 *src, u8 *dst, size_t len,
+//			const u8 *src, u8 *dst, unsigned int len,
 //			u8 tweak[AES_BLOCK_SIZE]);
 //
 // |key| is the data key.  |tweak| contains the next tweak; the encryption of
