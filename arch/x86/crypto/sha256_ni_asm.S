@@ -62,14 +62,14 @@
 
 #define SHA256CONSTANTS	%rax
 
-#define MSG		%xmm0
+#define MSG		%xmm0  /* sha256rnds2 implicit operand */
 #define STATE0		%xmm1
 #define STATE1		%xmm2
-#define MSGTMP0		%xmm3
-#define MSGTMP1		%xmm4
-#define MSGTMP2		%xmm5
-#define MSGTMP3		%xmm6
-#define MSGTMP4		%xmm7
+#define MSG0		%xmm3
+#define MSG1		%xmm4
+#define MSG2		%xmm5
+#define MSG3		%xmm6
+#define TMP		%xmm7
 
 #define SHUF_MASK	%xmm8
 
@@ -78,18 +78,16 @@
 
 .macro do_4rounds	i, m0, m1, m2, m3
 .if \i < 16
-	movdqu		\i*4(DATA_PTR), MSG
-	pshufb		SHUF_MASK, MSG
-	movdqa		MSG, \m0
-.else
-	movdqa		\m0, MSG
+	movdqu		\i*4(DATA_PTR), \m0
+	pshufb		SHUF_MASK, \m0
 .endif
-	paddd		(\i-32)*4(SHA256CONSTANTS), MSG
+	movdqa		(\i-32)*4(SHA256CONSTANTS), MSG
+	paddd		\m0, MSG
 	sha256rnds2	STATE0, STATE1
 .if \i >= 12 && \i < 60
-	movdqa		\m0, MSGTMP4
-	palignr		$4, \m3, MSGTMP4
-	paddd		MSGTMP4, \m1
+	movdqa		\m0, TMP
+	palignr		$4, \m3, TMP
+	paddd		TMP, \m1
 	sha256msg2	\m0, \m1
 .endif
 	punpckhqdq	MSG, MSG
@@ -97,13 +95,6 @@
 .if \i >= 4 && \i < 52
 	sha256msg1	\m0, \m3
 .endif
-.endm
-
-.macro do_16rounds	i
-	do_4rounds	(\i + 0),  MSGTMP0, MSGTMP1, MSGTMP2, MSGTMP3
-	do_4rounds	(\i + 4),  MSGTMP1, MSGTMP2, MSGTMP3, MSGTMP0
-	do_4rounds	(\i + 8),  MSGTMP2, MSGTMP3, MSGTMP0, MSGTMP1
-	do_4rounds	(\i + 12), MSGTMP3, MSGTMP0, MSGTMP1, MSGTMP2
 .endm
 
 /*
@@ -138,9 +129,9 @@ SYM_TYPED_FUNC_START(sha256_ni_transform)
 	movdqu		0*16(DIGEST_PTR), STATE0	/* DCBA */
 	movdqu		1*16(DIGEST_PTR), STATE1	/* HGFE */
 
-	movdqa		STATE0, MSGTMP4
+	movdqa		STATE0, TMP
 	punpcklqdq	STATE1, STATE0			/* FEBA */
-	punpckhqdq	MSGTMP4, STATE1			/* DCHG */
+	punpckhqdq	TMP, STATE1			/* DCHG */
 	pshufd		$0x1B, STATE0, STATE0		/* ABEF */
 	pshufd		$0xB1, STATE1, STATE1		/* CDGH */
 
@@ -152,10 +143,12 @@ SYM_TYPED_FUNC_START(sha256_ni_transform)
 	movdqa		STATE0, ABEF_SAVE
 	movdqa		STATE1, CDGH_SAVE
 
-	do_16rounds	0
-	do_16rounds	16
-	do_16rounds	32
-	do_16rounds	48
+.irp i, 0, 16, 32, 48
+	do_4rounds	(\i + 0),  MSG0, MSG1, MSG2, MSG3
+	do_4rounds	(\i + 4),  MSG1, MSG2, MSG3, MSG0
+	do_4rounds	(\i + 8),  MSG2, MSG3, MSG0, MSG1
+	do_4rounds	(\i + 12), MSG3, MSG0, MSG1, MSG2
+.endr
 
 	/* Add current hash values with previously saved */
 	paddd		ABEF_SAVE, STATE0
@@ -167,9 +160,9 @@ SYM_TYPED_FUNC_START(sha256_ni_transform)
 	jne		.Lloop0
 
 	/* Write hash values back in the correct order */
-	movdqa		STATE0, MSGTMP4
+	movdqa		STATE0, TMP
 	punpcklqdq	STATE1, STATE0			/* GHEF */
-	punpckhqdq	MSGTMP4, STATE1			/* ABCD */
+	punpckhqdq	TMP, STATE1			/* ABCD */
 	pshufd		$0xB1, STATE0, STATE0		/* HGFE */
 	pshufd		$0x1B, STATE1, STATE1		/* DCBA */
 
