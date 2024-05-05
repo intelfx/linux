@@ -50,6 +50,7 @@
 
 #define AMD_PSTATE_TRANSITION_LATENCY	20000
 #define AMD_PSTATE_TRANSITION_DELAY	1000
+#define AMD_PSTATE_PREFCORE_THRESHOLD	166
 
 /*
  * TODO: We need more time to fine tune processors with shared memory solution
@@ -337,11 +338,14 @@ static int pstate_init_perf(struct amd_cpudata *cpudata)
 	if (ret)
 		return ret;
 
-	/* Some CPUs have different highest_perf from others, it is safer
-	 * to read it than to assume some erroneous value, leading to performance issues.
+	/* For platforms that do not support the preferred core feature, the
+	 * highest_pef may be configured with 166 or 255, to avoid max frequency
+	 * calculated wrongly. we take the AMD_CPPC_HIGHEST_PERF(cap1) value as
+	 * the default max perf.
 	 */
-	highest_perf = amd_get_highest_perf();
-	if (highest_perf > AMD_CPPC_HIGHEST_PERF(cap1))
+	if (cpudata->hw_prefcore)
+		highest_perf = AMD_PSTATE_PREFCORE_THRESHOLD;
+	else
 		highest_perf = AMD_CPPC_HIGHEST_PERF(cap1);
 
 	WRITE_ONCE(cpudata->highest_perf, highest_perf);
@@ -363,11 +367,9 @@ static int cppc_init_perf(struct amd_cpudata *cpudata)
 	if (ret)
 		return ret;
 
-	/* Some CPUs have different highest_perf from others, it is safer
-	 * to read it than to assume some erroneous value, leading to performance issues.
-	 */
-	highest_perf = amd_get_highest_perf();
-	if (highest_perf > cppc_perf.highest_perf)
+	if (cpudata->hw_prefcore)
+		highest_perf = AMD_PSTATE_PREFCORE_THRESHOLD;
+	else
 		highest_perf = cppc_perf.highest_perf;
 
 	WRITE_ONCE(cpudata->highest_perf, highest_perf);
@@ -473,8 +475,6 @@ static inline bool amd_pstate_sample(struct amd_cpudata *cpudata)
 static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
 			      u32 des_perf, u32 max_perf, bool fast_switch, int gov_flags)
 {
-	unsigned long max_freq;
-	struct cpufreq_policy *policy = cpufreq_cpu_get(cpudata->cpu);
 	u64 prev = READ_ONCE(cpudata->cppc_req_cached);
 	u32 nominal_perf = READ_ONCE(cpudata->nominal_perf);
 	u64 value = prev;
@@ -484,9 +484,6 @@ static void amd_pstate_update(struct amd_cpudata *cpudata, u32 min_perf,
 	max_perf = clamp_t(unsigned long, max_perf, cpudata->min_limit_perf,
 			cpudata->max_limit_perf);
 	des_perf = clamp_t(unsigned long, des_perf, min_perf, max_perf);
-
-	max_freq = READ_ONCE(cpudata->max_limit_freq);
-	policy->cur = div_u64(des_perf * max_freq, max_perf);
 
 	if ((cppc_state == AMD_PSTATE_GUIDED) && (gov_flags & CPUFREQ_GOV_DYNAMIC_SWITCHING)) {
 		min_perf = des_perf;
@@ -613,9 +610,10 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
 				   unsigned long capacity)
 {
 	unsigned long max_perf, min_perf, des_perf,
-		      cap_perf, lowest_nonlinear_perf;
+		      cap_perf, lowest_nonlinear_perf, max_freq;
 	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
 	struct amd_cpudata *cpudata = policy->driver_data;
+	unsigned int target_freq;
 
 	if (policy->min != cpudata->min_limit_freq || policy->max != cpudata->max_limit_freq)
 		amd_pstate_update_min_max_limit(policy);
@@ -623,6 +621,7 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
 
 	cap_perf = READ_ONCE(cpudata->highest_perf);
 	lowest_nonlinear_perf = READ_ONCE(cpudata->lowest_nonlinear_perf);
+	max_freq = READ_ONCE(cpudata->max_freq);
 
 	des_perf = cap_perf;
 	if (target_perf < capacity)
@@ -640,6 +639,8 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
 		max_perf = min_perf;
 
 	des_perf = clamp_t(unsigned long, des_perf, min_perf, max_perf);
+	target_freq = div_u64(des_perf * max_freq, max_perf);
+	policy->cur = target_freq;
 
 	amd_pstate_update(cpudata, min_perf, des_perf, max_perf, true,
 			policy->governor->flags);
@@ -1634,12 +1635,6 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
 	cpudata->policy = policy->policy;
 
 	amd_pstate_epp_update_limit(policy);
-
-	/*
-	 * policy->cur is never updated with the amd_pstate_epp driver, but it
-	 * is used as a stale frequency value. So, keep it within limits.
-	 */
-	policy->cur = policy->min;
 
 	return 0;
 }
