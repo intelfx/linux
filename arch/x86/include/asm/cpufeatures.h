@@ -456,6 +456,8 @@
 #define X86_FEATURE_IBPB_BRTYPE		(20*32+28) /* "" MSR_PRED_CMD[IBPB] flushes all branch type predictions */
 #define X86_FEATURE_SRSO_NO		(20*32+29) /* "" CPU is not affected by SRSO */
 
+#define X86_FEATURE_HETERO_CORE_TOPOLOGY       (21*32+ 5) /* "" Heterogeneous Core Topology */
+
 /*
  * BUG word(s)
  */
