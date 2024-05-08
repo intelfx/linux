@@ -281,6 +281,26 @@ integer values defined between 0 to 255 when EPP feature is enabled by platform
 firmware, if EPP feature is disabled, driver will ignore the written value
 This attribute is read-write.
 
+``boost``
+The `boost` sysfs attribute provides control over the CPU core
+performance boost, allowing users to manage the maximum frequency limitation
+of the CPU. This attribute can be used to enable or disable the boost feature
+on individual CPUs.
+
+When the boost feature is enabled, the CPU can dynamically increase its frequency
+beyond the base frequency, providing enhanced performance for demanding workloads.
+On the other hand, disabling the boost feature restricts the CPU to operate at the
+base frequency, which may be desirable in certain scenarios to prioritize power
+efficiency or manage temperature.
+
+To manipulate the `boost` attribute, users can write a value of `0` to disable the
+boost or `1` to enable it, for the respective CPU using the sysfs path
+`/sys/devices/system/cpu/cpuX/cpufreq/boost`, where `X` represents the CPU number.
+
+It is important to note that modifying the global variable
+`amd_pstate_global_params.cpb_boost` will override the individual CPU settings.
+
+
 Other performance and frequency values can be read back from
 ``/sys/devices/system/cpu/cpuX/acpi_cppc/``, see :ref:`cppc_sysfs`.
 
@@ -299,6 +319,10 @@ module which supports the new AMD P-States mechanism on most of the future AMD
 platforms. The AMD P-States mechanism is the more performance and energy
 efficiency frequency management method on AMD processors.
 
+When users attempt to switch from the acpi-cpufreq driver to the amd-pstate driver's working mode,
+it is recommended to reboot the system. This is to ensure that any low-level power management
+control states are properly switched to pstate control. By rebooting, the firmware can initialize
+with optimal power states, reducing the likelihood of unexpected issues.
 
 ``amd-pstate`` Driver Operation Modes
 ======================================
@@ -406,7 +430,7 @@ control its functionality at the system level.  They are located in the
 ``/sys/devices/system/cpu/amd_pstate/`` directory and affect all CPUs.
 
 ``status``
-	Operation mode of the driver: "active", "passive" or "disable".
+	Operation mode of the driver: "active", "passive", "guided" or "disable".
 
 	"active"
 		The driver is functional and in the ``active mode``
@@ -444,9 +468,8 @@ control its functionality at the system level.  They are located in the
         Specifies whether core performance boost is requested to be enabled or disabled
         If core performance boost is disabled while a core is in a boosted P-state, the
         core automatically transitions to the highest performance non-boosted P-state.
-        AMD Core Performance Boost(CPB) is controlled by this new attribute file which
-        allow user to change all cores frequency boosting state. It supports both
-        ``active``, ``passive`` and ``guided`` mode control with below value write to it.
+        AMD Core Performance Boost(CPB) is controlled by this attribute file which allows
+        user to change all cores frequency boosting state. It supports all amd-pstate modes.
 
         "0" Disable Core Performance Boosting
         "1" Enable  Core Performance Boosting
@@ -482,6 +505,19 @@ operations for the new ``amd-pstate`` module with this tool. ::
 
 Diagnostics and Tuning
 =======================
+
+Debugging AMD P-State Driver Loading Issues
+------------------------------------------
+
+On some platforms, there may be issues with the loading of the amd-pstate driver.
+To capture debug messages for issue analysis, users can add below parameter,
+"amd_pstate.dyndbg=+p cppc_acpi.dyndbg=+p  loglevel=4 debug amd_pstate=active"
+to the kernel command line. This will enable dynamic debugging and allow better
+analysis and troubleshooting of the driver loading process.
+
+Please note that adding this parameter will only enable debug logging during the
+driver loading phase and may affect system behavior. Use this option with caution
+and only for debugging purposes.
 
 Trace Events
 --------------
