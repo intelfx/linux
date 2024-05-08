@@ -66,7 +66,7 @@
 static struct cpufreq_driver *current_pstate_driver;
 static struct cpufreq_driver amd_pstate_driver;
 static struct cpufreq_driver amd_pstate_epp_driver;
-static int cppc_state;
+static int cppc_state = CONFIG_X86_AMD_PSTATE_DEFAULT_MODE;
 static bool cppc_enabled;
 static bool amd_pstate_prefcore = true;
 static struct quirk_entry *quirks;
@@ -1957,10 +1957,6 @@ static int __init amd_pstate_init(void)
 
 	/* check if this machine need CPPC quirks */
 	dmi_check_system(amd_pstate_quirks_table);
-
-	/* get default driver mode for loading*/
-	cppc_state = CONFIG_X86_AMD_PSTATE_DEFAULT_MODE;
-	pr_debug("cppc working state set to mode:%d\n", cppc_state);
 
 	switch (cppc_state) {
 	case AMD_PSTATE_DISABLE:
