@@ -1962,7 +1962,6 @@ static int __init amd_pstate_init(void)
 	case AMD_PSTATE_DISABLE:
 		pr_info("driver load is disabled, boot with specific mode to enable this\n");
 		return -ENODEV;
-	case AMD_PSTATE_UNDEFINED:
 	case AMD_PSTATE_PASSIVE:
 	case AMD_PSTATE_ACTIVE:
 	case AMD_PSTATE_GUIDED:
