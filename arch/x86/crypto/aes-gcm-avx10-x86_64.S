@@ -415,7 +415,6 @@
 
 	// Store the lowest set of key powers.
 	vmovdqu8	H_CUR, (POWERS_PTR)
-	sub		$VL, POWERS_PTR
 
 	// Compute and store the remaining key powers.  With VL=32, repeatedly
 	// multiply [H^(i+1), H^i] by [H^2, H^2] to get [H^(i+3), H^(i+2)].
@@ -423,9 +422,9 @@
 	// [H^4, H^4, H^4, H^4] to get [H^(i+7), H^(i+6), H^(i+5), H^(i+4)].
 	mov		$(NUM_KEY_POWERS*16/VL) - 1, %eax
 .Lprecompute_next\@:
+	sub		$VL, POWERS_PTR
 	_ghash_mul	H_INC, H_CUR, H_CUR, GFPOLY, V0, V1, V2
 	vmovdqu8	H_CUR, (POWERS_PTR)
-	sub		$VL, POWERS_PTR
 	dec		%eax
 	jnz		.Lprecompute_next\@
 
@@ -434,7 +433,7 @@
 .endm
 
 // XOR together the 128-bit lanes of \src (whose low lane is \src_xmm) and store
-// the result in \dst_xmm.  This implicitly zeroes the other lanes of dst.
+// the result in \dst_xmm.  This implicitly zeroizes the other lanes of dst.
 .macro	_horizontal_xor	src, src_xmm, dst_xmm, t0_xmm, t1_xmm, t2_xmm
 	vextracti32x4	$1, \src, \t0_xmm
 .if VL == 32
@@ -970,15 +969,13 @@
 .endm
 
 // void aes_gcm_enc_final_vaes_avx10(const struct aes_gcm_key_avx10 *key,
-//				     const u32 le_ctr[4],
-//				     const u8 ghash_acc[16],
-//				     u64 total_aadlen, u64 total_datalen,
-//				     u8 *tag, int taglen);
+//				     const u32 le_ctr[4], u8 ghash_acc[16],
+//				     u64 total_aadlen, u64 total_datalen);
 // bool aes_gcm_dec_final_vaes_avx10(const struct aes_gcm_key_avx10 *key,
 //				     const u32 le_ctr[4],
 //				     const u8 ghash_acc[16],
 //				     u64 total_aadlen, u64 total_datalen,
-//				     const u8 *tag, int taglen);
+//				     const u8 tag[16], int taglen);
 //
 // This macro generates one of the above two functions (with \enc selecting
 // which one).  Both functions finish computing the GCM authentication tag by
@@ -986,11 +983,11 @@
 // |total_aadlen| and |total_datalen| must be the total length of the additional
 // authenticated data and the en/decrypted data in bytes, respectively.
 //
-// The encryption function then stores the computed authentication tag to |tag|.
-// The decryption function instead loads the expected authentication tag (the
-// one that was transmitted) from |tag|, compares it to the computed tag in
-// constant time, and returns true if and only if they match.  In both cases,
-// |taglen| is the length of the tag in bytes, 4 <= |taglen| <= 16.
+// The encryption function then stores the full-length (16-byte) computed
+// authentication tag to |ghash_acc|.  The decryption function instead loads the
+// expected authentication tag (the one that was transmitted) from the 16-byte
+// buffer |tag|, compares the first 4 <= |taglen| <= 16 bytes of it to the
+// computed tag in constant time, and returns true if and only if they match.
 .macro	_aes_gcm_final	enc
 
 	// Function arguments
@@ -1038,11 +1035,13 @@
 	// Load the first hash key power (H^1), which is stored last.
 	vmovdqu8	OFFSETOFEND_KEY_POWERS-16(KEY), H_POW1
 
-	// Prepare the mask that will be used to store or load the auth tag.
+.if !\enc
+	// Prepare a mask of TAGLEN one bits.
 	movl		8(%rsp), TAGLEN
 	mov		$-1, %eax
 	bzhi		TAGLEN, %eax, %eax
 	kmovd		%eax, %k1
+.endif
 
 	// Make %rax point to the last AES round key for the chosen AES variant.
 	lea		6*16(KEY,AESKEYLEN64,4), %rax
@@ -1072,28 +1071,33 @@
 	_ghash_mul_step	9, H_POW1, GHASH_ACC, GHASH_ACC, GFPOLY, \
 			%xmm1, %xmm2, %xmm3
 
-	// Undo the byte reflection of the GHASH accumulator, then encrypt it to
-	// produce the full-length auth tag.  Reduce latency by taking advantage
-	// of the property vaesenclast(key, a) ^ b == vaesenclast(key ^ b, a).
-	vpshufb		BSWAP_MASK, GHASH_ACC, %xmm1
-	vpxor		(%rax), %xmm1, %xmm1
-	vaesenclast	%xmm1, %xmm0, GHASH_ACC
+	// Undo the byte reflection of the GHASH accumulator.
+	vpshufb		BSWAP_MASK, GHASH_ACC, GHASH_ACC
 
-	// Store or compare the authentication tag.  To support authentication
-	// tags shorter than 16 bytes, use masking.
-.if \enc
-	// Encrypting: store the computed authentication tag.
-	vmovdqu8	GHASH_ACC, (TAG){%k1}
-.else
-	// Decrypting: compare the expected authentication tag (TAG) with the
-	// computed authentication tag GHASH_ACC.  Return a true/false boolean.
+	// Do the last AES round and XOR the resulting keystream block with the
+	// GHASH accumulator to produce the full computed authentication tag.
 	//
-	// Do this by XOR'ing the tags together and using vptest to check
-	// whether all bits are 0.  This should be constant-time.
+	// Reduce latency by taking advantage of the property vaesenclast(key,
+	// a) ^ b == vaesenclast(key ^ b, a).  I.e., XOR GHASH_ACC into the last
+	// round key, instead of XOR'ing the final AES output with GHASH_ACC.
+	//
+	// enc_final then returns the computed auth tag, while dec_final
+	// compares it with the transmitted one and returns a bool.  To compare
+	// the tags, dec_final XORs them together and uses vptest to check
+	// whether the result is all-zeroes.  This should be constant-time.
+	// dec_final applies the vaesenclast optimization to this additional
+	// value XOR'd too, using vpternlogd to XOR the last round key, GHASH
+	// accumulator, and transmitted auth tag together in one instruction.
+.if \enc
+	vpxor		(%rax), GHASH_ACC, %xmm1
+	vaesenclast	%xmm1, %xmm0, GHASH_ACC
+	vmovdqu		GHASH_ACC, (GHASH_ACC_PTR)
+.else
+	vmovdqu		(TAG), %xmm1
+	vpternlogd	$0x96, (%rax), GHASH_ACC, %xmm1
+	vaesenclast	%xmm1, %xmm0, %xmm0
 	xor		%eax, %eax
-	vmovdqu8	(TAG), %xmm0{%k1}{z}
-	vmovdqu8	GHASH_ACC, GHASH_ACC{%k1}{z}
-	vpxor		GHASH_ACC, %xmm0, %xmm0
+	vmovdqu8	%xmm0, %xmm0{%k1}{z}	// Truncate to TAGLEN bytes
 	vptest		%xmm0, %xmm0
 	sete		%al
 .endif

@@ -1271,14 +1271,13 @@ aes_gcm_dec_update_vaes_avx10_512(const struct aes_gcm_key_avx10 *key,
 
 asmlinkage void
 aes_gcm_enc_final_vaes_avx10(const struct aes_gcm_key_avx10 *key,
-			     const u32 le_ctr[4], const u8 ghash_acc[16],
-			     u64 total_aadlen, u64 total_datalen,
-			     u8 *tag, int taglen);
+			     const u32 le_ctr[4], u8 ghash_acc[16],
+			     u64 total_aadlen, u64 total_datalen);
 asmlinkage bool __must_check
 aes_gcm_dec_final_vaes_avx10(const struct aes_gcm_key_avx10 *key,
 			     const u32 le_ctr[4], const u8 ghash_acc[16],
 			     u64 total_aadlen, u64 total_datalen,
-			     const u8 *tag, int taglen);
+			     const u8 tag[16], int taglen);
 
 /*
  * This is the setkey function for the VAES + AVX10 implementations of AES-GCM.
@@ -1566,16 +1565,13 @@ gcm_crypt_vaes_avx10(struct aead_request *req, int flags)
 	/* Finalize */
 	taglen = crypto_aead_authsize(tfm);
 	if (flags & FLAG_ENC) {
-		unsigned int datalen = req->cryptlen;
-		u8 tag[16];
-
 		/* Finish computing the auth tag. */
 		aes_gcm_enc_final_vaes_avx10(key, le_ctr, ghash_acc, assoclen,
-					     datalen, tag, taglen);
+					     req->cryptlen);
 
 		/* Store the computed auth tag in the dst scatterlist. */
-		scatterwalk_map_and_copy(tag, req->dst, req->assoclen + datalen,
-					 taglen, 1);
+		scatterwalk_map_and_copy(ghash_acc, req->dst, req->assoclen +
+					 req->cryptlen, taglen, 1);
 	} else {
 		unsigned int datalen = req->cryptlen - taglen;
 		u8 tag[16];
