@@ -1023,6 +1023,7 @@ int bch2_fs_btree_key_cache_init(struct btree_key_cache *bc)
 
 	bc->table_init_done = true;
 
+	bc->shrink.batch		= 1 << 14;
 	bc->shrink.seeks		= 0;
 	bc->shrink.count_objects	= bch2_btree_key_cache_count;
 	bc->shrink.scan_objects		= bch2_btree_key_cache_scan;
