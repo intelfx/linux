@@ -495,11 +495,8 @@ static const struct uvc_control_mapping uvc_ctrl_power_line_mapping_uvc15 = {
 				  V4L2_CID_POWER_LINE_FREQUENCY_DISABLED),
 };
 
-static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping);
-
-static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
+static const struct uvc_control_mapping *uvc_ctrl_filter_plf_mapping
+		(struct uvc_video_chain *chain, struct uvc_control *ctrl)
 {
 	const struct uvc_control_mapping *out_mapping =
 					&uvc_ctrl_power_line_mapping_uvc11;
@@ -509,7 +506,7 @@ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
 
 	buf = kmalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
-		return -ENOMEM;
+		return NULL;
 
 	/* Save the default PLF value, so we can restore it. */
 	ret = uvc_query_ctrl(chain->dev, UVC_GET_CUR, ctrl->entity->id,
@@ -517,7 +514,7 @@ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
 			     buf, sizeof(*buf));
 	/* If we cannot read the control skip it. */
 	if (ret)
-		return ret;
+		return NULL;
 	init_val = *buf;
 
 	/* If PLF value cannot be set to off, it is limited. */
@@ -526,8 +523,7 @@ static int uvc_ctrl_add_plf_mapping(struct uvc_video_chain *chain,
 			     chain->dev->intfnum, ctrl->info.selector,
 			     buf, sizeof(*buf));
 	if (ret)
-		return __uvc_ctrl_add_mapping_to_list(chain, ctrl,
-					&uvc_ctrl_power_line_mapping_limited);
+		return &uvc_ctrl_power_line_mapping_limited;
 
 	/* UVC 1.1 does not define auto, we can exit. */
 	if (chain->dev->uvc_version < 0x150)
@@ -548,7 +544,7 @@ end:
 		       chain->dev->intfnum, ctrl->info.selector,
 		       buf, sizeof(*buf));
 
-	return __uvc_ctrl_add_mapping_to_list(chain, ctrl, out_mapping);
+	return out_mapping;
 }
 
 static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
@@ -843,7 +839,7 @@ static const struct uvc_control_mapping uvc_ctrl_mappings[] = {
 	{
 		.entity		= UVC_GUID_UVC_PROCESSING,
 		.selector	= UVC_PU_POWER_LINE_FREQUENCY_CONTROL,
-		.add_mapping	= uvc_ctrl_add_plf_mapping,
+		.filter_mapping	= uvc_ctrl_filter_plf_mapping,
 	},
 };
 
@@ -2411,8 +2407,9 @@ static int uvc_ctrl_add_info(struct uvc_device *dev, struct uvc_control *ctrl,
 /*
  * Add a control mapping to a given control.
  */
-static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
+static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
+				  struct uvc_control *ctrl,
+				  const struct uvc_control_mapping *mapping)
 {
 	struct uvc_control_mapping *map;
 	unsigned int size;
@@ -2483,14 +2480,6 @@ err_nomem:
 	kfree(map->name);
 	kfree(map);
 	return -ENOMEM;
-}
-
-static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
-	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
-{
-	if (mapping && mapping->add_mapping)
-		return mapping->add_mapping(chain, ctrl, mapping);
-	return __uvc_ctrl_add_mapping_to_list(chain, ctrl, mapping);
 }
 
 int uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
@@ -2681,7 +2670,14 @@ static void uvc_ctrl_init_ctrl(struct uvc_video_chain *chain,
 
 	/* Process common mappings. */
 	for (i = 0; i < ARRAY_SIZE(uvc_ctrl_mappings); ++i) {
-		const struct uvc_control_mapping *mapping = &uvc_ctrl_mappings[i];
+		const struct uvc_control_mapping *mapping = NULL;
+
+		/* Try to get a custom mapping from the device. */
+		if (uvc_ctrl_mappings[i].filter_mapping)
+			mapping = uvc_ctrl_mappings[i].filter_mapping(chain,
+								      ctrl);
+		if (!mapping)
+			mapping = &uvc_ctrl_mappings[i];
 
 		if (uvc_entity_match_guid(ctrl->entity, mapping->entity) &&
 		    ctrl->info.selector == mapping->selector)

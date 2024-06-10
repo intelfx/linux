@@ -126,9 +126,9 @@ struct uvc_control_mapping {
 	s32 master_manual;
 	u32 slave_ids[2];
 
-	int (*add_mapping)(struct uvc_video_chain *chain,
-			   struct uvc_control *ctrl,
-			   const struct uvc_control_mapping *mapping);
+	const struct uvc_control_mapping *(*filter_mapping)
+				(struct uvc_video_chain *chain,
+				struct uvc_control *ctrl);
 	s32 (*get)(struct uvc_control_mapping *mapping, u8 query,
 		   const u8 *data);
 	void (*set)(struct uvc_control_mapping *mapping, s32 value,
