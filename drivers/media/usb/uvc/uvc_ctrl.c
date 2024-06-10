@@ -2360,7 +2360,7 @@ static int uvc_ctrl_add_info(struct uvc_device *dev, struct uvc_control *ctrl,
 /*
  * Add a control mapping to a given control.
  */
-static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
+static int __uvc_ctrl_add_mapping_to_list(struct uvc_video_chain *chain,
 	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
 {
 	struct uvc_control_mapping *map;
@@ -2432,6 +2432,14 @@ err_nomem:
 	kfree(map->name);
 	kfree(map);
 	return -ENOMEM;
+}
+
+static int __uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
+	struct uvc_control *ctrl, const struct uvc_control_mapping *mapping)
+{
+	if (mapping && mapping->add_mapping)
+		return mapping->add_mapping(chain, ctrl, mapping);
+	return __uvc_ctrl_add_mapping_to_list(chain, ctrl, mapping);
 }
 
 int uvc_ctrl_add_mapping(struct uvc_video_chain *chain,
