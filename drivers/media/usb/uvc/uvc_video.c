@@ -473,29 +473,28 @@ static void uvc_video_clock_add_sample(struct uvc_clock *clock,
 
 	/*
 	 * If we write new data on the position where we had the last
-	 * overflow, remove the overflow pointer. There is no overflow
-	 * on the whole circular buffer.
+	 * overflow, remove the overflow pointer. There is no SOF overflow
+	 * in the whole circular buffer.
 	 */
 	if (clock->head == clock->last_sof_overflow)
 		clock->last_sof_overflow = -1;
 
 	spin_lock_irqsave(&clock->lock, flags);
 
-	/* Handle overflows */
+	/* Handle SOF overflows. */
 	if (clock->count > 0 && clock->last_sof > sample->dev_sof) {
 		/*
 		 * Remove data from the circular buffer that is older than the
-		 * last overflow. We only support one overflow per circular
-		 * buffer.
+		 * last SOF overflow. We only support one SOF overflow per
+		 * circular buffer.
 		 */
-		if (clock->last_sof_overflow != -1) {
+		if (clock->last_sof_overflow != -1)
 			clock->count = (clock->head - clock->last_sof_overflow
-					+ clock->count) % clock->count;
-		}
+					+ clock->size) % clock->size;
 		clock->last_sof_overflow = clock->head;
 	}
 
-	/* Add sample */
+	/* Add sample. */
 	clock->samples[clock->head] = *sample;
 	clock->head = (clock->head + 1) % clock->size;
 	clock->count = min(clock->count + 1, clock->size);
