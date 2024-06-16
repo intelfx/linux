@@ -1926,8 +1926,8 @@ static void uvc_unregister_video(struct uvc_device *dev)
 		/* 3. Wait for old ioctls to finish. */
 		mutex_lock(&stream->mutex);
 
-		/* 4. Stop streamming. */
-		uvc_queue_streamoff(&stream->queue, stream->type);
+		/* 4. Stop streaming. */
+		uvc_queue_release(&stream->queue);
 
 		mutex_unlock(&stream->mutex);
 
