@@ -52,6 +52,7 @@
 #define AMD_PSTATE_TRANSITION_LATENCY	20000
 #define AMD_PSTATE_TRANSITION_DELAY	1000
 #define AMD_PSTATE_FAST_CPPC_TRANSITION_DELAY 600
+
 #define CPPC_HIGHEST_PERF_EFFICIENT		132
 #define CPPC_HIGHEST_PERF_PERFORMANCE		196
 #define CPPC_HIGHEST_PERF_DEFAULT		166
@@ -95,15 +96,6 @@ enum amd_core_type {
 	CPU_CORE_TYPE_UNDEFINED = 2,
 };
 
-/*
- * TODO: We need more time to fine tune processors with shared memory solution
- * with community together.
- *
- * There are some performance drops on the CPU benchmarks which reports from
- * Suse. We are co-working with them to fine tune the shared memory solution. So
- * we disable it by default to go acpi-cpufreq on these processors and add a
- * module parameter to be able to enable it manually for debugging.
- */
 static struct cpufreq_driver *current_pstate_driver;
 static struct cpufreq_driver amd_pstate_driver;
 static struct cpufreq_driver amd_pstate_epp_driver;
@@ -374,14 +366,14 @@ static inline int amd_pstate_enable(bool enable)
 
 static void get_this_core_type(void *data)
 {
-	int *cpu_type = data;
+	enum amd_core_type *cpu_type = data;
 
 	*cpu_type = amd_get_this_core_type();
 }
 
-static int amd_pstate_get_cpu_type(int cpu)
+static enum amd_core_type  amd_pstate_get_cpu_type(int cpu)
 {
-	int cpu_type = 0;
+	enum amd_core_type cpu_type;
 
 	smp_call_function_single(cpu, get_this_core_type, &cpu_type, 1);
 
@@ -392,7 +384,7 @@ static u32 amd_pstate_highest_perf_set(struct amd_cpudata *cpudata)
 {
 	struct cpuinfo_x86 *c = &cpu_data(0);
 	u32 highest_perf;
-	int core_type;
+	enum amd_core_type core_type;
 
 	/*
 	 * For AMD CPUs with Family ID 19H and Model ID range 0x70 to 0x7f,
@@ -434,7 +426,15 @@ static int pstate_init_perf(struct amd_cpudata *cpudata)
 	if (ret)
 		return ret;
 
-	highest_perf = amd_pstate_highest_perf_set(cpudata);
+	/* For platforms that do not support the preferred core feature, the
+	 * highest_pef may be configured with 166 or 255, to avoid max frequency
+	 * calculated wrongly. we take the AMD_CPPC_HIGHEST_PERF(cap1) value as
+	 * the default max perf.
+	 */
+	if (cpudata->hw_prefcore)
+		highest_perf = amd_pstate_highest_perf_set(cpudata);
+	else
+		highest_perf = AMD_CPPC_HIGHEST_PERF(cap1);
 
 	WRITE_ONCE(cpudata->highest_perf, highest_perf);
 	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
@@ -455,7 +455,10 @@ static int cppc_init_perf(struct amd_cpudata *cpudata)
 	if (ret)
 		return ret;
 
-	highest_perf = amd_pstate_highest_perf_set(cpudata);
+	if (cpudata->hw_prefcore)
+		highest_perf = amd_pstate_highest_perf_set(cpudata);
+	else
+		highest_perf = cppc_perf.highest_perf;
 
 	WRITE_ONCE(cpudata->highest_perf, highest_perf);
 	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
@@ -1936,9 +1939,10 @@ static int __init amd_pstate_set_driver(int mode_idx)
 static bool amd_cppc_supported(void)
 {
 	struct cpuinfo_x86 *c = &cpu_data(0);
+	bool warn = false;
 
 	if ((boot_cpu_data.x86 == 0x17) && (boot_cpu_data.x86_model < 0x30)) {
-		pr_notice_once("CPPC feature is not supported by the processor\n");
+		pr_debug_once("CPPC feature is not supported by the processor\n");
 		return false;
 	}
 
@@ -1946,24 +1950,24 @@ static bool amd_cppc_supported(void)
 	 * If the CPPC feature is disabled in the BIOS for processors that support MSR-based CPPC,
 	 * the AMD Pstate driver may not function correctly.
 	 * Check the CPPC flag and display a warning message if the platform supports CPPC.
-	 * Notice: below checking code will not abort the driver registeration process.
+	 * Note: below checking code will not abort the driver registeration process because of
+	 * the code is added for debugging purposes.
 	 */
 	if (!cpu_feature_enabled(X86_FEATURE_CPPC)) {
 		if (cpu_feature_enabled(X86_FEATURE_ZEN1) || cpu_feature_enabled(X86_FEATURE_ZEN2)) {
 			if (c->x86_model > 0x60 && c->x86_model < 0xaf)
-				goto warn;
+				warn = true;
 		} else if (cpu_feature_enabled(X86_FEATURE_ZEN3) || cpu_feature_enabled(X86_FEATURE_ZEN4)) {
-			if ((c->x86_model > 0x10 && c->x86_model < 0x1F) || (c->x86_model > 0x40 && c->x86_model < 0xaf))
-				goto warn;
+			if ((c->x86_model > 0x10 && c->x86_model < 0x1F) ||
+					(c->x86_model > 0x40 && c->x86_model < 0xaf))
+				warn = true;
 		} else if (cpu_feature_enabled(X86_FEATURE_ZEN5)) {
-			goto warn;
+			warn = true;
 		}
 	}
 
-	return true;
-
-warn:
-	pr_notice_once("The CPPC feature is supported but currently disabled by the BIOS.\n"
+	if (warn)
+		pr_warn_once("The CPPC feature is supported but currently disabled by the BIOS.\n"
 					"Please enable it if your BIOS has the CPPC option.\n");
 	return true;
 }
@@ -1996,15 +2000,15 @@ static int __init amd_pstate_init(void)
 	dmi_check_system(amd_pstate_quirks_table);
 
 	/*
-	 * get driver mode for loading from command line choice or kernel config
-	 * cppc_state will be AMD_PSTATE_UNDEFINED if no command line input
-	 * command line choice will override the kconfig option
-	 */
+	* determine the driver mode from the command line or kernel config.
+	* If no command line input is provided, cppc_state will be AMD_PSTATE_UNDEFINED.
+	* command line options will override the kernel config settings.
+	*/
+
 	if (cppc_state == AMD_PSTATE_UNDEFINED) {
 		/* Disable on the following configs by default:
 		 * 1. Undefined platforms
 		 * 2. Server platforms
-		 * 3. Shared memory designs
 		 */
 		if (amd_pstate_acpi_pm_profile_undefined() ||
 		    amd_pstate_acpi_pm_profile_server()) {
