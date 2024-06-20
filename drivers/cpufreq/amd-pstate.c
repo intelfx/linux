@@ -53,9 +53,8 @@
 #define AMD_PSTATE_TRANSITION_DELAY	1000
 #define AMD_PSTATE_FAST_CPPC_TRANSITION_DELAY 600
 
-#define CPPC_HIGHEST_PERF_EFFICIENT		132
-#define CPPC_HIGHEST_PERF_PERFORMANCE		196
-#define CPPC_HIGHEST_PERF_DEFAULT		166
+#define CPPC_HIGHEST_PERF_PERFORMANCE	196
+#define CPPC_HIGHEST_PERF_DEFAULT	166
 
 #define AMD_CPPC_EPP_PERFORMANCE		0x00
 #define AMD_CPPC_EPP_BALANCE_PERFORMANCE	0x80
@@ -86,14 +85,6 @@ static const char * const amd_pstate_mode_string[] = {
 struct quirk_entry {
 	u32 nominal_freq;
 	u32 lowest_freq;
-};
-
-/* defined by CPUID_Fn80000026_EBX BIT [31:28] */
-enum amd_core_type {
-	CPU_CORE_TYPE_NO_HETERO_SUP = -1,
-	CPU_CORE_TYPE_PERFORMANCE = 0,
-	CPU_CORE_TYPE_EFFICIENCY = 1,
-	CPU_CORE_TYPE_UNDEFINED = 2,
 };
 
 static struct cpufreq_driver *current_pstate_driver;
@@ -364,27 +355,9 @@ static inline int amd_pstate_enable(bool enable)
 	return static_call(amd_pstate_enable)(enable);
 }
 
-static void get_this_core_type(void *data)
-{
-	enum amd_core_type *cpu_type = data;
-
-	*cpu_type = amd_get_this_core_type();
-}
-
-static enum amd_core_type  amd_pstate_get_cpu_type(int cpu)
-{
-	enum amd_core_type cpu_type;
-
-	smp_call_function_single(cpu, get_this_core_type, &cpu_type, 1);
-
-	return cpu_type;
-}
-
 static u32 amd_pstate_highest_perf_set(struct amd_cpudata *cpudata)
 {
 	struct cpuinfo_x86 *c = &cpu_data(0);
-	u32 highest_perf;
-	enum amd_core_type core_type;
 
 	/*
 	 * For AMD CPUs with Family ID 19H and Model ID range 0x70 to 0x7f,
@@ -394,26 +367,7 @@ static u32 amd_pstate_highest_perf_set(struct amd_cpudata *cpudata)
 	if (c->x86 == 0x19 && (c->x86_model >= 0x70 && c->x86_model <= 0x7f))
 		return CPPC_HIGHEST_PERF_PERFORMANCE;
 
-	core_type = amd_pstate_get_cpu_type(cpudata->cpu);
-	pr_debug("core_type %d found\n", core_type);
-
-	switch (core_type) {
-	case CPU_CORE_TYPE_NO_HETERO_SUP:
-		highest_perf = CPPC_HIGHEST_PERF_DEFAULT;
-		break;
-	case CPU_CORE_TYPE_PERFORMANCE:
-		highest_perf = CPPC_HIGHEST_PERF_PERFORMANCE;
-		break;
-	case CPU_CORE_TYPE_EFFICIENCY:
-		highest_perf = CPPC_HIGHEST_PERF_EFFICIENT;
-		break;
-	default:
-		highest_perf = CPPC_HIGHEST_PERF_DEFAULT;
-		WARN_ONCE(true, "WARNING: Undefined core type found");
-		break;
-	}
-
-    return highest_perf;
+	return CPPC_HIGHEST_PERF_DEFAULT;
 }
 
 static int pstate_init_perf(struct amd_cpudata *cpudata)
@@ -1399,11 +1353,6 @@ static int amd_pstate_cpu_boost_update(struct cpufreq_policy *policy, bool on)
 	struct cppc_perf_ctrls perf_ctrls;
 	u32 highest_perf, nominal_perf, nominal_freq, max_freq;
 	int ret;
-
-	if (!policy) {
-		pr_err("policy is null\n");
-		return -ENODATA;
-	}
 
 	highest_perf = READ_ONCE(cpudata->highest_perf);
 	nominal_perf = READ_ONCE(cpudata->nominal_perf);
