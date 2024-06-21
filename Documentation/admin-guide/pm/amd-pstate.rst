@@ -298,7 +298,8 @@ boost or `1` to enable it, for the respective CPU using the sysfs path
 `/sys/devices/system/cpu/cpuX/cpufreq/boost`, where `X` represents the CPU number.
 
 It is important to note that modifying the global variable
-`amd_pstate_global_params.cpb_boost` will override the individual CPU settings.
+`/sys/devices/system/cpu/amd_pstate/cpb_boost` will override the individual CPU
+settings.
 
 
 Other performance and frequency values can be read back from
@@ -467,8 +468,15 @@ control its functionality at the system level.  They are located in the
         AMD Core Performance Boost(CPB) is controlled by this attribute file which allows
         user to change all cores frequency boosting state. It supports all amd-pstate modes.
 
-        "0" Disable Core Performance Boosting
-        "1" Enable  Core Performance Boosting
+        States of the driver "/sys/devices/system/cpu/amd_pstate/cpb_boost"
+        "disabled" Core Performance Boosting Disabled.
+        "enabled"  Core Performance Boosting Enabled.
+
+        To enable core performance boost:
+          # echo "enabled" > /sys/devices/system/cpu/amd_pstate/cpb_boost
+
+        To disable core performance boost:
+          # echo "disabled" > /sys/devices/system/cpu/amd_pstate/cpb_boost
 
 ``cpupower`` tool support for ``amd-pstate``
 ===============================================
