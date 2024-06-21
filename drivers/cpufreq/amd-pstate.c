@@ -94,6 +94,8 @@ static int cppc_state = AMD_PSTATE_UNDEFINED;
 static bool cppc_enabled;
 static bool amd_pstate_prefcore = true;
 static struct quirk_entry *quirks;
+
+/* export the amd_pstate_global_params for unit test */
 struct amd_pstate_global_params amd_pstate_global_params;
 EXPORT_SYMBOL_GPL(amd_pstate_global_params);
 static int amd_pstate_cpu_boost(int cpu, bool state);
@@ -138,6 +140,16 @@ static unsigned int epp_values[] = {
 	[EPP_INDEX_BALANCE_POWERSAVE] = AMD_CPPC_EPP_BALANCE_POWERSAVE,
 	[EPP_INDEX_POWERSAVE] = AMD_CPPC_EPP_POWERSAVE,
  };
+
+enum CPB_STATE_INDEX {
+	CPB_STATE_DISABLED = 0,
+	CPB_STATE_ENABLED = 1,
+};
+
+static const char * const cpb_state[] = {
+	[CPB_STATE_DISABLED] = "disabled",
+	[CPB_STATE_ENABLED] = "enabled",
+};
 
 typedef int (*cppc_mode_transition_fn)(int);
 
@@ -705,14 +717,18 @@ static int amd_pstate_set_boost(struct cpufreq_policy *policy, int state)
 	return ret < 0 ? ret : 0;
 }
 
-static int amd_pstate_boost_set(struct amd_cpudata *cpudata)
+static int amd_pstate_init_boost_support(struct amd_cpudata *cpudata)
 {
 	u64 boost_val;
 	int ret = -1;
 
+	/*
+	 * If platform has no CPB support or disble it, initialize current driver
+	 * boost_enabled state to be false, it is not an error for cpufreq core to handle.
+	 */
 	if (!cpu_feature_enabled(X86_FEATURE_CPB)) {
 		pr_debug_once("Boost CPB capabilities not present in the processor\n");
-		ret = -EOPNOTSUPP;
+		ret = 0;
 		goto exit_err;
 	}
 
@@ -726,16 +742,16 @@ static int amd_pstate_boost_set(struct amd_cpudata *cpudata)
 	amd_pstate_global_params.cpb_supported = !(boost_val & MSR_K7_HWCR_CPB_DIS);
 	if (amd_pstate_global_params.cpb_supported) {
 		current_pstate_driver->boost_enabled = true;
-		WRITE_ONCE(cpudata->boost_supported, true);
-		WRITE_ONCE(cpudata->boost_state, true);
+		cpudata->boost_supported = true;
+		cpudata->boost_state = true;
 	}
 
 	amd_pstate_global_params.cpb_boost = amd_pstate_global_params.cpb_supported;
 	return 0;
 
 exit_err:
-	WRITE_ONCE(cpudata->boost_supported, false);
-	WRITE_ONCE(cpudata->boost_state, false);
+	cpudata->boost_supported = false;
+	cpudata->boost_state = false;
 	current_pstate_driver->boost_enabled = false;
 	amd_pstate_global_params.cpb_boost = false;
 	return ret;
@@ -1369,10 +1385,11 @@ static int amd_pstate_cpu_boost_update(struct cpufreq_policy *policy, bool on)
 		wrmsrl_on_cpu(cpudata->cpu, MSR_AMD_CPPC_REQ, value);
 	} else {
 		perf_ctrls.max_perf = on ? highest_perf : nominal_perf;
-		ret = cppc_set_epp_perf(cpudata->cpu, &perf_ctrls, 1);
+		ret = cppc_set_perf(cpudata->cpu, &perf_ctrls);
 		if (ret) {
 			cpufreq_cpu_release(policy);
-			pr_debug("failed to set energy perf value (%d)\n", ret);
+			pr_debug("Failed to set max perf on CPU:%d. ret:%d\n",
+				cpudata->cpu, ret);
 			return ret;
 		}
 	}
@@ -1418,7 +1435,11 @@ err_exit:
 static ssize_t cpb_boost_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", amd_pstate_global_params.cpb_boost);
+	bool cpb_idx;
+
+	cpb_idx = amd_pstate_global_params.cpb_boost;
+
+	return sysfs_emit(buf, "%s\n", cpb_state[cpb_idx]);
 }
 
 static ssize_t cpb_boost_store(struct device *dev, struct device_attribute *b,
@@ -1426,16 +1447,18 @@ static ssize_t cpb_boost_store(struct device *dev, struct device_attribute *b,
 {
 	bool new_state;
 	ssize_t ret;
-	int cpu;
+	int cpu, cpb_idx;
 
 	if (!amd_pstate_global_params.cpb_supported) {
 		pr_err("Boost mode is not supported by this processor or SBIOS\n");
 		return -EINVAL;
 	}
 
-	ret = kstrtobool(buf, &new_state);
-	if (ret)
-		return ret;
+	cpb_idx = sysfs_match_string(cpb_state, buf);
+	if (cpb_idx < 0)
+		return -EINVAL;
+
+	new_state = cpb_idx;
 
 	mutex_lock(&amd_pstate_driver_lock);
 	for_each_present_cpu(cpu) {
@@ -1522,7 +1545,7 @@ static int amd_pstate_init_boost(struct cpufreq_policy *policy)
 	int ret;
 
 	/* initialize cpu cores boot state */
-	ret = amd_pstate_boost_set(cpudata);
+	ret = amd_pstate_init_boost_support(cpudata);
 	if (ret)
 		return ret;
 
