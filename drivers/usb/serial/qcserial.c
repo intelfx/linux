@@ -32,6 +32,11 @@ enum qcserial_layouts {
 	QCSERIAL_SWI_SDX55_RMNET = 7, /* Sierra Wireless SDX55 */
 };
 
+enum qcserial_flags {
+	QC_SENDSETUP = (1 << 0),
+	QC_ZLP = (1 << 1),
+};
+
 #define DEVICE_G1K(v, p) \
 	USB_DEVICE(v, p), .driver_info = QCSERIAL_G1K
 #define DEVICE_SWI(v, p) \
@@ -258,7 +263,7 @@ static int qcprobe(struct usb_serial *serial, const struct usb_device_id *id)
 	__u8 nintf;
 	__u8 ifnum;
 	int altsetting = -1;
-	bool sendsetup = false;
+	unsigned long flags = 0;
 
 	/* we only support vendor specific functions */
 	if (intf->desc.bInterfaceClass != USB_CLASS_VENDOR_SPEC)
@@ -296,6 +301,9 @@ static int qcprobe(struct usb_serial *serial, const struct usb_device_id *id)
 
 	/* default to enabling interface */
 	altsetting = 0;
+
+	/* default to enabling ZLP */
+	flags |= QC_ZLP;
 
 	/*
 	 * Composite mode; don't bind to the QMI/net interface as that
@@ -382,11 +390,11 @@ static int qcprobe(struct usb_serial *serial, const struct usb_device_id *id)
 			break;
 		case 2:
 			dev_dbg(dev, "NMEA GPS interface found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		case 3:
 			dev_dbg(dev, "Modem port found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		default:
 			/* don't claim any unsupported interface */
@@ -442,11 +450,11 @@ static int qcprobe(struct usb_serial *serial, const struct usb_device_id *id)
 		switch (ifnum) {
 		case 2:
 			dev_dbg(dev, "Modem port found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		case 3:
 			dev_dbg(dev, "NMEA GPS interface found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		case 4:
 			dev_dbg(dev, "DM/DIAG interface found\n");
@@ -471,11 +479,11 @@ static int qcprobe(struct usb_serial *serial, const struct usb_device_id *id)
 		switch (ifnum) {
 		case 0:
 			dev_dbg(dev, "Modem port found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		case 1:
 			dev_dbg(dev, "NMEA GPS interface found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		case 2:
 			dev_dbg(dev, "DM/DIAG interface found\n");
@@ -498,7 +506,7 @@ static int qcprobe(struct usb_serial *serial, const struct usb_device_id *id)
 		switch (ifnum) {
 		case 3:
 			dev_dbg(dev, "Modem port found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		case 4:
 			dev_dbg(dev, "DM/DIAG interface found\n");
@@ -518,7 +526,7 @@ static int qcprobe(struct usb_serial *serial, const struct usb_device_id *id)
 		switch (ifnum) {
 		case 1:
 			dev_dbg(dev, "Modem port found\n");
-			sendsetup = true;
+			flags |= QC_SENDSETUP;
 			break;
 		case 2:
 			dev_dbg(dev, "DM/DIAG interface found\n");
@@ -547,7 +555,7 @@ done:
 	}
 
 	if (!retval)
-		usb_set_serial_data(serial, (void *)(unsigned long)sendsetup);
+		usb_set_serial_data(serial, (void *)flags);
 
 	return retval;
 }
@@ -555,15 +563,17 @@ done:
 static int qc_attach(struct usb_serial *serial)
 {
 	struct usb_wwan_intf_private *data;
-	bool sendsetup;
+	unsigned long flags = 0;
 
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 
-	sendsetup = !!(unsigned long)(usb_get_serial_data(serial));
-	if (sendsetup)
+	flags = (unsigned long)(usb_get_serial_data(serial));
+	if (flags & QC_SENDSETUP)
 		data->use_send_setup = 1;
+	if (flags & QC_ZLP)
+		data->use_zlp = 1;
 
 	spin_lock_init(&data->susp_lock);
 
