@@ -399,7 +399,7 @@ static int rapl_pmu_event_init(struct perf_event *event)
 
 	/* must be done before validate_group */
 	if (curr_rapl_pmus == rapl_pmus_core) {
-		rapl_pmu = curr_rapl_pmus->rapl_pmu[topology_core_id(event->cpu)];
+		rapl_pmu = curr_rapl_pmus->rapl_pmu[topology_logical_core_id(event->cpu)];
 		event->hw.event_base = rapl_model->rapl_core_msrs[bit].msr;
 	} else {
 		rapl_pmu = curr_rapl_pmus->rapl_pmu[get_rapl_pmu_idx(event->cpu)];
@@ -663,7 +663,7 @@ static int rapl_cpu_offline(unsigned int cpu)
 				  get_rapl_pmu_cpumask(cpu), cpu);
 
 	if (ret == 0 && rapl_model->core_events)
-		ret = __rapl_cpu_offline(rapl_pmus_core, topology_core_id(cpu),
+		ret = __rapl_cpu_offline(rapl_pmus_core, topology_logical_core_id(cpu),
 				   topology_sibling_cpumask(cpu), cpu);
 
 	return ret;
@@ -708,7 +708,7 @@ static int rapl_cpu_online(unsigned int cpu)
 				 get_rapl_pmu_cpumask(cpu), cpu);
 
 	if (ret == 0 && rapl_model->core_events)
-		ret = __rapl_cpu_online(rapl_pmus_core, topology_core_id(cpu),
+		ret = __rapl_cpu_online(rapl_pmus_core, topology_logical_core_id(cpu),
 				   topology_sibling_cpumask(cpu), cpu);
 
 	return ret;
