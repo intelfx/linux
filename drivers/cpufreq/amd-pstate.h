@@ -99,20 +99,8 @@ struct amd_cpudata {
 	u32	policy;
 	u64	cppc_cap1_cached;
 	bool	suspended;
+	s16	epp_default;
 	bool	boost_state;
 };
-
-/**
- * struct amd_pstate_global_params - Global parameters, mostly tunable via sysfs.
- * @cpb_boost:		Whether or not to use boost CPU P-states.
- * @cpb_supported:	Whether or not CPU boost P-states are available
- *			based on the MSR_K7_HWCR bit[25] state
- */
-struct amd_pstate_global_params {
-	bool cpb_boost;
-	bool cpb_supported;
-};
-
-extern struct amd_pstate_global_params amd_pstate_global_params;
 
 #endif /* _LINUX_AMD_PSTATE_H */
