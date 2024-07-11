@@ -25,6 +25,7 @@
  * Copyright (C) 2020 Alibaba, Inc, Alex Shi
  */
 
+#include "linux/zswap.h"
 #include <linux/page_counter.h>
 #include <linux/memcontrol.h>
 #include <linux/cgroup.h>
@@ -5576,7 +5577,7 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 #if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 	memcg->zswap_max = PAGE_COUNTER_MAX;
 	WRITE_ONCE(memcg->zswap_writeback,
-		!parent || READ_ONCE(parent->zswap_writeback));
+		parent ? READ_ONCE(parent->zswap_writeback) : -1);
 #endif
 	page_counter_set_high(&memcg->swap, PAGE_COUNTER_MAX);
 	if (parent) {
@@ -8220,8 +8221,20 @@ void obj_cgroup_uncharge_zswap(struct obj_cgroup *objcg, size_t size)
 
 bool mem_cgroup_zswap_writeback_enabled(struct mem_cgroup *memcg)
 {
+	int memcg_zswap_writeback;
+
 	/* if zswap is disabled, do not block pages going to the swapping device */
-	return !is_zswap_enabled() || !memcg || READ_ONCE(memcg->zswap_writeback);
+	if (!is_zswap_enabled())
+		return true;
+
+	memcg_zswap_writeback =
+		memcg ? READ_ONCE(memcg->zswap_writeback) : -1;
+
+	/* -1 means global default */
+	if (memcg_zswap_writeback < 0)
+		return is_zswap_writeback_enabled();
+
+	return !!memcg_zswap_writeback;
 }
 
 static u64 zswap_current_read(struct cgroup_subsys_state *css,
@@ -8259,8 +8272,13 @@ static ssize_t zswap_max_write(struct kernfs_open_file *of,
 static int zswap_writeback_show(struct seq_file *m, void *v)
 {
 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+	int memcg_zswap_writeback = READ_ONCE(memcg->zswap_writeback);
 
-	seq_printf(m, "%d\n", READ_ONCE(memcg->zswap_writeback));
+	/* -1 means global default */
+	if (memcg_zswap_writeback < 0)
+		memcg_zswap_writeback = is_zswap_writeback_enabled();
+
+	seq_printf(m, "%d\n", memcg_zswap_writeback);
 	return 0;
 }
 
@@ -8274,7 +8292,7 @@ static ssize_t zswap_writeback_write(struct kernfs_open_file *of,
 	if (parse_ret)
 		return parse_ret;
 
-	if (zswap_writeback != 0 && zswap_writeback != 1)
+	if (zswap_writeback < -1 || zswap_writeback > 1)
 		return -EINVAL;
 
 	WRITE_ONCE(memcg->zswap_writeback, zswap_writeback);

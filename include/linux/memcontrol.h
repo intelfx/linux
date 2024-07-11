@@ -224,8 +224,9 @@ struct mem_cgroup {
 	/*
 	 * Prevent pages from this memcg from being written back from zswap to
 	 * swap, and from being swapped out on zswap store failures.
+	 * (< 0: default)
 	 */
-	bool zswap_writeback;
+	int zswap_writeback;
 #endif
 
 	unsigned long soft_limit;

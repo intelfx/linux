@@ -1694,9 +1694,9 @@ PAGE_SIZE multiple when read back.
 	entries fault back in or are written out to disk.
 
   memory.zswap.writeback
-	A read-write single value file. The default value is "1". The
-	initial value of the root cgroup is 1, and when a new cgroup is
-	created, it inherits the current value of its parent.
+	A read-write single value file. The default is to follow the global
+  zswap.writeback_enabled module parameter (which is 1 by default), and
+  when a new cgroup is created, it inherits the parent configuration.
 
 	When this is set to 0, all swapping attempts to swapping devices
 	are disabled. This included both zswap writebacks, and swapping due
@@ -1707,6 +1707,9 @@ PAGE_SIZE multiple when read back.
 
 	Note that this is subtly different from setting memory.swap.max to
 	0, as it still allows for pages to be written to the zswap pool.
+
+  This can also be set to -1, which would make the cgroup (and its
+  future children) follow the global value again.
 
   memory.pressure
 	A read-only nested-keyed file.
