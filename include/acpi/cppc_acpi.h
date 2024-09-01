@@ -136,6 +136,16 @@ struct cppc_cpudata {
 	cpumask_var_t shared_cpu_map;
 };
 
+#ifdef CONFIG_CPU_SUP_AMD
+extern int amd_detect_prefcore(bool *detected);
+extern int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf);
+extern int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator);
+#else /* !CONFIG_CPU_SUP_AMD */
+static inline int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf) { return -ENODEV; }
+static inline int amd_detect_prefcore(bool *detected) { return -ENODEV; }
+static inline int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator) { return -ENODEV; }
+#endif /* !CONFIG_CPU_SUP_AMD */
+
 #ifdef CONFIG_ACPI_CPPC_LIB
 extern int cppc_get_desired_perf(int cpunum, u64 *desired_perf);
 extern int cppc_get_nominal_perf(int cpunum, u64 *nominal_perf);

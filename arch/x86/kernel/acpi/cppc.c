@@ -9,6 +9,18 @@
 #include <asm/processor.h>
 #include <asm/topology.h>
 
+#define CPPC_HIGHEST_PERF_PERFORMANCE	196
+#define CPPC_HIGHEST_PERF_PREFCORE	166
+
+enum amd_pref_core {
+	AMD_PREF_CORE_UNKNOWN = 0,
+	AMD_PREF_CORE_SUPPORTED,
+	AMD_PREF_CORE_UNSUPPORTED,
+};
+static enum amd_pref_core amd_pref_core_detected;
+static u64 boost_numerator;
+extern bool amd_pstate_msr;
+
 /* Refer to drivers/acpi/cppc_acpi.c for the description of functions */
 
 bool cpc_supported_by_cpu(void)
@@ -75,15 +87,17 @@ static void amd_set_max_freq_ratio(void)
 
 	rc = cppc_get_perf_caps(0, &perf_caps);
 	if (rc) {
-		pr_debug("Could not retrieve perf counters (%d)\n", rc);
+		pr_warn("Could not retrieve perf counters (%d)\n", rc);
 		return;
 	}
 
-	highest_perf = amd_get_highest_perf();
+	rc = amd_get_boost_ratio_numerator(0, &highest_perf);
+	if (rc)
+		pr_warn("Could not retrieve highest performance\n");
 	nominal_perf = perf_caps.nominal_perf;
 
-	if (!highest_perf || !nominal_perf) {
-		pr_debug("Could not retrieve highest or nominal performance\n");
+	if (!nominal_perf) {
+		pr_warn("Could not retrieve nominal performance\n");
 		return;
 	}
 
@@ -91,7 +105,7 @@ static void amd_set_max_freq_ratio(void)
 	/* midpoint between max_boost and max_P */
 	perf_ratio = (perf_ratio + SCHED_CAPACITY_SCALE) >> 1;
 	if (!perf_ratio) {
-		pr_debug("Non-zero highest/nominal perf values led to a 0 ratio\n");
+		pr_warn("Non-zero highest/nominal perf values led to a 0 ratio\n");
 		return;
 	}
 
@@ -116,3 +130,139 @@ void init_freq_invariance_cppc(void)
 	init_done = true;
 	mutex_unlock(&freq_invariance_lock);
 }
+
+/*
+ * Get the highest performance register value.
+ * @cpu: CPU from which to get highest performance.
+ * @highest_perf: Return address for highest performance value.
+ *
+ * Return: 0 for success, negative error code otherwise.
+ */
+int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf)
+{
+	u64 val;
+	int ret;
+
+	if (amd_pstate_msr) {
+		ret = rdmsrl_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &val);
+		if (ret)
+			goto out;
+
+		val = AMD_CPPC_HIGHEST_PERF(val);
+	} else {
+		ret = cppc_get_highest_perf(cpu, &val);
+		if (ret)
+			goto out;
+	}
+
+	WRITE_ONCE(*highest_perf, (u32)val);
+out:
+	return ret;
+}
+EXPORT_SYMBOL_GPL(amd_get_highest_perf);
+
+/**
+ * amd_detect_prefcore: Detect if CPUs in the system support preferred cores
+ * @detected: Output variable for the result of the detection.
+ *
+ * Determine whether CPUs in the system support preferred cores. On systems
+ * that support preferred cores, different highest perf values will be found
+ * on different cores. On other systems, the highest perf value will be the
+ * same on all cores.
+ *
+ * The result of the detection will be stored in the 'detected' parameter.
+ *
+ * Return: 0 for success, negative error code otherwise
+ */
+int amd_detect_prefcore(bool *detected)
+{
+	int cpu, count = 0;
+	u64 highest_perf[2] = {0};
+
+	if (WARN_ON(!detected))
+		return -EINVAL;
+
+	switch (amd_pref_core_detected) {
+	case AMD_PREF_CORE_SUPPORTED:
+		*detected = true;
+		return 0;
+	case AMD_PREF_CORE_UNSUPPORTED:
+		*detected = false;
+		return 0;
+	default:
+		break;
+	}
+
+	for_each_present_cpu(cpu) {
+		u32 tmp;
+		int ret;
+
+		ret = amd_get_highest_perf(cpu, &tmp);
+		if (ret)
+			return ret;
+
+		if (!count || (count == 1 && tmp != highest_perf[0]))
+			highest_perf[count++] = tmp;
+
+		if (count == 2)
+			break;
+	}
+
+	*detected = (count == 2);
+	boost_numerator = highest_perf[0];
+
+	amd_pref_core_detected = *detected ? AMD_PREF_CORE_SUPPORTED :
+					     AMD_PREF_CORE_UNSUPPORTED;
+
+	pr_debug("AMD CPPC preferred core is %ssupported (highest perf: 0x%llx)\n",
+		 *detected ? "" : "un", highest_perf[0]);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(amd_detect_prefcore);
+
+/**
+ * amd_get_boost_ratio_numerator: Get the numerator to use for boost ratio calculation
+ * @cpu: CPU to get numerator for.
+ * @numerator: Output variable for numerator.
+ *
+ * Determine the numerator to use for calculating the boost ratio on
+ * a CPU. On systems that support preferred cores, this will be a hardcoded
+ * value. On other systems this will the highest performance register value.
+ *
+ * Return: 0 for success, negative error code otherwise.
+ */
+int amd_get_boost_ratio_numerator(unsigned int cpu, u64 *numerator)
+{
+	bool prefcore;
+	int ret;
+
+	ret = amd_detect_prefcore(&prefcore);
+	if (ret)
+		return ret;
+
+	/* without preferred cores, return the highest perf register value */
+	if (!prefcore) {
+		*numerator = boost_numerator;
+		return 0;
+	}
+
+	/*
+	 * For AMD CPUs with Family ID 19H and Model ID range 0x70 to 0x7f,
+	 * the highest performance level is set to 196.
+	 * https://bugzilla.kernel.org/show_bug.cgi?id=218759
+	 */
+	if (cpu_feature_enabled(X86_FEATURE_ZEN4)) {
+		switch (boot_cpu_data.x86_model) {
+		case 0x70 ... 0x7f:
+			*numerator = CPPC_HIGHEST_PERF_PERFORMANCE;
+			return 0;
+		default:
+			break;
+		}
+	}
+	*numerator = CPPC_HIGHEST_PERF_PREFCORE;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(amd_get_boost_ratio_numerator);
