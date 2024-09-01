@@ -142,7 +142,7 @@ int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf)
 	u64 val;
 	int ret;
 
-	if (cpu_feature_enabled(X86_FEATURE_CPPC)) {
+	if (amd_pstate_msr) {
 		ret = rdmsrl_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &val);
 		if (ret)
 			goto out;
