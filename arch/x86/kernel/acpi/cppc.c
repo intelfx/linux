@@ -19,6 +19,7 @@ enum amd_pref_core {
 };
 static enum amd_pref_core amd_pref_core_detected;
 static u64 boost_numerator;
+extern bool amd_pstate_msr;
 
 /* Refer to drivers/acpi/cppc_acpi.c for the description of functions */
 
