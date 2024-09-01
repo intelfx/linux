@@ -60,18 +60,6 @@
 #define AMD_CPPC_EPP_BALANCE_POWERSAVE		0xBF
 #define AMD_CPPC_EPP_POWERSAVE			0xFF
 
-/*
- * enum amd_pstate_mode - driver working mode of amd pstate
- */
-enum amd_pstate_mode {
-	AMD_PSTATE_UNDEFINED = 0,
-	AMD_PSTATE_DISABLE,
-	AMD_PSTATE_PASSIVE,
-	AMD_PSTATE_ACTIVE,
-	AMD_PSTATE_GUIDED,
-	AMD_PSTATE_MAX,
-};
-
 static const char * const amd_pstate_mode_string[] = {
 	[AMD_PSTATE_UNDEFINED]   = "undefined",
 	[AMD_PSTATE_DISABLE]     = "disable",
@@ -80,6 +68,14 @@ static const char * const amd_pstate_mode_string[] = {
 	[AMD_PSTATE_GUIDED]      = "guided",
 	NULL,
 };
+
+const char *amd_pstate_get_mode_string(enum amd_pstate_mode mode)
+{
+	if (mode < 0 || mode >= AMD_PSTATE_MAX)
+		return NULL;
+	return amd_pstate_mode_string[mode];
+}
+EXPORT_SYMBOL_GPL(amd_pstate_get_mode_string);
 
 struct quirk_entry {
 	u32 nominal_freq;
@@ -689,7 +685,12 @@ static void amd_pstate_adjust_perf(unsigned int cpu,
 	unsigned long max_perf, min_perf, des_perf,
 		      cap_perf, lowest_nonlinear_perf;
 	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
-	struct amd_cpudata *cpudata = policy->driver_data;
+	struct amd_cpudata *cpudata;
+
+	if (!policy)
+		return;
+
+	cpudata = policy->driver_data;
 
 	if (policy->min != cpudata->min_limit_freq || policy->max != cpudata->max_limit_freq)
 		amd_pstate_update_min_max_limit(policy);
@@ -903,10 +904,15 @@ static void amd_pstate_init_prefcore(struct amd_cpudata *cpudata)
 static void amd_pstate_update_limits(unsigned int cpu)
 {
 	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
-	struct amd_cpudata *cpudata = policy->driver_data;
+	struct amd_cpudata *cpudata;
 	u32 prev_high = 0, cur_high = 0;
 	int ret;
 	bool highest_perf_changed = false;
+
+	if (!policy)
+		return;
+
+	cpudata = policy->driver_data;
 
 	mutex_lock(&amd_pstate_driver_lock);
 	if ((!amd_pstate_prefcore) || (!cpudata->hw_prefcore))
@@ -1382,7 +1388,7 @@ static ssize_t amd_pstate_show_status(char *buf)
 	return sysfs_emit(buf, "%s\n", amd_pstate_mode_string[cppc_state]);
 }
 
-static int amd_pstate_update_status(const char *buf, size_t size)
+int amd_pstate_update_status(const char *buf, size_t size)
 {
 	int mode_idx;
 
@@ -1399,6 +1405,7 @@ static int amd_pstate_update_status(const char *buf, size_t size)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(amd_pstate_update_status);
 
 static ssize_t status_show(struct device *dev,
 			   struct device_attribute *attr, char *buf)
@@ -1867,18 +1874,34 @@ static bool amd_cppc_supported(void)
 	}
 
 	/*
-	 * If the CPPC feature is disabled in the BIOS for processors that support MSR-based CPPC,
-	 * the AMD Pstate driver may not function correctly.
-	 * Check the CPPC flag and display a warning message if the platform supports CPPC.
-	 * Note: below checking code will not abort the driver registeration process because of
-	 * the code is added for debugging purposes.
+	 * If the CPPC feature is disabled in the BIOS for processors
+	 * that support MSR-based CPPC, the AMD Pstate driver may not
+	 * function correctly.
+	 *
+	 * For such processors, check the CPPC flag and display a
+	 * warning message if the platform supports CPPC.
+	 *
+	 * Note: The code check below will not abort the driver
+	 * registration process because of the code is added for
+	 * debugging purposes. Besides, it may still be possible for
+	 * the driver to work using the shared-memory mechanism.
 	 */
 	if (!cpu_feature_enabled(X86_FEATURE_CPPC)) {
-		if (cpu_feature_enabled(X86_FEATURE_ZEN3) ||
-		    cpu_feature_enabled(X86_FEATURE_ZEN4)) {
-			if ((c->x86_model > 0x10 && c->x86_model < 0x1F) ||
-					(c->x86_model > 0x40 && c->x86_model < 0xaf))
+		if (cpu_feature_enabled(X86_FEATURE_ZEN2)) {
+			switch (c->x86_model) {
+			case 0x60 ... 0x6F:
+			case 0x80 ... 0xAF:
 				warn = true;
+				break;
+			}
+		} else if (cpu_feature_enabled(X86_FEATURE_ZEN3) ||
+			   cpu_feature_enabled(X86_FEATURE_ZEN4)) {
+			switch (c->x86_model) {
+			case 0x10 ... 0x1F:
+			case 0x40 ... 0xAF:
+				warn = true;
+				break;
+			}
 		} else if (cpu_feature_enabled(X86_FEATURE_ZEN5)) {
 			warn = true;
 		}
