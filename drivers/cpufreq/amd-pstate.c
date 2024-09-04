@@ -418,14 +418,13 @@ static int pstate_init_perf(struct amd_cpudata *cpudata)
 static int cppc_init_perf(struct amd_cpudata *cpudata)
 {
 	struct cppc_perf_caps cppc_perf;
-	u32 highest_perf;
 
 	int ret = cppc_get_perf_caps(cpudata->cpu, &cppc_perf);
 	if (ret)
 		return ret;
 
 	WRITE_ONCE(cpudata->highest_perf, cppc_perf.highest_perf);
-	WRITE_ONCE(cpudata->max_limit_perf, highest_perf);
+	WRITE_ONCE(cpudata->max_limit_perf, cppc_perf.highest_perf);
 	WRITE_ONCE(cpudata->nominal_perf, cppc_perf.nominal_perf);
 	WRITE_ONCE(cpudata->lowest_nonlinear_perf,
 		   cppc_perf.lowest_nonlinear_perf);
@@ -1151,7 +1150,12 @@ static ssize_t show_amd_pstate_prefcore_ranking(struct cpufreq_policy *policy,
 static ssize_t show_amd_pstate_hw_prefcore(struct cpufreq_policy *policy,
 					   char *buf)
 {
-	return sysfs_emit(buf, "%s\n", str_enabled_disabled(amd_pstate_prefcore));
+	bool hw_prefcore;
+	struct amd_cpudata *cpudata = policy->driver_data;
+
+	hw_prefcore = READ_ONCE(cpudata->hw_prefcore);
+
+	return sysfs_emit(buf, "%s\n", str_enabled_disabled(hw_prefcore));
 }
 
 static ssize_t show_energy_performance_available_preferences(
