@@ -19,7 +19,6 @@ enum amd_pref_core {
 };
 static enum amd_pref_core amd_pref_core_detected;
 static u64 boost_numerator;
-extern bool amd_pstate_msr;
 
 /* Refer to drivers/acpi/cppc_acpi.c for the description of functions */
 
@@ -81,7 +80,7 @@ int cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val)
 static void amd_set_max_freq_ratio(void)
 {
 	struct cppc_perf_caps perf_caps;
-	u64 highest_perf, nominal_perf;
+	u64 numerator, nominal_perf;
 	u64 perf_ratio;
 	int rc;
 
@@ -91,9 +90,11 @@ static void amd_set_max_freq_ratio(void)
 		return;
 	}
 
-	rc = amd_get_boost_ratio_numerator(0, &highest_perf);
-	if (rc)
-		pr_warn("Could not retrieve highest performance\n");
+	rc = amd_get_boost_ratio_numerator(0, &numerator);
+	if (rc) {
+		pr_warn("Could not retrieve highest performance (%d)\n", rc);
+		return;
+	}
 	nominal_perf = perf_caps.nominal_perf;
 
 	if (!nominal_perf) {
@@ -101,13 +102,8 @@ static void amd_set_max_freq_ratio(void)
 		return;
 	}
 
-	perf_ratio = div_u64(highest_perf * SCHED_CAPACITY_SCALE, nominal_perf);
 	/* midpoint between max_boost and max_P */
-	perf_ratio = (perf_ratio + SCHED_CAPACITY_SCALE) >> 1;
-	if (!perf_ratio) {
-		pr_warn("Non-zero highest/nominal perf values led to a 0 ratio\n");
-		return;
-	}
+	perf_ratio = (div_u64(numerator * SCHED_CAPACITY_SCALE, nominal_perf) + SCHED_CAPACITY_SCALE) >> 1;
 
 	freq_invariance_set_perf_ratio(perf_ratio, false);
 }
@@ -143,7 +139,7 @@ int amd_get_highest_perf(unsigned int cpu, u32 *highest_perf)
 	u64 val;
 	int ret;
 
-	if (amd_pstate_msr) {
+	if (cpu_feature_enabled(X86_FEATURE_CPPC)) {
 		ret = rdmsrl_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &val);
 		if (ret)
 			goto out;
@@ -229,6 +225,10 @@ EXPORT_SYMBOL_GPL(amd_detect_prefcore);
  * Determine the numerator to use for calculating the boost ratio on
  * a CPU. On systems that support preferred cores, this will be a hardcoded
  * value. On other systems this will the highest performance register value.
+ *
+ * If booting the system with amd-pstate enabled but preferred cores disabled then
+ * the correct boost numerator will be returned to match hardware capabilities
+ * even if the preferred cores scheduling hints are not enabled.
  *
  * Return: 0 for success, negative error code otherwise.
  */
