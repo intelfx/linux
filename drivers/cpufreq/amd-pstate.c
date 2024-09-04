@@ -86,7 +86,7 @@ static struct cpufreq_driver amd_pstate_epp_driver;
 static int cppc_state = AMD_PSTATE_UNDEFINED;
 static bool cppc_enabled;
 static bool amd_pstate_prefcore = true;
-bool amd_pstate_msr = true;
+static bool amd_pstate_msr = true;
 static struct quirk_entry *quirks;
 
 /*
