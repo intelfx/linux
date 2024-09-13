@@ -162,17 +162,6 @@ static inline unsigned int get_rapl_pmu_idx(int cpu)
 					 topology_logical_die_id(cpu);
 }
 
-static inline struct rapl_pmu *cpu_to_rapl_pmu(unsigned int cpu)
-{
-	unsigned int rapl_pmu_idx = get_rapl_pmu_idx(cpu);
-
-	/*
-	 * The unsigned check also catches the '-1' return value for non
-	 * existent mappings in the topology map.
-	 */
-	return rapl_pmu_idx < rapl_pmus->nr_rapl_pmu ? rapl_pmus->pmus[rapl_pmu_idx] : NULL;
-}
-
 static inline u64 rapl_read_counter(struct perf_event *event)
 {
 	u64 raw;
@@ -348,7 +337,7 @@ static void rapl_pmu_event_del(struct perf_event *event, int flags)
 static int rapl_pmu_event_init(struct perf_event *event)
 {
 	u64 cfg = event->attr.config & RAPL_EVENT_MASK;
-	int bit, ret = 0;
+	int bit, rapl_pmu_idx, ret = 0;
 	struct rapl_pmu *pmu;
 
 	/* only look at RAPL events */
@@ -376,8 +365,12 @@ static int rapl_pmu_event_init(struct perf_event *event)
 	if (event->attr.sample_period) /* no sampling */
 		return -EINVAL;
 
+	rapl_pmu_idx = get_rapl_pmu_idx(event->cpu);
+	if (rapl_pmu_idx >= rapl_pmus->nr_rapl_pmu)
+		return -EINVAL;
+
 	/* must be done before validate_group */
-	pmu = cpu_to_rapl_pmu(event->cpu);
+	pmu = rapl_pmus->pmus[rapl_pmu_idx];
 	if (!pmu)
 		return -EINVAL;
 	event->pmu_private = pmu;
@@ -623,12 +616,16 @@ static const struct attribute_group *rapl_attr_update[] = {
 static void __init init_rapl_pmu(void)
 {
 	struct rapl_pmu *pmu;
-	int cpu;
+	int cpu, rapl_pmu_idx;
 
 	cpus_read_lock();
 
 	for_each_cpu(cpu, cpu_online_mask) {
-		pmu = cpu_to_rapl_pmu(cpu);
+		rapl_pmu_idx = get_rapl_pmu_idx(cpu);
+		if (rapl_pmu_idx >= rapl_pmus->nr_rapl_pmu)
+			continue;
+
+		pmu = rapl_pmus->pmus[rapl_pmu_idx];
 		if (pmu)
 			continue;
 		pmu = kzalloc_node(sizeof(*pmu), GFP_KERNEL, cpu_to_node(cpu));
@@ -640,7 +637,7 @@ static void __init init_rapl_pmu(void)
 		pmu->timer_interval = ms_to_ktime(rapl_timer_ms);
 		rapl_hrtimer_init(pmu);
 
-		rapl_pmus->pmus[get_rapl_pmu_idx(cpu)] = pmu;
+		rapl_pmus->pmus[rapl_pmu_idx] = pmu;
 	}
 
 	cpus_read_unlock();
