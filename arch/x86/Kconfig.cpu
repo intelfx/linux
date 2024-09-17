@@ -308,6 +308,14 @@ config X86_GENERIC
 	  This is really intended for distributors who need more
 	  generic optimizations.
 
+config X86_64_ISA_LEVEL
+	int "x86_64 ISA level"
+	range 1 4
+	depends on (CC_IS_GCC && GCC_VERSION > 110000) || (CC_IS_CLANG && CLANG_VERSION >= 120000)
+	depends on X86_64 && GENERIC_CPU
+	help
+	  Specify an x86_64 ISA level.
+
 #
 # Define implied options from the CPU selection here
 config X86_INTERNODE_CACHE_SHIFT
