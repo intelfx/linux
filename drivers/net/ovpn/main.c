@@ -13,7 +13,6 @@
 #include <linux/netdevice.h>
 #include <linux/inetdevice.h>
 //#include <linux/rcupdate.h>
-#include <linux/version.h>
 #include <net/gro_cells.h>
 #include <net/ip.h>
 #include <net/rtnetlink.h>
