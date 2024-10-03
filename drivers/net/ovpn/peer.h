@@ -20,9 +20,6 @@
 #include "socket.h"
 #include "stats.h"
 
-#include <net/dst_cache.h>
-#include <uapi/linux/ovpn.h>
-
 /**
  * struct ovpn_peer - the main remote peer object
  * @ovpn: main openvpn instance this peer belongs to
