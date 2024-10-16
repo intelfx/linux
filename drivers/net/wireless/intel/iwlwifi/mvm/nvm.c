@@ -560,7 +560,7 @@ int iwl_mvm_init_mcc(struct iwl_mvm *mvm)
 		nvm_lar = mvm->nvm_data->lar_enabled;
 		if (tlv_lar != nvm_lar)
 			IWL_INFO(mvm,
-				 "Conflict between TLV & NVM regarding enabling LAR (TLV = %s NVM =%s)\n",
+				 "Conflict between TLV & NVM regarding enabling LAR (TLV = %s NVM = %s)\n",
 				 tlv_lar ? "enabled" : "disabled",
 				 nvm_lar ? "enabled" : "disabled");
 	}

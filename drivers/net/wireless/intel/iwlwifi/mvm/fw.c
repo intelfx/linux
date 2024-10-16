@@ -1461,7 +1461,8 @@ int iwl_mvm_up(struct iwl_mvm *mvm)
 			goto error;
 	}
 
-	iwl_mvm_lari_cfg(mvm);
+	if (!iwlwifi_mod_params.lar_disable)
+		iwl_mvm_lari_cfg(mvm);
 
 	/* Init RSS configuration */
 	ret = iwl_configure_rxq(&mvm->fwrt);
