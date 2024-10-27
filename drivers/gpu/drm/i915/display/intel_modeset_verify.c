@@ -97,10 +97,10 @@ static void intel_pipe_config_sanity_check(const struct intel_crtc_state *crtc_s
 
 		/*
 		 * FDI already provided one idea for the dotclock.
-		 * Yell if the encoder disagrees. Allow for slight
-		 * rounding differences.
+		 * Yell if the encoder disagrees.
 		 */
-		drm_WARN(&i915->drm, abs(fdi_dotclock - dotclock) > 1,
+		drm_WARN(&i915->drm,
+			 !intel_fuzzy_clock_check(fdi_dotclock, dotclock),
 			 "FDI dotclock and encoder dotclock mismatch, fdi: %i, encoder: %i\n",
 			 fdi_dotclock, dotclock);
 	}
