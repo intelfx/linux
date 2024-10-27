@@ -1221,16 +1221,32 @@ static void amd_pstate_driver_cleanup(void)
 	current_pstate_driver = NULL;
 }
 
+static int amd_pstate_set_driver(int mode_idx)
+{
+	if (mode_idx >= AMD_PSTATE_DISABLE && mode_idx < AMD_PSTATE_MAX) {
+		cppc_state = mode_idx;
+		if (cppc_state == AMD_PSTATE_DISABLE)
+			pr_info("driver is explicitly disabled\n");
+
+		if (cppc_state == AMD_PSTATE_ACTIVE)
+			current_pstate_driver = &amd_pstate_epp_driver;
+
+		if (cppc_state == AMD_PSTATE_PASSIVE || cppc_state == AMD_PSTATE_GUIDED)
+			current_pstate_driver = &amd_pstate_driver;
+
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static int amd_pstate_register_driver(int mode)
 {
 	int ret;
 
-	if (mode == AMD_PSTATE_PASSIVE || mode == AMD_PSTATE_GUIDED)
-		current_pstate_driver = &amd_pstate_driver;
-	else if (mode == AMD_PSTATE_ACTIVE)
-		current_pstate_driver = &amd_pstate_epp_driver;
-	else
-		return -EINVAL;
+	ret = amd_pstate_set_driver(mode);
+	if (ret)
+		return ret;
 
 	cppc_state = mode;
 
@@ -1756,25 +1772,6 @@ static struct cpufreq_driver amd_pstate_epp_driver = {
 	.attr		= amd_pstate_epp_attr,
 };
 
-static int __init amd_pstate_set_driver(int mode_idx)
-{
-	if (mode_idx >= AMD_PSTATE_DISABLE && mode_idx < AMD_PSTATE_MAX) {
-		cppc_state = mode_idx;
-		if (cppc_state == AMD_PSTATE_DISABLE)
-			pr_info("driver is explicitly disabled\n");
-
-		if (cppc_state == AMD_PSTATE_ACTIVE)
-			current_pstate_driver = &amd_pstate_epp_driver;
-
-		if (cppc_state == AMD_PSTATE_PASSIVE || cppc_state == AMD_PSTATE_GUIDED)
-			current_pstate_driver = &amd_pstate_driver;
-
-		return 0;
-	}
-
-	return -EINVAL;
-}
-
 /*
  * CPPC function is not supported for family ID 17H with model_ID ranging from 0x10 to 0x2F.
  * show the debug message that helps to check if the CPU has CPPC support for loading issue.
@@ -1876,19 +1873,9 @@ static int __init amd_pstate_init(void)
 		cppc_state = CONFIG_X86_AMD_PSTATE_DEFAULT_MODE;
 	}
 
-	switch (cppc_state) {
-	case AMD_PSTATE_DISABLE:
+	if (cppc_state == AMD_PSTATE_DISABLE) {
 		pr_info("driver load is disabled, boot with specific mode to enable this\n");
 		return -ENODEV;
-	case AMD_PSTATE_PASSIVE:
-	case AMD_PSTATE_ACTIVE:
-	case AMD_PSTATE_GUIDED:
-		ret = amd_pstate_set_driver(cppc_state);
-		if (ret)
-			return ret;
-		break;
-	default:
-		return -EINVAL;
 	}
 
 	/* capability check */
@@ -1909,17 +1896,10 @@ static int __init amd_pstate_init(void)
 			return ret;
 	}
 
-	/* enable amd pstate feature */
-	ret = amd_pstate_enable(true);
-	if (ret) {
-		pr_err("failed to enable driver mode(%d)\n", cppc_state);
-		return ret;
-	}
-
-	ret = cpufreq_register_driver(current_pstate_driver);
+	ret = amd_pstate_register_driver(cppc_state);
 	if (ret) {
 		pr_err("failed to register with return %d\n", ret);
-		goto disable_driver;
+		return ret;
 	}
 
 	dev_root = bus_get_dev_root(&cpu_subsys);
@@ -1936,7 +1916,6 @@ static int __init amd_pstate_init(void)
 
 global_attr_free:
 	cpufreq_unregister_driver(current_pstate_driver);
-disable_driver:
 	amd_pstate_enable(false);
 	return ret;
 }
