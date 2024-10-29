@@ -1082,3 +1082,19 @@ int acpi_match_platform_list(const struct acpi_platform_list *plat)
 	return -ENODEV;
 }
 EXPORT_SYMBOL(acpi_match_platform_list);
+
+void acpi_decode_osc_bits(struct acpi_device *device, char *msg, u32 word,
+			  struct acpi_osc_bit_struct *table, int size)
+{
+	char buf[80];
+	int i, len = 0;
+	struct acpi_osc_bit_struct *entry;
+
+	buf[0] = '\0';
+	for (i = 0, entry = table; i < size; i++, entry++)
+		if (word & entry->bit)
+			len += scnprintf(buf + len, sizeof(buf) - len, "%s%s",
+					len ? " " : "", entry->desc);
+
+	dev_info(&device->dev, "_OSC: %s [%s]\n", msg, buf);
+}
