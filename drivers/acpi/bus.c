@@ -395,12 +395,16 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 	if (!ghes_disable)
 		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_APEI_SUPPORT;
 
-	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB", &handle)))
+	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB", &handle))) {
+		pr_err("ACPI: cannot get acpi_handle for \"\\_SB\"!\n");
 		return;
+	}
 
 	device = acpi_fetch_acpi_dev(handle);
-	if (!device)
+	if (!device) {
+		pr_err("ACPI: cannot get acpi_device for \"\\_SB\"!\n");
 		return;
+	}
 
 	decode_osc_support(device, "OS supports", capbuf[OSC_SUPPORT_DWORD]);
 
