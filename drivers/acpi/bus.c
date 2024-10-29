@@ -34,6 +34,35 @@
 
 #include "internal.h"
 
+static struct acpi_osc_bit_struct bus_osc_support_bit[] = {
+	{ OSC_SB_PAD_SUPPORT, "ProcessorAggregator" },
+	{ OSC_SB_PPC_OST_SUPPORT, "PPC-OST" },
+	{ OSC_SB_PR3_SUPPORT, "_PR3" },
+	{ OSC_SB_HOTPLUG_OST_SUPPORT, "HotplugOST" },
+	{ OSC_SB_APEI_SUPPORT, "APEI" },
+	{ OSC_SB_CPC_SUPPORT, "CPPC" },
+	{ OSC_SB_CPCV2_SUPPORT, "CPPCv2" },
+	{ OSC_SB_PCLPI_SUPPORT, "PC-LPI" },
+	{ OSC_SB_OSLPI_SUPPORT, "OS-LPI" },
+	{ OSC_SB_FAST_THERMAL_SAMPLING_SUPPORT, "FastThermalSampling" },
+	{ OSC_SB_OVER_16_PSTATES_SUPPORT, "16+PStates" },
+	{ OSC_SB_GED_SUPPORT, "GenericEventDevice" },
+	{ OSC_SB_CPC_DIVERSE_HIGH_SUPPORT, "CPPCDiverseHighest" },
+	{ OSC_SB_IRQ_RESOURCE_SOURCE_SUPPORT, "InterruptResourceSource" },
+	{ OSC_SB_CPC_FLEXIBLE_ADR_SPACE, "CPPCFlexibleAddressSpace" },
+	{ OSC_SB_GENERIC_INITIATOR_SUPPORT, "GenericInitiator" },
+	{ OSC_SB_NATIVE_USB4_SUPPORT, "USB4" },
+	{ OSC_SB_BATTERY_CHARGE_LIMITING_SUPPORT, "BatteryChargeLimiting" },
+	{ OSC_SB_PRM_SUPPORT, "PRM" },
+	{ OSC_SB_FFH_OPR_SUPPORT, "FFHOpRegion" },
+};
+
+static void decode_osc_support(struct acpi_device *device, char *msg, u32 word)
+{
+	acpi_decode_osc_bits(device, msg, word, bus_osc_support_bit,
+			    ARRAY_SIZE(bus_osc_support_bit));
+}
+
 struct acpi_device *acpi_root;
 struct proc_dir_entry *acpi_root_dir;
 EXPORT_SYMBOL(acpi_root_dir);
@@ -320,6 +349,7 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 		.cap.pointer = capbuf,
 	};
 	acpi_handle handle;
+	struct acpi_device *device;
 
 	capbuf[OSC_QUERY_DWORD] = OSC_QUERY_ENABLE;
 	capbuf[OSC_SUPPORT_DWORD] = OSC_SB_PR3_SUPPORT; /* _PR3 is in use */
@@ -364,17 +394,29 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 
 	if (!ghes_disable)
 		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_APEI_SUPPORT;
+
 	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB", &handle)))
 		return;
 
-	if (ACPI_FAILURE(acpi_run_osc(handle, &context)))
+	device = acpi_fetch_acpi_dev(handle);
+	if (!device)
 		return;
+
+	decode_osc_support(device, "OS supports", capbuf[OSC_SUPPORT_DWORD]);
+
+	if (ACPI_FAILURE(acpi_run_osc(handle, &context))) {
+		dev_warn(&device->dev, "_OSC: failed to query platform");
+		return;
+	}
 
 	capbuf_ret = context.ret.pointer;
 	if (context.ret.length <= OSC_SUPPORT_DWORD) {
+		dev_warn(&device->dev, "_OSC: failed to query platform");
 		kfree(context.ret.pointer);
 		return;
 	}
+	decode_osc_support(device, "Platform supports",
+			   capbuf_ret[OSC_SUPPORT_DWORD]);
 
 	/*
 	 * Now run _OSC again with query flag clear and with the caps
@@ -384,14 +426,19 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 	capbuf[OSC_SUPPORT_DWORD] = capbuf_ret[OSC_SUPPORT_DWORD];
 	kfree(context.ret.pointer);
 
-	if (ACPI_FAILURE(acpi_run_osc(handle, &context)))
+	if (ACPI_FAILURE(acpi_run_osc(handle, &context))) {
+		dev_warn(&device->dev, "_OSC: failed to request control");
 		return;
+	}
 
 	capbuf_ret = context.ret.pointer;
 	if (context.ret.length <= OSC_SUPPORT_DWORD) {
+		dev_warn(&device->dev, "_OSC: failed to query platform");
 		kfree(context.ret.pointer);
 		return;
 	}
+	decode_osc_support(device, "OS now controls",
+			   capbuf_ret[OSC_SUPPORT_DWORD]);
 
 #ifdef CONFIG_ACPI_CPPC_LIB
 	osc_sb_cppc2_support_acked =
