@@ -34,6 +34,35 @@
 
 #include "internal.h"
 
+static struct acpi_osc_bit_struct bus_osc_support_bit[] = {
+	{ OSC_SB_PAD_SUPPORT, "ProcessorAggregator" },
+	{ OSC_SB_PPC_OST_SUPPORT, "PPC-OST" },
+	{ OSC_SB_PR3_SUPPORT, "_PR3" },
+	{ OSC_SB_HOTPLUG_OST_SUPPORT, "HotplugOST" },
+	{ OSC_SB_APEI_SUPPORT, "APEI" },
+	{ OSC_SB_CPC_SUPPORT, "CPPC" },
+	{ OSC_SB_CPCV2_SUPPORT, "CPPCv2" },
+	{ OSC_SB_PCLPI_SUPPORT, "PC-LPI" },
+	{ OSC_SB_OSLPI_SUPPORT, "OS-LPI" },
+	{ OSC_SB_FAST_THERMAL_SAMPLING_SUPPORT, "FastThermalSampling" },
+	{ OSC_SB_OVER_16_PSTATES_SUPPORT, "16+PStates" },
+	{ OSC_SB_GED_SUPPORT, "GenericEventDevice" },
+	{ OSC_SB_CPC_DIVERSE_HIGH_SUPPORT, "CPPCDiverseHighest" },
+	{ OSC_SB_IRQ_RESOURCE_SOURCE_SUPPORT, "InterruptResourceSource" },
+	{ OSC_SB_CPC_FLEXIBLE_ADR_SPACE, "CPPCFlexibleAddressSpace" },
+	{ OSC_SB_GENERIC_INITIATOR_SUPPORT, "GenericInitiator" },
+	{ OSC_SB_NATIVE_USB4_SUPPORT, "USB4" },
+	{ OSC_SB_BATTERY_CHARGE_LIMITING_SUPPORT, "BatteryChargeLimiting" },
+	{ OSC_SB_PRM_SUPPORT, "PRM" },
+	{ OSC_SB_FFH_OPR_SUPPORT, "FFHOpRegion" },
+	{}
+};
+
+static void decode_osc_support(acpi_handle handle, char *msg, u32 *capbuf)
+{
+	acpi_decode_osc_bits(NULL, handle, msg, capbuf[OSC_SUPPORT_DWORD], bus_osc_support_bit);
+}
+
 struct acpi_device *acpi_root;
 struct proc_dir_entry *acpi_root_dir;
 EXPORT_SYMBOL(acpi_root_dir);
@@ -387,7 +416,8 @@ out:
 EXPORT_SYMBOL(acpi_run_osc);
 
 static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
-			      int rev, u32 *capbuf, size_t bufsize)
+			      int rev, u32 *capbuf, size_t bufsize,
+			      void (*decode_osc)(acpi_handle, char *, u32 *))
 {
 	union acpi_object in_params[4], *out_obj;
 	struct acpi_object_list input;
@@ -408,6 +438,9 @@ static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
 	/* First evaluate _OSC with OSC_QUERY_ENABLE set. */
 	capbuf[OSC_QUERY_DWORD] = OSC_QUERY_ENABLE;
 
+	if (decode_osc)
+		decode_osc(handle, "OS supports", capbuf);
+
 	status = acpi_eval_osc(handle, &guid, rev, &cap, in_params, &output);
 	if (ACPI_FAILURE(status))
 		return -ENODATA;
@@ -425,6 +458,9 @@ static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
 		ret = -ENODATA;
 		goto out;
 	}
+
+	if (decode_osc)
+		decode_osc(handle, "platform supports", retbuf);
 
 	/*
 	 * Clear the feature bits in the capabilities buffer that have not been
@@ -483,6 +519,9 @@ static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
 		acpi_handle_err(handle, "_OSC: errors while requesting control\n");
 		acpi_handle_err(handle, "_OSC: some features may be missing\n");
 	}
+
+	if (decode_osc)
+		decode_osc(handle, "OS now controls", capbuf);
 
 out:
 	ACPI_FREE(out_obj);
@@ -569,14 +608,10 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 
 	capbuf[OSC_SUPPORT_DWORD] = feature_mask;
 
-	acpi_handle_info(handle, "platform _OSC: OS support mask [%08x]\n", feature_mask);
-
-	if (acpi_osc_handshake(handle, sb_uuid_str, 1, capbuf, ARRAY_SIZE(capbuf)))
+	if (acpi_osc_handshake(handle, sb_uuid_str, 1, capbuf, ARRAY_SIZE(capbuf), decode_osc_support))
 		return;
 
 	feature_mask = capbuf[OSC_SUPPORT_DWORD];
-
-	acpi_handle_info(handle, "platform _OSC: OS control mask [%08x]\n", feature_mask);
 
 	osc_sb_cppc2_support_acked = feature_mask & OSC_SB_CPCV2_SUPPORT;
 	osc_sb_apei_support_acked = feature_mask & OSC_SB_APEI_SUPPORT;
@@ -620,7 +655,7 @@ static void acpi_bus_osc_negotiate_usb_control(void)
 	capbuf[OSC_SUPPORT_DWORD] = 0;
 	capbuf[OSC_CONTROL_DWORD] = control;
 
-	if (acpi_osc_handshake(handle, sb_usb_uuid_str, 1, capbuf, ARRAY_SIZE(capbuf)))
+	if (acpi_osc_handshake(handle, sb_usb_uuid_str, 1, capbuf, ARRAY_SIZE(capbuf), NULL))
 		return;
 
 	osc_sb_native_usb4_control = capbuf[OSC_CONTROL_DWORD];
