@@ -123,6 +123,7 @@ static struct acpi_osc_bit_struct pci_osc_support_bit[] = {
 	{ OSC_PCI_MSI_SUPPORT, "MSI" },
 	{ OSC_PCI_EDR_SUPPORT, "EDR" },
 	{ OSC_PCI_HPX_TYPE_3_SUPPORT, "HPX-Type3" },
+	{}
 };
 
 static struct acpi_osc_bit_struct pci_osc_control_bit[] = {
@@ -133,6 +134,7 @@ static struct acpi_osc_bit_struct pci_osc_control_bit[] = {
 	{ OSC_PCI_EXPRESS_CAPABILITY_CONTROL, "PCIeCapability" },
 	{ OSC_PCI_EXPRESS_LTR_CONTROL, "LTR" },
 	{ OSC_PCI_EXPRESS_DPC_CONTROL, "DPC" },
+	{}
 };
 
 static struct acpi_osc_bit_struct cxl_osc_support_bit[] = {
@@ -140,34 +142,32 @@ static struct acpi_osc_bit_struct cxl_osc_support_bit[] = {
 	{ OSC_CXL_2_0_PORT_DEV_REG_ACCESS_SUPPORT, "CXL20PortDevRegAccess" },
 	{ OSC_CXL_PROTOCOL_ERR_REPORTING_SUPPORT, "CXLProtocolErrorReporting" },
 	{ OSC_CXL_NATIVE_HP_SUPPORT, "CXLNativeHotPlug" },
+	{}
 };
 
 static struct acpi_osc_bit_struct cxl_osc_control_bit[] = {
 	{ OSC_CXL_ERROR_REPORTING_CONTROL, "CXLMemErrorReporting" },
+	{}
 };
 
 static void decode_osc_support(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, NULL, msg, word, pci_osc_support_bit,
-			     ARRAY_SIZE(pci_osc_support_bit));
+	acpi_decode_osc_bits(root->device, NULL, msg, word, pci_osc_support_bit);
 }
 
 static void decode_osc_control(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, NULL, msg, word, pci_osc_control_bit,
-			     ARRAY_SIZE(pci_osc_control_bit));
+	acpi_decode_osc_bits(root->device, NULL, msg, word, pci_osc_control_bit);
 }
 
 static void decode_cxl_osc_support(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, NULL, msg, word, cxl_osc_support_bit,
-			     ARRAY_SIZE(cxl_osc_support_bit));
+	acpi_decode_osc_bits(root->device, NULL, msg, word, cxl_osc_support_bit);
 }
 
 static void decode_cxl_osc_control(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, NULL, msg, word, cxl_osc_control_bit,
-			     ARRAY_SIZE(cxl_osc_control_bit));
+	acpi_decode_osc_bits(root->device, NULL, msg, word, cxl_osc_control_bit);
 }
 
 static inline bool is_pcie(struct acpi_pci_root *root)

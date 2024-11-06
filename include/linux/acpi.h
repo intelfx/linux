@@ -703,7 +703,7 @@ struct acpi_osc_bit_struct {
 };
 void acpi_decode_osc_bits(struct acpi_device *device, acpi_handle handle,
 			  char *msg, u32 word,
-			  struct acpi_osc_bit_struct *table, int size);
+			  struct acpi_osc_bit_struct *table);
 
 /* Table must be terminted by a NULL entry */
 struct acpi_platform_list {
