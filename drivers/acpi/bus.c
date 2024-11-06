@@ -58,9 +58,22 @@ static struct acpi_osc_bit_struct bus_osc_support_bit[] = {
 	{}
 };
 
+static struct acpi_osc_bit_struct bus_usb4_osc_support_bit[] = {
+	{ OSC_USB_USB3_TUNNELING, "USB3" },
+	{ OSC_USB_DP_TUNNELING, "DisplayPort" },
+	{ OSC_USB_PCIE_TUNNELING, "PCIe" },
+	{ OSC_USB_XDOMAIN, "XDomain" },
+	{}
+};
+
 static void decode_osc_support(acpi_handle handle, char *msg, u32 word)
 {
 	acpi_decode_osc_bits(NULL, handle, msg, word, bus_osc_support_bit);
+}
+
+static void decode_usb4_osc_support(acpi_handle handle, char *msg, u32 word)
+{
+	acpi_decode_osc_bits(NULL, handle, msg, word, bus_usb4_osc_support_bit);
 }
 
 struct acpi_device *acpi_root;
@@ -470,15 +483,6 @@ out_free:
 u32 osc_sb_native_usb4_control;
 EXPORT_SYMBOL_GPL(osc_sb_native_usb4_control);
 
-static void acpi_bus_decode_usb_osc(const char *msg, u32 bits)
-{
-	pr_info("%s USB3%c DisplayPort%c PCIe%c XDomain%c\n", msg,
-	       (bits & OSC_USB_USB3_TUNNELING) ? '+' : '-',
-	       (bits & OSC_USB_DP_TUNNELING) ? '+' : '-',
-	       (bits & OSC_USB_PCIE_TUNNELING) ? '+' : '-',
-	       (bits & OSC_USB_XDOMAIN) ? '+' : '-');
-}
-
 static u8 sb_usb_uuid_str[] = "23A0D13A-26AB-486C-9C5F-0FFA525A575A";
 static void acpi_bus_osc_negotiate_usb_control(void)
 {
@@ -511,15 +515,28 @@ static void acpi_bus_osc_negotiate_usb_control(void)
 	capbuf[OSC_SUPPORT_DWORD] = 0;
 	capbuf[OSC_CONTROL_DWORD] = control;
 
+	decode_usb4_osc_support(handle, "USB4: OS supports",
+				capbuf[OSC_CONTROL_DWORD]);
+
 	status = acpi_run_osc(handle, &context);
-	if (ACPI_FAILURE(status))
+	if (status == AE_NOT_FOUND) {
+		acpi_handle_info(handle, "_OSC: USB4: not supported\n");
 		return;
+	} else if (ACPI_FAILURE(status)) {
+		acpi_handle_err(handle, "_OSC: USB4: failed to query platform: %s\n",
+				acpi_format_exception(status));
+		return;
+	}
 
 	if (context.ret.length != sizeof(capbuf)) {
-		pr_info("USB4 _OSC: returned invalid length buffer\n");
+		acpi_handle_err(handle, "_OSC: USB4: failed to query platform: %llu != %zu bytes\n",
+				context.ret.length, sizeof(capbuf));
 		goto out_free;
 	}
 	capbuf_ret = context.ret.pointer;
+
+	decode_usb4_osc_support(handle, "USB4: platform supports",
+				capbuf_ret[OSC_CONTROL_DWORD]);
 
 	/*
 	 * Run _OSC again now with query bit clear and the control dword
@@ -531,20 +548,24 @@ static void acpi_bus_osc_negotiate_usb_control(void)
 	kfree(context.ret.pointer);
 
 	status = acpi_run_osc(handle, &context);
-	if (ACPI_FAILURE(status))
+	if (ACPI_FAILURE(status)) {
+		acpi_handle_err(handle, "_OSC: USB4: failed to request control: %s\n",
+				acpi_format_exception(status));
 		return;
+	}
 
 	if (context.ret.length != sizeof(capbuf)) {
-		pr_info("USB4 _OSC: returned invalid length buffer\n");
+		acpi_handle_err(handle, "_OSC: USB4: failed to request control: %llu != %lu bytes\n",
+				context.ret.length, sizeof(capbuf));
 		goto out_free;
 	}
+	capbuf_ret = context.ret.pointer;
+
+	decode_usb4_osc_support(handle, "USB4: OS now controls",
+				capbuf_ret[OSC_CONTROL_DWORD]);
 
 	osc_sb_native_usb4_control =
 		control & acpi_osc_ctx_get_pci_control(&context);
-
-	acpi_bus_decode_usb_osc("USB4 _OSC: OS supports", control);
-	acpi_bus_decode_usb_osc("USB4 _OSC: OS controls",
-				osc_sb_native_usb4_control);
 
 out_free:
 	kfree(context.ret.pointer);
