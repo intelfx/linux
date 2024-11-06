@@ -181,17 +181,12 @@ void acpi_bus_detach_private_data(acpi_handle handle)
 EXPORT_SYMBOL_GPL(acpi_bus_detach_private_data);
 
 static void acpi_print_osc_error(acpi_handle handle,
-				 struct acpi_osc_context *context, char *error)
+				 struct acpi_osc_context *context,
+				 const char *level, const char *error)
 {
-	int i;
-
-	acpi_handle_debug(handle, "(%s): %s\n", context->uuid_str, error);
-
-	pr_debug("_OSC request data:");
-	for (i = 0; i < context->cap.length; i += sizeof(u32))
-		pr_debug(" %x", *((u32 *)(context->cap.pointer + i)));
-
-	pr_debug("\n");
+	acpi_handle_printk(level, handle, "_OSC: (%s): %s\n", context->uuid_str, error);
+	print_hex_dump_debug(pr_fmt("_OSC request: "), DUMP_PREFIX_NONE, 16, 4,
+			     context->cap.pointer, context->cap.length, false);
 }
 
 acpi_status acpi_run_osc(acpi_handle handle, struct acpi_osc_context *context)
@@ -236,30 +231,34 @@ acpi_status acpi_run_osc(acpi_handle handle, struct acpi_osc_context *context)
 	if (out_obj->type != ACPI_TYPE_BUFFER
 		|| out_obj->buffer.length != context->cap.length) {
 		acpi_print_osc_error(handle, context,
-			"_OSC evaluation returned wrong type");
+			KERN_ERR, "evaluation returned wrong type");
 		status = AE_TYPE;
 		goto out_kfree;
 	}
 	/* Need to ignore the bit0 in result code */
-	errors = *((u32 *)out_obj->buffer.pointer) & ~(1 << 0);
+	errors = *((u32 *)out_obj->buffer.pointer) & ~BIT(0);
 	if (errors) {
-		if (errors & OSC_REQUEST_ERROR)
+		status = AE_ERROR;
+		if (errors & OSC_INVALID_UUID_ERROR) {
 			acpi_print_osc_error(handle, context,
-				"_OSC request failed");
-		if (errors & OSC_INVALID_UUID_ERROR)
+				KERN_DEBUG, "invalid UUID");
+			status = AE_NOT_FOUND;
+		}
+		else if (errors & OSC_INVALID_REVISION_ERROR) {
 			acpi_print_osc_error(handle, context,
-				"_OSC invalid UUID");
-		if (errors & OSC_INVALID_REVISION_ERROR)
-			acpi_print_osc_error(handle, context,
-				"_OSC invalid revision");
-		if (errors & OSC_CAPABILITIES_MASK_ERROR) {
+				KERN_DEBUG, "invalid revision");
+			status = AE_NOT_FOUND;
+		}
+		else if (errors & OSC_CAPABILITIES_MASK_ERROR) {
 			if (((u32 *)context->cap.pointer)[OSC_QUERY_DWORD]
 			    & OSC_QUERY_ENABLE)
 				goto out_success;
 			status = AE_SUPPORT;
-			goto out_kfree;
 		}
-		status = AE_ERROR;
+		else if (errors & OSC_REQUEST_ERROR) {
+			acpi_print_osc_error(handle, context,
+				KERN_ERR, "request failed");
+		}
 		goto out_kfree;
 	}
 out_success:
@@ -267,10 +266,10 @@ out_success:
 	context->ret.pointer = kmemdup(out_obj->buffer.pointer,
 				       context->ret.length, GFP_KERNEL);
 	if (!context->ret.pointer) {
-		status =  AE_NO_MEMORY;
+		status = AE_NO_MEMORY;
 		goto out_kfree;
 	}
-	status =  AE_OK;
+	status = AE_OK;
 
 out_kfree:
 	kfree(output.pointer);
