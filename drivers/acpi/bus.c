@@ -180,26 +180,24 @@ void acpi_bus_detach_private_data(acpi_handle handle)
 }
 EXPORT_SYMBOL_GPL(acpi_bus_detach_private_data);
 
-static void acpi_dump_osc_data(acpi_handle handle, const guid_t *guid, int rev,
-			       struct acpi_buffer *cap)
+static void acpi_osc_error_print(acpi_handle handle,
+				 const guid_t *guid, int rev,
+				 struct acpi_buffer *cap,
+				 const char *level, const char *error)
 {
-	u32 *capbuf = cap->pointer;
-	int i;
-
-	acpi_handle_debug(handle, "_OSC: UUID: %pUL, rev: %d\n", guid, rev);
-	for (i = 0; i < cap->length / sizeof(u32); i++)
-		acpi_handle_debug(handle, "_OSC: capabilities DWORD %i: [%08x]\n",
-				  i, capbuf[i]);
+	acpi_handle_printk(level, handle, "_OSC: (%pUL rev %d): %s\n", guid, rev, error);
+	print_hex_dump_debug(pr_fmt("_OSC: capabilities: "), DUMP_PREFIX_NONE, 16, 4,
+			     cap->pointer, cap->length, false);
 }
 
 #define OSC_ERROR_MASK 	(OSC_REQUEST_ERROR | OSC_INVALID_UUID_ERROR | \
 			 OSC_INVALID_REVISION_ERROR | \
 			 OSC_CAPABILITIES_MASK_ERROR)
 
-static int acpi_eval_osc(acpi_handle handle, guid_t *guid, int rev,
-			 struct acpi_buffer *cap,
-			 union acpi_object in_params[at_least 4],
-			 struct acpi_buffer *output)
+static acpi_status acpi_eval_osc(acpi_handle handle, guid_t *guid, int rev,
+				 struct acpi_buffer *cap,
+				 union acpi_object in_params[at_least 4],
+				 struct acpi_buffer *output)
 {
 	struct acpi_object_list input;
 	union acpi_object *out_obj;
@@ -222,66 +220,124 @@ static int acpi_eval_osc(acpi_handle handle, guid_t *guid, int rev,
 	output->pointer = NULL;
 
 	status = acpi_evaluate_object(handle, "_OSC", &input, output);
-	if (ACPI_FAILURE(status) || !output->length)
-		return -ENODATA;
+	if (status == AE_NOT_FOUND) {
+		acpi_handle_info(handle, "_OSC: not found\n");
+		return status;
+	}
+	if (ACPI_FAILURE(status)) {
+		acpi_handle_err(handle, "_OSC: failed to evaluate: %s\n",
+				acpi_format_exception(status));
+		return status;
+	}
+	if (!output->length) {
+		acpi_handle_err(handle, "_OSC: invalid return buffer\n");
+		return AE_ERROR;
+	}
 
 	out_obj = output->pointer;
 	if (out_obj->type != ACPI_TYPE_BUFFER ||
 	    out_obj->buffer.length != cap->length) {
-		acpi_handle_debug(handle, "Invalid _OSC return buffer\n");
-		acpi_dump_osc_data(handle, guid, rev, cap);
+		acpi_osc_error_print(handle, guid, rev, cap,
+				     KERN_ERR, "invalid return buffer");
 		ACPI_FREE(out_obj);
-		return -ENODATA;
+		return AE_ERROR;
 	}
 
 	return 0;
 }
 
-static bool acpi_osc_error_check(acpi_handle handle, guid_t *guid, int rev,
-				 struct acpi_buffer *cap, u32 *retbuf)
+/*
+ * XXX
+ * The overall idea here is that we distinguish four logical states as a result
+ * of a successsful _OSC call (i.e. not one that failed to evaluate, or returned
+ * a wrong type, etc):
+ * - no error
+ *   (this also covers the case where OSC_QUERY_ENABLE is set and we got a
+ *    OSC_CAPABILITIES_MASK_ERROR, because it is not an error for a platform
+ *    to not support some capabilities)
+ * - platform does not have this functionality at all
+ *   (e.g. GUID not recognized)
+ * - something unexpected happened and capability bits were not modified
+ *   (platform took no action, the OS must not assume control)
+ * - something unexpected happened and capability bits were modified
+ *   (platform took action, the OS must assume control of the remaining caps)
+ */
+
+typedef enum {
+	ACPI_OSC_NOT_SUPPORTED = -2,
+	ACPI_OSC_ERROR_FAIL = -1,
+	ACPI_OSC_OK = 0,
+	ACPI_OSC_ERROR_CONTINUE = 1,
+} acpi_osc_status;
+
+/*
+ * Check the result of a successful _OSC call for logical error conditions.
+
+ * Returns 0 if no errors worthy of note were detected, <0 if the result is not
+ * valid (the OS may not assume control), or >0 if some capabilities are missing
+ * but the OS must assume control of the remaining capabilities.
+ *
+ * If OSC_QUERY_ENABLE is set, the "capabilities masked" bit is ignored entirely
+ * as it is not an error for a platform not to support some capabilities,
+ * but any other errors are treated as fatal.
+ *
+ * Otherwise, we treat error bits in accordance with the ACPI spec
+ * (only OSC_INVALID_UUID_ERROR is treated as fatal, any other error bit is
+ * treated as non-fatal because the capabilities bits may have been modified
+ * and the OS must assume control of the remaining capabilities).
+ * We do not ignore any error bits as we should have already masked off any
+ * unsupported capabilities during the query, so if the firmware has masked off
+ * any _more_ bits it indicates a problem.
+ */
+static acpi_osc_status acpi_osc_error_check(acpi_handle handle, guid_t *guid, int rev,
+					    struct acpi_buffer *cap, u32 *retbuf)
 {
 	/* Only take defined error bits into account. */
 	u32 errors = retbuf[OSC_QUERY_DWORD] & OSC_ERROR_MASK;
 	u32 *capbuf = cap->pointer;
-	bool fail;
+	bool is_query = capbuf[OSC_QUERY_DWORD] & OSC_QUERY_ENABLE;
+	acpi_osc_status status;
 
 	/*
 	 * If OSC_QUERY_ENABLE is set, ignore the "capabilities masked"
 	 * bit because it merely means that some features have not been
 	 * acknowledged which is not unexpected.
 	 */
-	if (capbuf[OSC_QUERY_DWORD] & OSC_QUERY_ENABLE)
+	if (is_query)
 		errors &= ~OSC_CAPABILITIES_MASK_ERROR;
 
 	if (!errors)
-		return false;
+		return ACPI_OSC_OK;
 
-	acpi_dump_osc_data(handle, guid, rev, cap);
 	/*
 	 * As a rule, fail only if OSC_QUERY_ENABLE is set because otherwise the
 	 * acknowledged features need to be controlled.
 	 */
-	fail = !!(capbuf[OSC_QUERY_DWORD] & OSC_QUERY_ENABLE);
+	status = is_query ? ACPI_OSC_ERROR_FAIL : ACPI_OSC_ERROR_CONTINUE;
 
 	if (errors & OSC_REQUEST_ERROR)
-		acpi_handle_debug(handle, "_OSC: request failed\n");
+		acpi_osc_error_print(handle, guid, rev, cap,
+				     KERN_ERR, "request failed");
 
 	if (errors & OSC_INVALID_UUID_ERROR) {
-		acpi_handle_debug(handle, "_OSC: invalid UUID\n");
+		acpi_osc_error_print(handle, guid, rev, cap,
+				     is_query ? KERN_DEBUG : KERN_ERR, "invalid UUID");
 		/*
 		 * Always fail if this bit is set because it means that the
 		 * request could not be processed.
 		 */
-		fail = true;
+		status = ACPI_OSC_NOT_SUPPORTED;
 	}
 
 	if (errors & OSC_INVALID_REVISION_ERROR)
-		acpi_handle_debug(handle, "_OSC: invalid revision\n");
+		acpi_osc_error_print(handle, guid, rev, cap,
+				     KERN_ERR, "invalid revision");
 
 	if (errors & OSC_CAPABILITIES_MASK_ERROR)
-		acpi_handle_debug(handle, "_OSC: capability bits masked\n");
+		acpi_osc_error_print(handle, guid, rev, cap,
+				     KERN_ERR, "capability bits masked");
 
-	return fail;
+	return status;
 }
 
 acpi_status acpi_run_osc(acpi_handle handle, struct acpi_osc_context *context)
@@ -289,24 +345,29 @@ acpi_status acpi_run_osc(acpi_handle handle, struct acpi_osc_context *context)
 	union acpi_object in_params[4], *out_obj;
 	struct acpi_buffer output;
 	acpi_status status = AE_OK;
+	acpi_osc_status osc_status;
 	guid_t guid;
 	u32 *retbuf;
-	int ret;
 
 	if (!context || !context->cap.pointer ||
 	    context->cap.length < 2 * sizeof(u32) ||
 	    guid_parse(context->uuid_str, &guid))
 		return AE_BAD_PARAMETER;
 
-	ret = acpi_eval_osc(handle, &guid, context->rev, &context->cap,
-			    in_params, &output);
-	if (ret)
-		return AE_ERROR;
+	status = acpi_eval_osc(handle, &guid, context->rev, &context->cap,
+			       in_params, &output);
+	if (ACPI_FAILURE(status))
+		return status;
 
 	out_obj = output.pointer;
 	retbuf = (u32 *)out_obj->buffer.pointer;
 
-	if (acpi_osc_error_check(handle, &guid, context->rev, &context->cap, retbuf)) {
+	osc_status = acpi_osc_error_check(handle, &guid, context->rev, &context->cap, retbuf);
+	if (osc_status < 0) {
+		if (osc_status == ACPI_OSC_NOT_SUPPORTED)
+			acpi_handle_info(handle, "_OSC: not supported\n");
+		else
+			acpi_handle_err(handle, "_OSC: failed to query platform\n");
 		status = AE_ERROR;
 		goto out;
 	}
@@ -314,10 +375,10 @@ acpi_status acpi_run_osc(acpi_handle handle, struct acpi_osc_context *context)
 	context->ret.length = out_obj->buffer.length;
 	context->ret.pointer = kmemdup(retbuf, context->ret.length, GFP_KERNEL);
 	if (!context->ret.pointer) {
-		status =  AE_NO_MEMORY;
+		status = AE_NO_MEMORY;
 		goto out;
 	}
-	status =  AE_OK;
+	status = AE_OK;
 
 out:
 	ACPI_FREE(out_obj);
@@ -337,7 +398,9 @@ static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
 	struct acpi_buffer output;
 	u32 *retbuf, test;
 	guid_t guid;
-	int ret, i;
+	acpi_status status;
+	acpi_osc_status osc_status;
+	int ret = 0, i;
 
 	if (!capbuf || bufsize < 2 || guid_parse(uuid_str, &guid))
 		return -EINVAL;
@@ -345,14 +408,20 @@ static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
 	/* First evaluate _OSC with OSC_QUERY_ENABLE set. */
 	capbuf[OSC_QUERY_DWORD] = OSC_QUERY_ENABLE;
 
-	ret = acpi_eval_osc(handle, &guid, rev, &cap, in_params, &output);
-	if (ret)
-		return ret;
+	status = acpi_eval_osc(handle, &guid, rev, &cap, in_params, &output);
+	if (ACPI_FAILURE(status))
+		return -ENODATA;
 
 	out_obj = output.pointer;
 	retbuf = (u32 *)out_obj->buffer.pointer;
 
-	if (acpi_osc_error_check(handle, &guid, rev, &cap, retbuf)) {
+	osc_status = acpi_osc_error_check(handle, &guid, rev, &cap, retbuf);
+	if (osc_status == ACPI_OSC_NOT_SUPPORTED) {
+		acpi_handle_info(handle, "_OSC: not found\n");
+		ret = -ENODATA;
+		goto out;
+	} else if (osc_status < 0) {
+		acpi_handle_err(handle, "_OSC: failed to query platform\n");
 		ret = -ENODATA;
 		goto out;
 	}
@@ -386,7 +455,10 @@ static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
 	input.pointer = in_params;
 	input.count = 4;
 
-	if (ACPI_FAILURE(acpi_evaluate_object(handle, "_OSC", &input, &output))) {
+	status = acpi_evaluate_object(handle, "_OSC", &input, &output);
+	if (ACPI_FAILURE(status) || !output.length) {
+		acpi_handle_err(handle, "_OSC: failed to evaluate: %s\n",
+				acpi_format_exception(status));
 		ret = -ENODATA;
 		goto out;
 	}
@@ -398,14 +470,18 @@ static int acpi_osc_handshake(acpi_handle handle, const char *uuid_str,
 	for (i = OSC_QUERY_DWORD + 1; i < bufsize; i++)
 		capbuf[i] &= retbuf[i];
 
-	if (retbuf[OSC_QUERY_DWORD] & OSC_ERROR_MASK) {
-		/*
-		 * Complain about the unexpected errors and print diagnostic
-		 * information related to them.
-		 */
-		acpi_handle_err(handle, "_OSC: errors while processing control request\n");
+	/*
+	 * Complain about the unexpected errors and print diagnostic
+	 * information related to them.
+	 */
+	osc_status = acpi_osc_error_check(handle, &guid, rev, &cap, retbuf);
+	if (osc_status < 0) {
+		acpi_handle_err(handle, "_OSC: failed to request control\n");
+		ret = -ENODATA;
+		goto out;
+	} else if (osc_status != 0) {
+		acpi_handle_err(handle, "_OSC: errors while requesting control\n");
 		acpi_handle_err(handle, "_OSC: some features may be missing\n");
-		acpi_osc_error_check(handle, &guid, rev, &cap, retbuf);
 	}
 
 out:
