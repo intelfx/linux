@@ -148,25 +148,25 @@ static struct acpi_osc_bit_struct cxl_osc_control_bit[] = {
 
 static void decode_osc_support(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, msg, word, pci_osc_support_bit,
+	acpi_decode_osc_bits(root->device, NULL, msg, word, pci_osc_support_bit,
 			     ARRAY_SIZE(pci_osc_support_bit));
 }
 
 static void decode_osc_control(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, msg, word, pci_osc_control_bit,
+	acpi_decode_osc_bits(root->device, NULL, msg, word, pci_osc_control_bit,
 			     ARRAY_SIZE(pci_osc_control_bit));
 }
 
 static void decode_cxl_osc_support(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, msg, word, cxl_osc_support_bit,
+	acpi_decode_osc_bits(root->device, NULL, msg, word, cxl_osc_support_bit,
 			     ARRAY_SIZE(cxl_osc_support_bit));
 }
 
 static void decode_cxl_osc_control(struct acpi_pci_root *root, char *msg, u32 word)
 {
-	acpi_decode_osc_bits(root->device, msg, word, cxl_osc_control_bit,
+	acpi_decode_osc_bits(root->device, NULL, msg, word, cxl_osc_control_bit,
 			     ARRAY_SIZE(cxl_osc_control_bit));
 }
 
