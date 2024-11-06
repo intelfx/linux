@@ -316,10 +316,14 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 	struct acpi_osc_context context = {
 		.uuid_str = sb_uuid_str,
 		.rev = 1,
-		.cap.length = 8,
+		.cap.length = sizeof(capbuf),
 		.cap.pointer = capbuf,
 	};
 	acpi_handle handle;
+	acpi_status status;
+
+	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB", &handle)))
+		return;
 
 	capbuf[OSC_QUERY_DWORD] = OSC_QUERY_ENABLE;
 	capbuf[OSC_SUPPORT_DWORD] = OSC_SB_PR3_SUPPORT; /* _PR3 is in use */
@@ -364,17 +368,14 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 
 	if (!ghes_disable)
 		capbuf[OSC_SUPPORT_DWORD] |= OSC_SB_APEI_SUPPORT;
-	if (ACPI_FAILURE(acpi_get_handle(NULL, "\\_SB", &handle)))
+
+	status = acpi_run_osc(handle, &context);
+	if (ACPI_FAILURE(status))
 		return;
 
-	if (ACPI_FAILURE(acpi_run_osc(handle, &context)))
-		return;
-
+	if (context.ret.length < sizeof(capbuf))
+		goto out_free;
 	capbuf_ret = context.ret.pointer;
-	if (context.ret.length <= OSC_SUPPORT_DWORD) {
-		kfree(context.ret.pointer);
-		return;
-	}
 
 	/*
 	 * Now run _OSC again with query flag clear and with the caps
@@ -384,25 +385,28 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 	capbuf[OSC_SUPPORT_DWORD] = capbuf_ret[OSC_SUPPORT_DWORD];
 	kfree(context.ret.pointer);
 
-	if (ACPI_FAILURE(acpi_run_osc(handle, &context)))
+	status = acpi_run_osc(handle, &context);
+	if (ACPI_FAILURE(status))
 		return;
 
+	if (context.ret.length < sizeof(capbuf))
+		goto out_free;
 	capbuf_ret = context.ret.pointer;
-	if (context.ret.length > OSC_SUPPORT_DWORD) {
+
 #ifdef CONFIG_ACPI_CPPC_LIB
-		osc_sb_cppc2_support_acked = capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_CPCV2_SUPPORT;
+	osc_sb_cppc2_support_acked =
+		capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_CPCV2_SUPPORT;
 #endif
+	osc_sb_apei_support_acked =
+		capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_APEI_SUPPORT;
+	osc_pc_lpi_support_confirmed =
+		capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_PCLPI_SUPPORT;
+	osc_sb_native_usb4_support_confirmed =
+		capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_NATIVE_USB4_SUPPORT;
+	osc_cpc_flexible_adr_space_confirmed =
+		capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_CPC_FLEXIBLE_ADR_SPACE;
 
-		osc_sb_apei_support_acked =
-			capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_APEI_SUPPORT;
-		osc_pc_lpi_support_confirmed =
-			capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_PCLPI_SUPPORT;
-		osc_sb_native_usb4_support_confirmed =
-			capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_NATIVE_USB4_SUPPORT;
-		osc_cpc_flexible_adr_space_confirmed =
-			capbuf_ret[OSC_SUPPORT_DWORD] & OSC_SB_CPC_FLEXIBLE_ADR_SPACE;
-	}
-
+out_free:
 	kfree(context.ret.pointer);
 }
 
@@ -463,17 +467,15 @@ static void acpi_bus_osc_negotiate_usb_control(void)
 		pr_info("USB4 _OSC: returned invalid length buffer\n");
 		goto out_free;
 	}
+	capbuf_ret = context.ret.pointer;
 
 	/*
 	 * Run _OSC again now with query bit clear and the control dword
 	 * matching what the platform granted (which may not have all
 	 * the control bits set).
 	 */
-	capbuf_ret = context.ret.pointer;
-
 	capbuf[OSC_QUERY_DWORD] = 0;
 	capbuf[OSC_CONTROL_DWORD] = capbuf_ret[OSC_CONTROL_DWORD];
-
 	kfree(context.ret.pointer);
 
 	status = acpi_run_osc(handle, &context);
