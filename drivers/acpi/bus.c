@@ -58,9 +58,24 @@ static struct acpi_osc_bit_struct bus_osc_support_bit[] = {
 	{}
 };
 
+static struct acpi_osc_bit_struct bus_usb4_osc_support_bit[] = {
+	{ OSC_USB_USB3_TUNNELING, "USB3" },
+	{ OSC_USB_DP_TUNNELING, "DisplayPort" },
+	{ OSC_USB_PCIE_TUNNELING, "PCIe" },
+	{ OSC_USB_XDOMAIN, "XDomain" },
+	{}
+};
+
 static void decode_osc_support(acpi_handle handle, char *msg, u32 *capbuf)
 {
 	acpi_decode_osc_bits(NULL, handle, msg, capbuf[OSC_SUPPORT_DWORD], bus_osc_support_bit);
+}
+
+static void decode_usb4_osc_support(acpi_handle handle, char *msg, u32 *capbuf)
+{
+	char buf[255];
+	scnprintf(buf, sizeof(buf), "USB4: %s", msg);
+	acpi_decode_osc_bits(NULL, handle, buf, capbuf[OSC_CONTROL_DWORD], bus_usb4_osc_support_bit);
 }
 
 struct acpi_device *acpi_root;
@@ -628,15 +643,6 @@ static void acpi_bus_osc_negotiate_platform_control(void)
 u32 osc_sb_native_usb4_control;
 EXPORT_SYMBOL_GPL(osc_sb_native_usb4_control);
 
-static void acpi_bus_decode_usb_osc(const char *msg, u32 bits)
-{
-	pr_info("%s USB3%c DisplayPort%c PCIe%c XDomain%c\n", msg,
-	       (bits & OSC_USB_USB3_TUNNELING) ? '+' : '-',
-	       (bits & OSC_USB_DP_TUNNELING) ? '+' : '-',
-	       (bits & OSC_USB_PCIE_TUNNELING) ? '+' : '-',
-	       (bits & OSC_USB_XDOMAIN) ? '+' : '-');
-}
-
 static void acpi_bus_osc_negotiate_usb_control(void)
 {
 	static const u8 sb_usb_uuid_str[] = "23A0D13A-26AB-486C-9C5F-0FFA525A575A";
@@ -655,13 +661,10 @@ static void acpi_bus_osc_negotiate_usb_control(void)
 	capbuf[OSC_SUPPORT_DWORD] = 0;
 	capbuf[OSC_CONTROL_DWORD] = control;
 
-	if (acpi_osc_handshake(handle, sb_usb_uuid_str, 1, capbuf, ARRAY_SIZE(capbuf), NULL))
+	if (acpi_osc_handshake(handle, sb_usb_uuid_str, 1, capbuf, ARRAY_SIZE(capbuf), decode_usb4_osc_support))
 		return;
 
 	osc_sb_native_usb4_control = capbuf[OSC_CONTROL_DWORD];
-
-	acpi_bus_decode_usb_osc("USB4 _OSC: OS supports", control);
-	acpi_bus_decode_usb_osc("USB4 _OSC: OS controls", osc_sb_native_usb4_control);
 }
 
 /* --------------------------------------------------------------------------
