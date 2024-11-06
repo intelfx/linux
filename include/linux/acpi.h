@@ -701,7 +701,8 @@ struct acpi_osc_bit_struct {
 	u32 bit;
 	char *desc;
 };
-void acpi_decode_osc_bits(struct acpi_device *device, char *msg, u32 word,
+void acpi_decode_osc_bits(struct acpi_device *device, acpi_handle handle,
+			  char *msg, u32 word,
 			  struct acpi_osc_bit_struct *table, int size);
 
 /* Table must be terminted by a NULL entry */
