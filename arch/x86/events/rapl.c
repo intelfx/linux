@@ -699,6 +699,7 @@ static const struct attribute_group *rapl_attr_update[] = {
 
 static const struct attribute_group *rapl_core_attr_update[] = {
 	&rapl_events_core_group,
+	NULL,
 };
 
 static int __init init_rapl_pmu(struct rapl_pmus *rapl_pmus)
