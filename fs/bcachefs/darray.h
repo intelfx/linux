@@ -89,7 +89,7 @@ static inline int __darray_make_room(darray_char *d, size_t t_size, size_t more,
 	for (typeof(&(_d).data[0]) _i = (_d).data; _i < (_d).data + (_d).nr; _i++)
 
 #define darray_for_each_reverse(_d, _i)					\
-	for (typeof(&(_d).data[0]) _i = (_d).data + (_d).nr - 1; _i >= (_d).data; --_i)
+	for (typeof(&(_d).data[0]) _i = (_d).data + (_d).nr - 1; _i >= (_d).data && (_d).nr; --_i)
 
 #define darray_init(_d)							\
 do {									\
