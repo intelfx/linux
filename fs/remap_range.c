@@ -381,15 +381,13 @@ loff_t vfs_clone_file_range(struct file *file_in, loff_t pos_in,
 
 	WARN_ON_ONCE(remap_flags & REMAP_FILE_DEDUP);
 
-	if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
-		return -EXDEV;
-
 	ret = generic_file_rw_checks(file_in, file_out);
-	if (ret < 0)
+	if (ret)
 		return ret;
 
-	if (!file_in->f_op->remap_file_range)
-		return -EOPNOTSUPP;
+	ret = generic_file_remap_checks(file_in, file_out);
+	if (ret < 0)
+		return ret;
 
 	ret = remap_verify_area(file_in, pos_in, len, false);
 	if (ret)
@@ -438,6 +436,10 @@ loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
 	WARN_ON_ONCE(remap_flags & ~(REMAP_FILE_DEDUP |
 				     REMAP_FILE_CAN_SHORTEN));
 
+	ret = generic_file_remap_checks(src_file, dst_file);
+	if (ret)
+		return ret;
+
 	/*
 	 * This is redundant if called from vfs_dedupe_file_range(), but other
 	 * callers need it and it's not performance sesitive...
@@ -463,16 +465,8 @@ loff_t vfs_dedupe_file_range_one(struct file *src_file, loff_t src_pos,
 	if (!may_dedupe_file(dst_file))
 		goto out_drop_write;
 
-	ret = -EXDEV;
-	if (file_inode(src_file)->i_sb != file_inode(dst_file)->i_sb)
-		goto out_drop_write;
-
 	ret = -EISDIR;
 	if (S_ISDIR(file_inode(dst_file)->i_mode))
-		goto out_drop_write;
-
-	ret = -EINVAL;
-	if (!dst_file->f_op->remap_file_range)
 		goto out_drop_write;
 
 	if (len == 0) {
