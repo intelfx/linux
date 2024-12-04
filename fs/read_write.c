@@ -1556,6 +1556,35 @@ static int generic_copy_file_checks(struct file *file_in, loff_t pos_in,
 }
 
 /*
+ * Perform necessary checks before doing a file clone/remap.
+ *
+ * Unlike generic_copy_file_checks(), this is split into three steps:
+ * - generic_file_rw_checks()
+ * - generic_file_remap_checks()
+ * - generic_remap_checks() in remap_range.c
+ *
+ * This checks whether a remap operation is supported/allowed.
+ *
+ * Returns appropriate error code that caller should return or
+ * zero in case the copy should be allowed.
+ */
+int generic_file_remap_checks(struct file *file_in,
+			      struct file *file_out)
+{
+	int ret;
+
+	if (file_in->f_op->remap_file_range) {
+		ret = file_remap_checks(file_in, file_out);
+		if (ret)
+			return ret;
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+/*
  * copy_file_range() differs from regular file read and write in that it
  * specifically allows return partial success.  When it does so is up to
  * the copy_file_range method.
