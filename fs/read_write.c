@@ -1475,8 +1475,13 @@ static int file_copy_checks(struct file *file_in,
 static int file_remap_checks(struct file *file_in,
 			     struct file *file_out)
 {
-	if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
-		return -EXDEV;
+	if (file_in->f_op->fop_flags & FOP_REMAP_CROSS_SB) {
+		if (file_in->f_op != file_out->f_op)
+			return -EXDEV;
+	} else {
+		if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
+			return -EXDEV;
+	}
 	return 0;
 }
 
