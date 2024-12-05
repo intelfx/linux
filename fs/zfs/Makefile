@@ -4,7 +4,11 @@
 
 ZFS_MODULE_CFLAGS += -std=gnu11 -Wno-declaration-after-statement
 ZFS_MODULE_CFLAGS += -Wmissing-prototypes
-ZFS_MODULE_CFLAGS +=  -Wno-format-zero-length
+ZFS_MODULE_CFLAGS += -Wno-format-zero-length
+
+ifeq ($(CONFIG_ZFS_DEBUG),y)
+ZFS_MODULE_CFLAGS += -Werror
+endif
 
 ifneq ($(KBUILD_EXTMOD),)
 zfs_include = /home/intelfx/tmp/big/zfs/include
@@ -26,7 +30,12 @@ ZFS_MODULE_CFLAGS += -I$(zfs_include)/os/linux/spl
 ZFS_MODULE_CFLAGS += -I$(zfs_include)/os/linux/zfs
 ZFS_MODULE_CFLAGS += -I$(zfs_include)
 ZFS_MODULE_CPPFLAGS += -D_KERNEL
+
+ifeq ($(CONFIG_ZFS_DEBUG),y)
+ZFS_MODULE_CPPFLAGS += -DDEBUG -UNDEBUG
+else
 ZFS_MODULE_CPPFLAGS += -UDEBUG -DNDEBUG
+endif
 
 # KASAN enables -Werror=frame-larger-than=1024, which
 # breaks oh so many parts of our build.
