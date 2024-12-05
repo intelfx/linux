@@ -1099,6 +1099,9 @@ const struct address_space_operations zpl_address_space_operations = {
 };
 
 const struct file_operations zpl_file_operations = {
+#ifdef FOP_REMAP_CROSS_SB
+	.fop_flags  = FOP_REMAP_CROSS_SB,
+#endif
 	.open		= zpl_open,
 	.release	= zpl_release,
 	.llseek		= zpl_llseek,
