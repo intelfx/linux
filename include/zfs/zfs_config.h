@@ -867,7 +867,9 @@
 #define SYSTEM_LINUX 1
 
 /* Version number of package */
-/* #undef ZFS_DEBUG */
+#ifdef CONFIG_ZFS_DEBUG
+#define ZFS_DEBUG 1
+#endif
 
 /* /dev/zfs minor */
 #define ZFS_DEVICE_MINOR 249
