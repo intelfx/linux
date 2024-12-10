@@ -228,10 +228,10 @@
 #define HAVE_DECLARE_EVENT_CLASS 1
 
 /* 3-arg dequeue_signal() takes a type argument */
-/* #undef HAVE_DEQUEUE_SIGNAL_3ARG_TYPE */
+#define HAVE_DEQUEUE_SIGNAL_3ARG_TYPE 1
 
 /* dequeue_signal() takes 4 arguments */
-#define HAVE_DEQUEUE_SIGNAL_4ARG 1
+/* #undef HAVE_DEQUEUE_SIGNAL_4ARG */
 
 /* lookup_bdev() wants dev_t arg */
 #define HAVE_DEVT_LOOKUP_BDEV 1
@@ -483,7 +483,7 @@
 #define HAVE_MLOCKALL 1
 
 /* PG_error flag is available */
-#define HAVE_MM_PAGE_FLAG_ERROR 1
+/* #undef HAVE_MM_PAGE_FLAG_ERROR */
 
 /* page_mapping() is available */
 /* #undef HAVE_MM_PAGE_MAPPING */
@@ -513,7 +513,7 @@
 #define HAVE_PROC_OPS_STRUCT 1
 
 /* If available, contains the Python version number currently in use. */
-#define HAVE_PYTHON "3.12"
+#define HAVE_PYTHON "3.13"
 
 /* qat is enabled and existed */
 /* #undef HAVE_QAT */
@@ -788,7 +788,7 @@
 #define ZFS_DEVICE_MINOR 249
 
 /* Define the project alias string. */
-#define ZFS_META_ALIAS "zfs-2.3.0-rc3"
+#define ZFS_META_ALIAS "zfs-2.3.0-rc4"
 
 /* Define the project author. */
 #define ZFS_META_AUTHOR "OpenZFS"
@@ -797,7 +797,7 @@
 /* #undef ZFS_META_DATA */
 
 /* Define the maximum compatible kernel version. */
-#define ZFS_META_KVER_MAX "6.11"
+#define ZFS_META_KVER_MAX "6.12"
 
 /* Define the minimum compatible kernel version. */
 #define ZFS_META_KVER_MIN "4.18"
@@ -818,7 +818,7 @@
 #define ZFS_META_NAME "zfs"
 
 /* Define the project release. */
-#define ZFS_META_RELEASE "rc3"
+#define ZFS_META_RELEASE "rc4"
 
 /* Define the project version. */
 #define ZFS_META_VERSION "2.3.0"
