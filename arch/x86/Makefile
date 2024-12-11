@@ -184,8 +184,8 @@ else
         cflags-$(CONFIG_MCORE2)		+= -march=core2
         cflags-$(CONFIG_MATOM)		+= -march=atom
       ifeq ($(CONFIG_X86_64_ISA_LEVEL),1)
-        cflags-$(CONFIG_GENERIC_CPU)	+= -mtune=generic
-        rustflags-$(CONFIG_GENERIC_CPU)	+= -Ztune-cpu=generic
+        cflags-$(CONFIG_GENERIC_CPU)	+= -march=x86-64 -mtune=generic
+        rustflags-$(CONFIG_GENERIC_CPU)	+= -Ctarget-cpu=x86-64 -Ztune-cpu=generic
       else
         cflags-$(CONFIG_GENERIC_CPU)	+= -march=x86-64-v$(CONFIG_X86_64_ISA_LEVEL)
         rustflags-$(CONFIG_GENERIC_CPU)	+= -Ctarget-cpu=x86-64-v$(CONFIG_X86_64_ISA_LEVEL)
