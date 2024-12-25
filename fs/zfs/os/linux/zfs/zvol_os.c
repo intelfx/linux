@@ -83,6 +83,18 @@ static unsigned int zvol_blk_mq_blocks_per_thread = 8;
 
 static unsigned int zvol_num_taskqs = 0;
 
+/*
+ * Whether to report 4096-byte logical sectors on emulated block devices
+ * where appropriate (i.e. where volblocksize >= 4096), essentially
+ * emulating "4Kn" block devices.
+ *
+ * NB: the "logical" sector size is the smaller of the two, and is _not_
+ * a hint (i.e. it defines the mapping between the LBAs and byte offsets
+ * in the image). Changing the logical sector size implies loss of data,
+ * hence this is a parameter as it is not a backwards-compatible change.
+ */
+static unsigned int zvol_use_4kn = 0;
+
 #ifndef	BLKDEV_DEFAULT_RQ
 /* BLKDEV_MAX_RQ was renamed to BLKDEV_DEFAULT_RQ in the 5.16 kernel */
 #define	BLKDEV_DEFAULT_RQ BLKDEV_MAX_RQ
@@ -1107,7 +1119,9 @@ typedef struct zvol_queue_limits {
 	unsigned int	zql_max_hw_sectors;
 	unsigned short	zql_max_segments;
 	unsigned int	zql_max_segment_size;
+	unsigned int	zql_io_min;
 	unsigned int	zql_io_opt;
+	unsigned int	zql_logical_block_size;
 	unsigned int	zql_physical_block_size;
 	unsigned int	zql_max_discard_sectors;
 	unsigned int	zql_discard_granularity;
@@ -1117,7 +1131,7 @@ static void
 zvol_queue_limits_init(zvol_queue_limits_t *limits, zvol_state_t *zv,
     boolean_t use_blk_mq)
 {
-	limits->zql_max_hw_sectors = (DMU_MAX_ACCESS / 4) >> 9;
+	limits->zql_max_hw_sectors = (DMU_MAX_ACCESS / 4) >> SECTOR_SHIFT;
 
 	if (use_blk_mq) {
 		/*
@@ -1176,11 +1190,25 @@ zvol_queue_limits_init(zvol_queue_limits_t *limits, zvol_state_t *zv,
 		limits->zql_max_segment_size = UINT_MAX;
 	}
 
+	/*
+	 * topology values in order of decreasing size:
+	 * - zql_io_opt (optimal I/O size): the largest I/O size that has benefits
+	 * - zql_io_min (minimal I/O size): the smallest I/O size that does not incur penalties
+	 * - physical_block_size: the smallest I/O size that can be written atomically
+	 * - logical_block_size: the size of an (emulated) LBA
+	 */
+	/* these two are hints */
 	limits->zql_io_opt = DMU_MAX_ACCESS / 2;
+	limits->zql_io_min = zv->zv_volblocksize;
 
+	/* this is a (stronger?) hint */
 	limits->zql_physical_block_size = zv->zv_volblocksize;
+	/* this is NOT a hint */
+	limits->zql_logical_block_size =
+		(zvol_use_4kn && zv->zv_volblocksize >= 4096) ? 4096
+		                                              : 512;
 	limits->zql_max_discard_sectors =
-	    (zvol_max_discard_blocks * zv->zv_volblocksize) >> 9;
+	    (zvol_max_discard_blocks * zv->zv_volblocksize) >> SECTOR_SHIFT;
 	limits->zql_discard_granularity = zv->zv_volblocksize;
 }
 
@@ -1194,6 +1222,8 @@ zvol_queue_limits_convert(zvol_queue_limits_t *limits,
 	qlimits->max_segments = limits->zql_max_segments;
 	qlimits->max_segment_size = limits->zql_max_segment_size;
 	qlimits->io_opt = limits->zql_io_opt;
+	qlimits->io_min = limits->zql_io_min;
+	qlimits->logical_block_size = limits->zql_logical_block_size;
 	qlimits->physical_block_size = limits->zql_physical_block_size;
 	qlimits->max_discard_sectors = limits->zql_max_discard_sectors;
 	qlimits->max_hw_discard_sectors = limits->zql_max_discard_sectors;
@@ -1214,6 +1244,8 @@ zvol_queue_limits_apply(zvol_queue_limits_t *limits,
 	blk_queue_max_segments(queue, limits->zql_max_segments);
 	blk_queue_max_segment_size(queue, limits->zql_max_segment_size);
 	blk_queue_io_opt(queue, limits->zql_io_opt);
+	blk_queue_io_min(queue, limits->zql_io_min);
+	blk_queue_logical_block_size(queue, limits->zql_logical_block_size);
 	blk_queue_physical_block_size(queue, limits->zql_physical_block_size);
 	blk_queue_max_discard_sectors(queue, limits->zql_max_discard_sectors);
 	blk_queue_discard_granularity(queue, limits->zql_discard_granularity);
@@ -1665,7 +1697,7 @@ zvol_os_create_minor(const char *name)
 	    == 0)
 		zv->zv_threading = volthreading;
 
-	set_capacity(zv->zv_zso->zvo_disk, zv->zv_volsize >> 9);
+	set_capacity(zv->zv_zso->zvo_disk, zv->zv_volsize >> SECTOR_SHIFT);
 
 #ifdef QUEUE_FLAG_DISCARD
 	blk_queue_flag_set(QUEUE_FLAG_DISCARD, zv->zv_zso->zvo_queue);
@@ -1933,6 +1965,9 @@ MODULE_PARM_DESC(zvol_use_blk_mq, "Use the blk-mq API for zvols");
 module_param(zvol_blk_mq_blocks_per_thread, uint, 0644);
 MODULE_PARM_DESC(zvol_blk_mq_blocks_per_thread,
 	"Process volblocksize blocks per thread");
+
+module_param(zvol_use_4kn, uint, 0644);
+MODULE_PARM_DESC(zvol_use_4kn, "Use 4096-byte sector size when appropriate");
 
 #ifndef HAVE_BLKDEV_GET_ERESTARTSYS
 module_param(zvol_open_timeout_ms, uint, 0644);

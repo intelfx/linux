@@ -788,7 +788,7 @@
 #define ZFS_DEVICE_MINOR 249
 
 /* Define the project alias string. */
-#define ZFS_META_ALIAS "zfs-2.3.0-rc4"
+#define ZFS_META_ALIAS "zfs-2.3.0-rc4_12_gd4734dd877"
 
 /* Define the project author. */
 #define ZFS_META_AUTHOR "OpenZFS"
@@ -818,7 +818,7 @@
 #define ZFS_META_NAME "zfs"
 
 /* Define the project release. */
-#define ZFS_META_RELEASE "rc4"
+#define ZFS_META_RELEASE "rc4_12_gd4734dd877"
 
 /* Define the project version. */
 #define ZFS_META_VERSION "2.3.0"

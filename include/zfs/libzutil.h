@@ -283,6 +283,12 @@ static inline char *zfs_strerror(int errnum) {
 #endif
 }
 
+/*
+ * Return the version string
+ * (avoids including zfs_gitrev.h into every file and busting caches)
+ */
+_LIBZUTIL_H const char *zfs_version_git(void);
+
 #ifdef	__cplusplus
 }
 #endif
