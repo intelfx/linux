@@ -800,9 +800,8 @@ void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable)
 						AMD_IP_BLOCK_TYPE_GFX, true))
 					adev->gfx.gfx_off_state = true;
 			} else {
-				queue_delayed_work(amdgpu_reclaim_wq,
-						   &adev->gfx.gfx_off_delay_work,
-						   delay);
+				schedule_delayed_work(&adev->gfx.gfx_off_delay_work,
+					      delay);
 			}
 		}
 	} else {
