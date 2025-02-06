@@ -96,6 +96,8 @@ struct amd_cpudata {
 	bool	boost_supported;
 	bool	hw_prefcore;
 
+	struct mutex	lock;
+
 	/* EPP feature related attributes*/
 	u8	epp_cached;
 	u32	policy;
