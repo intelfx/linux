@@ -162,19 +162,20 @@ static void amd_pstate_ut_check_perf(u32 index)
 			lowest_perf = AMD_CPPC_LOWEST_PERF(cap1);
 		}
 
-		if (highest_perf != READ_ONCE(cpudata->highest_perf) && !cpudata->hw_prefcore) {
+		if (highest_perf != READ_ONCE(cpudata->perf.highest_perf) &&
+		    !cpudata->hw_prefcore) {
 			pr_err("%s cpu%d highest=%d %d highest perf doesn't match\n",
-				__func__, cpu, highest_perf, cpudata->highest_perf);
+				__func__, cpu, highest_perf, cpudata->perf.highest_perf);
 			goto skip_test;
 		}
-		if ((nominal_perf != READ_ONCE(cpudata->nominal_perf)) ||
-			(lowest_nonlinear_perf != READ_ONCE(cpudata->lowest_nonlinear_perf)) ||
-			(lowest_perf != READ_ONCE(cpudata->lowest_perf))) {
+		if ((nominal_perf != READ_ONCE(cpudata->perf.nominal_perf)) ||
+			(lowest_nonlinear_perf != READ_ONCE(cpudata->perf.lowest_nonlinear_perf)) ||
+			(lowest_perf != READ_ONCE(cpudata->perf.lowest_perf))) {
 			amd_pstate_ut_cases[index].result = AMD_PSTATE_UT_RESULT_FAIL;
 			pr_err("%s cpu%d nominal=%d %d lowest_nonlinear=%d %d lowest=%d %d, they should be equal!\n",
-				__func__, cpu, nominal_perf, cpudata->nominal_perf,
-				lowest_nonlinear_perf, cpudata->lowest_nonlinear_perf,
-				lowest_perf, cpudata->lowest_perf);
+				__func__, cpu, nominal_perf, cpudata->perf.nominal_perf,
+				lowest_nonlinear_perf, cpudata->perf.lowest_nonlinear_perf,
+				lowest_perf, cpudata->perf.lowest_perf);
 			goto skip_test;
 		}
 

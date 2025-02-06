@@ -13,6 +13,34 @@
 /*********************************************************************
  *                        AMD P-state INTERFACE                       *
  *********************************************************************/
+
+/**
+ * union perf_cached - A union to cache performance-related data.
+ * @highest_perf: the maximum performance an individual processor may reach,
+ *		  assuming ideal conditions
+ *		  For platforms that do not support the preferred core feature, the
+ *		  highest_pef may be configured with 166 or 255, to avoid max frequency
+ *		  calculated wrongly. we take the fixed value as the highest_perf.
+ * @nominal_perf: the maximum sustained performance level of the processor,
+ *		  assuming ideal operating conditions
+ * @lowest_nonlinear_perf: the lowest performance level at which nonlinear power
+ *			   savings are achieved
+ * @lowest_perf: the absolute lowest performance level of the processor
+ * @min_limit_perf: Cached value of the performance corresponding to policy->min
+ * @max_limit_perf: Cached value of the performance corresponding to policy->max
+ */
+union perf_cached {
+	struct {
+		u8	highest_perf;
+		u8	nominal_perf;
+		u8	lowest_nonlinear_perf;
+		u8	lowest_perf;
+		u8	min_limit_perf;
+		u8	max_limit_perf;
+	};
+	u64	val;
+};
+
 /**
  * struct  amd_aperf_mperf
  * @aperf: actual performance frequency clock count
@@ -30,20 +58,8 @@ struct amd_aperf_mperf {
  * @cpu: CPU number
  * @req: constraint request to apply
  * @cppc_req_cached: cached performance request hints
- * @highest_perf: the maximum performance an individual processor may reach,
- *		  assuming ideal conditions
- *		  For platforms that do not support the preferred core feature, the
- *		  highest_pef may be configured with 166 or 255, to avoid max frequency
- *		  calculated wrongly. we take the fixed value as the highest_perf.
- * @nominal_perf: the maximum sustained performance level of the processor,
- *		  assuming ideal operating conditions
- * @lowest_nonlinear_perf: the lowest performance level at which nonlinear power
- *			   savings are achieved
- * @lowest_perf: the absolute lowest performance level of the processor
  * @prefcore_ranking: the preferred core ranking, the higher value indicates a higher
  * 		  priority.
- * @min_limit_perf: Cached value of the performance corresponding to policy->min
- * @max_limit_perf: Cached value of the performance corresponding to policy->max
  * @nominal_freq: the frequency (in khz) that mapped to nominal_perf
  * @lowest_nonlinear_freq: the frequency (in khz) that mapped to lowest_nonlinear_perf
  * @cur: Difference of Aperf/Mperf/tsc count between last and current sample
@@ -66,13 +82,9 @@ struct amd_cpudata {
 	struct	freq_qos_request req[2];
 	u64	cppc_req_cached;
 
-	u8	highest_perf;
-	u8	nominal_perf;
-	u8	lowest_nonlinear_perf;
-	u8	lowest_perf;
+	union perf_cached perf;
+
 	u8	prefcore_ranking;
-	u8	min_limit_perf;
-	u8	max_limit_perf;
 
 	u32	nominal_freq;
 	u32	lowest_nonlinear_freq;
