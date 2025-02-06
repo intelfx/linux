@@ -97,9 +97,10 @@ struct amd_cpudata {
 
 	struct mutex	lock;
 
+	struct cpufreq_policy *policy;
+
 	/* EPP feature related attributes*/
 	u8	epp_cached;
-	u32	policy;
 	bool	suspended;
 	u8	epp_default;
 };

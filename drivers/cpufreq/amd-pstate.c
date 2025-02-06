@@ -418,7 +418,7 @@ static int amd_pstate_set_energy_pref_index(struct cpufreq_policy *policy,
 	else
 		epp = epp_values[pref_index];
 
-	if (epp > 0 && cpudata->policy == CPUFREQ_POLICY_PERFORMANCE) {
+	if (epp > 0 && policy->policy == CPUFREQ_POLICY_PERFORMANCE) {
 		pr_debug("EPP cannot be set under performance policy\n");
 		return -EBUSY;
 	}
@@ -719,7 +719,7 @@ static void amd_pstate_update_min_max_limit(struct cpufreq_policy *policy)
 	perf.max_limit_perf = freq_to_perf(perf, cpudata->nominal_freq, policy->max);
 	perf.min_limit_perf = freq_to_perf(perf, cpudata->nominal_freq, policy->min);
 
-	if (cpudata->policy == CPUFREQ_POLICY_PERFORMANCE)
+	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE)
 		perf.min_limit_perf = min(perf.nominal_perf, perf.max_limit_perf);
 
 	WRITE_ONCE(cpudata->perf, perf);
@@ -1066,6 +1066,7 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
 		return -ENOMEM;
 
 	cpudata->cpu = policy->cpu;
+	cpudata->policy = policy;
 
 	mutex_init(&cpudata->lock);
 	guard(mutex)(&cpudata->lock);
@@ -1248,9 +1249,8 @@ static ssize_t show_energy_performance_available_preferences(
 {
 	int i = 0;
 	int offset = 0;
-	struct amd_cpudata *cpudata = policy->driver_data;
 
-	if (cpudata->policy == CPUFREQ_POLICY_PERFORMANCE)
+	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE)
 		return sysfs_emit_at(buf, offset, "%s\n",
 				energy_perf_strings[EPP_INDEX_PERFORMANCE]);
 
@@ -1567,6 +1567,7 @@ static int amd_pstate_epp_cpu_init(struct cpufreq_policy *policy)
 		return -ENOMEM;
 
 	cpudata->cpu = policy->cpu;
+	cpudata->policy = policy;
 
 	mutex_init(&cpudata->lock);
 	guard(mutex)(&cpudata->lock);
@@ -1656,7 +1657,7 @@ static int amd_pstate_epp_update_limit(struct cpufreq_policy *policy)
 
 	amd_pstate_update_min_max_limit(policy);
 
-	if (cpudata->policy == CPUFREQ_POLICY_PERFORMANCE)
+	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE)
 		epp = 0;
 	else
 		epp = READ_ONCE(cpudata->epp_cached);
@@ -1675,7 +1676,7 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
 	if (!policy->cpuinfo.max_freq)
 		return -ENODEV;
 
-	cpudata->policy = policy->policy;
+	cpudata->policy = policy;
 
 	ret = amd_pstate_epp_update_limit(policy);
 	if (ret)
