@@ -100,7 +100,6 @@ struct amd_cpudata {
 	struct cpufreq_policy *policy;
 
 	/* EPP feature related attributes*/
-	u8	epp_cached;
 	bool	suspended;
 	u8	epp_default;
 };
