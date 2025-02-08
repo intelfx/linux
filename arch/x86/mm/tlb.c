@@ -1339,10 +1339,6 @@ static struct flush_tlb_info *get_flush_tlb_info(struct mm_struct *mm,
 	info->new_tlb_gen	= new_tlb_gen;
 	info->initiating_cpu	= smp_processor_id();
 
-	WARN_ONCE(start != info->start || end != info->end,
-		  "TLB flush not stride %x aligned. Start %lx, end %lx\n",
-		  1 << stride_shift, start, end);
-
 	/*
 	 * If the number of flushes is so large that a full flush
 	 * would be faster, do a full flush.
