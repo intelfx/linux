@@ -405,11 +405,11 @@ static void use_global_asid(struct mm_struct *mm)
 	guard(raw_spinlock_irqsave)(&global_asid_lock);
 
 	/* This process is already using broadcast TLB invalidation. */
-	if (READ_ONCE(mm->context.global_asid))
+	if (mm->context.global_asid)
 		return;
 
 	/* The last global ASID was consumed while waiting for the lock. */
-	if (!READ_ONCE(global_asid_available)) {
+	if (!global_asid_available) {
 		VM_WARN_ONCE(1, "Ran out of global ASIDs\n");
 		return;
 	}
@@ -527,14 +527,8 @@ static inline void invlpgb_flush_addr_nosync(unsigned long addr, u16 nr)
 static void broadcast_tlb_flush(struct flush_tlb_info *info)
 {
 	bool pmd = info->stride_shift == PMD_SHIFT;
-	unsigned long maxnr = invlpgb_count_max;
 	unsigned long asid = info->mm->context.global_asid;
 	unsigned long addr = info->start;
-	unsigned long nr;
-
-	/* Flushing multiple pages at once is not supported with 1GB pages. */
-	if (info->stride_shift > PMD_SHIFT)
-		maxnr = 1;
 
 	/*
 	 * TLB flushes with INVLPGB are kicked off asynchronously.
@@ -547,15 +541,14 @@ static void broadcast_tlb_flush(struct flush_tlb_info *info)
 		if (static_cpu_has(X86_FEATURE_PTI))
 			invlpgb_flush_single_pcid_nosync(user_pcid(asid));
 	} else do {
-		/*
-		 * Calculate how many pages can be flushed at once; if the
-		 * remainder of the range is less than one page, flush one.
-		 */
-		nr = min(maxnr, (info->end - addr) >> info->stride_shift);
-		nr = max(nr, 1);
+		unsigned long nr = 1;
+
+		if (info->stride_shift <= PMD_SHIFT) {
+			nr = (info->end - addr) >> info->stride_shift;
+			nr = clamp_val(nr, 1, invlpgb_count_max);
+		}
 
 		invlpgb_flush_user_nr_nosync(kern_pcid(asid), addr, nr, pmd, info->freed_tables);
-		/* Do any CPUs supporting INVLPGB need PTI? */
 		if (static_cpu_has(X86_FEATURE_PTI))
 			invlpgb_flush_user_nr_nosync(user_pcid(asid), addr, nr, pmd, info->freed_tables);
 
@@ -1434,8 +1427,8 @@ static bool broadcast_kernel_range_flush(struct flush_tlb_info *info)
 	}
 
 	for (addr = info->start; addr < info->end; addr += nr << PAGE_SHIFT) {
-		nr = min((info->end - addr) >> PAGE_SHIFT, invlpgb_count_max);
-		nr = max(nr, 1); /* Round up if the last page is partial. */
+		nr = (info->end - addr) >> PAGE_SHIFT;
+		nr = clamp_val(nr, 1, invlpgb_count_max);
 		invlpgb_flush_addr_nosync(addr, nr);
 	}
 	tlbsync();
