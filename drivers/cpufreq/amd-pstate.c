@@ -965,6 +965,7 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
 		perf.lowest_perf = freq_to_perf(perf, nominal_freq, min_freq);
 	} else
 		min_freq = cppc_perf.lowest_freq;
+	min_freq *= 1000;
 
 	/**
 	 * Below values need to be initialized correctly, otherwise driver will fail to load
@@ -1662,6 +1663,9 @@ static int amd_pstate_epp_suspend(struct cpufreq_policy *policy)
 {
 	struct amd_cpudata *cpudata = policy->driver_data;
 
+	/* invalidate to ensure it's rewritten during resume */
+	cpudata->cppc_req_cached = 0;
+
 	/* set this flag to avoid setting core offline*/
 	cpudata->suspended = true;
 
@@ -1672,8 +1676,17 @@ static int amd_pstate_epp_resume(struct cpufreq_policy *policy)
 {
 	struct amd_cpudata *cpudata = policy->driver_data;
 
+	if (cpudata->suspended) {
+		union perf_cached perf = READ_ONCE(cpudata->perf);
+		int ret;
 
-	cpudata->suspended = false;
+		/* enable amd pstate from suspend state*/
+		ret = amd_pstate_epp_update_limit(policy);
+		if (ret)
+			return ret;
+
+		cpudata->suspended = false;
+	}
 
 	return 0;
 }
