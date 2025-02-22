@@ -246,8 +246,8 @@ static void __tlb_remove_table_free(struct mmu_table_batch *batch)
  * IRQs delays the completion of the TLB flush we can never observe an already
  * freed page.
  *
- * Architectures that do not have this (PPC) need to delay the freeing by some
- * other means, this is that means.
+ * Architectures that do not use IPIs (PPC, x86 paravirt, AMD INVLPGB, ARM64)
+ * need to delay the freeing by some other means, this is that means.
  *
  * What we do is batch the freed directory pages (tables) and RCU free them.
  * We use the sched RCU variant, as that guarantees that IRQ/preempt disabling

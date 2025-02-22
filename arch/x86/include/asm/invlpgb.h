@@ -33,6 +33,7 @@ static inline void __invlpgb(unsigned long asid, unsigned long pcid,
 /* Wait for INVLPGB originated by this CPU to complete. */
 static inline void __tlbsync(void)
 {
+	cant_migrate();
 	/* TLBSYNC: supported in binutils >= 0.36. */
 	asm volatile(".byte 0x0f, 0x01, 0xff" ::: "memory");
 }
