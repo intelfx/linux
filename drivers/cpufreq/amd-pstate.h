@@ -58,8 +58,11 @@ struct amd_aperf_mperf {
  * @cpu: CPU number
  * @req: constraint request to apply
  * @cppc_req_cached: cached performance request hints
+ * @perf: cached performance-related data
  * @prefcore_ranking: the preferred core ranking, the higher value indicates a higher
  * 		  priority.
+ * @min_limit_freq: Cached value of policy->min (in khz)
+ * @max_limit_freq: Cached value of policy->max (in khz)
  * @nominal_freq: the frequency (in khz) that mapped to nominal_perf
  * @lowest_nonlinear_freq: the frequency (in khz) that mapped to lowest_nonlinear_perf
  * @cur: Difference of Aperf/Mperf/tsc count between last and current sample
@@ -84,7 +87,8 @@ struct amd_cpudata {
 	union perf_cached perf;
 
 	u8	prefcore_ranking;
-
+	u32	min_limit_freq;
+	u32	max_limit_freq;
 	u32	nominal_freq;
 	u32	lowest_nonlinear_freq;
 
@@ -95,11 +99,8 @@ struct amd_cpudata {
 	bool	boost_supported;
 	bool	hw_prefcore;
 
-	struct mutex	lock;
-
-	struct cpufreq_policy *policy;
-
 	/* EPP feature related attributes*/
+	u32	policy;
 	bool	suspended;
 	u8	epp_default;
 };
