@@ -143,9 +143,9 @@ static struct quirk_entry quirk_amd_mts = {
 
 static inline u8 freq_to_perf(union perf_cached perf, u32 nominal_freq, unsigned int freq_val)
 {
-	u8 perf_val = DIV_ROUND_UP_ULL((u64)freq_val * perf.nominal_perf, nominal_freq);
+	u32 perf_val = DIV_ROUND_UP_ULL((u64)freq_val * perf.nominal_perf, nominal_freq);
 
-	return clamp_t(u8, perf_val, perf.lowest_perf, perf.highest_perf);
+	return (u8)clamp(perf_val, perf.lowest_perf, perf.highest_perf);
 }
 
 static inline u32 perf_to_freq(union perf_cached perf, u32 nominal_freq, u8 perf_val)
