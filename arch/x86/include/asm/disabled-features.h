@@ -132,6 +132,7 @@
 #ifdef CONFIG_X86_BROADCAST_TLB_FLUSH
 #define DISABLE_INVLPGB		0
 #else
+/* Keep 32 bit kernels smaller by compiling out the INVLPGB code. */
 #define DISABLE_INVLPGB		(1 << (X86_FEATURE_INVLPGB & 31))
 #endif
 
