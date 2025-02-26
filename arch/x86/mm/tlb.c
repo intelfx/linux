@@ -270,7 +270,7 @@ static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 /*
  * Global ASIDs are allocated for multi-threaded processes that are
  * active on multiple CPUs simultaneously, giving each of those
- * processes the same PCIDs on every CPU, for use with hardware-assisted
+ * processes the same PCID on every CPU, for use with hardware-assisted
  * TLB shootdown on remote CPUs, like AMD INVLPGB or Intel RAR.
  *
  * These global ASIDs are held for the lifetime of the process.
@@ -319,7 +319,7 @@ static u16 allocate_global_asid(void)
 
 	asid = find_next_zero_bit(global_asid_used, MAX_ASID_AVAILABLE, last_global_asid);
 
-	if (asid >= MAX_ASID_AVAILABLE) {
+	if (asid >= MAX_ASID_AVAILABLE && !global_asid_available) {
 		/* This should never happen. */
 		VM_WARN_ONCE(1, "Unable to allocate global ASID despite %d available\n",
 				global_asid_available);
@@ -334,7 +334,7 @@ static u16 allocate_global_asid(void)
 }
 
 /*
- * Check whether a process is currently active on more than "threshold" CPUs.
+ * Check whether a process is currently active on more than @threshold CPUs.
  * This is a cheap estimation on whether or not it may make sense to assign
  * a global ASID to this process, and use broadcast TLB invalidation.
  */
@@ -386,10 +386,10 @@ static void use_global_asid(struct mm_struct *mm)
 	if (!asid)
 		return;
 
-	assign_mm_global_asid(mm, asid);
+	mm_assign_global_asid(mm, asid);
 }
 
-void destroy_context_free_global_asid(struct mm_struct *mm)
+void mm_free_global_asid(struct mm_struct *mm)
 {
 	if (!mm_global_asid(mm))
 		return;
@@ -397,10 +397,12 @@ void destroy_context_free_global_asid(struct mm_struct *mm)
 	guard(raw_spinlock_irqsave)(&global_asid_lock);
 
 	/* The global ASID can be re-used only after flush at wrap-around. */
+#ifdef CONFIG_X86_BROADCAST_TLB_FLUSH
 	__set_bit(mm->context.global_asid, global_asid_freed);
 
 	mm->context.global_asid = 0;
 	global_asid_available++;
+#endif
 }
 
 /*
@@ -452,7 +454,7 @@ static void finish_asid_transition(struct flush_tlb_info *info)
 	int bc_asid = mm_global_asid(mm);
 	int cpu;
 
-	if (!READ_ONCE(mm->context.asid_transition))
+	if (!in_asid_transition(mm))
 		return;
 
 	for_each_cpu(cpu, mm_cpumask(mm)) {
@@ -482,15 +484,15 @@ static void finish_asid_transition(struct flush_tlb_info *info)
 	}
 
 	/* All the CPUs running this process are using the global ASID. */
-	WRITE_ONCE(mm->context.asid_transition, false);
+	clear_asid_transition(mm);
 }
 
 static inline void tlbsync(void)
 {
-	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
+	if (!cpu_need_tlbsync())
 		return;
 	__tlbsync();
-	this_cpu_write(cpu_tlbstate.need_tlbsync, false);
+	cpu_write_tlbsync(false);
 }
 
 static inline void invlpgb_flush_user_nr_nosync(unsigned long pcid,
@@ -499,28 +501,28 @@ static inline void invlpgb_flush_user_nr_nosync(unsigned long pcid,
 						bool freed_tables)
 {
 	__invlpgb_flush_user_nr_nosync(pcid, addr, nr, pmd_stride, freed_tables);
-	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
-		this_cpu_write(cpu_tlbstate.need_tlbsync, true);
+	if (!cpu_need_tlbsync())
+		cpu_write_tlbsync(true);
 }
 
 static inline void invlpgb_flush_single_pcid_nosync(unsigned long pcid)
 {
 	__invlpgb_flush_single_pcid_nosync(pcid);
-	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
-		this_cpu_write(cpu_tlbstate.need_tlbsync, true);
+	if (!cpu_need_tlbsync())
+		cpu_write_tlbsync(true);
 }
 
 static inline void invlpgb_flush_addr_nosync(unsigned long addr, u16 nr)
 {
 	__invlpgb_flush_addr_nosync(addr, nr);
-	if (!this_cpu_read(cpu_tlbstate.need_tlbsync))
-		this_cpu_write(cpu_tlbstate.need_tlbsync, true);
+	if (!cpu_need_tlbsync())
+		cpu_write_tlbsync(true);
 }
 
 static void broadcast_tlb_flush(struct flush_tlb_info *info)
 {
 	bool pmd = info->stride_shift == PMD_SHIFT;
-	unsigned long asid = info->mm->context.global_asid;
+	unsigned long asid = mm_global_asid(info->mm);
 	unsigned long addr = info->start;
 
 	/*
@@ -1377,17 +1379,6 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
 }
 
-
-static bool broadcast_flush_tlb_all(void)
-{
-	if (!cpu_feature_enabled(X86_FEATURE_INVLPGB))
-		return false;
-
-	guard(preempt)();
-	invlpgb_flush_all();
-	return true;
-}
-
 static void do_flush_tlb_all(void *info)
 {
 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH_RECEIVED);
@@ -1399,17 +1390,19 @@ void flush_tlb_all(void)
 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH);
 
 	/* First try (faster) hardware-assisted TLB invalidation. */
-	if (broadcast_flush_tlb_all())
+	if (cpu_feature_enabled(X86_FEATURE_INVLPGB)) {
+		guard(preempt)();
+		invlpgb_flush_all();
 		return;
+	}
 
 	/* Fall back to the IPI-based invalidation. */
 	on_each_cpu(do_flush_tlb_all, NULL, 1);
 }
 
-static bool invlpgb_kernel_range_flush(struct flush_tlb_info *info)
+static void invlpgb_kernel_range_flush(struct flush_tlb_info *info)
 {
-	unsigned long addr;
-	unsigned long nr;
+	unsigned long addr, nr;
 
 	for (addr = info->start; addr < info->end; addr += nr << PAGE_SHIFT) {
 		nr = (info->end - addr) >> PAGE_SHIFT;
@@ -1417,7 +1410,6 @@ static bool invlpgb_kernel_range_flush(struct flush_tlb_info *info)
 		invlpgb_flush_addr_nosync(addr, nr);
 	}
 	__tlbsync();
-	return true;
 }
 
 static void do_kernel_range_flush(void *info)

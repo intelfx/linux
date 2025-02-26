@@ -187,7 +187,7 @@ static inline void cr4_init_shadow(void)
 extern unsigned long mmu_cr4_features;
 extern u32 *trampoline_cr4_features;
 
-/* How many pages can we invalidate with one INVLPGB. */
+/* How many pages can be invalidated with one INVLPGB. */
 extern u16 invlpgb_count_max;
 
 extern void initialize_tlbstate_and_flush(void);
@@ -247,14 +247,6 @@ static inline bool is_global_asid(u16 asid)
 	return !is_dyn_asid(asid);
 }
 
-static inline bool in_asid_transition(struct mm_struct *mm)
-{
-	if (!cpu_feature_enabled(X86_FEATURE_INVLPGB))
-		return false;
-
-	return mm && READ_ONCE(mm->context.asid_transition);
-}
-
 #ifdef CONFIG_X86_BROADCAST_TLB_FLUSH
 static inline u16 mm_global_asid(struct mm_struct *mm)
 {
@@ -271,7 +263,7 @@ static inline u16 mm_global_asid(struct mm_struct *mm)
 	return asid;
 }
 
-static inline void assign_mm_global_asid(struct mm_struct *mm, u16 asid)
+static inline void mm_assign_global_asid(struct mm_struct *mm, u16 asid)
 {
 	/*
 	 * Notably flush_tlb_mm_range() -> broadcast_tlb_flush() ->
@@ -281,17 +273,54 @@ static inline void assign_mm_global_asid(struct mm_struct *mm, u16 asid)
 	mm->context.asid_transition = true;
 	smp_store_release(&mm->context.global_asid, asid);
 }
+
+static inline void clear_asid_transition(struct mm_struct *mm)
+{
+	WRITE_ONCE(mm->context.asid_transition, false);
+}
+
+static inline bool in_asid_transition(struct mm_struct *mm)
+{
+	if (!cpu_feature_enabled(X86_FEATURE_INVLPGB))
+		return false;
+
+	return mm && READ_ONCE(mm->context.asid_transition);
+}
+
+static inline bool cpu_need_tlbsync(void)
+{
+	return this_cpu_read(cpu_tlbstate.need_tlbsync);
+}
+
+static inline void cpu_write_tlbsync(bool state)
+{
+	this_cpu_write(cpu_tlbstate.need_tlbsync, state);
+}
 #else
 static inline u16 mm_global_asid(struct mm_struct *mm)
 {
 	return 0;
 }
 
-static inline void assign_mm_global_asid(struct mm_struct *mm, u16 asid)
+static inline void mm_assign_global_asid(struct mm_struct *mm, u16 asid)
 {
 }
 
-static inline void tlbsync(void)
+static inline void clear_asid_transition(struct mm_struct *mm)
+{
+}
+
+static inline bool in_asid_transition(struct mm_struct *mm)
+{
+	return false;
+}
+
+static inline bool cpu_need_tlbsync(void)
+{
+	return false;
+}
+
+static inline void cpu_write_tlbsync(bool state)
 {
 }
 #endif
