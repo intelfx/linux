@@ -70,10 +70,16 @@ static inline void __invlpgb(unsigned long asid, unsigned long pcid,
 	asm volatile(".byte 0x0f, 0x01, 0xfe" : : "a" (rax), "c" (ecx), "d" (edx));
 }
 
-/* Wait for INVLPGB originated by this CPU to complete. */
 static inline void __tlbsync(void)
 {
+	/*
+	 * tlbsync waits for invlpgb instructions originating on the
+	 * same CPU to have completed. Print a warning if we could have
+	 * migrated, and might not be waiting on all the invlpgbs issued
+	 * during this TLB invalidation sequence.
+	 */
 	cant_migrate();
+
 	/* TLBSYNC: supported in binutils >= 0.36. */
 	asm volatile(".byte 0x0f, 0x01, 0xff" ::: "memory");
 }
