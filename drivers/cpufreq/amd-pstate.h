@@ -18,9 +18,11 @@
  * union perf_cached - A union to cache performance-related data.
  * @highest_perf: the maximum performance an individual processor may reach,
  *		  assuming ideal conditions
- *		  For platforms that do not support the preferred core feature, the
- *		  highest_pef may be configured with 166 or 255, to avoid max frequency
- *		  calculated wrongly. we take the fixed value as the highest_perf.
+ *		  For platforms that support the preferred core feature, the highest_perf value maybe
+ * 		  configured to any value in the range 166-255 by the firmware (because the preferred
+ * 		  core ranking is encoded in the highest_perf value). To maintain consistency across
+ * 		  all platforms, we split the highest_perf and preferred core ranking values into
+ * 		  cpudata->perf.highest_perf and cpudata->prefcore_ranking.
  * @nominal_perf: the maximum sustained performance level of the processor,
  *		  assuming ideal operating conditions
  * @lowest_nonlinear_perf: the lowest performance level at which nonlinear power
