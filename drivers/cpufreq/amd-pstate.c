@@ -406,21 +406,7 @@ static inline int msr_cppc_enable(struct cpufreq_policy *policy)
 
 static int shmem_cppc_enable(struct cpufreq_policy *policy)
 {
-	struct cppc_perf_ctrls perf_ctrls;
-	int ret;
-
-	ret = cppc_set_enable(policy->cpu, 1);
-	if (ret)
-		return ret;
-
-	/* Enable autonomous mode for EPP */
-	if (cppc_state == AMD_PSTATE_ACTIVE) {
-		/* Set desired perf as zero to allow EPP firmware control */
-		perf_ctrls.desired_perf = 0;
-		ret = cppc_set_perf(policy->cpu, &perf_ctrls);
-	}
-
-	return ret;
+	return cppc_set_enable(policy->cpu, 1);
 }
 
 DEFINE_STATIC_CALL(amd_pstate_cppc_enable, msr_cppc_enable);
@@ -950,6 +936,7 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
 	if (quirks && quirks->lowest_freq) {
 		min_freq = quirks->lowest_freq;
 		perf.lowest_perf = freq_to_perf(perf, nominal_freq, min_freq);
+		WRITE_ONCE(cpudata->perf, perf);
 	} else
 		min_freq = cppc_perf.lowest_freq;
 
@@ -1035,6 +1022,10 @@ static int amd_pstate_cpu_init(struct cpufreq_policy *policy)
 	policy->cpuinfo.max_freq = policy->max = perf_to_freq(perf,
 							      cpudata->nominal_freq,
 							      perf.highest_perf);
+
+	ret = amd_pstate_cppc_enable(policy);
+	if (ret)
+		goto free_cpudata1;
 
 	policy->boost_enabled = READ_ONCE(cpudata->boost_supported);
 
@@ -1195,18 +1186,6 @@ static ssize_t store_energy_performance_preference(
 	if (epp > 0 && policy->policy == CPUFREQ_POLICY_PERFORMANCE) {
 		pr_debug("EPP cannot be set under performance policy\n");
 		return -EBUSY;
-	}
-
-	if (trace_amd_pstate_epp_perf_enabled()) {
-		union perf_cached perf = cpudata->perf;
-
-		trace_amd_pstate_epp_perf(cpudata->cpu, perf.highest_perf,
-					  epp,
-					  FIELD_GET(AMD_CPPC_MIN_PERF_MASK, cpudata->cppc_req_cached),
-					  FIELD_GET(AMD_CPPC_MAX_PERF_MASK, cpudata->cppc_req_cached),
-					  policy->boost_enabled,
-					  FIELD_GET(AMD_CPPC_EPP_PERF_MASK,
-						    cpudata->cppc_req_cached) != epp);
 	}
 
 	ret = amd_pstate_set_epp(policy, epp);
@@ -1618,18 +1597,9 @@ static int amd_pstate_epp_set_policy(struct cpufreq_policy *policy)
 
 static int amd_pstate_epp_cpu_online(struct cpufreq_policy *policy)
 {
-	struct amd_cpudata *cpudata = policy->driver_data;
-	int ret;
-
 	pr_debug("AMD CPU Core %d going online\n", policy->cpu);
 
-	ret = amd_pstate_cppc_enable(policy);
-	if (ret)
-		return ret;
-
-	cpudata->suspended = false;
-
-	return 0;
+	return amd_pstate_cppc_enable(policy);
 }
 
 static int amd_pstate_epp_cpu_offline(struct cpufreq_policy *policy)
@@ -1689,8 +1659,8 @@ static struct cpufreq_driver amd_pstate_epp_driver = {
 	.exit		= amd_pstate_epp_cpu_exit,
 	.offline	= amd_pstate_epp_cpu_offline,
 	.online		= amd_pstate_epp_cpu_online,
-	.suspend        = amd_pstate_epp_suspend,
-	.resume         = amd_pstate_epp_resume,
+	.suspend	= amd_pstate_epp_suspend,
+	.resume		= amd_pstate_epp_resume,
 	.update_limits	= amd_pstate_update_limits,
 	.set_boost	= amd_pstate_set_boost,
 	.name		= "amd-pstate-epp",

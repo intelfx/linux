@@ -114,11 +114,11 @@ static int amd_pstate_ut_check_perf(u32 index)
 	u32 highest_perf = 0, nominal_perf = 0, lowest_nonlinear_perf = 0, lowest_perf = 0;
 	u64 cap1 = 0;
 	struct cppc_perf_caps cppc_perf;
-	struct amd_cpudata *cpudata = NULL;
 	union perf_cached cur_perf;
 
 	for_each_online_cpu(cpu) {
 		struct cpufreq_policy *policy __free(put_cpufreq_policy) = NULL;
+		struct amd_cpudata *cpudata;
 
 		policy = cpufreq_cpu_get(cpu);
 		if (!policy)
@@ -152,16 +152,16 @@ static int amd_pstate_ut_check_perf(u32 index)
 		cur_perf = READ_ONCE(cpudata->perf);
 		if (highest_perf != cur_perf.highest_perf && !cpudata->hw_prefcore) {
 			pr_err("%s cpu%d highest=%d %d highest perf doesn't match\n",
-				__func__, cpu, highest_perf, cpudata->perf.highest_perf);
+				__func__, cpu, highest_perf, cur_perf.highest_perf);
 			return -EINVAL;
 		}
 		if (nominal_perf != cur_perf.nominal_perf ||
 		   (lowest_nonlinear_perf != cur_perf.lowest_nonlinear_perf) ||
 		   (lowest_perf != cur_perf.lowest_perf)) {
 			pr_err("%s cpu%d nominal=%d %d lowest_nonlinear=%d %d lowest=%d %d, they should be equal!\n",
-				__func__, cpu, nominal_perf, cpudata->perf.nominal_perf,
-				lowest_nonlinear_perf, cpudata->perf.lowest_nonlinear_perf,
-				lowest_perf, cpudata->perf.lowest_perf);
+				__func__, cpu, nominal_perf, cur_perf.nominal_perf,
+				lowest_nonlinear_perf, cur_perf.lowest_nonlinear_perf,
+				lowest_perf, cur_perf.lowest_perf);
 			return -EINVAL;
 		}
 
