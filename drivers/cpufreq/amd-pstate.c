@@ -933,20 +933,19 @@ static int amd_pstate_init_freq(struct amd_cpudata *cpudata)
 		return ret;
 	perf = READ_ONCE(cpudata->perf);
 
+	if (quirks && quirks->nominal_freq)
+		nominal_freq = quirks->nominal_freq;
+	else
+		nominal_freq = cppc_perf.nominal_freq;
+	nominal_freq *= 1000;
+
 	if (quirks && quirks->lowest_freq) {
 		min_freq = quirks->lowest_freq;
 		perf.lowest_perf = freq_to_perf(perf, nominal_freq, min_freq);
 		WRITE_ONCE(cpudata->perf, perf);
 	} else
 		min_freq = cppc_perf.lowest_freq;
-
-	if (quirks && quirks->nominal_freq)
-		nominal_freq = quirks->nominal_freq;
-	else
-		nominal_freq = cppc_perf.nominal_freq;
-
 	min_freq *= 1000;
-	nominal_freq *= 1000;
 
 	WRITE_ONCE(cpudata->nominal_freq, nominal_freq);
 
