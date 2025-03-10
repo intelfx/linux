@@ -231,7 +231,7 @@ static void choose_new_asid(struct mm_struct *next, u64 next_tlb_gen,
 	 * TLB consistency for global ASIDs is maintained with hardware assisted
 	 * remote TLB flushing. Global ASIDs are always up to date.
 	 */
-	if (static_cpu_has(X86_FEATURE_INVLPGB)) {
+	if (cpu_feature_enabled(X86_FEATURE_INVLPGB)) {
 		u16 global_asid = mm_global_asid(next);
 
 		if (global_asid) {
@@ -376,7 +376,12 @@ static void use_global_asid(struct mm_struct *mm)
 	if (mm_global_asid(mm))
 		return;
 
-	/* The last global ASID was consumed while waiting for the lock. */
+	/*
+	 * The last global ASID was consumed while waiting for the lock.
+	 *
+	 * If this fires, a more aggressive ASID reuse scheme might be
+	 * needed.
+	 */
 	if (!global_asid_available) {
 		VM_WARN_ONCE(1, "Ran out of global ASIDs\n");
 		return;
@@ -391,13 +396,16 @@ static void use_global_asid(struct mm_struct *mm)
 
 void mm_free_global_asid(struct mm_struct *mm)
 {
+	if (!cpu_feature_enabled(X86_FEATURE_INVLPGB))
+		return;
+
 	if (!mm_global_asid(mm))
 		return;
 
 	guard(raw_spinlock_irqsave)(&global_asid_lock);
 
 	/* The global ASID can be re-used only after flush at wrap-around. */
-#ifdef CONFIG_X86_BROADCAST_TLB_FLUSH
+#ifdef CONFIG_BROADCAST_TLB_FLUSH
 	__set_bit(mm->context.global_asid, global_asid_freed);
 
 	mm->context.global_asid = 0;
@@ -408,36 +416,33 @@ void mm_free_global_asid(struct mm_struct *mm)
 /*
  * Is the mm transitioning from a CPU-local ASID to a global ASID?
  */
-static bool needs_global_asid_reload(struct mm_struct *next, u16 prev_asid)
+static bool mm_needs_global_asid(struct mm_struct *mm, u16 asid)
 {
-	u16 global_asid = mm_global_asid(next);
+	u16 global_asid = mm_global_asid(mm);
 
-	if (!static_cpu_has(X86_FEATURE_INVLPGB))
+	if (!cpu_feature_enabled(X86_FEATURE_INVLPGB))
 		return false;
 
 	/* Process is transitioning to a global ASID */
-	if (global_asid && prev_asid != global_asid)
+	if (global_asid && asid != global_asid)
 		return true;
 
 	return false;
 }
 
 /*
- * x86 has 4k ASIDs (2k when compiled with KPTI), but the largest
- * x86 systems have over 8k CPUs. Because of this potential ASID
- * shortage, global ASIDs are handed out to processes that have
- * frequent TLB flushes and are active on 4 or more CPUs simultaneously.
+ * x86 has 4k ASIDs (2k when compiled with KPTI), but the largest x86
+ * systems have over 8k CPUs. Because of this potential ASID shortage,
+ * global ASIDs are handed out to processes that have frequent TLB
+ * flushes and are active on 4 or more CPUs simultaneously.
  */
 static void consider_global_asid(struct mm_struct *mm)
 {
-	if (!static_cpu_has(X86_FEATURE_INVLPGB))
+	if (!cpu_feature_enabled(X86_FEATURE_INVLPGB))
 		return;
 
 	/* Check every once in a while. */
 	if ((current->pid & 0x1f) != (jiffies & 0x1f))
-		return;
-
-	if (!READ_ONCE(global_asid_available))
 		return;
 
 	/*
@@ -454,7 +459,7 @@ static void finish_asid_transition(struct flush_tlb_info *info)
 	int bc_asid = mm_global_asid(mm);
 	int cpu;
 
-	if (!in_asid_transition(mm))
+	if (!mm_in_asid_transition(mm))
 		return;
 
 	for_each_cpu(cpu, mm_cpumask(mm)) {
@@ -484,39 +489,7 @@ static void finish_asid_transition(struct flush_tlb_info *info)
 	}
 
 	/* All the CPUs running this process are using the global ASID. */
-	clear_asid_transition(mm);
-}
-
-static inline void tlbsync(void)
-{
-	if (!cpu_need_tlbsync())
-		return;
-	__tlbsync();
-	cpu_write_tlbsync(false);
-}
-
-static inline void invlpgb_flush_user_nr_nosync(unsigned long pcid,
-						unsigned long addr,
-						u16 nr, bool pmd_stride,
-						bool freed_tables)
-{
-	__invlpgb_flush_user_nr_nosync(pcid, addr, nr, pmd_stride, freed_tables);
-	if (!cpu_need_tlbsync())
-		cpu_write_tlbsync(true);
-}
-
-static inline void invlpgb_flush_single_pcid_nosync(unsigned long pcid)
-{
-	__invlpgb_flush_single_pcid_nosync(pcid);
-	if (!cpu_need_tlbsync())
-		cpu_write_tlbsync(true);
-}
-
-static inline void invlpgb_flush_addr_nosync(unsigned long addr, u16 nr)
-{
-	__invlpgb_flush_addr_nosync(addr, nr);
-	if (!cpu_need_tlbsync())
-		cpu_write_tlbsync(true);
+	mm_clear_asid_transition(mm);
 }
 
 static void broadcast_tlb_flush(struct flush_tlb_info *info)
@@ -533,7 +506,7 @@ static void broadcast_tlb_flush(struct flush_tlb_info *info)
 	if (info->end == TLB_FLUSH_ALL) {
 		invlpgb_flush_single_pcid_nosync(kern_pcid(asid));
 		/* Do any CPUs supporting INVLPGB need PTI? */
-		if (static_cpu_has(X86_FEATURE_PTI))
+		if (cpu_feature_enabled(X86_FEATURE_PTI))
 			invlpgb_flush_single_pcid_nosync(user_pcid(asid));
 	} else do {
 		unsigned long nr = 1;
@@ -543,9 +516,9 @@ static void broadcast_tlb_flush(struct flush_tlb_info *info)
 			nr = clamp_val(nr, 1, invlpgb_count_max);
 		}
 
-		invlpgb_flush_user_nr_nosync(kern_pcid(asid), addr, nr, pmd, info->freed_tables);
-		if (static_cpu_has(X86_FEATURE_PTI))
-			invlpgb_flush_user_nr_nosync(user_pcid(asid), addr, nr, pmd, info->freed_tables);
+		invlpgb_flush_user_nr_nosync(kern_pcid(asid), addr, nr, pmd);
+		if (cpu_feature_enabled(X86_FEATURE_PTI))
+			invlpgb_flush_user_nr_nosync(user_pcid(asid), addr, nr, pmd);
 
 		addr += nr << info->stride_shift;
 	} while (addr < info->end);
@@ -817,8 +790,6 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
 		WARN_ON_ONCE(!irqs_disabled());
 
-	tlbsync();
-
 	/*
 	 * Verify that CR3 is what we think it is.  This will catch
 	 * hypothetical buggy code that directly switches to swapper_pg_dir
@@ -882,14 +853,14 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 			cpumask_set_cpu(cpu, mm_cpumask(next));
 
 		/* Check if the current mm is transitioning to a global ASID */
-		if (needs_global_asid_reload(next, prev_asid)) {
+		if (mm_needs_global_asid(next, prev_asid)) {
 			next_tlb_gen = atomic64_read(&next->context.tlb_gen);
 			choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
 			goto reload_tlb;
 		}
 
 		/*
-		 * Broadcast TLB invalidation keeps this PCID up to date
+		 * Broadcast TLB invalidation keeps this ASID up to date
 		 * all the time.
 		 */
 		if (is_global_asid(prev_asid))
@@ -930,7 +901,7 @@ void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
 
 		/*
 		 * Let nmi_uaccess_okay() and finish_asid_transition()
-		 * know that we're changing CR3.
+		 * know that CR3 is changing.
 		 */
 		this_cpu_write(cpu_tlbstate.loaded_mm, LOADED_MM_SWITCHING);
 		barrier();
@@ -998,8 +969,6 @@ reload_tlb:
  */
 void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
 {
-	tlbsync();
-
 	if (this_cpu_read(cpu_tlbstate.loaded_mm) == &init_mm)
 		return;
 
@@ -1099,7 +1068,7 @@ static void flush_tlb_func(void *info)
 		return;
 
 	/* Reload the ASID if transitioning into or out of a global ASID */
-	if (needs_global_asid_reload(loaded_mm, loaded_mm_asid)) {
+	if (mm_needs_global_asid(loaded_mm, loaded_mm_asid)) {
 		switch_mm_irqs_off(NULL, loaded_mm, NULL);
 		loaded_mm_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
 	}
@@ -1267,7 +1236,7 @@ STATIC_NOPV void native_flush_tlb_multi(const struct cpumask *cpumask,
 	 * up on the new contents of what used to be page tables, while
 	 * doing a speculative memory access.
 	 */
-	if (info->freed_tables || in_asid_transition(info->mm))
+	if (info->freed_tables || mm_in_asid_transition(info->mm))
 		on_each_cpu_mask(cpumask, flush_tlb_func, (void *)info, true);
 	else
 		on_each_cpu_cond_mask(tlb_is_not_lazy, flush_tlb_func,
@@ -1390,23 +1359,27 @@ void flush_tlb_all(void)
 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH);
 
 	/* First try (faster) hardware-assisted TLB invalidation. */
-	if (cpu_feature_enabled(X86_FEATURE_INVLPGB)) {
-		guard(preempt)();
+	if (cpu_feature_enabled(X86_FEATURE_INVLPGB))
 		invlpgb_flush_all();
-		return;
-	}
-
-	/* Fall back to the IPI-based invalidation. */
-	on_each_cpu(do_flush_tlb_all, NULL, 1);
+	else
+		/* Fall back to the IPI-based invalidation. */
+		on_each_cpu(do_flush_tlb_all, NULL, 1);
 }
 
+/* Flush an arbitrarily large range of memory with INVLPGB. */
 static void invlpgb_kernel_range_flush(struct flush_tlb_info *info)
 {
 	unsigned long addr, nr;
 
 	for (addr = info->start; addr < info->end; addr += nr << PAGE_SHIFT) {
 		nr = (info->end - addr) >> PAGE_SHIFT;
+
+		/*
+		 * INVLPGB has a limit on the size of ranges it can
+		 * flush. Break up large flushes.
+		 */
 		nr = clamp_val(nr, 1, invlpgb_count_max);
+
 		invlpgb_flush_addr_nosync(addr, nr);
 	}
 	__tlbsync();
@@ -1631,7 +1604,9 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 	 * a local TLB flush is needed. Optimize this use-case by calling
 	 * flush_tlb_func_local() directly in this case.
 	 */
-	if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
+	if (cpu_feature_enabled(X86_FEATURE_INVLPGB)) {
+		invlpgb_flush_all_nonglobals();
+	} else if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids) {
 		flush_tlb_multi(&batch->cpumask, info);
 	} else if (cpumask_test_cpu(cpu, &batch->cpumask)) {
 		lockdep_assert_irqs_enabled();
@@ -1640,50 +1615,10 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 		local_irq_enable();
 	}
 
-	/*
-	 * If we issued (asynchronous) INVLPGB flushes, wait for them here.
-	 * The cpumask above contains only CPUs that were running tasks
-	 * not using broadcast TLB flushing.
-	 */
-	tlbsync();
-
 	cpumask_clear(&batch->cpumask);
 
 	put_flush_tlb_info();
 	put_cpu();
-}
-
-void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
-					     struct mm_struct *mm,
-					     unsigned long uaddr)
-{
-	u16 asid = mm_global_asid(mm);
-
-	if (asid) {
-		invlpgb_flush_user_nr_nosync(kern_pcid(asid), uaddr, 1, false, false);
-		/* Do any CPUs supporting INVLPGB need PTI? */
-		if (static_cpu_has(X86_FEATURE_PTI))
-			invlpgb_flush_user_nr_nosync(user_pcid(asid), uaddr, 1, false, false);
-
-		/*
-		 * Some CPUs might still be using a local ASID for this
-		 * process, and require IPIs, while others are using the
-		 * global ASID.
-		 *
-		 * In this corner case we need to do both the broadcast
-		 * TLB invalidation, and send IPIs. The IPIs will help
-		 * stragglers transition to the broadcast ASID.
-		 */
-		if (in_asid_transition(mm))
-			asid = 0;
-	}
-
-	if (!asid) {
-		inc_mm_tlb_gen(mm);
-		cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
-	}
-
-	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
 }
 
 /*

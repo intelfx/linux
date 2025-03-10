@@ -1073,7 +1073,7 @@ static void init_amd(struct cpuinfo_x86 *c)
 	clear_cpu_cap(c, X86_FEATURE_APIC_MSRS_FENCE);
 
 	/* Enable Translation Cache Extension */
-	if (cpu_feature_enabled(X86_FEATURE_TCE))
+	if (cpu_has(c, X86_FEATURE_TCE))
 		msr_set_bit(MSR_EFER, _EFER_TCE);
 }
 
@@ -1143,7 +1143,7 @@ static void cpu_detect_tlb_amd(struct cpuinfo_x86 *c)
 	tlb_lli_4m[ENTRIES] = tlb_lli_2m[ENTRIES] >> 1;
 
 	/* Max number of pages INVLPGB can invalidate in one shot */
-	if (boot_cpu_has(X86_FEATURE_INVLPGB))
+	if (cpu_has(c, X86_FEATURE_INVLPGB))
 		invlpgb_count_max = (cpuid_edx(0x80000008) & 0xffff) + 1;
 }
 
