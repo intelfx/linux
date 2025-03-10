@@ -401,7 +401,7 @@ menuconfig PROCESSOR_SELECT
 	  This lets you choose what x86 vendor support code your kernel
 	  will include.
 
-config X86_BROADCAST_TLB_FLUSH
+config BROADCAST_TLB_FLUSH
 	def_bool y
 	depends on CPU_SUP_AMD && 64BIT
 

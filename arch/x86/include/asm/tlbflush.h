@@ -105,9 +105,6 @@ struct tlb_state {
 	 * need to be invalidated.
 	 */
 	bool invalidate_other;
-#ifdef CONFIG_X86_BROADCAST_TLB_FLUSH
-	bool need_tlbsync;
-#endif
 
 #ifdef CONFIG_ADDRESS_MASKING
 	/*
@@ -247,7 +244,7 @@ static inline bool is_global_asid(u16 asid)
 	return !is_dyn_asid(asid);
 }
 
-#ifdef CONFIG_X86_BROADCAST_TLB_FLUSH
+#ifdef CONFIG_BROADCAST_TLB_FLUSH
 static inline u16 mm_global_asid(struct mm_struct *mm)
 {
 	u16 asid;
@@ -263,6 +260,14 @@ static inline u16 mm_global_asid(struct mm_struct *mm)
 	return asid;
 }
 
+static inline void mm_init_global_asid(struct mm_struct *mm)
+{
+	if (cpu_feature_enabled(X86_FEATURE_INVLPGB)) {
+		mm->context.global_asid = 0;
+		mm->context.asid_transition = false;
+	}
+}
+
 static inline void mm_assign_global_asid(struct mm_struct *mm, u16 asid)
 {
 	/*
@@ -274,56 +279,25 @@ static inline void mm_assign_global_asid(struct mm_struct *mm, u16 asid)
 	smp_store_release(&mm->context.global_asid, asid);
 }
 
-static inline void clear_asid_transition(struct mm_struct *mm)
+static inline void mm_clear_asid_transition(struct mm_struct *mm)
 {
 	WRITE_ONCE(mm->context.asid_transition, false);
 }
 
-static inline bool in_asid_transition(struct mm_struct *mm)
+static inline bool mm_in_asid_transition(struct mm_struct *mm)
 {
 	if (!cpu_feature_enabled(X86_FEATURE_INVLPGB))
 		return false;
 
 	return mm && READ_ONCE(mm->context.asid_transition);
 }
-
-static inline bool cpu_need_tlbsync(void)
-{
-	return this_cpu_read(cpu_tlbstate.need_tlbsync);
-}
-
-static inline void cpu_write_tlbsync(bool state)
-{
-	this_cpu_write(cpu_tlbstate.need_tlbsync, state);
-}
 #else
-static inline u16 mm_global_asid(struct mm_struct *mm)
-{
-	return 0;
-}
-
-static inline void mm_assign_global_asid(struct mm_struct *mm, u16 asid)
-{
-}
-
-static inline void clear_asid_transition(struct mm_struct *mm)
-{
-}
-
-static inline bool in_asid_transition(struct mm_struct *mm)
-{
-	return false;
-}
-
-static inline bool cpu_need_tlbsync(void)
-{
-	return false;
-}
-
-static inline void cpu_write_tlbsync(bool state)
-{
-}
-#endif
+static inline u16 mm_global_asid(struct mm_struct *mm) { return 0; }
+static inline void mm_init_global_asid(struct mm_struct *mm) { }
+static inline void mm_assign_global_asid(struct mm_struct *mm, u16 asid) { }
+static inline void mm_clear_asid_transition(struct mm_struct *mm) { }
+static inline bool mm_in_asid_transition(struct mm_struct *mm) { return false; }
+#endif /* CONFIG_BROADCAST_TLB_FLUSH */
 
 #ifdef CONFIG_PARAVIRT
 #include <asm/paravirt.h>
@@ -372,15 +346,21 @@ static inline u64 inc_mm_tlb_gen(struct mm_struct *mm)
 	return atomic64_inc_return(&mm->context.tlb_gen);
 }
 
+static inline void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
+					     struct mm_struct *mm,
+					     unsigned long uaddr)
+{
+	inc_mm_tlb_gen(mm);
+	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
+	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
+}
+
 static inline void arch_flush_tlb_batched_pending(struct mm_struct *mm)
 {
 	flush_tlb_mm(mm);
 }
 
 extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);
-extern void arch_tlbbatch_add_pending(struct arch_tlbflush_unmap_batch *batch,
-					     struct mm_struct *mm,
-					     unsigned long uaddr);
 
 static inline bool pte_flags_need_flush(unsigned long oldflags,
 					unsigned long newflags,
