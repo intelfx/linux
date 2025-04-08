@@ -260,26 +260,6 @@ enum tpm2_return_codes {
 	TPM2_RC_SESSION_MEMORY	= 0x0903,
 };
 
-/*
- * Convert a return value from tpm_transmit_cmd() to a POSIX return value. The
- * fallback return value is -EFAULT.
- */
-static inline ssize_t tpm_to_ret(ssize_t ret)
-{
-	/* Already a POSIX error: */
-	if (ret < 0)
-		return ret;
-
-	switch (ret) {
-	case TPM2_RC_SUCCESS:
-		return 0;
-	case TPM2_RC_SESSION_MEMORY:
-		return -ENOMEM;
-	default:
-		return -EFAULT;
-	}
-}
-
 enum tpm2_command_codes {
 	TPM2_CC_FIRST		        = 0x011F,
 	TPM2_CC_HIERARCHY_CONTROL       = 0x0121,
@@ -455,6 +435,24 @@ static inline bool tpm_is_firmware_upgrade(struct tpm_chip *chip)
 static inline u32 tpm2_rc_value(u32 rc)
 {
 	return (rc & BIT(7)) ? rc & 0xbf : rc;
+}
+
+/*
+ * Convert a return value from tpm_transmit_cmd() to POSIX error code.
+ */
+static inline ssize_t tpm_ret_to_err(ssize_t ret)
+{
+	if (ret < 0)
+		return ret;
+
+	switch (tpm2_rc_value(ret)) {
+	case TPM2_RC_SUCCESS:
+		return 0;
+	case TPM2_RC_SESSION_MEMORY:
+		return -ENOMEM;
+	default:
+		return -EFAULT;
+	}
 }
 
 #if defined(CONFIG_TCG_TPM) || defined(CONFIG_TCG_TPM_MODULE)
