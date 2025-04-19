@@ -115,15 +115,17 @@ config WIREGUARD_DEBUG
 
 	  Say N here unless you know what you're doing.
 
-config OVPN_DCO_V2
-	tristate "OpenVPN data channel offload (reloaded)"
+config OVPN
+	tristate "OpenVPN data channel offload"
 	depends on NET && INET
-	select NET_UDP_TUNNEL
+	depends on IPV6 || !IPV6
 	select DST_CACHE
+	select NET_UDP_TUNNEL
 	select CRYPTO
 	select CRYPTO_AES
 	select CRYPTO_GCM
 	select CRYPTO_CHACHA20POLY1305
+	select STREAM_PARSER
 	help
 	  This module enhances the performance of the OpenVPN userspace software
 	  by offloading the data channel processing to kernelspace.
