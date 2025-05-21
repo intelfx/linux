@@ -66,7 +66,6 @@ static bool ovpn_socket_put(struct ovpn_peer *peer, struct ovpn_socket *sock)
 void ovpn_socket_release(struct ovpn_peer *peer)
 {
 	struct ovpn_socket *sock;
-	struct sock *sk;
 	bool released;
 
 	might_sleep();
@@ -76,14 +75,13 @@ void ovpn_socket_release(struct ovpn_peer *peer)
 	if (!sock)
 		return;
 
-	/* sock->sk may be released concurrently, therefore we
-	 * first attempt grabbing a reference.
-	 * if sock->sk is NULL it means it is already being
-	 * destroyed and we don't need any further cleanup
+	/* sanity check: we should not end up here if the socket
+	 * was already closed
 	 */
-	sk = sock->sock->sk;
-	if (!sk || !refcount_inc_not_zero(&sk->sk_refcnt))
+	if (!sock->sock->sk) {
+		DEBUG_NET_WARN_ON_ONCE(1);
 		return;
+	}
 
 	/* Drop the reference while holding the sock lock to avoid
 	 * concurrent ovpn_socket_new call to mess up with a partially
@@ -92,18 +90,18 @@ void ovpn_socket_release(struct ovpn_peer *peer)
 	 * Holding the lock ensures that a socket with refcnt 0 is fully
 	 * detached before it can be picked by a concurrent reader.
 	 */
-	lock_sock(sk);
+	lock_sock(sock->sock->sk);
 	released = ovpn_socket_put(peer, sock);
-	release_sock(sk);
+	release_sock(sock->sock->sk);
 
 	/* align all readers with sk_user_data being NULL */
 	synchronize_rcu();
 
 	/* following cleanup should happen with lock released */
 	if (released) {
-		if (sk->sk_protocol == IPPROTO_UDP) {
+		if (sock->sock->sk->sk_protocol == IPPROTO_UDP) {
 			netdev_put(sock->ovpn->dev, &sock->dev_tracker);
-		} else if (sk->sk_protocol == IPPROTO_TCP) {
+		} else if (sock->sock->sk->sk_protocol == IPPROTO_TCP) {
 			/* wait for TCP jobs to terminate */
 			ovpn_tcp_socket_wait_finish(sock);
 			ovpn_peer_put(sock->peer);
@@ -113,7 +111,6 @@ void ovpn_socket_release(struct ovpn_peer *peer)
 		 */
 		kfree(sock);
 	}
-	sock_put(sk);
 }
 
 static bool ovpn_socket_hold(struct ovpn_socket *sock)
