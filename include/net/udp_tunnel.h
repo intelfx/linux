@@ -220,6 +220,18 @@ static inline void udp_tunnel_encap_enable(struct sock *sk)
 	udp_encap_enable();
 }
 
+static inline void udp_tunnel_encap_disable(struct sock *sk)
+{
+	if (udp_test_and_set_bit(ENCAP_ENABLED, sk))
+		return;
+
+#if IS_ENABLED(CONFIG_IPV6)
+	if (READ_ONCE(sk->sk_family) == PF_INET6)
+		ipv6_stub->udpv6_encap_disable();
+#endif
+	udp_encap_disable();
+}
+
 #define UDP_TUNNEL_NIC_MAX_TABLES	4
 
 enum udp_tunnel_nic_info_flags {
