@@ -92,6 +92,7 @@ struct udp_tunnel_sock_cfg {
 /* Setup the given (UDP) sock to receive UDP encapsulated packets */
 void setup_udp_tunnel_sock(struct net *net, struct socket *sock,
 			   struct udp_tunnel_sock_cfg *sock_cfg);
+void cleanup_udp_tunnel_sock(struct sock *sk);
 
 /* -- List of parsable UDP tunnel types --
  *
@@ -191,6 +192,21 @@ static inline int udp_tunnel_handle_offloads(struct sk_buff *skb, bool udp_csum)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_NET_UDP_TUNNEL)
+void udp_tunnel_update_gro_lookup(struct net *net, struct sock *sk, bool add);
+void udp_tunnel_update_gro_rcv(struct sock *sk, bool add);
+#else
+static inline void udp_tunnel_update_gro_lookup(struct net *net,
+						struct sock *sk, bool add) {}
+static inline void udp_tunnel_update_gro_rcv(struct sock *sk, bool add) {}
+#endif
+
+static inline void udp_tunnel_cleanup_gro(struct sock *sk)
+{
+	udp_tunnel_update_gro_rcv(sk, false);
+	udp_tunnel_update_gro_lookup(sock_net(sk), sk, false);
+}
+
 static inline void udp_tunnel_encap_enable(struct sock *sk)
 {
 	if (udp_test_and_set_bit(ENCAP_ENABLED, sk))
@@ -200,6 +216,7 @@ static inline void udp_tunnel_encap_enable(struct sock *sk)
 	if (READ_ONCE(sk->sk_family) == PF_INET6)
 		ipv6_stub->udpv6_encap_enable();
 #endif
+	udp_tunnel_update_gro_rcv(sk, true);
 	udp_encap_enable();
 }
 
