@@ -369,6 +369,12 @@ ssize_t fsg_show_inquiry_string(struct fsg_lun *curlun, char *buf)
 }
 EXPORT_SYMBOL_GPL(fsg_show_inquiry_string);
 
+ssize_t fsg_show_inquiry_string_cdrom(struct fsg_lun *curlun, char *buf)
+{
+	return sprintf(buf, "%s\n", curlun->inquiry_string_cdrom);
+}
+EXPORT_SYMBOL_GPL(fsg_show_inquiry_string_cdrom);
+
 /*
  * The caller must hold fsg->filesem for reading when calling this function.
  */
@@ -499,23 +505,42 @@ ssize_t fsg_store_removable(struct fsg_lun *curlun, const char *buf,
 }
 EXPORT_SYMBOL_GPL(fsg_store_removable);
 
-ssize_t fsg_store_inquiry_string(struct fsg_lun *curlun, const char *buf,
-				 size_t count)
+static ssize_t _fsg_store_inquiry_string(struct fsg_lun *curlun,
+					 const char *buf, size_t count,
+					 bool cdrom)
 {
-	const size_t len = min(count, sizeof(curlun->inquiry_string));
+	char *inq_ptr = (cdrom
+			 ? curlun->inquiry_string_cdrom
+			 : curlun->inquiry_string);
+	const size_t inq_size = (cdrom
+				 ? sizeof(curlun->inquiry_string_cdrom)
+				 : sizeof(curlun->inquiry_string));
+	const size_t len = min(count, inq_size);
 
 	if (len == 0 || buf[0] == '\n') {
-		curlun->inquiry_string[0] = 0;
+		inq_ptr[0] = 0;
 	} else {
-		snprintf(curlun->inquiry_string,
-			 sizeof(curlun->inquiry_string), "%-28s", buf);
-		if (curlun->inquiry_string[len-1] == '\n')
-			curlun->inquiry_string[len-1] = ' ';
+		snprintf(inq_ptr, inq_size, "%-28s", buf);
+		if (inq_ptr[len-1] == '\n')
+			inq_ptr[len-1] = ' ';
 	}
 
 	return count;
 }
+
+ssize_t fsg_store_inquiry_string(struct fsg_lun *curlun, const char *buf,
+				 size_t count)
+{
+	return _fsg_store_inquiry_string(curlun, buf, count, false);
+}
 EXPORT_SYMBOL_GPL(fsg_store_inquiry_string);
+
+ssize_t fsg_store_inquiry_string_cdrom(struct fsg_lun *curlun, const char *buf,
+				       size_t count)
+{
+	return _fsg_store_inquiry_string(curlun, buf, count, true);
+}
+EXPORT_SYMBOL_GPL(fsg_store_inquiry_string_cdrom);
 
 ssize_t fsg_store_forced_eject(struct fsg_lun *curlun, struct rw_semaphore *filesem,
 			       const char *buf, size_t count)

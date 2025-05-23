@@ -1071,7 +1071,10 @@ static int do_inquiry(struct fsg_common *common, struct fsg_buffhd *bh)
 	buf[5] = 0;		/* No special options */
 	buf[6] = 0;
 	buf[7] = 0;
-	if (curlun->inquiry_string[0])
+	if (curlun->cdrom && curlun->inquiry_string_cdrom[0])
+		memcpy(buf + 8, curlun->inquiry_string_cdrom,
+		       sizeof(curlun->inquiry_string_cdrom));
+	else if (curlun->inquiry_string[0])
 		memcpy(buf + 8, curlun->inquiry_string,
 		       sizeof(curlun->inquiry_string));
 	else
@@ -3613,6 +3616,21 @@ static ssize_t fsg_lun_opts_inquiry_string_store(struct config_item *item,
 
 CONFIGFS_ATTR(fsg_lun_opts_, inquiry_string);
 
+static ssize_t fsg_lun_opts_inquiry_string_cdrom_show(struct config_item *item,
+						      char *page)
+{
+	return fsg_show_inquiry_string_cdrom(to_fsg_lun_opts(item)->lun, page);
+}
+
+static ssize_t fsg_lun_opts_inquiry_string_cdrom_store(struct config_item *item,
+						       const char *page, size_t len)
+{
+	return fsg_store_inquiry_string_cdrom(to_fsg_lun_opts(item)->lun,
+					      page, len);
+}
+
+CONFIGFS_ATTR(fsg_lun_opts_, inquiry_string_cdrom);
+
 static ssize_t fsg_lun_opts_forced_eject_store(struct config_item *item,
 					       const char *page, size_t len)
 {
@@ -3632,6 +3650,7 @@ static struct configfs_attribute *fsg_lun_attrs[] = {
 	&fsg_lun_opts_attr_cdrom,
 	&fsg_lun_opts_attr_nofua,
 	&fsg_lun_opts_attr_inquiry_string,
+	&fsg_lun_opts_attr_inquiry_string_cdrom,
 	&fsg_lun_opts_attr_forced_eject,
 	NULL,
 };
