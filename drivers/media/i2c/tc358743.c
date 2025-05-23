@@ -687,10 +687,19 @@ static unsigned tc358743_num_csi_lanes_needed(struct v4l2_subdev *sd)
 	struct tc358743_platform_data *pdata = &state->pdata;
 	u32 bits_pr_pixel =
 		(state->mbus_fmt_code == MEDIA_BUS_FMT_UYVY8_1X16) ?  16 : 24;
-	u32 bps = bt->width * bt->height * fps(bt) * bits_pr_pixel;
+	u32 bps;
+	if (state->mbus_fmt_code == MEDIA_BUS_FMT_UYVY8_1X16) {
+		bps = bt->width * bt->height * fps(bt) * bits_pr_pixel;
+	} else {
+		bps = (bt->width + bt->hsync) * (bt->height + bt->vsync) * fps(bt) * bits_pr_pixel;
+	}
 	u32 bps_pr_lane = (pdata->refclk_hz / pdata->pll_prd) * pdata->pll_fbd;
 
-	return DIV_ROUND_UP(bps, bps_pr_lane);
+	/*
+	 * We're don't using DIV_ROUND_UP() here because its formula
+	 * causes u32 overflow when values are too big.
+	 */
+	return (bps / bps_pr_lane) + (((bps % bps_pr_lane) != 0) ? 1 : 0);
 }
 
 static void tc358743_set_csi(struct v4l2_subdev *sd)
