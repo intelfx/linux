@@ -439,9 +439,9 @@ void ovpn_udp_socket_detach(struct ovpn_socket *ovpn_sock)
 	/* Disable CHECKSUM_UNNECESSARY to CHECKSUM_COMPLETE conversion */
 	inet_dec_convert_csum(sk);
 
-	udp_sk(sk)->encap_type = 0;
-	udp_sk(sk)->encap_rcv = NULL;
-	udp_sk(sk)->encap_destroy = NULL;
+	WRITE_ONCE(udp_sk(sk)->encap_type, 0);
+	WRITE_ONCE(udp_sk(sk)->encap_rcv, NULL);
+	WRITE_ONCE(udp_sk(sk)->encap_destroy, NULL);
 
 	rcu_assign_sk_user_data(sk, NULL);
 }
