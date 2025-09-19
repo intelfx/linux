@@ -70,7 +70,7 @@ static void get_energy_units(struct amd_energy_data *data)
 {
 	u64 rapl_units;
 
-	rdmsrl_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
+	rdmsrq_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
 	data->energy_units = (rapl_units & AMD_ENERGY_UNIT_MASK) >> 8;
 }
 
@@ -81,7 +81,7 @@ static void accumulate_delta(struct amd_energy_data *data,
 	u64 input;
 
 	mutex_lock(&data->lock);
-	rdmsrl_safe_on_cpu(cpu, reg, &input);
+	rdmsrq_safe_on_cpu(cpu, reg, &input);
 	input &= AMD_ENERGY_MASK;
 
 	accum = &data->accums[channel];
@@ -125,7 +125,7 @@ static void amd_add_delta(struct amd_energy_data *data, int ch,
 	u64 input;
 
 	mutex_lock(&data->lock);
-	rdmsrl_safe_on_cpu(cpu, reg, &input);
+	rdmsrq_safe_on_cpu(cpu, reg, &input);
 	input &= AMD_ENERGY_MASK;
 
 	accum = &data->accums[ch];
