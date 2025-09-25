@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/hwmon/raspberrypi,rp1-adc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Rasberry Pi RP1 ADC device
+
+maintainers:
+  - Stanimir Varbanov <svarbanov@suse.de>
+
+description: |
+  The RP1 ADC is a five input successive-approximation ADC with 12-bit
+  resolution (ENOB 9.5-bit) at 500kSPS. It has four external inputs
+  and one internal temperature sensor.
+
+properties:
+  compatible:
+    const: raspberrypi,rp1-adc
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  vref-supply:
+    description:
+      Reference voltage regulator 3.3V.
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - vref-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    adc@400c8000 {
+      compatible = "raspberrypi,rp1-adc";
+      reg = <0x400c8000 0x4000>;
+      clocks = <&rp1_clocks 30>;
+      vref-supply = <&rp1_vdd_3v3>;
+    };
