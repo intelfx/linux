@@ -67,6 +67,14 @@
 		gpios = <&gio_aon 4 GPIO_ACTIVE_HIGH>;
 	};
 
+	rp1_vdd_3v3: rp1_vdd_3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vdd-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
 	wl_on_reg: wl-on-reg {
 		compatible = "regulator-fixed";
 		regulator-name = "wl-on-regulator";

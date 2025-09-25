@@ -24,6 +24,11 @@
 	status = "okay";
 };
 
+&rp1_adc {
+	vref-supply = <&rp1_vdd_3v3>;
+	status = "okay";
+};
+
 &rp1_eth {
 	status = "okay";
 	phy-mode = "rgmii-id";
