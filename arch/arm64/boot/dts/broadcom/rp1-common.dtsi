@@ -40,6 +40,13 @@ pci_ep_bus: pci-ep-bus@1 {
 			     <2 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
+	rp1_adc: adc@400c8000 {
+		compatible = "raspberrypi,rp1-adc";
+		reg = <0x00 0x400c8000 0x0 0x4000>;
+		clocks = <&rp1_clocks RP1_CLK_ADC>;
+		status = "disabled";
+	};
+
 	rp1_eth: ethernet@40100000 {
 		compatible = "raspberrypi,rp1-gem";
 		reg = <0x00 0x40100000  0x0 0x4000>;
