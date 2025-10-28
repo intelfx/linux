@@ -299,7 +299,7 @@ static int amdgpu_vmid_grab_reserved(struct amdgpu_vm *vm,
 	* user of the VMID.
 	*/
 	r = amdgpu_sync_fence(&(*id)->active, &job->base.s_fence->finished,
-			      GFP_NOWAIT);
+			      GFP_ATOMIC);
 	if (r)
 		return r;
 
@@ -359,7 +359,7 @@ static int amdgpu_vmid_grab_used(struct amdgpu_vm *vm,
 		 */
 		r = amdgpu_sync_fence(&(*id)->active,
 				      &job->base.s_fence->finished,
-				      GFP_NOWAIT);
+				      GFP_ATOMIC);
 		if (r)
 			return r;
 
@@ -412,7 +412,7 @@ int amdgpu_vmid_grab(struct amdgpu_vm *vm, struct amdgpu_ring *ring,
 			/* Remember this submission as user of the VMID */
 			r = amdgpu_sync_fence(&id->active,
 					      &job->base.s_fence->finished,
-					      GFP_NOWAIT);
+					      GFP_ATOMIC);
 			if (r)
 				goto error;
 
