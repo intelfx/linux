@@ -5,6 +5,7 @@
 ZFS_MODULE_CFLAGS += -std=gnu11 -Wno-declaration-after-statement
 ZFS_MODULE_CFLAGS += -Wmissing-prototypes
 ZFS_MODULE_CFLAGS += -Wno-format-zero-length
+ZFS_MODULE_CFLAGS += -Wno-typedef-redefinition
 
 ifneq ($(KBUILD_EXTMOD),)
 ZFS_MODULE_CFLAGS += 
