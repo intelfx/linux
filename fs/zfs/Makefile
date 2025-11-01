@@ -5,6 +5,7 @@
 ZFS_MODULE_CFLAGS += -std=gnu99 -Wno-declaration-after-statement
 ZFS_MODULE_CFLAGS += -Wmissing-prototypes
 ZFS_MODULE_CFLAGS += -Wno-format-zero-length
+ZFS_MODULE_CFLAGS += -Wno-typedef-redefinition
 
 ifeq ($(CONFIG_ZFS_DEBUG),y)
 ZFS_MODULE_CFLAGS += -Werror
