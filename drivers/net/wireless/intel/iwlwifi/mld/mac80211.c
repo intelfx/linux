@@ -470,7 +470,8 @@ static int iwl_mld_hw_verify_preconditions(struct iwl_mld *mld)
 		return -EINVAL;
 
 	/* LAR is expected to be enabled for all supported devices */
-	if (WARN_ON(!mld->nvm_data->lar_enabled))
+	if (!iwlwifi_mod_params.lar_disable &&
+	    WARN_ON(!mld->nvm_data->lar_enabled))
 		return -EINVAL;
 
 	/* All supported devices are currently using version 3 of the cmd.
