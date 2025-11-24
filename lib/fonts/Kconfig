@@ -112,6 +112,42 @@ config FONT_SUN12x22
 	  big letters (like the letters used in the SPARC PROM). If the
 	  standard font is unreadable for you, say Y, otherwise say N.
 
+config FONT_TER6x12
+	bool "Terminus 6x12 font" if FONTS
+	depends on FRAMEBUFFER_CONSOLE || DRM_PANIC
+	help
+	  Terminus Font is a clean, fixed width bitmap font, designed
+	  for long (8 and more hours per day) work with computers.
+
+	  This is the smallest version for use with low-resolution screens or
+	  to maximize the amount of text visible on screen, while staying
+	  reasonably legible.
+
+config FONT_TER8x16
+	bool "Terminus 8x16 font" if FONTS
+	depends on FRAMEBUFFER_CONSOLE || DRM_PANIC
+	help
+	  Terminus Font is a clean, fixed width bitmap font, designed
+	  for long (8 and more hours per day) work with computers.
+
+	  This is the standard resolution version for use with VGA-compatible
+	  displays, achieving a traditional 80x25 console layout on resolutions
+	  like 640x480.
+
+config FONT_TER12x24
+	bool "Terminus 12x24 font" if FONTS
+	depends on FRAMEBUFFER_CONSOLE || DRM_PANIC
+	help
+	  Terminus Font is a clean, fixed width bitmap font, designed
+	  for long (8 and more hours per day) work with computers.
+
+	  This is the medium-large version for higher-resolution screens,
+	  offering improved readability while still offering a 80x25 console
+	  on displays like 1024x768 or above.
+
+	  If the standard font is uncomfortable for you but 16x32 is too large
+	  still, say Y.
+
 config FONT_TER16x32
 	bool "Terminus 16x32 font (not supported by all drivers)"
 	depends on FRAMEBUFFER_CONSOLE || DRM_PANIC
@@ -119,6 +155,7 @@ config FONT_TER16x32
 	help
 	  Terminus Font is a clean, fixed width bitmap font, designed
 	  for long (8 and more hours per day) work with computers.
+
 	  This is the high resolution, large version for use with HiDPI screens.
 	  If the standard font is unreadable for you, say Y, otherwise say N.
 
@@ -140,6 +177,9 @@ config FONT_AUTOSELECT
 	depends on !FONT_SUN8x16
 	depends on !FONT_SUN12x22
 	depends on !FONT_10x18
+	depends on !FONT_TER6x12
+	depends on !FONT_TER8x16
+	depends on !FONT_TER12x24
 	depends on !FONT_TER16x32
 	depends on !FONT_6x8
 	select FONT_8x16
