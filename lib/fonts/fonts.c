@@ -54,8 +54,17 @@ static const struct font_desc *fonts[] = {
 #ifdef CONFIG_FONT_6x10
 	&font_6x10,
 #endif
+#ifdef CONFIG_FONT_TER6x12
+	&font_ter_6x12,
+#endif
+#ifdef CONFIG_FONT_TER8x16
+	&font_ter_8x16,
+#endif
 #ifdef CONFIG_FONT_TER10x18
 	&font_ter_10x18,
+#endif
+#ifdef CONFIG_FONT_TER12x24
+	&font_ter_12x24,
 #endif
 #ifdef CONFIG_FONT_TER16x32
 	&font_ter_16x32,
