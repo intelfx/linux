@@ -130,13 +130,12 @@ const struct font_desc *get_default_font(int xres, int yres,
 			c = 100;
 #endif
 #endif
-		if ((yres < 400) == (f->height <= 8))
-			c += 1000;
-
-		/* prefer a bigger font for high resolution */
+		/* prefer a bigger font for high resolution, and vice versa */
 		res = (xres / f->width) * (yres / f->height) / 1000;
 		if (res > 20)
 			c += 20 - res;
+		else if (res < 5)
+			c += res - 5;
 
 		if ((!font_w || test_bit(f->width - 1, font_w)) &&
 		    (!font_h || test_bit(f->height - 1, font_h)))
