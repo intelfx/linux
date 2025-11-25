@@ -124,6 +124,8 @@ const struct font_desc *get_default_font(int xres, int yres,
 	int i, c, cc, res;
 	const struct font_desc *f, *g;
 
+	pr_err("XXX: get_default_font: called for %dx%d", xres, yres);
+
 	g = NULL;
 	cc = -10000;
 	for (i = 0; i < num_fonts; i++) {
@@ -139,22 +141,37 @@ const struct font_desc *get_default_font(int xres, int yres,
 			c = 100;
 #endif
 #endif
+
 		/* prefer a bigger font for high resolution, and vice versa */
 		res = (xres / f->width) * (yres / f->height) / 1000;
 		if (res > 20)
+		{
+			pr_err("XXX: font %s [%dx%d] -= %d due to xres*yres very big; adj=20-res, res=%d (%dx%d console)",
+				f->name, f->width, f->height, 20 - res, res, (xres/f->width), (yres/f->height));
 			c += 20 - res;
+		}
 		else if (res < 5)
+		{
+			pr_err("XXX: font %s [%dx%d] -= %d due to xres*yres very small; adj=res-5, res=%d (%dx%d console)",
+				f->name, f->width, f->height, res - 5, res, (xres/f->width), (yres/f->height));
 			c += res - 5;
+		}
+		else {
+			pr_err("XXX: font %s [%dx%d] not adjusting due to xres*yres either big or small; adj_toobig=%d (20-res), adj_toosmall=%d (res-5), res=%d (%dx%d console)",
+				f->name, f->width, f->height, 20 - res, res - 5, res, (xres/f->width), (yres/f->height));
+		}
 
 		if ((!font_w || test_bit(f->width - 1, font_w)) &&
 		    (!font_h || test_bit(f->height - 1, font_h)))
 			c += 1000;
 
+		pr_err("XXX: get_default_font: for %dx%d font %s [%dx%d] pref %d score %d", xres, yres, f->name, f->width, f->height, f->pref, c);
 		if (c > cc) {
 			cc = c;
 			g = f;
 		}
 	}
+	pr_err("XXX: get_default_font: chose for %dx%d font %s [%dx%d] pref %d score %d", xres, yres, g->name, g->width, g->height, g->pref, cc);
 	return g;
 }
 EXPORT_SYMBOL(get_default_font);
