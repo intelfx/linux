@@ -127,6 +127,9 @@ const struct font_desc *get_default_font(int xres, int yres,
 	int i, c, cc, res;
 	const struct font_desc *f, *g;
 
+	pr_debug("fonts: choosing font for %dx%d console",
+		 xres, yres);
+
 	g = NULL;
 	cc = -10000;
 	for (i = 0; i < num_fonts; i++) {
@@ -142,22 +145,47 @@ const struct font_desc *get_default_font(int xres, int yres,
 			c = 100;
 #endif
 #endif
+
+#define _MAX_RES 14
+#define _MIN_RES 5
+
+		int xchars = (xres / f->width), ychars = (yres / f->height), adj = 0;
+
 		/* prefer a bigger font for high resolution, and vice versa */
 		res = (xres / f->width) * (yres / f->height) / 1000;
-		if (res > 20)
-			c += 20 - res;
-		else if (res < 5)
-			c += res - 5;
+		if (res > _MAX_RES) {
+			adj = _MAX_RES - res;
+			c += _MAX_RES - res;
+			pr_debug("fonts: font %s [%dx%d] (%dx%d): font too small (res=%d), score-=%d",
+				 f->name, f->width, f->height, xchars, ychars, res, -adj);
+		} else if (res < _MIN_RES) {
+			adj = res - _MIN_RES;
+			c += res - _MIN_RES;
+			pr_debug("fonts: font %s [%dx%d] (%dx%d): font too large (res=%d), score-=%d",
+				 f->name, f->width, f->height, xchars, ychars, res, -adj);
+		} else {
+			pr_debug("fonts: font %s [%dx%d] (%dx%d): font is usable (res=%d)",
+				 f->name, f->width, f->height, xchars, ychars, res);
+		}
 
 		if ((!font_w || test_bit(f->width - 1, font_w)) &&
 		    (!font_h || test_bit(f->height - 1, font_h)))
 			c += 1000;
+		else
+			pr_debug("fonts: font %s [%dx%d]: not preferring due to unsupported bitmap dimensions",
+				 f->name, f->width, f->height);
+
+		pr_debug("fonts: font %s [%dx%d] (%dx%d): pref=%d, adj=%d (res=%d), score=%d",
+			  f->name, f->width, f->height, xchars, ychars, f->pref, adj, res, c);
 
 		if (c > cc) {
 			cc = c;
 			g = f;
 		}
 	}
+
+	pr_notice("fonts: chose font for %dx%d console: font %s [%dx%d] (%dx%d chars): res=%d, pref=%d, score=%d",
+		  xres, yres, g->name, g->width, g->height, (xres/g->width), (yres/g->height), (xres/g->width) * (yres/g->height) / 1000, g->pref, cc);
 	return g;
 }
 EXPORT_SYMBOL(get_default_font);
