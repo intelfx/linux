@@ -673,9 +673,9 @@ static u8 build_attr(struct vc_data *vc, u8 _color,
 	if (_reverse)
 		a = (a & 0x88) | (((a >> 4) | (a << 4)) & 0x77);
 	if (_blink)
-		a ^= 0x80;
+		a |= 0x80;
 	if (_intensity == VCI_BOLD)
-		a ^= 0x08;
+		a |= 0x08;
 	if (vc->vc_hi_font_mask == 0x100)
 		a <<= 1;
 	return a;
