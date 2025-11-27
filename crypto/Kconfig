@@ -1,9 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0
-#
-# Generic algorithms support
-#
-config XOR_BLOCKS
-	tristate "Accelerated block xor algorithm"
 
 #
 # async_tx api: hardware offloaded memory transfer/transform support
