@@ -1794,8 +1794,7 @@ static void csi_m(struct vc_data *vc)
 				(vc->state.color & 0x0f);
 			break;
 		case CSI_m_BRIGHT_FG_COLOR_BEG ... CSI_m_BRIGHT_FG_COLOR_END:
-			vc->state.intensity = VCI_BOLD;
-			vc->vc_par[i] -= CSI_m_BRIGHT_FG_COLOR_OFF;
+			vc->vc_par[i] -= CSI_m_BRIGHT_FG_COLOR_OFF - 8;
 			fallthrough;
 		case CSI_m_FG_COLOR_BEG ... CSI_m_FG_COLOR_END:
 			vc->vc_par[i] -= CSI_m_FG_COLOR_BEG;
