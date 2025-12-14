@@ -124,9 +124,9 @@
 #include <kunit/visibility.h>
 
 #ifdef CONFIG_USER_NS
-extern int unprivileged_userns_clone;
+static int unprivileged_userns_clone = 1;
 #else
-#define unprivileged_userns_clone 0
+#define unprivileged_userns_clone 1
 #endif
 
 /*
@@ -1952,10 +1952,6 @@ __latent_entropy struct task_struct *copy_process(
 	if ((clone_flags & (CLONE_NEWUSER|CLONE_FS)) == (CLONE_NEWUSER|CLONE_FS))
 		return ERR_PTR(-EINVAL);
 
-	if ((clone_flags & CLONE_NEWUSER) && !unprivileged_userns_clone)
-		if (!capable(CAP_SYS_ADMIN))
-			return ERR_PTR(-EPERM);
-
 	/*
 	 * Thread groups must share signals as well, and detached threads
 	 * can only be started up within the thread group.
@@ -1998,6 +1994,11 @@ __latent_entropy struct task_struct *copy_process(
 		 */
 		if (clone_flags & CLONE_DETACHED)
 			return ERR_PTR(-EINVAL);
+	}
+
+	if ((clone_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
+		if (!capable(CAP_SYS_ADMIN))
+			return ERR_PTR(-EPERM);
 	}
 
 	/*
@@ -3035,6 +3036,10 @@ static int check_unshare_flags(unsigned long unshare_flags)
 		if (!current_is_single_threaded())
 			return -EINVAL;
 	}
+	if ((unshare_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
+		if (!capable(CAP_SYS_ADMIN))
+			return -EPERM;
+	}
 
 	return 0;
 }
@@ -3116,12 +3121,6 @@ int ksys_unshare(unsigned long unshare_flags)
 	 */
 	if (unshare_flags & CLONE_NEWNS)
 		unshare_flags |= CLONE_FS;
-
-	if ((unshare_flags & CLONE_NEWUSER) && !unprivileged_userns_clone) {
-		err = -EPERM;
-		if (!capable(CAP_SYS_ADMIN))
-			goto bad_unshare_out;
-	}
 
 	err = check_unshare_flags(unshare_flags);
 	if (err)
@@ -3271,6 +3270,15 @@ static const struct ctl_table fork_sysctl_table[] = {
 		.mode		= 0644,
 		.proc_handler	= sysctl_max_threads,
 	},
+#ifdef CONFIG_USER_NS
+	{
+		.procname	= "unprivileged_userns_clone",
+		.data		= &unprivileged_userns_clone,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+#endif
 };
 
 static int __init init_fork_sysctl(void)
