@@ -77,7 +77,8 @@
 #include <linux/kernel.h>
 #include <linux/uuid.h>
 #include <uapi/linux/magic.h>
-#include "vstructs.h"
+
+#include "util/vstructs.h"
 
 #ifdef __KERNEL__
 typedef uuid_t __uuid_t;
@@ -423,7 +424,8 @@ enum bch_bkey_type_flags {
 	x(logged_op_truncate,	32,	BKEY_TYPE_strict_btree_checks)	\
 	x(logged_op_finsert,	33,	BKEY_TYPE_strict_btree_checks)	\
 	x(accounting,		34,	BKEY_TYPE_strict_btree_checks)	\
-	x(inode_alloc_cursor,	35,	BKEY_TYPE_strict_btree_checks)
+	x(inode_alloc_cursor,	35,	BKEY_TYPE_strict_btree_checks)	\
+	x(extent_whiteout,	36,	BKEY_TYPE_strict_btree_checks)
 
 enum bch_bkey_type {
 #define x(name, nr, ...) KEY_TYPE_##name	= nr,
@@ -437,6 +439,10 @@ struct bch_deleted {
 };
 
 struct bch_whiteout {
+	struct bch_val		v;
+};
+
+struct bch_extent_whiteout {
 	struct bch_val		v;
 };
 
@@ -500,27 +506,27 @@ struct bch_sb_field {
 	x(downgrade,			14)	\
 	x(recovery_passes,		15)
 
-#include "alloc_background_format.h"
-#include "dirent_format.h"
-#include "disk_accounting_format.h"
-#include "disk_groups_format.h"
-#include "extents_format.h"
-#include "ec_format.h"
-#include "inode_format.h"
-#include "journal_seq_blacklist_format.h"
-#include "logged_ops_format.h"
-#include "lru_format.h"
-#include "quota_format.h"
-#include "recovery_passes_format.h"
-#include "reflink_format.h"
-#include "replicas_format.h"
-#include "snapshot_format.h"
-#include "subvolume_format.h"
-#include "sb-counters_format.h"
-#include "sb-downgrade_format.h"
-#include "sb-errors_format.h"
-#include "sb-members_format.h"
-#include "xattr_format.h"
+#include "alloc/accounting_format.h"
+#include "alloc/disk_groups_format.h"
+#include "alloc/lru_format.h"
+#include "alloc/replicas_format.h"
+#include "alloc/format.h"
+#include "data/ec_format.h"
+#include "data/extents_format.h"
+#include "data/reflink_format.h"
+#include "fs/dirent_format.h"
+#include "fs/inode_format.h"
+#include "fs/logged_ops_format.h"
+#include "fs/quota_format.h"
+#include "fs/xattr_format.h"
+#include "init/passes_format.h"
+#include "journal/seq_blacklist_format.h"
+#include "sb/counters_format.h"
+#include "sb/downgrade_format.h"
+#include "sb/errors_format.h"
+#include "sb/members_format.h"
+#include "snapshots/snapshot_format.h"
+#include "snapshots/subvolume_format.h"
 
 enum bch_sb_field_type {
 #define x(f, nr)	BCH_SB_FIELD_##f = nr,
@@ -649,7 +655,6 @@ struct bch_sb_field_ext {
 /*
  * field 1:		version name
  * field 2:		BCH_VERSION(major, minor)
- * field 3:		recovery passess required on upgrade
  */
 #define BCH_METADATA_VERSIONS()						\
 	x(bkey_renumber,		BCH_VERSION(0, 10))		\
@@ -700,7 +705,10 @@ struct bch_sb_field_ext {
 	x(extent_flags,			BCH_VERSION(1, 25))		\
 	x(snapshot_deletion_v2,		BCH_VERSION(1, 26))		\
 	x(fast_device_removal,		BCH_VERSION(1, 27))		\
-	x(inode_has_case_insensitive,	BCH_VERSION(1, 28))
+	x(inode_has_case_insensitive,	BCH_VERSION(1, 28))		\
+	x(extent_snapshot_whiteouts,	BCH_VERSION(1, 29))		\
+	x(31bit_dirent_offset,		BCH_VERSION(1, 30))		\
+	x(btree_node_accounting,	BCH_VERSION(1, 31))
 
 enum bcachefs_metadata_version {
 	bcachefs_metadata_version_min = 9,
@@ -711,7 +719,7 @@ enum bcachefs_metadata_version {
 };
 
 static const __maybe_unused
-unsigned bcachefs_metadata_required_upgrade_below = bcachefs_metadata_version_rebalance_work;
+unsigned bcachefs_metadata_required_upgrade_below = bcachefs_metadata_version_btree_node_accounting;
 
 #define bcachefs_metadata_version_current	(bcachefs_metadata_version_max - 1)
 
@@ -959,7 +967,8 @@ enum bch_sb_feature {
 	x(alloc_info,				0)	\
 	x(alloc_metadata,			1)	\
 	x(extents_above_btree_updates_done,	2)	\
-	x(bformat_overflow_done,		3)
+	x(bformat_overflow_done,		3)	\
+	x(no_stale_ptrs,			4)
 
 enum bch_sb_compat {
 #define x(f, n) BCH_COMPAT_##f,
@@ -1340,6 +1349,7 @@ enum btree_id_flags {
 	  BTREE_IS_snapshots|							\
 	  BTREE_IS_data,							\
 	  BIT_ULL(KEY_TYPE_whiteout)|						\
+	  BIT_ULL(KEY_TYPE_extent_whiteout)|					\
 	  BIT_ULL(KEY_TYPE_error)|						\
 	  BIT_ULL(KEY_TYPE_cookie)|						\
 	  BIT_ULL(KEY_TYPE_extent)|						\
@@ -1371,7 +1381,8 @@ enum btree_id_flags {
 	  BIT_ULL(KEY_TYPE_alloc_v4))						\
 	x(quotas,		5,	0,					\
 	  BIT_ULL(KEY_TYPE_quota))						\
-	x(stripes,		6,	0,					\
+	x(stripes,		6,						\
+	  BTREE_IS_data,							\
 	  BIT_ULL(KEY_TYPE_stripe))						\
 	x(reflink,		7,						\
 	  BTREE_IS_extents|							\
@@ -1431,9 +1442,9 @@ enum btree_id {
  */
 #define BTREE_ID_NR_MAX		63
 
-static inline bool btree_id_is_alloc(enum btree_id id)
+static inline bool btree_id_is_alloc(enum btree_id btree)
 {
-	switch (id) {
+	switch (btree) {
 	case BTREE_ID_alloc:
 	case BTREE_ID_backpointers:
 	case BTREE_ID_need_discard:
@@ -1445,6 +1456,33 @@ static inline bool btree_id_is_alloc(enum btree_id id)
 	default:
 		return false;
 	}
+}
+
+/* We can reconstruct these btrees from information in other btrees */
+static inline bool btree_id_can_reconstruct(enum btree_id btree)
+{
+	if (btree_id_is_alloc(btree))
+		return true;
+
+	switch (btree) {
+	case BTREE_ID_snapshot_trees:
+	case BTREE_ID_deleted_inodes:
+	case BTREE_ID_rebalance_work:
+	case BTREE_ID_subvolume_children:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * We can reconstruct BTREE_ID_alloc, but reconstucting it from scratch is not
+ * so cheap and OOMs on huge filesystems (until we have online
+ * check_allocations)
+ */
+static inline bool btree_id_recovers_from_scan(enum btree_id btree)
+{
+	return btree == BTREE_ID_alloc || !btree_id_can_reconstruct(btree);
 }
 
 #define BTREE_MAX_DEPTH		4U

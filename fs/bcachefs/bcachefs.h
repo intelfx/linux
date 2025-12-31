@@ -187,6 +187,10 @@
 #define ENUMERATED_REF_DEBUG
 #endif
 
+#ifdef __KERNEL__
+#define CONFIG_BCACHEFS_ASYNC_OBJECT_LISTS
+#endif
+
 #ifndef dynamic_fault
 #define dynamic_fault(...)		0
 #endif
@@ -196,7 +200,6 @@
 #include <linux/backing-dev-defs.h>
 #include <linux/bug.h>
 #include <linux/bio.h>
-#include <linux/closure.h>
 #include <linux/kobject.h>
 #include <linux/list.h>
 #include <linux/math64.h>
@@ -216,43 +219,53 @@
 #include <linux/unicode.h>
 
 #include "bcachefs_format.h"
-#include "btree_journal_iter_types.h"
-#include "disk_accounting_types.h"
 #include "errcode.h"
-#include "fast_list.h"
-#include "fifo.h"
-#include "nocow_locking_types.h"
 #include "opts.h"
-#include "sb-errors_types.h"
-#include "seqmutex.h"
-#include "snapshot_types.h"
-#include "time_stats.h"
-#include "util.h"
 
-#include "alloc_types.h"
-#include "async_objs_types.h"
-#include "btree_gc_types.h"
-#include "btree_types.h"
-#include "btree_node_scan_types.h"
-#include "btree_write_buffer_types.h"
-#include "buckets_types.h"
-#include "buckets_waiting_for_journal_types.h"
-#include "clock_types.h"
-#include "disk_groups_types.h"
-#include "ec_types.h"
-#include "enumerated_ref_types.h"
-#include "journal_types.h"
-#include "keylist_types.h"
-#include "quota_types.h"
-#include "rebalance_types.h"
-#include "recovery_passes_types.h"
-#include "replicas_types.h"
-#include "sb-members_types.h"
-#include "subvolume_types.h"
-#include "super_types.h"
-#include "thread_with_file_types.h"
+#include "closure.h"
 
-#include "trace.h"
+#include "util/clock_types.h"
+#include "util/enumerated_ref_types.h"
+#include "util/fast_list.h"
+#include "util/fifo.h"
+#include "util/seqmutex.h"
+#include "util/time_stats.h"
+#include "util/thread_with_file_types.h"
+#include "util/util.h"
+
+#include "alloc/accounting_types.h"
+#include "alloc/buckets_types.h"
+#include "alloc/buckets_waiting_for_journal_types.h"
+#include "alloc/disk_groups_types.h"
+#include "alloc/replicas_types.h"
+#include "alloc/types.h"
+
+#include "btree/check_types.h"
+#include "btree/journal_overlay_types.h"
+#include "btree/types.h"
+#include "btree/node_scan_types.h"
+#include "btree/write_buffer_types.h"
+
+#include "data/ec_types.h"
+#include "data/keylist_types.h"
+#include "data/nocow_locking_types.h"
+#include "data/rebalance_types.h"
+
+#include "debug/async_objs_types.h"
+#include "debug/trace.h"
+
+#include "fs/quota_types.h"
+
+#include "init/passes_types.h"
+#include "init/dev_types.h"
+
+#include "journal/types.h"
+
+#include "sb/errors_types.h"
+#include "sb/members_types.h"
+
+#include "snapshots/snapshot_types.h"
+#include "snapshots/subvolume_types.h"
 
 #define count_event(_c, _name)	this_cpu_inc((_c)->counters[BCH_COUNTER_##_name])
 
@@ -329,19 +342,21 @@ do {									\
 		bch2_print_str(_c, __VA_ARGS__);			\
 } while (0)
 
-#define bch_info(c, fmt, ...) \
-	bch2_print(c, KERN_INFO bch2_fmt(c, fmt), ##__VA_ARGS__)
-#define bch_info_ratelimited(c, fmt, ...) \
-	bch2_print_ratelimited(c, KERN_INFO bch2_fmt(c, fmt), ##__VA_ARGS__)
-#define bch_notice(c, fmt, ...) \
-	bch2_print(c, KERN_NOTICE bch2_fmt(c, fmt), ##__VA_ARGS__)
-#define bch_warn(c, fmt, ...) \
-	bch2_print(c, KERN_WARNING bch2_fmt(c, fmt), ##__VA_ARGS__)
-#define bch_warn_ratelimited(c, fmt, ...) \
-	bch2_print_ratelimited(c, KERN_WARNING bch2_fmt(c, fmt), ##__VA_ARGS__)
+#define bch_log(c, loglevel, fmt, ...) \
+	bch2_print(c, loglevel bch2_fmt(c, fmt), ##__VA_ARGS__)
+#define bch_log_ratelimited(c, loglevel, fmt, ...) \
+	bch2_print_ratelimited(c, loglevel bch2_fmt(c, fmt), ##__VA_ARGS__)
 
-#define bch_err(c, fmt, ...) \
-	bch2_print(c, KERN_ERR bch2_fmt(c, fmt), ##__VA_ARGS__)
+#define bch_err(c, ...)			bch_log(c, KERN_ERR, __VA_ARGS__)
+#define bch_err_ratelimited(c, ...)	bch_log_ratelimited(c, KERN_ERR, __VA_ARGS__)
+#define bch_warn(c, ...)		bch_log(c, KERN_WARNING, __VA_ARGS__)
+#define bch_warn_ratelimited(c, ...)	bch_log_ratelimited(c, KERN_WARNING, __VA_ARGS__)
+#define bch_notice(c, ...)		bch_log(c, KERN_NOTICE, __VA_ARGS__)
+#define bch_info(c, ...)		bch_log(c, KERN_INFO, __VA_ARGS__)
+#define bch_info_ratelimited(c, ...)	bch_log_ratelimited(c, KERN_INFO, __VA_ARGS__)
+#define bch_verbose(c, ...)		bch_log(c, KERN_DEBUG, __VA_ARGS__)
+#define bch_verbose_ratelimited(c, ...)	bch_log_ratelimited(c, KERN_DEBUG, __VA_ARGS__)
+
 #define bch_err_dev(ca, fmt, ...) \
 	bch2_print(c, KERN_ERR bch2_fmt_dev(ca, fmt), ##__VA_ARGS__)
 #define bch_err_dev_offset(ca, _offset, fmt, ...) \
@@ -351,8 +366,6 @@ do {									\
 #define bch_err_inum_offset(c, _inum, _offset, fmt, ...) \
 	bch2_print(c, KERN_ERR bch2_fmt_inum_offset(c, _inum, _offset, fmt), ##__VA_ARGS__)
 
-#define bch_err_ratelimited(c, fmt, ...) \
-	bch2_print_ratelimited(c, KERN_ERR bch2_fmt(c, fmt), ##__VA_ARGS__)
 #define bch_err_dev_ratelimited(ca, fmt, ...) \
 	bch2_print_ratelimited(ca, KERN_ERR bch2_fmt_dev(ca, fmt), ##__VA_ARGS__)
 #define bch_err_dev_offset_ratelimited(ca, _offset, fmt, ...) \
@@ -386,32 +399,6 @@ do {									\
 			##__VA_ARGS__, bch2_err_str(_ret));		\
 } while (0)
 
-#define bch_verbose(c, fmt, ...)					\
-do {									\
-	if ((c)->opts.verbose)						\
-		bch_info(c, fmt, ##__VA_ARGS__);			\
-} while (0)
-
-#define bch_verbose_ratelimited(c, fmt, ...)				\
-do {									\
-	if ((c)->opts.verbose)						\
-		bch_info_ratelimited(c, fmt, ##__VA_ARGS__);		\
-} while (0)
-
-#define pr_verbose_init(opts, fmt, ...)					\
-do {									\
-	if (opt_get(opts, verbose))					\
-		pr_info(fmt, ##__VA_ARGS__);				\
-} while (0)
-
-static inline int __bch2_err_trace(struct bch_fs *c, int err)
-{
-	trace_error_throw(c, err, _THIS_IP_);
-	return err;
-}
-
-#define bch_err_throw(_c, _err) __bch2_err_trace(_c, -BCH_ERR_##_err)
-
 /* Parameters that are useful for debugging, but should always be compiled in: */
 #define BCH_DEBUG_PARAMS_ALWAYS()					\
 	BCH_DEBUG_PARAM(key_merging_disabled,				\
@@ -429,9 +416,6 @@ static inline int __bch2_err_trace(struct bch_fs *c, int err)
 		"Reread btree nodes at various points to verify the "	\
 		"mergesort in the read path against modifications "	\
 		"done in memory")					\
-	BCH_DEBUG_PARAM(verify_all_btree_replicas,			\
-		"When reading btree nodes, read all replicas and "	\
-		"compare them")						\
 	BCH_DEBUG_PARAM(backpointers_no_use_write_buffer,		\
 		"Don't use the write buffer for backpointers, enabling "\
 		"extra runtime checks")					\
@@ -484,18 +468,14 @@ BCH_DEBUG_PARAMS_ALL()
 	x(btree_node_compact)			\
 	x(btree_node_merge)			\
 	x(btree_node_sort)			\
-	x(btree_node_get)			\
 	x(btree_node_read)			\
 	x(btree_node_read_done)			\
 	x(btree_node_write)			\
 	x(btree_interior_update_foreground)	\
 	x(btree_interior_update_total)		\
+	x(btree_write_buffer_flush)		\
 	x(btree_gc)				\
 	x(data_write)				\
-	x(data_write_to_submit)			\
-	x(data_write_to_queue)			\
-	x(data_write_to_btree_update)		\
-	x(data_write_btree_update)		\
 	x(data_read)				\
 	x(data_promote)				\
 	x(journal_flush_write)			\
@@ -509,6 +489,7 @@ BCH_DEBUG_PARAMS_ALL()
 	x(blocked_allocate)			\
 	x(blocked_allocate_open_bucket)		\
 	x(blocked_write_buffer_full)		\
+	x(blocked_writeback_throttle)		\
 	x(nocow_lock_contended)
 
 enum bch_time_stats {
@@ -549,6 +530,7 @@ struct discard_in_flight {
 	x(journal_read)					\
 	x(fs_journal_alloc)				\
 	x(fs_resize_on_mount)				\
+	x(sb_journal_sort)				\
 	x(btree_node_read)				\
 	x(btree_node_read_all_replicas)			\
 	x(btree_node_scrub)				\
@@ -700,6 +682,7 @@ struct bch_dev {
 	x(error)			\
 	x(topology_error)		\
 	x(errors_fixed)			\
+	x(errors_fixed_silent)		\
 	x(errors_not_fixed)		\
 	x(no_invalid_checks)		\
 	x(discard_mount_opt_set)	\
@@ -714,6 +697,7 @@ struct btree_debug {
 	unsigned		id;
 };
 
+#define BCH_LINK_MAX	U32_MAX
 #define BCH_TRANSACTIONS_NR 128
 
 struct btree_transaction_stats {
@@ -819,6 +803,7 @@ struct bch_fs {
 	struct work_struct	read_only_work;
 
 	struct bch_dev __rcu	*devs[BCH_SB_MEMBERS_MAX];
+	struct bch_devs_mask	devs_removed;
 
 	struct bch_accounting_mem accounting;
 
@@ -832,6 +817,10 @@ struct bch_fs {
 	struct bch_disk_groups_cpu __rcu *disk_groups;
 
 	struct bch_opts		opts;
+	atomic_t		opt_change_cookie;
+
+	unsigned		loglevel;
+	unsigned		prev_loglevel;
 
 	/* Updated by bch2_sb_update():*/
 	struct {
@@ -860,8 +849,8 @@ struct bch_fs {
 		unsigned long	errors_silent[BITS_TO_LONGS(BCH_FSCK_ERR_MAX)];
 		u64		btrees_lost_data;
 	}			sb;
-	DARRAY(enum bcachefs_metadata_version)
-				incompat_versions_requested;
+
+	unsigned long		incompat_versions_requested[BITS_TO_LONGS(BCH_VERSION_MINOR(bcachefs_metadata_version_current))];
 
 	struct unicode_map	*cf_encoding;
 
@@ -910,6 +899,7 @@ struct bch_fs {
 	struct list_head	btree_interior_update_list;
 	struct list_head	btree_interior_updates_unwritten;
 	struct mutex		btree_interior_update_lock;
+	struct mutex		btree_interior_update_commit_lock;
 	struct closure_waitlist	btree_interior_update_wait;
 
 	struct workqueue_struct	*btree_interior_update_worker;
@@ -1063,8 +1053,6 @@ struct bch_fs {
 
 	atomic64_t		key_version;
 
-	mempool_t		large_bkey_pool;
-
 	/* MOVE.C */
 	struct list_head	moving_context_list;
 	struct mutex		moving_context_lock;
@@ -1168,7 +1156,14 @@ struct bch_fs {
 	struct mutex		fsck_error_counts_lock;
 };
 
-extern struct wait_queue_head bch2_read_only_wait;
+static inline int __bch2_err_trace(struct bch_fs *c, int err)
+{
+	this_cpu_inc(c->counters[BCH_COUNTER_error_throw]);
+	trace_error_throw(c, err, _THIS_IP_);
+	return err;
+}
+
+#define bch_err_throw(_c, _err) __bch2_err_trace(_c, -BCH_ERR_##_err)
 
 static inline bool bch2_ro_ref_tryget(struct bch_fs *c)
 {
@@ -1180,7 +1175,7 @@ static inline bool bch2_ro_ref_tryget(struct bch_fs *c)
 
 static inline void bch2_ro_ref_put(struct bch_fs *c)
 {
-	if (refcount_dec_and_test(&c->ro_ref))
+	if (c && refcount_dec_and_test(&c->ro_ref))
 		wake_up(&c->ro_ref_wait);
 }
 
@@ -1283,13 +1278,20 @@ static inline bool bch2_discard_opt_enabled(struct bch_fs *c, struct bch_dev *ca
 		: ca->mi.discard;
 }
 
-static inline bool bch2_fs_casefold_enabled(struct bch_fs *c)
+static inline int bch2_fs_casefold_enabled(struct bch_fs *c)
 {
-#ifdef CONFIG_UNICODE
-	return !c->opts.casefold_disabled;
-#else
-	return false;
-#endif
+	if (!IS_ENABLED(CONFIG_UNICODE))
+		return bch_err_throw(c, no_casefolding_without_utf8);
+	if (c->opts.casefold_disabled)
+		return bch_err_throw(c, casefolding_disabled);
+	return 0;
+}
+
+static inline const char *strip_bch2(const char *msg)
+{
+	if (!strncmp("bch2_", msg, 5))
+		return msg + 5;
+	return msg;
 }
 
 #endif /* _BCACHEFS_H */

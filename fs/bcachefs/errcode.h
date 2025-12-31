@@ -5,6 +5,7 @@
 #define BCH_ERRCODES()								\
 	x(ERANGE,			ERANGE_option_too_small)		\
 	x(ERANGE,			ERANGE_option_too_big)			\
+	x(ERANGE,			projid_too_big)				\
 	x(EINVAL,			injected)				\
 	x(BCH_ERR_injected,		injected_fs_start)			\
 	x(EINVAL,			mount_option)				\
@@ -89,6 +90,8 @@
 	x(ENOMEM,			ENOMEM_disk_accounting)			\
 	x(ENOMEM,			ENOMEM_stripe_head_alloc)		\
 	x(ENOMEM,                       ENOMEM_journal_read_bucket)             \
+	x(ENOMEM,                       ENOMEM_acl)				\
+	x(ENOMEM,                       ENOMEM_move_extent)			\
 	x(ENOSPC,			ENOSPC_disk_reservation)		\
 	x(ENOSPC,			ENOSPC_bucket_alloc)			\
 	x(ENOSPC,			ENOSPC_disk_label_add)			\
@@ -116,6 +119,7 @@
 	x(ENOENT,			ENOENT_not_directory)			\
 	x(ENOENT,			ENOENT_directory_dead)			\
 	x(ENOENT,			ENOENT_subvolume)			\
+	x(ENOENT,			ENOENT_snapshot)			\
 	x(ENOENT,			ENOENT_snapshot_tree)			\
 	x(ENOENT,			ENOENT_dirent_doesnt_match_inode)	\
 	x(ENOENT,			ENOENT_dev_not_found)			\
@@ -149,6 +153,7 @@
 	x(BCH_ERR_transaction_restart,	transaction_restart_upgrade)		\
 	x(BCH_ERR_transaction_restart,	transaction_restart_key_cache_fill)	\
 	x(BCH_ERR_transaction_restart,	transaction_restart_key_cache_raced)	\
+	x(BCH_ERR_transaction_restart,	transaction_restart_lock_root_race)	\
 	x(BCH_ERR_transaction_restart,	transaction_restart_split_race)		\
 	x(BCH_ERR_transaction_restart,	transaction_restart_write_buffer_flush)	\
 	x(BCH_ERR_transaction_restart,	transaction_restart_nested)		\
@@ -170,7 +175,7 @@
 	x(BCH_ERR_btree_insert_fail,	btree_insert_need_journal_reclaim)	\
 	x(0,				backpointer_to_overwritten_btree_node)	\
 	x(0,				journal_reclaim_would_deadlock)		\
-	x(EINVAL,			fsck)					\
+	x(EROFS,			fsck)					\
 	x(BCH_ERR_fsck,			fsck_ask)				\
 	x(BCH_ERR_fsck,			fsck_fix)				\
 	x(BCH_ERR_fsck,			fsck_delete_bkey)			\
@@ -182,14 +187,19 @@
 	x(BCH_ERR_recovery_will_run,	restart_recovery)			\
 	x(BCH_ERR_recovery_will_run,	cannot_rewind_recovery)			\
 	x(BCH_ERR_recovery_will_run,	recovery_pass_will_run)			\
-	x(0,				data_update_done)			\
 	x(0,				bkey_was_deleted)			\
-	x(BCH_ERR_data_update_done,	data_update_done_would_block)		\
+	x(0,				bucket_not_moveable)			\
+	x(BCH_ERR_bucket_not_moveable,	bucket_not_moveable_dev_not_rw)		\
+	x(BCH_ERR_bucket_not_moveable,	bucket_not_moveable_bucket_open)	\
+	x(BCH_ERR_bucket_not_moveable,	bucket_not_moveable_bp_mismatch)	\
+	x(BCH_ERR_bucket_not_moveable,	bucket_not_moveable_lru_race)		\
+	x(0,				data_update_done)			\
 	x(BCH_ERR_data_update_done,	data_update_done_unwritten)		\
 	x(BCH_ERR_data_update_done,	data_update_done_no_writes_needed)	\
-	x(BCH_ERR_data_update_done,	data_update_done_no_snapshot)		\
-	x(BCH_ERR_data_update_done,	data_update_done_no_dev_refs)		\
-	x(BCH_ERR_data_update_done,	data_update_done_no_rw_devs)		\
+	x(0,				data_update_fail)			\
+	x(BCH_ERR_data_update_fail,	data_update_fail_would_block)		\
+	x(BCH_ERR_data_update_fail,	data_update_fail_no_snapshot)		\
+	x(BCH_ERR_data_update_fail,	data_update_fail_no_rw_devs)		\
 	x(EINVAL,			device_state_not_allowed)		\
 	x(EINVAL,			member_info_missing)			\
 	x(EINVAL,			mismatched_block_size)			\
@@ -215,7 +225,18 @@
 	x(EINVAL,			varint_decode_error)			\
 	x(EINVAL,			erasure_coding_found_btree_node)	\
 	x(EINVAL,			option_negative)			\
+	x(EINVAL,			topology_repair)			\
+	x(BCH_ERR_topology_repair,	topology_repair_drop_this_node)		\
+	x(BCH_ERR_topology_repair,	topology_repair_drop_prev_node)		\
+	x(BCH_ERR_topology_repair,	topology_repair_did_fill_from_scan)	\
+	x(EMLINK,			too_many_links)				\
 	x(EOPNOTSUPP,			may_not_use_incompat_feature)		\
+	x(EOPNOTSUPP,			no_casefolding_without_utf8)		\
+	x(EOPNOTSUPP,			casefolding_disabled)			\
+	x(EOPNOTSUPP,			casefold_opt_is_dir_only)		\
+	x(EOPNOTSUPP,			unsupported_fsx_flag)			\
+	x(EOPNOTSUPP,			unsupported_fa_flag)			\
+	x(EOPNOTSUPP,			unsupported_fallocate_mode)		\
 	x(EROFS,			erofs_trans_commit)			\
 	x(EROFS,			erofs_no_writes)			\
 	x(EROFS,			erofs_journal_err)			\
@@ -226,6 +247,7 @@
 	x(EROFS,			erofs_no_alloc_info)			\
 	x(EROFS,			erofs_filesystem_full)			\
 	x(EROFS,			insufficient_devices)			\
+	x(EROFS,			erofs_recovery_cancelled)		\
 	x(0,				operation_blocked)			\
 	x(BCH_ERR_operation_blocked,	btree_cache_cannibalize_lock_blocked)	\
 	x(BCH_ERR_operation_blocked,	journal_res_blocked)			\
@@ -331,6 +353,7 @@
 	x(BCH_ERR_data_read,		data_read_no_encryption_key)		\
 	x(BCH_ERR_data_read,		data_read_buffer_too_small)		\
 	x(BCH_ERR_data_read,		data_read_key_overwritten)		\
+	x(0,				rbio_narrow_crcs_fail)			\
 	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_fixable)		\
 	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_want_retry)		\
 	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_must_retry)		\
@@ -338,6 +361,7 @@
 	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_incompatible)	\
 	x(0,				nopromote)				\
 	x(BCH_ERR_nopromote,		nopromote_may_not)			\
+	x(BCH_ERR_nopromote,		nopromote_no_rewrites)			\
 	x(BCH_ERR_nopromote,		nopromote_already_promoted)		\
 	x(BCH_ERR_nopromote,		nopromote_unwritten)			\
 	x(BCH_ERR_nopromote,		nopromote_congested)			\
@@ -346,7 +370,11 @@
 	x(BCH_ERR_nopromote,		nopromote_enomem)			\
 	x(0,				invalid_snapshot_node)			\
 	x(0,				option_needs_open_fs)			\
-	x(0,				remove_disk_accounting_entry)
+	x(0,				remove_disk_accounting_entry)		\
+	x(0,				nocow_trylock_fail)			\
+	x(BCH_ERR_nocow_trylock_fail,	nocow_trylock_contended)		\
+	x(BCH_ERR_nocow_trylock_fail,	nocow_trylock_bucket_full)		\
+	x(EINTR,			recovery_cancelled)
 
 enum bch_errcode {
 	BCH_ERR_START		= 2048,
