@@ -3,10 +3,16 @@
 #define _BCACHEFS_BTREE_ITER_H
 
 #include "btree/bset.h"
+#include "btree/cache.h"
 #include "btree/types.h"
 
+#include "sb/counters.h"
+
 void bch2_trans_updates_to_text(struct printbuf *, struct btree_trans *);
-void bch2_btree_path_to_text(struct printbuf *, struct btree_trans *, btree_path_idx_t);
+void bch2_btree_path_to_text_short(struct printbuf *, struct btree_trans *,
+				   btree_path_idx_t, struct btree_path *);
+void bch2_btree_path_to_text(struct printbuf *, struct btree_trans *,
+			     btree_path_idx_t, struct btree_path *);
 void bch2_trans_paths_to_text(struct printbuf *, struct btree_trans *);
 void bch2_dump_trans_paths_updates(struct btree_trans *);
 
@@ -37,7 +43,14 @@ static inline void __btree_path_get(struct btree_trans *trans, struct btree_path
 
 	path->ref++;
 	path->intent_ref += intent;
-	trace_btree_path_get_ll(trans, path);
+
+	event_trace(trans->c, btree_path_get_ll, buf, ({
+		prt_printf(&buf, "%s: path %3u ref %u btree ", trans->fn,
+			   idx, path->ref);
+		bch2_btree_id_to_text(&buf, path->btree_id);
+		prt_str(&buf, " pos ");
+		bch2_bpos_to_text(&buf, path->pos);
+	}));
 }
 
 static inline bool __btree_path_put(struct btree_trans *trans, struct btree_path *path, bool intent)
@@ -47,7 +60,14 @@ static inline bool __btree_path_put(struct btree_trans *trans, struct btree_path
 	EBUG_ON(!path->ref);
 	EBUG_ON(!path->intent_ref && intent);
 
-	trace_btree_path_put_ll(trans, path);
+	event_trace(trans->c, btree_path_put_ll, buf, ({
+		prt_printf(&buf, "%s: path %3zu ref %u btree ", trans->fn,
+			   path - trans->paths, path->ref);
+		bch2_btree_id_to_text(&buf, path->btree_id);
+		prt_str(&buf, " pos ");
+		bch2_bpos_to_text(&buf, path->pos);
+	}));
+
 	path->intent_ref -= intent;
 	return --path->ref == 0;
 }
@@ -383,7 +403,7 @@ static inline int trans_maybe_inject_restart(struct btree_trans *trans, unsigned
 {
 #ifdef CONFIG_BCACHEFS_INJECT_TRANSACTION_RESTARTS
 	if (!(ktime_get_ns() & ~(~0ULL << min(63, (10 + trans->restart_count_this_trans))))) {
-		trace_and_count(trans->c, trans_restart_injected, trans, ip);
+		event_inc_trace(trans->c, trans_restart_injected, buf, prt_str(&buf, trans->fn));
 		return btree_trans_restart_ip(trans,
 					BCH_ERR_transaction_restart_fault_inject, ip);
 	}
@@ -407,6 +427,7 @@ static inline void bch2_btree_path_downgrade(struct btree_trans *trans,
 
 void bch2_trans_downgrade(struct btree_trans *);
 
+void bch2_trans_revalidate_updates_in_node(struct btree_trans *, struct btree *);
 void bch2_trans_node_add(struct btree_trans *trans, struct btree_path *, struct btree *);
 void bch2_trans_node_drop(struct btree_trans *trans, struct btree *);
 void bch2_trans_node_reinit_iter(struct btree_trans *, struct btree *);
@@ -483,12 +504,20 @@ static inline void bch2_btree_iter_set_snapshot(struct btree_iter *iter, u32 sna
 
 void bch2_trans_iter_exit(struct btree_iter *);
 
+static inline bool btree_id_cached(enum btree_id btree)
+{
+	return BIT_ULL(btree) &
+		(BIT_ULL(BTREE_ID_alloc)|
+		 BIT_ULL(BTREE_ID_inodes)|
+		 BIT_ULL(BTREE_ID_logged_ops));
+}
+
 static inline enum btree_iter_update_trigger_flags
 bch2_btree_iter_flags(struct btree_trans *trans,
 		      unsigned btree_id, unsigned level,
 		      enum btree_iter_update_trigger_flags flags)
 {
-	if (level || !btree_id_cached(trans->c, btree_id)) {
+	if (level || !btree_id_cached(btree_id)) {
 		flags &= ~BTREE_ITER_cached;
 		flags &= ~BTREE_ITER_with_key_cache;
 	} else if (!(flags & BTREE_ITER_cached))
@@ -550,9 +579,9 @@ static inline void __bch2_trans_iter_init(struct btree_trans *trans,
 	    __builtin_constant_p(flags))
 		bch2_trans_iter_init_common(trans, iter, btree, pos, 0, 0,
 				bch2_btree_iter_flags(trans, btree, 0, flags),
-				_RET_IP_);
+				_THIS_IP_);
 	else
-		bch2_trans_iter_init_outlined(trans, iter, btree, pos, flags, _RET_IP_);
+		bch2_trans_iter_init_outlined(trans, iter, btree, pos, flags, _THIS_IP_);
 }
 
 static inline void bch2_trans_iter_init(struct btree_trans *trans,
@@ -564,6 +593,13 @@ static inline void bch2_trans_iter_init(struct btree_trans *trans,
 	__bch2_trans_iter_init(trans, iter, btree, pos, flags);
 }
 
+#define DEFINE_CLASS2(_name, _type, _exit, _init, _init_args...)		\
+typedef _type class_##_name##_t;					\
+static __always_inline void class_##_name##_destructor(_type *p)			\
+{ _type _T = *p; _exit; }						\
+static __always_inline _type class_##_name##_constructor(_init_args)		\
+{ _type t = _init; return t; }
+
 #define bch2_trans_iter_class_init(_trans, _btree, _pos, _flags)		\
 ({										\
 	struct btree_iter iter;							\
@@ -571,7 +607,7 @@ static inline void bch2_trans_iter_init(struct btree_trans *trans,
 	iter;									\
 })
 
-DEFINE_CLASS(btree_iter, struct btree_iter,
+DEFINE_CLASS2(btree_iter, struct btree_iter,
 	     bch2_trans_iter_exit(&_T),
 	     bch2_trans_iter_class_init(trans, btree, pos, flags),
 	     struct btree_trans *trans,
@@ -718,7 +754,7 @@ static inline struct bkey_s_c __bch2_bkey_get_typed(struct btree_iter *iter,
 #define bch2_bkey_get_typed(_iter, _type)						\
 	bkey_s_c_to_##_type(__bch2_bkey_get_typed(_iter, KEY_TYPE_##_type))
 
-static inline void __bkey_val_copy(void *dst_v, unsigned dst_size, struct bkey_s_c src_k)
+static inline void __bkey_val_copy_pad(void *dst_v, unsigned dst_size, struct bkey_s_c src_k)
 {
 	unsigned b = min_t(unsigned, dst_size, bkey_val_bytes(src_k.k));
 	memcpy(dst_v, src_k.v, b);
@@ -726,10 +762,10 @@ static inline void __bkey_val_copy(void *dst_v, unsigned dst_size, struct bkey_s
 		memset(dst_v + b, 0, dst_size - b);
 }
 
-#define bkey_val_copy(_dst_v, _src_k)					\
+#define bkey_val_copy_pad(_dst_v, _src_k)				\
 do {									\
 	BUILD_BUG_ON(!__typecheck(*_dst_v, *_src_k.v));			\
-	__bkey_val_copy(_dst_v, sizeof(*_dst_v), _src_k.s_c);		\
+	__bkey_val_copy_pad(_dst_v, sizeof(*_dst_v), _src_k.s_c);	\
 } while (0)
 
 static inline int __bch2_bkey_get_val_typed(struct btree_trans *trans,
@@ -742,7 +778,7 @@ static inline int __bch2_bkey_get_val_typed(struct btree_trans *trans,
 	struct bkey_s_c k = __bch2_bkey_get_typed(&iter, type);
 	int ret = bkey_err(k);
 	if (!ret)
-		__bkey_val_copy(val, val_size, k);
+		__bkey_val_copy_pad(val, val_size, k);
 	return ret;
 }
 

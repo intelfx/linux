@@ -160,6 +160,10 @@ enum bch_fsck_flags {
 	x(extent_ptrs_redundant_stripe,				139,	0)		\
 	x(extent_ptrs_unwritten,				140,	0)		\
 	x(extent_ptrs_written_and_unwritten,			141,	0)		\
+	x(extent_ptrs_all_invalid,				338,	0)		\
+	x(extent_reconcile_bad_pending,				332,	0)		\
+	x(extent_reconcile_bad_hipri,				333,	0)		\
+	x(extent_reconcile_bad_replicas,			339,	0)		\
 	x(ptr_to_invalid_device,				142,	0)		\
 	x(ptr_to_removed_device,				322,	FSCK_AUTOFIX)	\
 	x(ptr_to_duplicate_device,				143,	0)		\
@@ -194,6 +198,7 @@ enum bch_fsck_flags {
 	x(stripe_pos_bad,					167,	0)		\
 	x(stripe_val_size_bad,					168,	0)		\
 	x(stripe_csum_granularity_bad,				290,	0)		\
+	x(stripe_sectors_zero,					340,	0)		\
 	x(stripe_sector_count_wrong,				169,	0)		\
 	x(snapshot_tree_pos_bad,				170,	0)		\
 	x(snapshot_tree_to_missing_snapshot,			171,	0)		\
@@ -209,11 +214,11 @@ enum bch_fsck_flags {
 	x(snapshot_skiplist_bad,				181,	0)		\
 	x(snapshot_should_not_have_subvol,			182,	0)		\
 	x(snapshot_to_bad_snapshot_tree,			183,	FSCK_AUTOFIX)	\
-	x(snapshot_bad_depth,					184,	0)		\
-	x(snapshot_bad_skiplist,				185,	0)		\
+	x(snapshot_bad_depth,					184,	FSCK_AUTOFIX)	\
+	x(snapshot_bad_skiplist,				185,	FSCK_AUTOFIX)	\
 	x(subvol_pos_bad,					186,	0)		\
 	x(subvol_not_master_and_not_snapshot,			187,	FSCK_AUTOFIX)	\
-	x(subvol_to_missing_root,				188,	0)		\
+	x(subvol_to_missing_root,				188,	FSCK_AUTOFIX)	\
 	x(subvol_root_wrong_bi_subvol,				189,	FSCK_AUTOFIX)	\
 	x(bkey_in_missing_snapshot,				190,	0)		\
 	x(bkey_in_deleted_snapshot,				315,	FSCK_AUTOFIX)	\
@@ -223,7 +228,7 @@ enum bch_fsck_flags {
 	x(inode_unpack_error,					193,	0)		\
 	x(inode_str_hash_invalid,				194,	0)		\
 	x(inode_v3_fields_start_bad,				195,	0)		\
-	x(inode_snapshot_mismatch,				196,	0)		\
+	x(inode_snapshot_mismatch,				196,	FSCK_AUTOFIX)	\
 	x(snapshot_key_missing_inode_snapshot,			314,	FSCK_AUTOFIX)	\
 	x(inode_unlinked_but_clean,				197,	0)		\
 	x(inode_unlinked_but_nlink_nonzero,			198,	0)		\
@@ -272,7 +277,7 @@ enum bch_fsck_flags {
 	x(dirent_in_missing_dir_inode,				227,	0)		\
 	x(dirent_in_non_dir_inode,				228,	0)		\
 	x(dirent_to_missing_inode,				229,	FSCK_AUTOFIX)	\
-	x(dirent_to_overwritten_inode,				302,	0)		\
+	x(dirent_to_overwritten_inode,				302,	FSCK_AUTOFIX)	\
 	x(dirent_to_missing_subvol,				230,	0)		\
 	x(dirent_to_itself,					231,	0)		\
 	x(dirent_casefold_mismatch,				318,	FSCK_AUTOFIX)	\
@@ -319,9 +324,9 @@ enum bch_fsck_flags {
 	x(subvol_missing,					308,	FSCK_AUTOFIX)	\
 	x(alloc_key_stripe_sectors_wrong,			271,	FSCK_AUTOFIX)	\
 	x(accounting_mismatch,					272,	FSCK_AUTOFIX)	\
-	x(accounting_replicas_not_marked,			273,	0)		\
+	x(accounting_replicas_not_marked,			273,	FSCK_AUTOFIX)	\
 	x(accounting_to_invalid_device,				289,	0)		\
-	x(invalid_btree_id,					274,	FSCK_AUTOFIX)		\
+	x(invalid_btree_id,					274,	FSCK_AUTOFIX)	\
 	x(alloc_key_io_time_bad,				275,	0)		\
 	x(alloc_key_fragmentation_lru_wrong,			276,	FSCK_AUTOFIX)	\
 	x(accounting_key_junk_at_end,				277,	FSCK_AUTOFIX)	\
@@ -335,13 +340,21 @@ enum bch_fsck_flags {
 	x(logged_op_but_clean,					283,	FSCK_AUTOFIX)	\
 	x(compression_opt_not_marked_in_sb,			295,	FSCK_AUTOFIX)	\
 	x(compression_type_not_marked_in_sb,			296,	FSCK_AUTOFIX)	\
+	x(compression_error,					342,	0)		\
 	x(directory_size_mismatch,				303,	FSCK_AUTOFIX)	\
 	x(dirent_cf_name_too_big,				304,	0)		\
 	x(dirent_stray_data_after_cf_name,			305,	0)		\
-	x(rebalance_work_incorrectly_set,			309,	FSCK_AUTOFIX)	\
-	x(rebalance_work_incorrectly_unset,			310,	FSCK_AUTOFIX)	\
+	x(reconcile_work_incorrectly_set,			309,	FSCK_AUTOFIX)	\
+	x(reconcile_work_phys_incorrectly_set,			341,	FSCK_AUTOFIX)	\
 	x(validate_error_in_commit,				329,	0)		\
-	x(MAX,							330,	0)
+	x(extent_io_opts_not_set,				330,	FSCK_AUTOFIX)	\
+	x(extent_io_opts_unneeded,				331,	FSCK_AUTOFIX)	\
+	x(reconcile_bp_to_missing_btree_ptr,			310,	FSCK_AUTOFIX)	\
+	x(reconcile_bp_to_leaf_node_key,			334,	FSCK_AUTOFIX)	\
+	x(btree_ptr_with_no_reconcile_bp,			335,	FSCK_AUTOFIX)	\
+	x(btree_ptr_with_bad_reconcile_bp,			336,	FSCK_AUTOFIX)	\
+	x(btree_ptr_to_bad_reconcile_bp,			337,	FSCK_AUTOFIX)	\
+	x(MAX,							343,	0)
 
 enum bch_sb_error_id {
 #define x(t, n, ...) BCH_FSCK_ERR_##t = n,
@@ -349,12 +362,14 @@ enum bch_sb_error_id {
 #undef x
 };
 
+typedef struct bch_sb_field_error_entry {
+	__le64		v;
+	__le64		last_error_time;
+} bch_sb_field_error_entry;
+
 struct bch_sb_field_errors {
 	struct bch_sb_field	field;
-	struct bch_sb_field_error_entry {
-		__le64		v;
-		__le64		last_error_time;
-	}			entries[];
+	bch_sb_field_error_entry entries[];
 };
 
 LE64_BITMASK(BCH_SB_ERROR_ENTRY_ID,	struct bch_sb_field_error_entry, v,  0, 16);

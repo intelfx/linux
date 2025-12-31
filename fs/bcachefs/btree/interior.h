@@ -1,15 +1,16 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _BCACHEFS_BTREE_UPDATE_INTERIOR_H
-#define _BCACHEFS_BTREE_UPDATE_INTERIOR_H
+#ifndef _BCACHEFS_BTREE_INTERIOR_H
+#define _BCACHEFS_BTREE_INTERIOR_H
 
 #include "btree/cache.h"
 #include "btree/locking.h"
 #include "btree/update.h"
+#include "data/write_types.h"
 
 #define BTREE_UPDATE_NODES_MAX		((BTREE_MAX_DEPTH - 2) * 2 + GC_MERGE_NODES)
 
-#define BTREE_UPDATE_JOURNAL_RES	(BTREE_UPDATE_NODES_MAX * (BKEY_BTREE_PTR_U64s_MAX + 1))
-
+int bch2_btree_node_check_topology_msg(struct btree_trans *, struct btree *,
+				       struct printbuf *);
 int bch2_btree_node_check_topology(struct btree_trans *, struct btree *);
 
 #define BTREE_UPDATE_MODES()	\
@@ -28,6 +29,7 @@ struct btree_update_node {
 	struct btree			*b;
 	unsigned			level;
 	bool				root;
+	bool				update_node_key;
 	__le64				seq;
 	__BKEY_PADDED(key, BKEY_BTREE_PTR_VAL_U64s_MAX);
 };
@@ -111,9 +113,6 @@ struct btree_update {
 						     BCH_REPLICAS_MAX];
 	open_bucket_idx_t		nr_open_buckets;
 
-	unsigned			journal_u64s;
-	u64				journal_entries[BTREE_UPDATE_JOURNAL_RES];
-
 	/* Only here to reduce stack usage on recursive splits: */
 	struct keylist			parent_keys;
 	/*
@@ -124,56 +123,64 @@ struct btree_update {
 	u64				inline_keys[BKEY_BTREE_PTR_U64s_MAX * 3];
 };
 
+static inline enum bch_trans_commit_flags
+btree_update_set_watermark_hipri(enum bch_trans_commit_flags flags)
+{
+	enum bch_watermark watermark = flags & BCH_WATERMARK_MASK;
+	if (watermark == BCH_WATERMARK_copygc)
+		watermark = BCH_WATERMARK_btree_copygc;
+	if (watermark < BCH_WATERMARK_btree)
+		watermark = BCH_WATERMARK_btree;
+
+	flags &= ~BCH_WATERMARK_MASK;
+	flags |= watermark;
+	return flags;
+}
+
 struct btree *__bch2_btree_node_alloc_replacement(struct btree_update *,
 						  struct btree_trans *,
 						  struct btree *,
 						  struct bkey_format);
 
-int bch2_btree_split_leaf(struct btree_trans *, btree_path_idx_t, unsigned);
+int bch2_btree_split_leaf(struct btree_trans *, btree_path_idx_t, enum bch_trans_commit_flags);
 
 int bch2_btree_increase_depth(struct btree_trans *, btree_path_idx_t, unsigned);
 
 int __bch2_foreground_maybe_merge(struct btree_trans *, btree_path_idx_t,
-				  unsigned, unsigned, enum btree_node_sibling);
+				  unsigned, enum bch_trans_commit_flags,
+				  u64 *, enum btree_node_sibling);
 
-static inline int bch2_foreground_maybe_merge_sibling(struct btree_trans *trans,
-					btree_path_idx_t path_idx,
-					unsigned level, unsigned flags,
-					enum btree_node_sibling sib)
+static inline bool btree_node_needs_merge(struct btree_trans *trans, struct btree *b, int d)
 {
-	struct btree_path *path = trans->paths + path_idx;
-	struct btree *b;
-
-	EBUG_ON(!btree_node_locked(path, level));
-
 	if (static_branch_unlikely(&bch2_btree_node_merging_disabled))
-		return 0;
+		return false;
 
-	b = path->l[level].b;
-	if (b->sib_u64s[sib] > trans->c->btree_foreground_merge_threshold)
-		return 0;
-
-	return __bch2_foreground_maybe_merge(trans, path_idx, level, flags, sib);
+	return (int) min(b->sib_u64s[0], b->sib_u64s[1]) + d <=
+		(int) trans->c->btree.foreground_merge_threshold;
 }
 
 static inline int bch2_foreground_maybe_merge(struct btree_trans *trans,
-					      btree_path_idx_t path,
-					      unsigned level,
-					      unsigned flags)
+					      btree_path_idx_t path_idx,
+					      unsigned level, enum bch_trans_commit_flags flags,
+					      int u64s_delta,
+					      u64 *merge_count)
 {
 	bch2_trans_verify_not_unlocked_or_in_restart(trans);
 
-	return  bch2_foreground_maybe_merge_sibling(trans, path, level, flags,
-						    btree_prev_sib) ?:
-		bch2_foreground_maybe_merge_sibling(trans, path, level, flags,
-						    btree_next_sib);
+	struct btree_path *path = trans->paths + path_idx;
+	struct btree *b = path->l[level].b;
+
+	EBUG_ON(!btree_node_locked(path, level));
+
+	if (likely(!btree_node_needs_merge(trans, b, u64s_delta)))
+		return 0;
+
+	return  __bch2_foreground_maybe_merge(trans, path_idx, level, flags, merge_count, btree_prev_sib) ?:
+		__bch2_foreground_maybe_merge(trans, path_idx, level, flags, merge_count, btree_next_sib);
 }
 
 int bch2_btree_node_get_iter(struct btree_trans *, struct btree_iter *, struct btree *);
 
-int bch2_btree_node_rewrite(struct btree_trans *, struct btree_iter *,
-			    struct btree *, unsigned,
-			    enum bch_trans_commit_flags);
 int bch2_btree_node_rewrite_key(struct btree_trans *,
 				enum btree_id, unsigned,
 				struct bkey_i *,
@@ -181,12 +188,11 @@ int bch2_btree_node_rewrite_key(struct btree_trans *,
 int bch2_btree_node_rewrite_pos(struct btree_trans *,
 				enum btree_id, unsigned,
 				struct bpos, unsigned,
-				enum bch_trans_commit_flags);
-int bch2_btree_node_rewrite_key_get_iter(struct btree_trans *,
-					 struct btree *,
-					 enum bch_trans_commit_flags);
+				enum bch_trans_commit_flags,
+				enum bch_write_flags);
 
 void bch2_btree_node_rewrite_async(struct bch_fs *, struct btree *);
+void bch2_btree_node_merge_async(struct bch_fs *, struct btree *);
 
 int bch2_btree_node_update_key(struct btree_trans *, struct btree_iter *,
 			       struct btree *, struct bkey_i *,
@@ -215,8 +221,8 @@ static inline unsigned btree_update_reserve_required(struct bch_fs *c,
 
 static inline void btree_node_reset_sib_u64s(struct btree *b)
 {
-	b->sib_u64s[0] = b->nr.live_u64s;
-	b->sib_u64s[1] = b->nr.live_u64s;
+	b->sib_u64s[0] = !bpos_eq(b->data->min_key, POS_MIN)	? b->nr.live_u64s : U16_MAX;
+	b->sib_u64s[1] = !bpos_eq(b->key.k.p, SPOS_MAX)		? b->nr.live_u64s : U16_MAX;
 }
 
 static inline void *btree_data_end(struct btree *b)
@@ -360,4 +366,4 @@ void bch2_fs_btree_interior_update_exit(struct bch_fs *);
 void bch2_fs_btree_interior_update_init_early(struct bch_fs *);
 int bch2_fs_btree_interior_update_init(struct bch_fs *);
 
-#endif /* _BCACHEFS_BTREE_UPDATE_INTERIOR_H */
+#endif /* _BCACHEFS_BTREE_INTERIOR_H */

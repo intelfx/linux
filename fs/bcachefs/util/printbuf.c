@@ -5,6 +5,7 @@
 #include <linux/err.h>
 #include <linux/export.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/slab.h>
 #include <linux/string_helpers.h>
 
@@ -30,7 +31,7 @@ static inline unsigned cur_tabstop(struct printbuf *buf)
 		: 0;
 }
 
-int bch2_printbuf_make_room(struct printbuf *out, unsigned extra)
+int bch2_printbuf_make_room_gfp(struct printbuf *out, unsigned extra, gfp_t gfp)
 {
 	/* Reserved space for terminating nul: */
 	extra += 1;
@@ -45,8 +46,10 @@ int bch2_printbuf_make_room(struct printbuf *out, unsigned extra)
 
 	unsigned new_size = roundup_pow_of_two(out->size + extra);
 
+	bool may_vmalloc = out->may_vmalloc && !out->atomic;
+
 	/* Sanity check... */
-	if (new_size > PAGE_SIZE << MAX_PAGE_ORDER) {
+	if (new_size > (may_vmalloc ? INT_MAX : (PAGE_SIZE << MAX_PAGE_ORDER))) {
 		out->allocation_failure = true;
 		out->overflow = true;
 		return -ENOMEM;
@@ -56,7 +59,9 @@ int bch2_printbuf_make_room(struct printbuf *out, unsigned extra)
 	 * Note: output buffer must be freeable with kfree(), it's not required
 	 * that the user use printbuf_exit().
 	 */
-	char *buf = krealloc(out->buf, new_size, !out->atomic ? GFP_KERNEL : GFP_NOWAIT);
+	char *buf = may_vmalloc
+		? kvrealloc(out->buf, new_size, gfp)
+		: krealloc(out->buf, new_size, !out->atomic ? gfp : GFP_NOWAIT);
 
 	if (!buf) {
 		out->allocation_failure = true;
@@ -67,6 +72,11 @@ int bch2_printbuf_make_room(struct printbuf *out, unsigned extra)
 	out->buf	= buf;
 	out->size	= new_size;
 	return 0;
+}
+
+int bch2_printbuf_make_room(struct printbuf *out, unsigned extra)
+{
+	return bch2_printbuf_make_room_gfp(out, extra, GFP_KERNEL);
 }
 
 static void printbuf_advance_pos(struct printbuf *out, unsigned len)
@@ -151,7 +161,7 @@ static void __printbuf_do_indent(struct printbuf *out, unsigned pos)
 
 static inline void printbuf_do_indent(struct printbuf *out, unsigned pos)
 {
-	if (out->has_indent_or_tabstops && !out->suppress_indent_tabstop_handling)
+	if (out->has_indent_or_tabstops)
 		__printbuf_do_indent(out, pos);
 }
 
@@ -216,7 +226,7 @@ const char *bch2_printbuf_str(const struct printbuf *buf)
 void bch2_printbuf_exit(struct printbuf *buf)
 {
 	if (buf->heap_allocated) {
-		kfree(buf->buf);
+		kvfree(buf->buf);
 		buf->buf = ERR_PTR(-EINTR); /* poison value */
 	}
 }
@@ -248,7 +258,7 @@ int bch2_printbuf_tabstop_push(struct printbuf *buf, unsigned spaces)
 		? buf->_tabstops[buf->nr_tabstops - 1]
 		: 0;
 
-	if (WARN_ON(buf->nr_tabstops >= ARRAY_SIZE(buf->_tabstops)))
+	if (WARN_ON_ONCE(buf->nr_tabstops >= ARRAY_SIZE(buf->_tabstops)))
 		return -EINVAL;
 
 	buf->_tabstops[buf->nr_tabstops++] = prev_tabstop + spaces;
@@ -367,7 +377,7 @@ static void __prt_tab(struct printbuf *out)
  */
 void bch2_prt_tab(struct printbuf *out)
 {
-	if (WARN_ON(!cur_tabstop(out)))
+	if (WARN_ON_ONCE(!cur_tabstop(out)))
 		return;
 
 	__prt_tab(out);
@@ -394,7 +404,7 @@ static void __prt_tab_rjust(struct printbuf *buf)
  */
 void bch2_prt_tab_rjust(struct printbuf *buf)
 {
-	if (WARN_ON(!cur_tabstop(buf)))
+	if (WARN_ON_ONCE(!cur_tabstop(buf)))
 		return;
 
 	__prt_tab_rjust(buf);
@@ -429,10 +439,38 @@ void bch2_prt_bytes_indented(struct printbuf *out, const char *str, unsigned cou
 void bch2_prt_human_readable_u64(struct printbuf *out, u64 v)
 {
 	bch2_printbuf_make_room(out, 10);
-	unsigned len = string_get_size(v, 1, !out->si_units,
-				       out->buf + out->pos,
-				       printbuf_remaining_size(out));
-	printbuf_advance_pos(out, len);
+
+	static const char units[] = { 0, 'k', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y' };
+	unsigned u = 0, r, base = out->si_units ? 1000 : 1024;
+
+	while (u + 1 < ARRAY_SIZE(units) && v >= base) {
+		r = do_div(v, base);
+		u++;
+	}
+
+	unsigned prev_pos = out->pos;
+	bch2_prt_printf(out, "%llu", v);
+
+	if (u) {
+		int prec = 3 - (out->pos - prev_pos);
+		if (prec > 0) {
+			if (!out->si_units) {
+				/* express the remainder as a decimal.  It's currently the
+				 * numerator of a fraction whose denominator is
+				 * divisor[units_base], which is 1 << 10 for STRING_UNITS_2 */
+				r *= 1000;
+				r >>= 10;
+			}
+
+			prt_char(out, '.');
+			prev_pos = out->pos;
+			bch2_prt_printf(out, "%03u", r);
+			out->pos = min(out->pos, prev_pos + prec);
+			out->buf[out->pos] = '\0';
+		}
+
+		prt_char(out, units[u]);
+	}
 }
 
 /**

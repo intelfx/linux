@@ -43,6 +43,18 @@ static inline void bch2_accounting_accumulate(struct bkey_i_accounting *dst,
 		dst->k.bversion = src.k->bversion;
 }
 
+void __bch2_accounting_maybe_kill(struct bch_fs *, struct bpos pos);
+
+static inline void bch2_accounting_accumulate_maybe_kill(struct bch_fs *c,
+							 struct bkey_i_accounting *dst,
+							 struct bkey_s_c_accounting src)
+{
+	bch2_accounting_accumulate(dst, src);
+
+	if (bch2_accounting_key_is_zero(accounting_i_to_s_c(dst)))
+		__bch2_accounting_maybe_kill(c, dst->k.p);
+}
+
 static inline void fs_usage_data_type_to_base(struct bch_fs_usage_base *fs_usage,
 					      enum bch_data_type data_type,
 					      s64 sectors)
@@ -95,23 +107,20 @@ do {									\
 	(_k)._type	= (struct bch_acct_##_type) { __VA_ARGS__ };	\
 } while (0)
 
-#define bch2_disk_accounting_mod2_nr(_trans, _gc, _v, _nr, ...)		\
+#define bch2_disk_accounting_mod2(_trans, _gc, _v, ...)			\
 ({									\
 	struct disk_accounting_pos pos;					\
 	disk_accounting_key_init(pos, __VA_ARGS__);			\
-	bch2_disk_accounting_mod(trans, &pos, _v, _nr, _gc);		\
+	bch2_disk_accounting_mod(trans, &pos, _v, ARRAY_SIZE(_v), _gc);	\
 })
-
-#define bch2_disk_accounting_mod2(_trans, _gc, _v, ...)			\
-	bch2_disk_accounting_mod2_nr(_trans, _gc, _v, ARRAY_SIZE(_v), __VA_ARGS__)
 
 int bch2_mod_dev_cached_sectors(struct btree_trans *, unsigned, s64, bool);
 
 int bch2_accounting_validate(struct bch_fs *, struct bkey_s_c,
 			     struct bkey_validate_context);
-void bch2_accounting_key_to_text(struct printbuf *, struct disk_accounting_pos *);
+void bch2_accounting_key_to_text(struct printbuf *, struct bch_fs *, struct disk_accounting_pos *);
 void bch2_accounting_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
-void bch2_accounting_swab(struct bkey_s);
+void bch2_accounting_swab(const struct bch_fs *, struct bkey_s);
 
 #define bch2_bkey_ops_accounting ((struct bkey_ops) {	\
 	.key_validate	= bch2_accounting_validate,	\
@@ -142,6 +151,7 @@ void bch2_accounting_mem_gc(struct bch_fs *);
 static inline bool bch2_accounting_is_mem(struct disk_accounting_pos *acc)
 {
 	return acc->type < BCH_DISK_ACCOUNTING_TYPE_NR &&
+		acc->type != BCH_DISK_ACCOUNTING_snapshot &&
 		acc->type != BCH_DISK_ACCOUNTING_inum;
 }
 
@@ -205,13 +215,10 @@ static inline int bch2_accounting_mem_mod_locked(struct btree_trans *trans,
 
 	while ((idx = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
 				      accounting_pos_cmp, &a.k->p)) >= acc->k.nr) {
-		int ret = 0;
 		if (unlikely(write_locked))
-			ret = bch2_accounting_mem_insert_locked(c, a, mode);
+			try(bch2_accounting_mem_insert_locked(c, a, mode));
 		else
-			ret = bch2_accounting_mem_insert(c, a, mode);
-		if (ret)
-			return ret;
+			try(bch2_accounting_mem_insert(c, a, mode));
 	}
 
 	struct accounting_mem_entry *e = &acc->k.data[idx];
@@ -225,7 +232,7 @@ static inline int bch2_accounting_mem_mod_locked(struct btree_trans *trans,
 
 static inline int bch2_accounting_mem_add(struct btree_trans *trans, struct bkey_s_c_accounting a, bool gc)
 {
-	guard(percpu_read)(&trans->c->mark_lock);
+	guard(percpu_read)(&trans->c->capacity.mark_lock);
 	return bch2_accounting_mem_mod_locked(trans, a, gc ? BCH_ACCOUNTING_gc : BCH_ACCOUNTING_normal, false);
 }
 
@@ -248,7 +255,7 @@ static inline void bch2_accounting_mem_read_counters(struct bch_accounting_mem *
 static inline void bch2_accounting_mem_read(struct bch_fs *c, struct bpos p,
 					    u64 *v, unsigned nr)
 {
-	guard(percpu_read)(&c->mark_lock);
+	guard(percpu_read)(&c->capacity.mark_lock);
 	struct bch_accounting_mem *acc = &c->accounting;
 	unsigned idx = eytzinger0_find(acc->k.data, acc->k.nr, sizeof(acc->k.data[0]),
 				       accounting_pos_cmp, &p);
@@ -295,6 +302,14 @@ static inline void bch2_accounting_trans_commit_revert(struct btree_trans *trans
 
 int bch2_fs_replicas_usage_read(struct bch_fs *, darray_char *);
 int bch2_fs_accounting_read(struct bch_fs *, darray_char *, unsigned);
+int bch2_fs_accounting_read_key(struct btree_trans *, struct disk_accounting_pos *, u64 *, unsigned);
+
+#define bch2_fs_accounting_read_key2(_trans, _v, ...)			\
+({									\
+	struct disk_accounting_pos pos;					\
+	disk_accounting_key_init(pos, __VA_ARGS__);			\
+	bch2_fs_accounting_read_key(trans, &pos, _v, ARRAY_SIZE(_v));	\
+})
 
 int bch2_gc_accounting_start(struct bch_fs *);
 int bch2_gc_accounting_done(struct bch_fs *);

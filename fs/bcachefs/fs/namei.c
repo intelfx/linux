@@ -129,13 +129,13 @@ int bch2_create_trans(struct btree_trans *trans,
 	}
 
 	if (!(flags & BCH_CREATE_TMPFILE)) {
-		struct bch_hash_info dir_hash = bch2_hash_info_init(c, dir_u);
-		u64 dir_offset;
+		struct bch_hash_info dir_hash;
+		try(bch2_hash_info_init(c, dir_u, &dir_hash));
 
-		if (is_subdir_for_nlink(new_inode))
-			dir_u->bi_nlink++;
+		dir_u->bi_nlink += is_subdir_for_nlink(new_inode);
 		dir_u->bi_mtime = dir_u->bi_ctime = now;
 
+		u64 dir_offset;
 		try(bch2_dirent_create(trans, dir, &dir_hash,
 					   dir_type,
 					   name,
@@ -176,7 +176,6 @@ int bch2_link_trans(struct btree_trans *trans,
 	struct bch_fs *c = trans->c;
 	CLASS(btree_iter_uninit, dir_iter)(trans);
 	CLASS(btree_iter_uninit, inode_iter)(trans);
-	struct bch_hash_info dir_hash;
 	u64 now = bch2_current_time(c);
 	u64 dir_offset = 0;
 
@@ -195,7 +194,8 @@ int bch2_link_trans(struct btree_trans *trans,
 
 	dir_u->bi_mtime = dir_u->bi_ctime = now;
 
-	dir_hash = bch2_hash_info_init(c, dir_u);
+	struct bch_hash_info dir_hash;
+	try(bch2_hash_info_init(c, dir_u, &dir_hash));
 
 	try(bch2_dirent_create(trans, dir, &dir_hash,
 			       mode_to_type(inode_u->bi_mode),
@@ -227,7 +227,8 @@ int bch2_unlink_trans(struct btree_trans *trans,
 
 	try(bch2_inode_peek(trans, &dir_iter, dir_u, dir, BTREE_ITER_intent));
 
-	struct bch_hash_info dir_hash = bch2_hash_info_init(c, dir_u);
+	struct bch_hash_info dir_hash;
+	try(bch2_hash_info_init(c, dir_u, &dir_hash));
 
 	subvol_inum inum;
 	try(bch2_dirent_lookup_trans(trans, &dirent_iter, dir, &dir_hash,
@@ -331,19 +332,19 @@ int bch2_rename_trans(struct btree_trans *trans,
 	CLASS(btree_iter_uninit, dst_dir_iter)(trans);
 	CLASS(btree_iter_uninit, src_inode_iter)(trans);
 	CLASS(btree_iter_uninit, dst_inode_iter)(trans);
-	struct bch_hash_info src_hash, dst_hash;
 	subvol_inum src_inum, dst_inum;
 	u64 src_offset, dst_offset;
 	u64 now = bch2_current_time(c);
 
 	try(bch2_inode_peek(trans, &src_dir_iter, src_dir_u, src_dir, BTREE_ITER_intent));
 
-	src_hash = bch2_hash_info_init(c, src_dir_u);
+	struct bch_hash_info src_hash, dst_hash;
+	try(bch2_hash_info_init(c, src_dir_u, &src_hash));
 
 	if (!subvol_inum_eq(dst_dir, src_dir)) {
 		try(bch2_inode_peek(trans, &dst_dir_iter, dst_dir_u, dst_dir, BTREE_ITER_intent));
 
-		dst_hash = bch2_hash_info_init(c, dst_dir_u);
+		try(bch2_hash_info_init(c, dst_dir_u, &dst_hash));
 	} else {
 		dst_dir_u = src_dir_u;
 		dst_hash = src_hash;
@@ -518,21 +519,38 @@ static inline void prt_printf_reversed(struct printbuf *out, const char *fmt, ..
 	printbuf_reverse_from(out, orig_pos);
 }
 
-static int __bch2_inum_to_path(struct btree_trans *trans,
-			       u32 subvol, u64 inum, u32 snapshot,
-			       struct printbuf *path)
+DEFINE_DARRAY(subvol_inum);
+
+static int bch2_inum_to_path_reversed(struct btree_trans *trans,
+				      u32 subvol, u64 inum, u32 snapshot,
+				      struct printbuf *path)
 {
-	unsigned orig_pos = path->pos;
+	struct bch_fs *c = trans->c;
 	int ret = 0;
-	DARRAY(subvol_inum) inums = {};
+	CLASS(darray_subvol_inum, inums)();
 
 	if (!snapshot) {
-		ret = bch2_subvolume_get_snapshot(trans, subvol, &snapshot);
-		if (ret)
-			goto disconnected;
+		if (subvol) {
+			ret = bch2_subvolume_get_snapshot(trans, subvol, &snapshot);
+		} else {
+			struct bkey_s_c k;
+			for_each_btree_key_max_norestart(trans, iter,
+					BTREE_ID_inodes,
+					POS(0, inum),
+					SPOS(0, inum, U32_MAX),
+					BTREE_ITER_all_snapshots|
+					BTREE_ITER_with_updates, k, ret) {
+				if (bkey_is_inode(k.k)) {
+					snapshot = k.k->p.snapshot;
+					break;
+				}
+			}
+			if (!ret && !snapshot)
+				ret = bch_err_throw(c, ENOENT_snapshot);
+		}
 	}
 
-	while (true) {
+	while (!ret) {
 		subvol_inum n = (subvol_inum) { subvol ?: snapshot, inum };
 
 		if (darray_find_p(inums, i, i->subvol == n.subvol && i->inum == n.inum)) {
@@ -540,22 +558,21 @@ static int __bch2_inum_to_path(struct btree_trans *trans,
 			break;
 		}
 
-		ret = darray_push(&inums, n);
-		if (ret)
-			goto err;
+		try(darray_push(&inums, n));
 
 		struct bch_inode_unpacked inode;
-		ret = bch2_inode_find_by_inum_snapshot(trans, inum, snapshot, &inode, 0);
+		ret = bch2_inode_find_by_inum_snapshot(trans, inum, snapshot, &inode,
+						       BTREE_ITER_with_updates);
 		if (ret)
-			goto disconnected;
+			break;
 
 		if (inode.bi_subvol == BCACHEFS_ROOT_SUBVOL &&
 		    inode.bi_inum == BCACHEFS_ROOT_INO)
 			break;
 
 		if (!inode.bi_dir && !inode.bi_dir_offset) {
-			ret = bch_err_throw(trans->c, ENOENT_inode_no_backpointer);
-			goto disconnected;
+			ret = bch_err_throw(c, ENOENT_inode_no_backpointer);
+			break;
 		}
 
 		inum = inode.bi_dir;
@@ -563,15 +580,16 @@ static int __bch2_inum_to_path(struct btree_trans *trans,
 			subvol = inode.bi_parent_subvol;
 			ret = bch2_subvolume_get_snapshot(trans, inode.bi_parent_subvol, &snapshot);
 			if (ret)
-				goto disconnected;
+				break;
 		}
 
 		CLASS(btree_iter, d_iter)(trans, BTREE_ID_dirents,
-					  SPOS(inode.bi_dir, inode.bi_dir_offset, snapshot), 0);
+					  SPOS(inode.bi_dir, inode.bi_dir_offset, snapshot),
+					  BTREE_ITER_with_updates);
 		struct bkey_s_c_dirent d = bch2_bkey_get_typed(&d_iter, dirent);
 		ret = bkey_err(d.s_c);
 		if (ret)
-			goto disconnected;
+			break;
 
 		struct qstr dirent_name = bch2_dirent_get_name(d);
 
@@ -580,25 +598,30 @@ static int __bch2_inum_to_path(struct btree_trans *trans,
 		prt_char(path, '/');
 	}
 
-	if (orig_pos == path->pos)
-		prt_char(path, '/');
-out:
-	if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
-		goto err;
+	if (ret && !bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
+		prt_printf_reversed(path, "(%s: disconnected at %llu.%u)",
+				    bch2_err_str(ret), inum, snapshot);
+		ret = 0;
+	}
 
-	ret = path->allocation_failure ? -ENOMEM : 0;
-	if (ret)
-		goto err;
-
-	printbuf_reverse_from(path, orig_pos);
-	darray_exit(&inums);
-	return 0;
-err:
-	darray_exit(&inums);
 	return ret;
-disconnected:
-	prt_printf_reversed(path, "(disconnected at %llu.%u)", inum, snapshot);
-	goto out;
+}
+
+static int __bch2_inum_to_path(struct btree_trans *trans,
+			       u32 subvol, u64 inum, u32 snapshot,
+			       struct printbuf *path)
+{
+	struct printbuf_restore restore = printbuf_state_save(path);
+	unsigned orig_pos = path->pos;
+	int ret = bch2_inum_to_path_reversed(trans, subvol, inum, snapshot, path);
+	if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+		printbuf_state_restore(path, restore); /* Don't leave garbage output */
+	else {
+		if (!ret && orig_pos == path->pos)
+			prt_char(path, '/');
+		printbuf_reverse_from(path, orig_pos);
+	}
+	return ret;
 }
 
 int bch2_inum_to_path(struct btree_trans *trans,
@@ -832,10 +855,8 @@ int bch2_check_inode_has_case_insensitive(struct btree_trans *trans,
 		prt_printf(&buf, "casefolded dir with has_case_insensitive not set\ninum %llu:%u ",
 			   inode->bi_inum, inode->bi_snapshot);
 
-		ret = bch2_inum_snapshot_to_path(trans, inode->bi_inum, inode->bi_snapshot,
-						 snapshot_overwrites, &buf);
-		if (ret)
-			goto out;
+		try(bch2_inum_snapshot_to_path(trans, inode->bi_inum, inode->bi_snapshot,
+					       snapshot_overwrites, &buf));
 
 		if (fsck_err(trans, inode_has_case_insensitive_not_set, "%s", buf.buf)) {
 			inode->bi_flags |= BCH_INODE_has_case_insensitive;
@@ -844,7 +865,7 @@ int bch2_check_inode_has_case_insensitive(struct btree_trans *trans,
 	}
 
 	if (!(inode->bi_flags & BCH_INODE_has_case_insensitive))
-		goto out;
+		return 0;
 
 	struct bch_inode_unpacked dir = *inode;
 	u32 snapshot = dir.bi_snapshot;
@@ -852,30 +873,22 @@ int bch2_check_inode_has_case_insensitive(struct btree_trans *trans,
 	while (!(dir.bi_inum	== BCACHEFS_ROOT_INO &&
 		 dir.bi_subvol	== BCACHEFS_ROOT_SUBVOL)) {
 		if (dir.bi_parent_subvol) {
-			ret = bch2_subvolume_get_snapshot(trans, dir.bi_parent_subvol, &snapshot);
-			if (ret)
-				goto out;
+			try(bch2_subvolume_get_snapshot(trans, dir.bi_parent_subvol, &snapshot));
 
 			snapshot_overwrites = NULL;
 		}
 
-		ret = bch2_inode_find_by_inum_snapshot(trans, dir.bi_dir, snapshot, &dir, 0);
-		if (ret)
-			goto out;
+		try(bch2_inode_find_by_inum_snapshot(trans, dir.bi_dir, snapshot, &dir, 0));
 
 		if (!(dir.bi_flags & BCH_INODE_has_case_insensitive)) {
 			prt_printf(&buf, "parent of casefolded dir with has_case_insensitive not set\n");
 
-			ret = bch2_inum_snapshot_to_path(trans, dir.bi_inum, dir.bi_snapshot,
-							 snapshot_overwrites, &buf);
-			if (ret)
-				goto out;
+			try(bch2_inum_snapshot_to_path(trans, dir.bi_inum, dir.bi_snapshot,
+						       snapshot_overwrites, &buf));
 
 			if (fsck_err(trans, inode_parent_has_case_insensitive_not_set, "%s", buf.buf)) {
 				dir.bi_flags |= BCH_INODE_has_case_insensitive;
-				ret = __bch2_fsck_write_inode(trans, &dir);
-				if (ret)
-					goto out;
+				try(__bch2_fsck_write_inode(trans, &dir));
 			}
 		}
 
@@ -886,15 +899,11 @@ int bch2_check_inode_has_case_insensitive(struct btree_trans *trans,
 		if (!repairing_parents)
 			break;
 	}
-out:
-fsck_err:
-	bch_err_fn(trans->c, ret);
-	if (ret)
-		return ret;
 
 	if (repairing_parents)
 		return bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc) ?:
 			bch_err_throw(trans->c, transaction_restart_nested);
 
-	return 0;
+fsck_err:
+	return ret;
 }

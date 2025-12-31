@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-
 #include "bcachefs.h"
 
 #include "alloc/replicas.h"
@@ -7,6 +6,7 @@
 #include "btree/bkey_methods.h"
 #include "btree/bkey_buf.h"
 #include "btree/cache.h"
+#include "btree/interior.h"
 #include "btree/iter.h"
 #include "btree/journal_overlay.h"
 #include "btree/key_cache.h"
@@ -22,6 +22,8 @@
 
 #include "journal/journal.h"
 #include "journal/read.h"
+
+#include "sb/counters.h"
 
 #include "snapshots/snapshot.h"
 
@@ -140,6 +142,36 @@ static void __bch2_btree_path_verify_cached(struct btree_trans *trans,
 		btree_node_unlock(trans, path, 0);
 }
 
+static void path_verify_level_err(struct btree_path *path, unsigned level,
+				  const struct bkey_packed *p, const struct bkey_packed *k,
+				  const char *msg)
+{
+	struct btree_path_level *l = &path->l[level];
+	CLASS(printbuf, buf)();
+	prt_printf(&buf, "path should be %s key at level %u", msg, level);
+
+	prt_str(&buf, "\npath pos ");
+	bch2_bpos_to_text(&buf, path->pos);
+
+	prt_str(&buf, "\nprev key ");
+	if (p) {
+		struct bkey uk = bkey_unpack_key(l->b, p);
+		bch2_bkey_to_text(&buf, &uk);
+	} else {
+		prt_printf(&buf, "(none)");
+	}
+
+	prt_str(&buf, "\ncur  key ");
+	if (k) {
+		struct bkey uk = bkey_unpack_key(l->b, k);
+		bch2_bkey_to_text(&buf, &uk);
+	} else {
+		prt_printf(&buf, "(none)");
+	}
+
+	panic("%s\n", buf.buf);
+}
+
 static void __bch2_btree_path_verify_level(struct btree_trans *trans,
 				struct btree_path *path, unsigned level)
 {
@@ -172,7 +204,6 @@ static void __bch2_btree_path_verify_level(struct btree_trans *trans,
 		? bch2_btree_node_iter_peek(&tmp, l->b)
 		: bch2_btree_node_iter_peek_all(&tmp, l->b);
 
-	const char *msg;
 	if (!(level > path->level && trans->journal_replay_not_finished)) {
 		/*
 		 * We can't run these checks for interior nodes when we're still
@@ -184,46 +215,15 @@ static void __bch2_btree_path_verify_level(struct btree_trans *trans,
 		 * for.
 		 */
 
-		if (p && bkey_iter_pos_cmp(l->b, p, &path->pos) >= 0) {
-			msg = "before";
-			goto err;
-		}
+		if (p && bkey_iter_pos_cmp(l->b, p, &path->pos) >= 0)
+			path_verify_level_err(path, level, p, k, "before");
 
-		if (k && bkey_iter_pos_cmp(l->b, k, &path->pos) < 0) {
-			msg = "after";
-			goto err;
-		}
+		if (k && bkey_iter_pos_cmp(l->b, k, &path->pos) < 0)
+			path_verify_level_err(path, level, p, k, "after");
 	}
 
 	if (!locked)
 		btree_node_unlock(trans, path, level);
-	return;
-err:
-	{
-		CLASS(printbuf, buf)();
-		prt_printf(&buf, "path should be %s key at level %u", msg, level);
-
-		prt_str(&buf, "\npath pos ");
-		bch2_bpos_to_text(&buf, path->pos);
-
-		prt_str(&buf, "\nprev key ");
-		if (p) {
-			struct bkey uk = bkey_unpack_key(l->b, p);
-			bch2_bkey_to_text(&buf, &uk);
-		} else {
-			prt_printf(&buf, "(none)");
-		}
-
-		prt_str(&buf, "\ncur  key ");
-		if (k) {
-			struct bkey uk = bkey_unpack_key(l->b, k);
-			bch2_bkey_to_text(&buf, &uk);
-		} else {
-			prt_printf(&buf, "(none)");
-		}
-
-		panic("%s\n", buf.buf);
-	}
 }
 
 static void __bch2_btree_path_verify(struct btree_trans *trans,
@@ -398,8 +398,6 @@ static void btree_node_iter_set_set_pos(struct btree_node_iter *iter,
 					struct bset_tree *t,
 					struct bkey_packed *k)
 {
-	struct btree_node_iter_set *set;
-
 	btree_node_iter_for_each(iter, set)
 		if (set->end == t->end_offset) {
 			set->k = __btree_node_key_to_offset(b, k);
@@ -445,7 +443,6 @@ static void __bch2_btree_node_iter_fix(struct btree_path *path,
 				       unsigned new_u64s)
 {
 	const struct bkey_packed *end = btree_bkey_last(b, t);
-	struct btree_node_iter_set *set;
 	unsigned offset = __btree_node_key_to_offset(b, where);
 	int shift = new_u64s - clobber_u64s;
 	unsigned old_end = t->end_offset - shift;
@@ -454,41 +451,39 @@ static void __bch2_btree_node_iter_fix(struct btree_path *path,
 		orig_iter_pos >= offset &&
 		orig_iter_pos <= offset + clobber_u64s;
 
-	btree_node_iter_for_each(node_iter, set)
-		if (set->end == old_end)
-			goto found;
-
-	/* didn't find the bset in the iterator - might have to readd it: */
-	if (new_u64s &&
-	    bkey_iter_pos_cmp(b, where, &path->pos) >= 0) {
-		bch2_btree_node_iter_push(node_iter, b, where, end);
-		goto fixup_done;
+	struct btree_node_iter_set *set = btree_node_iter_set_find(node_iter, old_end);
+	if (!set) {
+		/* didn't find the bset in the iterator - might have to readd it: */
+		if (new_u64s &&
+		    bkey_iter_pos_cmp(b, where, &path->pos) >= 0) {
+			bch2_btree_node_iter_push(node_iter, b, where, end);
+		} else {
+			/* Iterator is after key that changed */
+			return;
+		}
 	} else {
-		/* Iterator is after key that changed */
-		return;
+		set->end = t->end_offset;
+
+		/* Iterator hasn't gotten to the key that changed yet: */
+		if (set->k < offset)
+			return;
+
+		if (new_u64s &&
+		    bkey_iter_pos_cmp(b, where, &path->pos) >= 0) {
+			set->k = offset;
+		} else if (set->k < offset + clobber_u64s) {
+			set->k = offset + new_u64s;
+			if (set->k == set->end)
+				bch2_btree_node_iter_set_drop(node_iter, set);
+		} else {
+			/* Iterator is after key that changed */
+			set->k = (int) set->k + shift;
+			return;
+		}
+
+		bch2_btree_node_iter_sort(node_iter, b);
 	}
-found:
-	set->end = t->end_offset;
 
-	/* Iterator hasn't gotten to the key that changed yet: */
-	if (set->k < offset)
-		return;
-
-	if (new_u64s &&
-	    bkey_iter_pos_cmp(b, where, &path->pos) >= 0) {
-		set->k = offset;
-	} else if (set->k < offset + clobber_u64s) {
-		set->k = offset + new_u64s;
-		if (set->k == set->end)
-			bch2_btree_node_iter_set_drop(node_iter, set);
-	} else {
-		/* Iterator is after key that changed */
-		set->k = (int) set->k + shift;
-		return;
-	}
-
-	bch2_btree_node_iter_sort(node_iter, b);
-fixup_done:
 	if (node_iter->data[0].k != orig_iter_pos)
 		iter_current_key_modified = true;
 
@@ -615,12 +610,13 @@ static inline bool btree_path_advance_to_pos(struct btree_path *path,
 	return true;
 }
 
-static inline void __btree_path_level_init(struct btree_path *path,
+static inline void __btree_path_level_init(struct btree_trans *trans,
+					   struct btree_path *path,
 					   unsigned level)
 {
 	struct btree_path_level *l = &path->l[level];
 
-	bch2_btree_node_iter_init(&l->iter, l->b, &path->pos);
+	bch2_btree_node_iter_init(trans->c, l->b, &l->iter, &path->pos);
 
 	/*
 	 * Iterators to interior nodes should always be pointed at the first non
@@ -640,12 +636,12 @@ void bch2_btree_path_level_init(struct btree_trans *trans,
 
 	path->l[b->c.level].lock_seq = six_lock_seq(&b->c.lock);
 	path->l[b->c.level].b = b;
-	__btree_path_level_init(path, b->c.level);
+	__btree_path_level_init(trans, path, b->c.level);
 }
 
 /* Btree path: fixups after btree node updates: */
 
-static void bch2_trans_revalidate_updates_in_node(struct btree_trans *trans, struct btree *b)
+void bch2_trans_revalidate_updates_in_node(struct btree_trans *trans, struct btree *b)
 {
 	struct bch_fs *c = trans->c;
 
@@ -729,12 +725,24 @@ void bch2_trans_node_reinit_iter(struct btree_trans *trans, struct btree *b)
 	unsigned i;
 
 	trans_for_each_path_with_node(trans, b, path, i)
-		__btree_path_level_init(path, b->c.level);
+		__btree_path_level_init(trans, path, b->c.level);
 
 	bch2_trans_revalidate_updates_in_node(trans, b);
 }
 
 /* Btree path: traverse, set_pos: */
+
+static noinline_for_stack int btree_node_root_err(struct btree_trans *trans, struct btree *b)
+{
+	struct bch_fs *c = trans->c;
+	CLASS(bch_log_msg, msg)(c);
+
+	prt_str(&msg.m, "btree root doesn't cover expected range:\n");
+	bch2_btree_pos_to_text(&msg.m, c, b);
+	prt_newline(&msg.m);
+
+	return __bch2_topology_error(c, &msg.m);
+}
 
 static inline int btree_path_lock_root(struct btree_trans *trans,
 				       struct btree_path *path,
@@ -752,6 +760,8 @@ static inline int btree_path_lock_root(struct btree_trans *trans,
 	while (1) {
 		struct btree *b = READ_ONCE(r->b);
 		if (unlikely(!b)) {
+			if (!test_bit(BCH_FS_btree_running, &c->flags))
+				return bch_err_throw(c, btree_not_started);
 			BUG_ON(!r->error);
 			return r->error;
 		}
@@ -783,6 +793,13 @@ static inline int btree_path_lock_root(struct btree_trans *trans,
 		if (likely(b == READ_ONCE(r->b) &&
 			   b->c.level == path->level &&
 			   !race_fault())) {
+			if (unlikely(!bpos_eq(b->data->min_key, POS_MIN) ||
+				     !bpos_eq(b->key.k.p, SPOS_MAX))) {
+				ret = btree_node_root_err(trans, b);
+				six_unlock_type(&b->c.lock, lock_type);
+				return ret;
+			}
+
 			for (i = 0; i < path->level; i++)
 				path->l[i].b = ERR_PTR(-BCH_ERR_no_btree_node_lock_root);
 			path->l[path->level].b = b;
@@ -805,34 +822,27 @@ static int btree_path_prefetch(struct btree_trans *trans, struct btree_path *pat
 	struct bch_fs *c = trans->c;
 	struct btree_path_level *l = path_l(path);
 	struct btree_node_iter node_iter = l->iter;
-	struct bkey_packed *k;
 	unsigned nr = test_bit(BCH_FS_started, &c->flags)
 		? (path->level > 1 ? 0 :  2)
 		: (path->level > 1 ? 1 : 16);
-	bool was_locked = btree_node_locked(path, path->level);
-	int ret = 0;
 
 	struct bkey_buf tmp __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&tmp);
 
-	while (nr-- && !ret) {
-		if (!bch2_btree_node_relock(trans, path, path->level))
-			break;
+	while (nr--) {
+		BUG_ON(!btree_node_locked(path, path->level));
 
 		bch2_btree_node_iter_advance(&node_iter, l->b);
-		k = bch2_btree_node_iter_peek(&node_iter, l->b);
+		struct bkey_packed *k = bch2_btree_node_iter_peek(&node_iter, l->b);
 		if (!k)
 			break;
 
 		bch2_bkey_buf_unpack(&tmp, l->b, k);
-		ret = bch2_btree_node_prefetch(trans, path, tmp.k, path->btree_id,
-					       path->level - 1);
+		try(bch2_btree_node_prefetch(trans, path, tmp.k, path->btree_id,
+					     path->level - 1));
 	}
 
-	if (!was_locked)
-		btree_node_unlock(trans, path, path->level);
-
-	return ret;
+	return 0;
 }
 
 static int btree_path_prefetch_j(struct btree_trans *trans, struct btree_path *path,
@@ -897,15 +907,15 @@ static noinline_for_stack int btree_node_missing_err(struct btree_trans *trans,
 						     struct btree_path *path)
 {
 	struct bch_fs *c = trans->c;
-	CLASS(printbuf, buf)();
+	CLASS(bch_log_msg, msg)(c);
 
-	prt_str(&buf, "node not found at pos: ");
-	bch2_bpos_to_text(&buf, path->pos);
-	prt_str(&buf, "\n  within parent node ");
-	bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&path_l(path)->b->key));
-	prt_newline(&buf);
+	prt_str(&msg.m, "node not found at pos: ");
+	bch2_bpos_to_text(&msg.m, path->pos);
+	prt_str(&msg.m, "\n  within parent node ");
+	bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&path_l(path)->b->key));
+	prt_newline(&msg.m);
 
-	return __bch2_topology_error(c, &buf);
+	return __bch2_topology_error(c, &msg.m);
 }
 
 static noinline_for_stack int btree_node_gap_err(struct btree_trans *trans,
@@ -913,17 +923,30 @@ static noinline_for_stack int btree_node_gap_err(struct btree_trans *trans,
 						 struct bkey_i *k)
 {
 	struct bch_fs *c = trans->c;
-	CLASS(printbuf, buf)();
+	CLASS(bch_log_msg, msg)(c);
 
-	prt_str(&buf, "node doesn't cover expected range at pos: ");
-	bch2_bpos_to_text(&buf, path->pos);
-	prt_str(&buf, "\n  within parent node ");
-	bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&path_l(path)->b->key));
-	prt_str(&buf, "\n  but got node: ");
-	bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(k));
-	prt_newline(&buf);
+	struct btree *b = path_l(path)->b;
 
-	return __bch2_topology_error(c, &buf);
+	prt_str(&msg.m, "lookup found topology error:\n");
+	prt_str(&msg.m, "node doesn't cover expected range at pos: ");
+	bch2_bpos_to_text(&msg.m, path->pos);
+	prt_newline(&msg.m);
+
+	scoped_guard(printbuf_indent, &msg.m) {
+		prt_str(&msg.m, "within parent node ");
+		bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&path_l(path)->b->key));
+		prt_newline(&msg.m);
+
+		prt_printf(&msg.m, "but got node: ");
+		bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(k));
+		prt_newline(&msg.m);
+	}
+
+	bch2_prt_task_backtrace(&msg.m, current, 1, GFP_KERNEL);
+
+	guard(printbuf_indent)(&msg.m);
+	return bch2_btree_node_check_topology_msg(trans, b, &msg.m) ?:
+		__bch2_topology_error(c, &msg.m);
 }
 
 static noinline int btree_node_iter_and_journal_peek(struct btree_trans *trans,
@@ -932,26 +955,21 @@ static noinline int btree_node_iter_and_journal_peek(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	struct btree_path_level *l = path_l(path);
-	int ret = 0;
 
-	struct btree_and_journal_iter jiter;
+	struct btree_and_journal_iter jiter __cleanup(bch2_btree_and_journal_iter_exit);
 	__bch2_btree_and_journal_iter_init_node_iter(trans, &jiter, l->b, l->iter, path->pos);
 
 	struct bkey_s_c k = bch2_btree_and_journal_iter_peek(c, &jiter);
-	if (!k.k) {
-		ret = btree_node_missing_err(trans, path);
-		goto err;
-	}
+	if (!k.k)
+		return btree_node_missing_err(trans, path);
 
 	bkey_reassemble(&trans->btree_path_down, k);
 
 	if ((flags & BTREE_ITER_prefetch) &&
 	    c->opts.btree_node_prefetch)
-		ret = btree_path_prefetch_j(trans, path, &jiter);
+		return btree_path_prefetch_j(trans, path, &jiter);
 
-err:
-	bch2_btree_and_journal_iter_exit(&jiter);
-	return ret;
+	return 0;
 }
 
 static inline bool bpos_in_btree_node_key(struct bpos pos, const struct bkey_i *k)
@@ -1025,7 +1043,6 @@ static int bch2_btree_path_traverse_all(struct btree_trans *trans)
 {
 	struct bch_fs *c = trans->c;
 	struct btree_path *path;
-	unsigned long trace_ip = _RET_IP_;
 	unsigned i;
 	int ret = 0;
 
@@ -1047,9 +1064,7 @@ retry_all:
 	trans_set_locked(trans, false);
 
 	if (unlikely(trans->memory_allocation_failure)) {
-		struct closure cl;
-
-		closure_init_stack(&cl);
+		CLASS(closure_stack, cl)();
 
 		do {
 			ret = bch2_btree_cache_cannibalize_lock(trans, &cl);
@@ -1092,7 +1107,12 @@ err:
 
 	trans->in_traverse_all = false;
 
-	trace_and_count(c, trans_traverse_all, trans, trace_ip);
+	event_inc_trace(c, trans_traverse_all, buf, ({
+		prt_printf(&buf, "%s\n", trans->fn);
+		prt_printf(&buf, "nr_paths %u/%u\n",
+			   bitmap_weight(trans->paths_allocated, trans->nr_paths),
+			   trans->nr_paths);
+	}));
 	return ret;
 }
 
@@ -1188,7 +1208,10 @@ int bch2_btree_path_traverse_one(struct btree_trans *trans,
 	if (unlikely(!trans->srcu_held))
 		bch2_trans_srcu_lock(trans);
 
-	trace_btree_path_traverse_start(trans, path);
+	event_trace(trans->c, btree_path_traverse_start, buf, ({
+		prt_printf(&buf, "%s\n", trans->fn);
+		bch2_btree_path_to_text(&buf, trans, path_idx, trans->paths + path_idx);
+	}));
 
 	/*
 	 * Ensure we obey path->should_be_locked: if it's set, we can't unlock
@@ -1253,7 +1276,10 @@ int bch2_btree_path_traverse_one(struct btree_trans *trans,
 
 out_uptodate:
 	path->uptodate = BTREE_ITER_UPTODATE;
-	trace_btree_path_traverse_end(trans, path);
+	event_trace(trans->c, btree_path_traverse_end, buf, ({
+		prt_printf(&buf, "%s\n", trans->fn);
+		bch2_btree_path_to_text(&buf, trans, path_idx, trans->paths + path_idx);
+	}));
 out:
 	if (bch2_err_matches(ret, BCH_ERR_transaction_restart) != !!trans->restarted)
 		panic("ret %s (%i) trans->restarted %s (%i)\n",
@@ -1299,22 +1325,24 @@ btree_path_idx_t __bch2_btree_path_make_mut(struct btree_trans *trans,
 	struct btree_path *old = trans->paths + path;
 	__btree_path_put(trans, trans->paths + path, intent);
 	path = btree_path_clone(trans, path, intent, ip);
-	trace_btree_path_clone(trans, old, trans->paths + path);
+
+	event_trace(trans->c, btree_path_clone, buf, ({
+		prt_printf(&buf, "%s: old %zu\n", trans->fn, old - trans->paths);
+		bch2_btree_path_to_text_short(&buf, trans, path, trans->paths + path);
+	}));
+
 	trans->paths[path].preserve = false;
 	return path;
 }
 
-btree_path_idx_t __must_check
-__bch2_btree_path_set_pos(struct btree_trans *trans,
-			  btree_path_idx_t path_idx, struct bpos new_pos,
-			  bool intent, unsigned long ip)
+static btree_path_idx_t path_set_pos_trace(struct btree_trans *trans,
+					   btree_path_idx_t path_idx, struct bpos new_pos,
+					   bool intent, unsigned long ip)
 {
 	int cmp = bpos_cmp(new_pos, trans->paths[path_idx].pos);
 
 	bch2_trans_verify_not_unlocked_or_in_restart(trans);
 	EBUG_ON(!trans->paths[path_idx].ref);
-
-	trace_btree_path_set_pos(trans, trans->paths + path_idx, &new_pos);
 
 	path_idx = bch2_btree_path_make_mut(trans, path_idx, intent, ip);
 
@@ -1326,40 +1354,67 @@ __bch2_btree_path_set_pos(struct btree_trans *trans,
 		btree_node_unlock(trans, path, 0);
 		path->l[0].b = ERR_PTR(-BCH_ERR_no_btree_node_up);
 		btree_path_set_dirty(trans, path, BTREE_ITER_NEED_TRAVERSE);
-		goto out;
+	} else {
+		unsigned level = btree_path_up_until_good_node(trans, path, cmp);
+
+		if (btree_path_node(path, level)) {
+			struct btree_path_level *l = &path->l[level];
+
+			BUG_ON(!btree_node_locked(path, level));
+			/*
+			 * We might have to skip over many keys, or just a few: try
+			 * advancing the node iterator, and if we have to skip over too
+			 * many keys just reinit it (or if we're rewinding, since that
+			 * is expensive).
+			 */
+			if (cmp < 0 ||
+			    !btree_path_advance_to_pos(path, l, 8))
+				bch2_btree_node_iter_init(trans->c, l->b, &l->iter, &path->pos);
+
+			/*
+			 * Iterators to interior nodes should always be pointed at the first non
+			 * whiteout:
+			 */
+			if (unlikely(level))
+				bch2_btree_node_iter_peek(&l->iter, l->b);
+		}
+
+		if (unlikely(level != path->level)) {
+			btree_path_set_dirty(trans, path, BTREE_ITER_NEED_TRAVERSE);
+			__bch2_btree_path_unlock(trans, path);
+		}
 	}
 
-	unsigned level = btree_path_up_until_good_node(trans, path, cmp);
-
-	if (btree_path_node(path, level)) {
-		struct btree_path_level *l = &path->l[level];
-
-		BUG_ON(!btree_node_locked(path, level));
-		/*
-		 * We might have to skip over many keys, or just a few: try
-		 * advancing the node iterator, and if we have to skip over too
-		 * many keys just reinit it (or if we're rewinding, since that
-		 * is expensive).
-		 */
-		if (cmp < 0 ||
-		    !btree_path_advance_to_pos(path, l, 8))
-			bch2_btree_node_iter_init(&l->iter, l->b, &path->pos);
-
-		/*
-		 * Iterators to interior nodes should always be pointed at the first non
-		 * whiteout:
-		 */
-		if (unlikely(level))
-			bch2_btree_node_iter_peek(&l->iter, l->b);
-	}
-
-	if (unlikely(level != path->level)) {
-		btree_path_set_dirty(trans, path, BTREE_ITER_NEED_TRAVERSE);
-		__bch2_btree_path_unlock(trans, path);
-	}
-out:
 	bch2_btree_path_verify(trans, path);
 	return path_idx;
+}
+
+btree_path_idx_t __must_check
+__bch2_btree_path_set_pos(struct btree_trans *trans,
+			  btree_path_idx_t path_idx, struct bpos new_pos,
+			  bool intent, unsigned long ip)
+{
+
+	if (!trace_btree_path_set_pos_enabled()) {
+		return path_set_pos_trace(trans, path_idx, new_pos, intent, ip);
+	} else {
+		CLASS(printbuf, buf)();
+		guard(printbuf_indent_nextline)(&buf);
+
+		prt_printf(&buf, "%s caller: %ps\n", trans->fn, (void *) ip);
+		prt_newline(&buf);
+		bch2_btree_path_to_text(&buf, trans, path_idx, trans->paths + path_idx);
+
+		path_idx = path_set_pos_trace(trans, path_idx, new_pos, intent, ip);
+
+		prt_newline(&buf);
+		bch2_btree_path_to_text(&buf, trans, path_idx, trans->paths + path_idx);
+		prt_newline(&buf);
+
+		trace_btree_path_set_pos(trans->c, buf.buf);
+
+		return path_idx;
+	}
 }
 
 /* Btree path: main interface: */
@@ -1428,39 +1483,41 @@ void bch2_path_put(struct btree_trans *trans, btree_path_idx_t path_idx, bool in
 	if (!__btree_path_put(trans, path, intent))
 		return;
 
-	if (!path->preserve && !path->should_be_locked)
-		goto free;
-
-	dup = path->preserve
-		? have_path_at_pos(trans, path)
-		: have_node_at_pos(trans, path);
-	if (!dup)
-		return;
-
-	/*
-	 * If we need this path locked, the duplicate also has te be locked
-	 * before we free this one:
-	 */
-	if (path->should_be_locked &&
-	    !dup->should_be_locked &&
-	    !trans->restarted) {
-		if (!(trans->locked
-		      ? bch2_btree_path_relock_norestart(trans, dup)
-		      : bch2_btree_path_can_relock(trans, dup)))
+	if (path->preserve || path->should_be_locked) {
+		dup = path->preserve
+			? have_path_at_pos(trans, path)
+			: have_node_at_pos(trans, path);
+		if (!dup)
 			return;
 
-		dup->should_be_locked = true;
+		/*
+		 * If we need this path locked, the duplicate also has te be locked
+		 * before we free this one:
+		 */
+		if (path->should_be_locked &&
+		    !dup->should_be_locked &&
+		    !trans->restarted) {
+			if (!(trans->locked
+			      ? bch2_btree_path_relock_norestart(trans, dup)
+			      : bch2_btree_path_can_relock(trans, dup)))
+				return;
+
+			dup->should_be_locked = true;
+		}
+
+		BUG_ON(path->should_be_locked &&
+		       !trans->restarted &&
+		       trans->locked &&
+		       !btree_node_locked(dup, dup->level));
+
+		path->should_be_locked = false;
+		dup->preserve |= path->preserve;
 	}
 
-	BUG_ON(path->should_be_locked &&
-	       !trans->restarted &&
-	       trans->locked &&
-	       !btree_node_locked(dup, dup->level));
-
-	path->should_be_locked = false;
-	dup->preserve |= path->preserve;
-free:
-	trace_btree_path_free(trans, path_idx, dup);
+	event_trace(trans->c, btree_path_free, buf, ({
+		prt_printf(&buf, "%s: dup %zu\n", trans->fn, dup - trans->paths);
+		bch2_btree_path_to_text_short(&buf, trans, path_idx, path);
+	}));
 	__bch2_path_free(trans, path_idx);
 }
 
@@ -1533,10 +1590,9 @@ void bch2_trans_updates_to_text(struct printbuf *buf, struct btree_trans *trans)
 	}
 }
 
-static void bch2_btree_path_to_text_short(struct printbuf *out, struct btree_trans *trans, btree_path_idx_t path_idx)
+void bch2_btree_path_to_text_short(struct printbuf *out, struct btree_trans *trans,
+				   btree_path_idx_t path_idx, struct btree_path *path)
 {
-	struct btree_path *path = trans->paths + path_idx;
-
 	prt_printf(out, "path: idx %3u ref %u:%u %c %c %c ",
 		   path_idx, path->ref, path->intent_ref,
 		   path->preserve ? 'P' : ' ',
@@ -1575,14 +1631,14 @@ static const char *btree_node_locked_str(enum btree_node_locked_type t)
 	}
 }
 
-void bch2_btree_path_to_text(struct printbuf *out, struct btree_trans *trans, btree_path_idx_t path_idx)
+void bch2_btree_path_to_text(struct printbuf *out, struct btree_trans *trans,
+			     btree_path_idx_t path_idx, struct btree_path *path)
 {
-	bch2_btree_path_to_text_short(out, trans, path_idx);
-
-	struct btree_path *path = trans->paths + path_idx;
-
-	prt_printf(out, " uptodate %u locks_want %u", path->uptodate, path->locks_want);
+	bch2_btree_path_to_text_short(out, trans, path_idx, path);
 	prt_newline(out);
+
+	prt_newline(out);
+	prt_printf(out, " ptodate %u locks_want %u", path->uptodate, path->locks_want);
 	guard(printbuf_indent)(out);
 
 	for (unsigned l = 0; l < BTREE_MAX_DEPTH; l++) {
@@ -1609,7 +1665,7 @@ void __bch2_trans_paths_to_text(struct printbuf *out, struct btree_trans *trans,
 		btree_trans_sort_paths(trans);
 
 	trans_for_each_path_idx_inorder(trans, iter) {
-		bch2_btree_path_to_text_short(out, trans, iter.path_idx);
+		bch2_btree_path_to_text_short(out, trans, iter.path_idx, trans->paths + iter.path_idx);
 		prt_newline(out);
 	}
 }
@@ -1623,13 +1679,10 @@ void bch2_trans_paths_to_text(struct printbuf *out, struct btree_trans *trans)
 static noinline __cold
 void __bch2_dump_trans_paths_updates(struct btree_trans *trans, bool nosort)
 {
-	CLASS(printbuf, buf)();
-	bch2_log_msg_start(trans->c, &buf);
+	CLASS(bch_log_msg, msg)(trans->c);
 
-	__bch2_trans_paths_to_text(&buf, trans, nosort);
-	bch2_trans_updates_to_text(&buf, trans);
-
-	bch2_print_str(trans->c, KERN_ERR, buf.buf);
+	__bch2_trans_paths_to_text(&msg.m, trans, nosort);
+	bch2_trans_updates_to_text(&msg.m, trans);
 }
 
 noinline __cold
@@ -1661,14 +1714,10 @@ static void bch2_trans_update_max_paths(struct btree_trans *trans)
 noinline __cold
 int __bch2_btree_trans_too_many_iters(struct btree_trans *trans)
 {
-	if (trace_trans_restart_too_many_iters_enabled()) {
-		CLASS(printbuf, buf)();
-
+	event_inc_trace(trans->c, trans_restart_too_many_iters, buf, ({
+		prt_printf(&buf, "%s\n", trans->fn);
 		bch2_trans_paths_to_text(&buf, trans);
-		trace_trans_restart_too_many_iters(trans, _THIS_IP_, buf.buf);
-	}
-
-	count_event(trans->c, trans_restart_too_many_iters);
+	}));
 
 	return btree_trans_restart(trans, BCH_ERR_transaction_restart_too_many_iters);
 }
@@ -1789,7 +1838,12 @@ btree_path_idx_t bch2_path_get(struct btree_trans *trans,
 	    trans->paths[path_pos].btree_id	== btree_id &&
 	    trans->paths[path_pos].level	== level &&
 	    bch2_btree_path_upgrade_norestart(trans, trans->paths + path_pos, locks_want)) {
-		trace_btree_path_get(trans, trans->paths + path_pos, &pos);
+		event_trace(trans->c, btree_path_get, buf, ({
+			prt_printf(&buf, "%s\n", trans->fn);
+			bch2_btree_path_to_text_short(&buf, trans, path_pos, trans->paths + path_pos);
+			prt_printf(&buf, "new pos: ");
+			bch2_bpos_to_text(&buf, pos);
+		}));
 
 		__btree_path_get(trans, trans->paths + path_pos, intent);
 		path_idx = bch2_btree_path_set_pos(trans, path_pos, pos, intent, ip);
@@ -1814,7 +1868,10 @@ btree_path_idx_t bch2_path_get(struct btree_trans *trans,
 #endif
 		trans->paths_sorted		= false;
 
-		trace_btree_path_alloc(trans, path);
+		event_trace(trans->c, btree_path_alloc, buf, ({
+			prt_printf(&buf, "%s\n", trans->fn);
+			bch2_btree_path_to_text_short(&buf, trans, path_idx, path);
+		}));
 	}
 
 	if (!(flags & BTREE_ITER_nopreserve))
@@ -1866,8 +1923,11 @@ struct bkey_s_c bch2_btree_path_peek_slot(struct btree_path *path, struct bkey *
 
 		EBUG_ON(k.k && bkey_deleted(k.k) && bpos_eq(k.k->p, path->pos));
 
-		if (!k.k || !bpos_eq(path->pos, k.k->p))
-			goto hole;
+		if (!k.k || !bpos_eq(path->pos, k.k->p)) {
+			bkey_init(u);
+			u->p = path->pos;
+			return (struct bkey_s_c) { u, NULL };
+		}
 	} else {
 		struct bkey_cached *ck = (void *) path->l[0].b;
 		if (!ck)
@@ -1881,10 +1941,6 @@ struct bkey_s_c bch2_btree_path_peek_slot(struct btree_path *path, struct bkey *
 	}
 
 	return k;
-hole:
-	bkey_init(u);
-	u->p = path->pos;
-	return (struct bkey_s_c) { u, NULL };
 }
 
 void bch2_set_btree_iter_dontneed(struct btree_iter *iter)
@@ -1971,9 +2027,8 @@ struct btree *bch2_btree_iter_peek_node_and_restart(struct btree_iter *iter)
 {
 	struct btree *b;
 
-	while (b = bch2_btree_iter_peek_node(iter),
-	       bch2_err_matches(PTR_ERR_OR_ZERO(b), BCH_ERR_transaction_restart))
-		bch2_trans_begin(iter->trans);
+	lockrestart_do(iter->trans,
+		       PTR_ERR_OR_ZERO(b = bch2_btree_iter_peek_node(iter)));
 
 	return b;
 }
@@ -2013,8 +2068,12 @@ struct btree *bch2_btree_iter_next_node(struct btree_iter *iter)
 	bch2_btree_path_downgrade(trans, path);
 
 	if (!bch2_btree_node_relock(trans, path, path->level + 1)) {
-		trace_and_count(trans->c, trans_restart_relock_next_node, trans, _THIS_IP_, path);
+		event_inc_trace(trans->c, trans_restart_relock_next_node, buf, ({
+			prt_printf(&buf, "%s\n", trans->fn);
+			bch2_btree_path_to_text(&buf, trans, iter->path, path);
+		}));
 		ret = btree_trans_restart(trans, BCH_ERR_transaction_restart_relock);
+
 		__bch2_btree_path_unlock(trans, path);
 		path->l[path->level].b		= ERR_PTR(-BCH_ERR_no_btree_node_relock);
 		path->l[path->level + 1].b	= ERR_PTR(-BCH_ERR_no_btree_node_relock);
@@ -2123,6 +2182,7 @@ void bch2_btree_trans_peek_updates(struct btree_trans *trans, struct btree_iter 
 	trans_for_each_update(trans, i)
 		if (!i->key_cache_already_flushed &&
 		    i->btree_id == iter->btree_id &&
+		    i->level	== iter->min_depth &&
 		    bpos_ge(i->k->k.p, search_key) &&
 		    bpos_le(i->k->k.p, k->k ? k->k->p : end)) {
 			iter->k = i->k->k;
@@ -2137,6 +2197,7 @@ void bch2_btree_trans_peek_slot_updates(struct btree_trans *trans, struct btree_
 	trans_for_each_update(trans, i)
 		if (!i->key_cache_already_flushed &&
 		    i->btree_id == iter->btree_id &&
+		    i->level	== iter->min_depth &&
 		    bpos_eq(i->k->k.p, iter->pos)) {
 			iter->k = i->k->k;
 			*k = bkey_i_to_s_c(i->k);
@@ -2343,6 +2404,9 @@ static struct bkey_s_c __bch2_btree_iter_peek(struct btree_iter *iter, struct bp
 		if (likely(k.k)) {
 			break;
 		} else if (likely(!bpos_eq(l->b->key.k.p, SPOS_MAX))) {
+			if (btree_node_needs_merge(trans, l->b, 0))
+				bch2_btree_node_merge_async(trans->c, l->b);
+
 			/* Advance to next leaf node: */
 			search_key = bpos_successor(l->b->key.k.p);
 		} else {
@@ -2355,9 +2419,7 @@ static struct bkey_s_c __bch2_btree_iter_peek(struct btree_iter *iter, struct bp
 
 	bch2_btree_iter_verify(iter);
 
-	if (trace___btree_iter_peek_enabled()) {
-		CLASS(printbuf, buf)();
-
+	event_trace(trans->c, __btree_iter_peek, buf, ({
 		int ret = bkey_err(k);
 		if (ret)
 			prt_str(&buf, bch2_err_str(ret));
@@ -2365,8 +2427,7 @@ static struct bkey_s_c __bch2_btree_iter_peek(struct btree_iter *iter, struct bp
 			bch2_bkey_val_to_text(&buf, trans->c, k);
 		else
 			prt_str(&buf, "(null)");
-		trace___btree_iter_peek(trans->c, buf.buf);
-	}
+	}));
 
 	return k;
 }
@@ -2544,9 +2605,7 @@ out_no_locked:
 
 	bch2_btree_iter_verify_entry_exit(iter);
 
-	if (trace_btree_iter_peek_max_enabled()) {
-		CLASS(printbuf, buf)();
-
+	event_trace(trans->c, btree_iter_peek_max, buf, ({
 		int ret = bkey_err(k);
 		if (ret)
 			prt_str(&buf, bch2_err_str(ret));
@@ -2554,8 +2613,7 @@ out_no_locked:
 			bch2_bkey_val_to_text(&buf, trans->c, k);
 		else
 			prt_str(&buf, "(null)");
-		trace_btree_iter_peek_max(trans->c, buf.buf);
-	}
+	}));
 
 	return k;
 end:
@@ -2757,9 +2815,11 @@ struct bkey_s_c bch2_btree_iter_peek_prev_min(struct btree_iter *iter, struct bp
 					saved_path = btree_path_clone(trans, iter->path,
 								iter->flags & BTREE_ITER_intent,
 								_THIS_IP_);
-					trace_btree_path_save_pos(trans,
-								  trans->paths + iter->path,
-								  trans->paths + saved_path);
+					event_trace(trans->c, btree_path_save_pos, buf, ({
+						prt_printf(&buf, "%s: old %u\n", trans->fn, iter->path);
+						bch2_btree_path_to_text_short(&buf, trans, saved_path,
+									      trans->paths + saved_path);
+					}));
 				}
 
 				search_key = bpos_predecessor(k.k->p);
@@ -2797,9 +2857,7 @@ out_no_locked:
 	bch2_btree_iter_verify_entry_exit(iter);
 	bch2_btree_iter_verify(iter);
 
-	if (trace_btree_iter_peek_prev_min_enabled()) {
-		CLASS(printbuf, buf)();
-
+	event_trace(trans->c, btree_iter_peek_prev_min, buf, ({
 		int ret = bkey_err(k);
 		if (ret)
 			prt_str(&buf, bch2_err_str(ret));
@@ -2807,8 +2865,8 @@ out_no_locked:
 			bch2_bkey_val_to_text(&buf, trans->c, k);
 		else
 			prt_str(&buf, "(null)");
-		trace_btree_iter_peek_prev_min(trans->c, buf.buf);
-	}
+	}));
+
 	return k;
 end:
 	bch2_btree_iter_set_pos(iter, end);
@@ -2977,9 +3035,7 @@ out:
 	if (unlikely(ret))
 		k = bkey_s_c_err(ret);
 out2:
-	if (trace_btree_iter_peek_slot_enabled()) {
-		CLASS(printbuf, buf)();
-
+	event_trace(trans->c, btree_iter_peek_slot, buf, ({
 		int ret = bkey_err(k);
 		if (ret)
 			prt_str(&buf, bch2_err_str(ret));
@@ -2987,8 +3043,7 @@ out2:
 			bch2_bkey_val_to_text(&buf, trans->c, k);
 		else
 			prt_str(&buf, "(null)");
-		trace_btree_iter_peek_slot(trans->c, buf.buf);
-	}
+	}));
 
 	return k;
 }
@@ -3014,11 +3069,7 @@ struct bkey_s_c bch2_btree_iter_peek_and_restart_outlined(struct btree_iter *ite
 {
 	struct bkey_s_c k;
 
-	while (btree_trans_too_many_iters(iter->trans) ||
-	       (k = bch2_btree_iter_peek_type(iter, iter->flags),
-		bch2_err_matches(bkey_err(k), BCH_ERR_transaction_restart)))
-		bch2_trans_begin(iter->trans);
-
+	lockrestart_do(iter->trans, bkey_err(k = bch2_btree_iter_peek_type(iter, iter->flags)));
 	return k;
 }
 
@@ -3073,37 +3124,36 @@ void __bch2_btree_trans_sort_paths(struct btree_trans *trans)
 
 	btree_trans_verify_sorted_refs(trans);
 
-	if (trans->paths_sorted)
-		goto out;
+	if (!trans->paths_sorted) {
+		/*
+		 * Cocktail shaker sort: this is efficient because iterators will be
+		 * mostly sorted.
+		 */
+		do {
+			swapped = false;
 
-	/*
-	 * Cocktail shaker sort: this is efficient because iterators will be
-	 * mostly sorted.
-	 */
-	do {
-		swapped = false;
-
-		for (i = inc > 0 ? l : r - 2;
-		     i + 1 < r && i >= l;
-		     i += inc) {
-			if (btree_path_cmp(trans->paths + trans->sorted[i],
-					   trans->paths + trans->sorted[i + 1]) > 0) {
-				swap(trans->sorted[i], trans->sorted[i + 1]);
-				trans->paths[trans->sorted[i]].sorted_idx = i;
-				trans->paths[trans->sorted[i + 1]].sorted_idx = i + 1;
-				swapped = true;
+			for (i = inc > 0 ? l : r - 2;
+			     i + 1 < r && i >= l;
+			     i += inc) {
+				if (btree_path_cmp(trans->paths + trans->sorted[i],
+						   trans->paths + trans->sorted[i + 1]) > 0) {
+					swap(trans->sorted[i], trans->sorted[i + 1]);
+					trans->paths[trans->sorted[i]].sorted_idx = i;
+					trans->paths[trans->sorted[i + 1]].sorted_idx = i + 1;
+					swapped = true;
+				}
 			}
-		}
 
-		if (inc > 0)
-			--r;
-		else
-			l++;
-		inc = -inc;
-	} while (swapped);
+			if (inc > 0)
+				--r;
+			else
+				l++;
+			inc = -inc;
+		} while (swapped);
 
-	trans->paths_sorted = true;
-out:
+		trans->paths_sorted = true;
+	}
+
 	btree_trans_verify_sorted(trans);
 }
 
@@ -3191,7 +3241,7 @@ void __bch2_trans_node_iter_init(struct btree_trans *trans,
 	flags |= BTREE_ITER_snapshot_field;
 	flags |= BTREE_ITER_all_snapshots;
 
-	if (!depth && btree_id_cached(trans->c, btree_id))
+	if (!depth && btree_id_cached(btree_id))
 		flags |= BTREE_ITER_with_key_cache;
 
 	bch2_trans_iter_init_common(trans, iter, btree_id, pos, locks_want, depth,
@@ -3245,13 +3295,11 @@ void *__bch2_trans_kmalloc(struct btree_trans *trans, size_t size, unsigned long
 
 	if (WARN_ON_ONCE(new_bytes > BTREE_TRANS_MEM_MAX)) {
 #ifdef CONFIG_BCACHEFS_TRANS_KMALLOC_TRACE
-		CLASS(printbuf, buf)();
-		bch2_log_msg_start(c, &buf);
-		prt_printf(&buf, "bump allocator exceeded BTREE_TRANS_MEM_MAX (%u)\n",
+		CLASS(bch_log_msg, msg)(c);
+		prt_printf(&msg.m, "bump allocator exceeded BTREE_TRANS_MEM_MAX (%u)\n",
 			   BTREE_TRANS_MEM_MAX);
 
-		bch2_trans_kmalloc_trace_to_text(&buf, &trans->trans_kmalloc_trace);
-		bch2_print_str(c, KERN_ERR, buf.buf);
+		bch2_trans_kmalloc_trace_to_text(&msg.m, &trans->trans_kmalloc_trace);
 #endif
 	}
 
@@ -3282,7 +3330,8 @@ void *__bch2_trans_kmalloc(struct btree_trans *trans, size_t size, unsigned long
 
 	if (old_bytes) {
 		trans->realloc_bytes_required = new_bytes;
-		trace_and_count(c, trans_restart_mem_realloced, trans, _RET_IP_, new_bytes);
+		event_inc_trace(c, trans_restart_mem_realloced, buf,
+			prt_printf(&buf, "%s\nbytes %u\n", trans->fn, new_bytes));
 		return ERR_PTR(btree_trans_restart_ip(trans,
 					BCH_ERR_transaction_restart_mem_realloced, _RET_IP_));
 	}
@@ -3296,7 +3345,7 @@ void *__bch2_trans_kmalloc(struct btree_trans *trans, size_t size, unsigned long
 	new_mem = allocate_dropping_locks_norelock(trans, lock_dropped,
 					kmalloc(new_bytes, _gfp|__GFP_NOWARN));
 	if (!new_mem) {
-		new_mem = mempool_alloc(&c->btree_trans_mem_pool, GFP_KERNEL);
+		new_mem = mempool_alloc(&c->btree.trans.malloc_pool, GFP_KERNEL);
 		new_bytes = BTREE_TRANS_MEM_MAX;
 		trans->used_mempool = true;
 	}
@@ -3320,9 +3369,15 @@ void *__bch2_trans_kmalloc(struct btree_trans *trans, size_t size, unsigned long
 
 static inline void check_srcu_held_too_long(struct btree_trans *trans)
 {
-	WARN(trans->srcu_held && time_after(jiffies, trans->srcu_lock_time + HZ * 10),
-	     "btree trans held srcu lock (delaying memory reclaim) for %lu seconds",
-	     (jiffies - trans->srcu_lock_time) / HZ);
+	if (unlikely(trans->srcu_held && time_after(jiffies, trans->srcu_lock_time + HZ * 10))) {
+		CLASS(printbuf, buf)();
+
+		prt_printf(&buf, "btree trans held srcu lock (delaying memory reclaim) for %lu seconds\n",
+			   (jiffies - trans->srcu_lock_time) / HZ);
+		bch2_sb_recent_counters_to_text(&buf, &trans->c->counters);
+
+		WARN_RATELIMIT(true, "%s", buf.buf);
+	}
 }
 
 void bch2_trans_srcu_unlock(struct btree_trans *trans)
@@ -3337,7 +3392,7 @@ void bch2_trans_srcu_unlock(struct btree_trans *trans)
 				path->l[0].b = ERR_PTR(-BCH_ERR_no_btree_node_srcu_reset);
 
 		check_srcu_held_too_long(trans);
-		srcu_read_unlock(&c->btree_trans_barrier, trans->srcu_idx);
+		srcu_read_unlock(&c->btree.trans.barrier, trans->srcu_idx);
 		trans->srcu_held = false;
 	}
 }
@@ -3345,7 +3400,7 @@ void bch2_trans_srcu_unlock(struct btree_trans *trans)
 static void bch2_trans_srcu_lock(struct btree_trans *trans)
 {
 	if (!trans->srcu_held) {
-		trans->srcu_idx = srcu_read_lock(&trans->c->btree_trans_barrier);
+		trans->srcu_idx = srcu_read_lock(&trans->c->btree.trans.barrier);
 		trans->srcu_lock_time	= jiffies;
 		trans->srcu_held = true;
 	}
@@ -3384,7 +3439,7 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 		(void)lock_dropped;
 
 		if (!new_mem) {
-			new_mem = mempool_alloc(&trans->c->btree_trans_mem_pool, GFP_KERNEL);
+			new_mem = mempool_alloc(&trans->c->btree.trans.malloc_pool, GFP_KERNEL);
 			new_bytes = BTREE_TRANS_MEM_MAX;
 			trans->used_mempool = true;
 			kfree(trans->mem);
@@ -3478,30 +3533,27 @@ unsigned bch2_trans_get_fn_idx(const char *fn)
 	return 0;
 }
 
-struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
-	__acquires(&c->btree_trans_barrier)
+static inline struct btree_trans *bch2_trans_alloc(struct bch_fs *c)
 {
-	struct btree_trans *trans;
-
 	if (IS_ENABLED(__KERNEL__)) {
-		trans = this_cpu_xchg(c->btree_trans_bufs->trans, NULL);
+		struct btree_trans *trans = this_cpu_xchg(c->btree.trans.bufs->trans, NULL);
 		if (trans) {
 			memset(trans, 0, offsetof(struct btree_trans, list));
-			goto got_trans;
+			return trans;
 		}
 	}
 
-	trans = mempool_alloc(&c->btree_trans_pool, GFP_NOFS);
+	struct btree_trans *trans = mempool_alloc(&c->btree.trans.pool, GFP_NOFS);
 	memset(trans, 0, sizeof(*trans));
 
-	seqmutex_lock(&c->btree_trans_lock);
+	seqmutex_lock(&c->btree.trans.lock);
 	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
 		struct btree_trans *pos;
 		pid_t pid = current->pid;
 
 		trans->locking_wait.task = current;
 
-		list_for_each_entry(pos, &c->btree_trans_list, list) {
+		list_for_each_entry(pos, &c->btree.trans.list, list) {
 			struct task_struct *pos_task = READ_ONCE(pos->locking_wait.task);
 			/*
 			 * We'd much prefer to be stricter here and completely
@@ -3515,9 +3567,24 @@ struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
 		}
 	}
 
-	list_add(&trans->list, &c->btree_trans_list);
-	seqmutex_unlock(&c->btree_trans_lock);
-got_trans:
+	list_add(&trans->list, &c->btree.trans.list);
+	seqmutex_unlock(&c->btree.trans.lock);
+
+	return trans;
+}
+
+struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
+	__acquires(&c->btree.trans.barrier)
+{
+	/*
+	 * No multithreaded btree access until we've gone RW and are no longer
+	 * modifying the journal keys gap buffer
+	 */
+	EBUG_ON(!test_bit(BCH_FS_may_go_rw, &c->flags) &&
+		current != c->recovery_task);
+
+	struct btree_trans *trans = bch2_trans_alloc(c);
+
 	trans->c		= c;
 	trans->last_begin_time	= local_clock();
 	trans->fn_idx		= fn_idx;
@@ -3533,6 +3600,7 @@ got_trans:
 
 	*trans_paths_nr(trans->paths) = BTREE_ITER_INITIAL;
 
+	/* Reserve path 0 for our sentinal value */
 	trans->paths_allocated[0] = 1;
 
 	static struct lock_class_key lockdep_key;
@@ -3541,7 +3609,7 @@ got_trans:
 	if (fn_idx < BCH_TRANSACTIONS_NR) {
 		trans->fn = bch2_btree_transaction_fns[fn_idx];
 
-		struct btree_transaction_stats *s = &c->btree_transaction_stats[fn_idx];
+		struct btree_transaction_stats *s = &c->btree.trans.stats[fn_idx];
 
 		if (s->max_mem) {
 			unsigned expected_mem_bytes = roundup_pow_of_two(s->max_mem);
@@ -3554,7 +3622,7 @@ got_trans:
 		trans->nr_paths_max = s->nr_max_paths;
 	}
 
-	trans->srcu_idx		= srcu_read_lock(&c->btree_trans_barrier);
+	trans->srcu_idx		= srcu_read_lock(&c->btree.trans.barrier);
 	trans->srcu_lock_time	= jiffies;
 	trans->srcu_held	= true;
 	trans_set_locked(trans, false);
@@ -3583,18 +3651,16 @@ static void check_btree_paths_leaked(struct btree_trans *trans)
 		struct btree_path *path;
 		unsigned i;
 
-		CLASS(printbuf, buf)();
-		bch2_log_msg_start(c, &buf);
+		CLASS(bch_log_msg, msg)(c);
 
-		prt_printf(&buf, "btree paths leaked from %s!\n", trans->fn);
+		prt_printf(&msg.m, "btree paths leaked from %s!\n", trans->fn);
 		trans_for_each_path(trans, path, i)
 			if (path->ref)
-				prt_printf(&buf, "btree %s %pS\n",
+				prt_printf(&msg.m, "btree %s %pS\n",
 					   bch2_btree_id_str(path->btree_id),
 					   (void *) path->ip_allocated);
 
-		bch2_fs_emergency_read_only2(c, &buf);
-		bch2_print_str(c, KERN_ERR, buf.buf);
+		bch2_fs_emergency_read_only(c, &msg.m);
 	}
 }
 #else
@@ -3602,7 +3668,7 @@ static inline void check_btree_paths_leaked(struct btree_trans *trans) {}
 #endif
 
 void bch2_trans_put(struct btree_trans *trans)
-	__releases(&c->btree_trans_barrier)
+	__releases(&c->btree.trans.barrier)
 {
 	struct bch_fs *c = trans->c;
 
@@ -3619,7 +3685,7 @@ void bch2_trans_put(struct btree_trans *trans)
 
 	if (trans->srcu_held) {
 		check_srcu_held_too_long(trans);
-		srcu_read_unlock(&c->btree_trans_barrier, trans->srcu_idx);
+		srcu_read_unlock(&c->btree.trans.barrier, trans->srcu_idx);
 	}
 
 	if (unlikely(trans->journal_replay_not_finished))
@@ -3647,35 +3713,35 @@ void bch2_trans_put(struct btree_trans *trans)
 		kvfree_rcu_mightsleep(paths_allocated);
 
 	if (trans->used_mempool)
-		mempool_free(trans->mem, &c->btree_trans_mem_pool);
+		mempool_free(trans->mem, &c->btree.trans.malloc_pool);
 	else
 		kfree(trans->mem);
 
 	/* Userspace doesn't have a real percpu implementation: */
 	if (IS_ENABLED(__KERNEL__))
-		trans = this_cpu_xchg(c->btree_trans_bufs->trans, trans);
+		trans = this_cpu_xchg(c->btree.trans.bufs->trans, trans);
 
 	if (trans) {
-		seqmutex_lock(&c->btree_trans_lock);
+		seqmutex_lock(&c->btree.trans.lock);
 		list_del(&trans->list);
-		seqmutex_unlock(&c->btree_trans_lock);
+		seqmutex_unlock(&c->btree.trans.lock);
 
-		mempool_free(trans, &c->btree_trans_pool);
+		mempool_free(trans, &c->btree.trans.pool);
 	}
 }
 
 bool bch2_current_has_btree_trans(struct bch_fs *c)
 {
-	seqmutex_lock(&c->btree_trans_lock);
+	seqmutex_lock(&c->btree.trans.lock);
 	struct btree_trans *trans;
 	bool ret = false;
-	list_for_each_entry(trans, &c->btree_trans_list, list)
+	list_for_each_entry(trans, &c->btree.trans.list, list)
 		if (trans->locking_wait.task == current &&
 		    trans->locked) {
 			ret = true;
 			break;
 		}
-	seqmutex_unlock(&c->btree_trans_lock);
+	seqmutex_unlock(&c->btree.trans.lock);
 	return ret;
 }
 
@@ -3770,26 +3836,26 @@ void bch2_fs_btree_iter_exit(struct bch_fs *c)
 	struct btree_trans *trans;
 	int cpu;
 
-	if (c->btree_trans_bufs)
+	if (c->btree.trans.bufs)
 		for_each_possible_cpu(cpu) {
 			struct btree_trans *trans =
-				per_cpu_ptr(c->btree_trans_bufs, cpu)->trans;
+				per_cpu_ptr(c->btree.trans.bufs, cpu)->trans;
 
 			if (trans) {
-				seqmutex_lock(&c->btree_trans_lock);
+				seqmutex_lock(&c->btree.trans.lock);
 				list_del(&trans->list);
-				seqmutex_unlock(&c->btree_trans_lock);
+				seqmutex_unlock(&c->btree.trans.lock);
 			}
 			kfree(trans);
 		}
-	free_percpu(c->btree_trans_bufs);
+	free_percpu(c->btree.trans.bufs);
 
-	trans = list_first_entry_or_null(&c->btree_trans_list, struct btree_trans, list);
+	trans = list_first_entry_or_null(&c->btree.trans.list, struct btree_trans, list);
 	if (trans)
 		panic("%s leaked btree_trans\n", trans->fn);
 
-	for (s = c->btree_transaction_stats;
-	     s < c->btree_transaction_stats + ARRAY_SIZE(c->btree_transaction_stats);
+	for (s = c->btree.trans.stats;
+	     s < c->btree.trans.stats + ARRAY_SIZE(c->btree.trans.stats);
 	     s++) {
 #ifdef CONFIG_BCACHEFS_TRANS_KMALLOC_TRACE
 		darray_exit(&s->trans_kmalloc_trace);
@@ -3798,39 +3864,39 @@ void bch2_fs_btree_iter_exit(struct bch_fs *c)
 		bch2_time_stats_exit(&s->lock_hold_times);
 	}
 
-	if (c->btree_trans_barrier_initialized) {
-		synchronize_srcu_expedited(&c->btree_trans_barrier);
-		cleanup_srcu_struct(&c->btree_trans_barrier);
+	if (c->btree.trans.barrier_initialized) {
+		synchronize_srcu_expedited(&c->btree.trans.barrier);
+		cleanup_srcu_struct(&c->btree.trans.barrier);
 	}
-	mempool_exit(&c->btree_trans_mem_pool);
-	mempool_exit(&c->btree_trans_pool);
+	mempool_exit(&c->btree.trans.malloc_pool);
+	mempool_exit(&c->btree.trans.pool);
 }
 
 void bch2_fs_btree_iter_init_early(struct bch_fs *c)
 {
 	struct btree_transaction_stats *s;
 
-	for (s = c->btree_transaction_stats;
-	     s < c->btree_transaction_stats + ARRAY_SIZE(c->btree_transaction_stats);
+	for (s = c->btree.trans.stats;
+	     s < c->btree.trans.stats + ARRAY_SIZE(c->btree.trans.stats);
 	     s++) {
 		bch2_time_stats_init(&s->duration);
 		bch2_time_stats_init(&s->lock_hold_times);
 		mutex_init(&s->lock);
 	}
 
-	INIT_LIST_HEAD(&c->btree_trans_list);
-	seqmutex_init(&c->btree_trans_lock);
+	INIT_LIST_HEAD(&c->btree.trans.list);
+	seqmutex_init(&c->btree.trans.lock);
 }
 
 int bch2_fs_btree_iter_init(struct bch_fs *c)
 {
-	c->btree_trans_bufs = alloc_percpu(struct btree_trans_buf);
-	if (!c->btree_trans_bufs)
+	c->btree.trans.bufs = alloc_percpu(struct btree_trans_buf);
+	if (!c->btree.trans.bufs)
 		return -ENOMEM;
 
-	try(mempool_init_kmalloc_pool(&c->btree_trans_pool, 1, sizeof(struct btree_trans)));
-	try(mempool_init_kmalloc_pool(&c->btree_trans_mem_pool, 1, BTREE_TRANS_MEM_MAX));
-	try(init_srcu_struct(&c->btree_trans_barrier));
+	try(mempool_init_kmalloc_pool(&c->btree.trans.pool, 1, sizeof(struct btree_trans)));
+	try(mempool_init_kmalloc_pool(&c->btree.trans.malloc_pool, 1, BTREE_TRANS_MEM_MAX));
+	try(init_srcu_struct(&c->btree.trans.barrier));
 
 	/*
 	 * static annotation (hackily done) for lock ordering of reclaim vs.
@@ -3844,7 +3910,7 @@ int bch2_fs_btree_iter_init(struct bch_fs *c)
 	fs_reclaim_release(GFP_KERNEL);
 #endif
 
-	c->btree_trans_barrier_initialized = true;
+	c->btree.trans.barrier_initialized = true;
 	return 0;
 
 }

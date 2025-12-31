@@ -33,8 +33,9 @@ static int bch2_sb_counters_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_counters_to_text(struct printbuf *out, struct bch_sb *sb,
-			      struct bch_sb_field *f)
+static void bch2_sb_counters_to_text(struct printbuf *out,
+				     struct bch_fs *c, struct bch_sb *sb,
+				     struct bch_sb_field *f)
 {
 	struct bch_sb_field_counters *ctrs = field_to_type(f, counters);
 	unsigned int nr = bch2_sb_counter_nr_entries(ctrs);
@@ -54,14 +55,14 @@ int bch2_sb_counters_to_cpu(struct bch_fs *c)
 	unsigned int nr = bch2_sb_counter_nr_entries(ctrs);
 
 	for (unsigned i = 0; i < BCH_COUNTER_NR; i++)
-		c->counters_on_mount[i] = 0;
+		c->counters.mount[i] = 0;
 
 	for (unsigned i = 0; i < BCH_COUNTER_NR; i++) {
 		unsigned stable = counters_to_stable_map[i];
 		if (stable < nr) {
 			u64 v = le64_to_cpu(ctrs->d[stable]);
-			percpu_u64_set(&c->counters[i], v);
-			c->counters_on_mount[i] = v;
+			percpu_u64_set(&c->counters.now[i], v);
+			c->counters.mount[i] = v;
 		}
 	}
 
@@ -86,24 +87,70 @@ int bch2_sb_counters_from_cpu(struct bch_fs *c)
 	for (unsigned i = 0; i < BCH_COUNTER_NR; i++) {
 		unsigned stable = counters_to_stable_map[i];
 		if (stable < nr)
-			ctrs->d[stable] = cpu_to_le64(percpu_u64_get(&c->counters[i]));
+			ctrs->d[stable] = cpu_to_le64(percpu_u64_get(&c->counters.now[i]));
 	}
 
 	return 0;
 }
 
+static void bch2_sb_counters_work(struct work_struct *work)
+{
+	struct bch_fs_counters *c = container_of(work, struct bch_fs_counters, work.work);
+
+	memmove((void *) c->recent + sizeof(u64) * BCH_COUNTER_NR,
+		c->recent,
+		sizeof(u64) *
+		BCH_COUNTER_NR *
+		(NR_RECENT_COUNTERS - 1));
+
+	for (unsigned i = 0; i < BCH_COUNTER_NR; i++)
+		c->recent[0][i] = percpu_u64_get(&c->now[i]);
+
+	queue_delayed_work(system_unbound_wq, &c->work, HZ / 2);
+}
+
+void bch2_sb_recent_counters_to_text(struct printbuf *out, struct bch_fs_counters *c)
+{
+	unsigned long active[BITS_TO_LONGS(BCH_COUNTER_NR)];
+	memset(active, 0, sizeof(active));
+
+	for (unsigned i = 0; i < BCH_COUNTER_NR; i++)
+		if (c->recent[NR_RECENT_COUNTERS - 1][i] != percpu_u64_get(&c->now[i]))
+			__set_bit(i, active);
+
+	for (unsigned i = 0; i < BCH_COUNTER_NR; i++) {
+		if (!test_bit(i, active))
+			continue;
+
+		prt_printf(out, "%s:", bch2_counter_names[i]);
+
+		u64 prev = percpu_u64_get(&c->now[i]);
+
+		for (unsigned j = 0; j < NR_RECENT_COUNTERS; j++) {
+			prt_printf(out, "\t%llu", prev - c->recent[j][i]);
+			prev = c->recent[j][i];
+		}
+		prt_newline(out);
+	}
+}
+
 void bch2_fs_counters_exit(struct bch_fs *c)
 {
-	free_percpu(c->counters);
+	cancel_delayed_work_sync(&c->counters.work);
+	free_percpu(c->counters.now);
 }
 
 int bch2_fs_counters_init(struct bch_fs *c)
 {
-	c->counters = __alloc_percpu(sizeof(u64) * BCH_COUNTER_NR, sizeof(u64));
-	if (!c->counters)
+	c->counters.now = __alloc_percpu(sizeof(u64) * BCH_COUNTER_NR, sizeof(u64));
+	if (!c->counters.now)
 		return -BCH_ERR_ENOMEM_fs_counters_init;
 
-	return bch2_sb_counters_to_cpu(c);
+	try(bch2_sb_counters_to_cpu(c));
+
+	INIT_DELAYED_WORK(&c->counters.work, bch2_sb_counters_work);
+	queue_delayed_work(system_unbound_wq, &c->counters.work, HZ / 2);
+	return 0;
 }
 
 const struct bch_sb_field_ops bch_sb_field_ops_counters = {
@@ -130,8 +177,8 @@ long bch2_ioctl_query_counters(struct bch_fs *c,
 
 		if (stable < arg.nr) {
 			u64 v = !(arg.flags & BCH_IOCTL_QUERY_COUNTERS_MOUNT)
-				? percpu_u64_get(&c->counters[i])
-				: c->counters_on_mount[i];
+				? percpu_u64_get(&c->counters.now[i])
+				: c->counters.mount[i];
 
 			try(put_user(v, &user_arg->d[stable]));
 		}

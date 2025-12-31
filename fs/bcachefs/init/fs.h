@@ -35,23 +35,21 @@ extern struct mutex bch2_fs_list_lock;
 struct bch_fs *__bch2_uuid_to_fs(__uuid_t uuid);
 struct bch_fs *bch2_uuid_to_fs(__uuid_t);
 
-bool bch2_fs_emergency_read_only(struct bch_fs *);
-bool bch2_fs_emergency_read_only2(struct bch_fs *, struct printbuf *);
+bool bch2_fs_emergency_read_only(struct bch_fs *, struct printbuf *);
+bool bch2_fs_emergency_read_only_locked(struct bch_fs *, struct printbuf *out);
 
-bool bch2_fs_emergency_read_only_locked(struct bch_fs *);
 void bch2_fs_read_only(struct bch_fs *);
 
 int bch2_fs_read_write(struct bch_fs *);
 int bch2_fs_read_write_early(struct bch_fs *);
+int bch2_fs_init_rw(struct bch_fs *);
 
 int bch2_fs_resize_on_mount(struct bch_fs *);
 
-void __bch2_fs_stop(struct bch_fs *);
-void bch2_fs_free(struct bch_fs *);
-void bch2_fs_stop(struct bch_fs *);
-
-int bch2_fs_init_rw(struct bch_fs *);
 int bch2_fs_start(struct bch_fs *);
+int bch2_fs_stop(struct bch_fs *);
+
+int bch2_fs_exit(struct bch_fs *);
 struct bch_fs *bch2_fs_open(darray_const_str *, struct bch_opts *);
 
 #endif /* _BCACHEFS_SUPER_H */

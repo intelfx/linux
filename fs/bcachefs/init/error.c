@@ -35,7 +35,7 @@ bool __bch2_inconsistent_error(struct bch_fs *c, struct printbuf *out)
 		return false;
 	case BCH_ON_ERROR_fix_safe:
 	case BCH_ON_ERROR_ro:
-		bch2_fs_emergency_read_only2(c, out);
+		bch2_fs_emergency_read_only(c, out);
 		return true;
 	case BCH_ON_ERROR_panic:
 		bch2_print_str(c, KERN_ERR, out->buf);
@@ -112,23 +112,30 @@ int __bch2_topology_error(struct bch_fs *c, struct printbuf *out)
 
 int bch2_fs_topology_error(struct bch_fs *c, const char *fmt, ...)
 {
-	CLASS(printbuf, buf)();
-	bch2_log_msg_start(c, &buf);
+	CLASS(bch_log_msg, msg)(c);
 
 	va_list args;
 	va_start(args, fmt);
-	prt_vprintf(&buf, fmt, args);
+	prt_vprintf(&msg.m, fmt, args);
 	va_end(args);
 
-	int ret = __bch2_topology_error(c, &buf);
-	bch2_print_str(c, KERN_ERR, buf.buf);
-	return ret;
+	return __bch2_topology_error(c, &msg.m);
 }
 
-void bch2_fatal_error(struct bch_fs *c)
+void bch2_fatal_error(struct bch_fs *c, const char *func, const char *fmt, ...)
 {
-	if (bch2_fs_emergency_read_only(c))
-		bch_err(c, "fatal error - emergency read only");
+	CLASS(bch_log_msg, msg)(c);
+	msg.m.suppress = true; /* only print if this message caused us to go RO */
+
+	prt_printf(&msg.m, "%s(): fatal error ", func);
+
+	va_list args;
+	va_start(args, fmt);
+	prt_vprintf(&msg.m, fmt, args);
+	va_end(args);
+
+	bch2_fs_emergency_read_only(c, &msg.m);
+	prt_printf(&msg.m, "fatal error - emergency read only");
 }
 
 void bch2_io_error_work(struct work_struct *work)
@@ -147,6 +154,7 @@ void bch2_io_error_work(struct work_struct *work)
 		if (ca->mi.state >= BCH_MEMBER_STATE_ro)
 			return;
 
+		bool print = true;
 		CLASS(printbuf, buf)();
 		__bch2_log_msg_start(ca->name, &buf);
 
@@ -158,9 +166,10 @@ void bch2_io_error_work(struct work_struct *work)
 
 		prt_printf(&buf, "setting %s ro", dev ? "device" : "filesystem");
 		if (!dev)
-			bch2_fs_emergency_read_only2(c, &buf);
+			print = bch2_fs_emergency_read_only(c, &buf);
 
-		bch2_print_str(c, KERN_ERR, buf.buf);
+		if (print)
+			bch2_print_str(c, KERN_ERR, buf.buf);
 	}
 }
 
@@ -272,27 +281,27 @@ static struct fsck_err_state *fsck_err_get(struct bch_fs *c,
 {
 	struct fsck_err_state *s;
 
-	list_for_each_entry(s, &c->fsck_error_msgs, list)
+	list_for_each_entry(s, &c->errors.msgs, list)
 		if (s->id == id) {
 			/*
 			 * move it to the head of the list: repeated fsck errors
 			 * are common
 			 */
-			list_move(&s->list, &c->fsck_error_msgs);
+			list_move(&s->list, &c->errors.msgs);
 			return s;
 		}
 
 	s = kzalloc(sizeof(*s), GFP_NOFS);
 	if (!s) {
-		if (!c->fsck_alloc_msgs_err)
+		if (!c->errors.msgs_alloc_err)
 			bch_err(c, "kmalloc err, cannot ratelimit fsck errs");
-		c->fsck_alloc_msgs_err = true;
+		c->errors.msgs_alloc_err = true;
 		return NULL;
 	}
 
 	INIT_LIST_HEAD(&s->list);
 	s->id = id;
-	list_add(&s->list, &c->fsck_error_msgs);
+	list_add(&s->list, &c->errors.msgs);
 	return s;
 }
 
@@ -383,7 +392,7 @@ bool __bch2_count_fsck_err(struct bch_fs *c,
 
 	bool print = true, repeat = false, suppress = false;
 
-	scoped_guard(mutex, &c->fsck_error_msgs_lock)
+	scoped_guard(mutex, &c->errors.msgs_lock)
 		count_fsck_err_locked(c, id, msg->buf, &repeat, &print, &suppress);
 
 	if (suppress)
@@ -504,7 +513,7 @@ int __bch2_fsck_err(struct bch_fs *c,
 		}
 	}
 
-	mutex_lock(&c->fsck_error_msgs_lock);
+	mutex_lock(&c->errors.msgs_lock);
 	bool repeat = false, print = true, suppress = false;
 	bool inconsistent = false, exiting = false;
 	struct fsck_err_state *s =
@@ -530,7 +539,7 @@ int __bch2_fsck_err(struct bch_fs *c,
 	} else if (!test_bit(BCH_FS_in_fsck, &c->flags)) {
 		if (c->opts.errors != BCH_ON_ERROR_continue ||
 		    !(flags & (FSCK_CAN_FIX|FSCK_CAN_IGNORE))) {
-			prt_str_indented(out, ", shutting down\n"
+			prt_str(out, ", shutting down\n"
 					 "error not marked as autofix and not in fsck\n"
 					 "run fsck, and forward to devs so error can be marked for self-healing");
 			inconsistent = true;
@@ -624,7 +633,7 @@ print:
 	if (s)
 		s->ret = ret;
 err_unlock:
-	mutex_unlock(&c->fsck_error_msgs_lock);
+	mutex_unlock(&c->errors.msgs_lock);
 err:
 	if (trans &&
 	    !(flags & FSCK_ERR_NO_LOG) &&
@@ -706,9 +715,9 @@ static void __bch2_flush_fsck_errs(struct bch_fs *c, bool print)
 {
 	struct fsck_err_state *s, *n;
 
-	guard(mutex)(&c->fsck_error_msgs_lock);
+	guard(mutex)(&c->errors.msgs_lock);
 
-	list_for_each_entry_safe(s, n, &c->fsck_error_msgs, list) {
+	list_for_each_entry_safe(s, n, &c->errors.msgs, list) {
 		if (print && s->ratelimited && s->last_msg)
 			bch_err(c, "Saw %llu errors like:\n  %s", s->nr, s->last_msg);
 
@@ -744,7 +753,7 @@ int bch2_inum_offset_err_msg_trans_norestart(struct btree_trans *trans, struct p
 		prt_printf(out, "inum %llu", pos.inode);
 	else if (ret)
 		prt_printf(out, "inum %u:%llu", subvol, pos.inode);
-	prt_printf(out, " offset %llu: ", pos.offset << 9);
+	prt_printf(out, " offset %llu", pos.offset << 9);
 	return 0;
 }
 
@@ -752,4 +761,23 @@ void bch2_inum_offset_err_msg_trans(struct btree_trans *trans, struct printbuf *
 				    u32 subvol, struct bpos pos)
 {
 	lockrestart_do(trans, bch2_inum_offset_err_msg_trans_norestart(trans, out, subvol, pos));
+}
+
+void bch2_fs_errors_exit(struct bch_fs *c)
+{
+	darray_exit(&c->errors.counts);
+}
+
+void bch2_fs_errors_init_early(struct bch_fs *c)
+{
+	INIT_LIST_HEAD(&c->errors.msgs);
+	mutex_init(&c->errors.msgs_lock);
+
+	mutex_init(&c->errors.counts_lock);
+	darray_init(&c->errors.counts);
+}
+
+int bch2_fs_errors_init(struct bch_fs *c)
+{
+	return bch2_sb_errors_to_cpu(c);
 }

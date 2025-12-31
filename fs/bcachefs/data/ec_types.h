@@ -4,12 +4,6 @@
 
 #include "bcachefs_format.h"
 
-union bch_replicas_padded {
-	u8				bytes[struct_size_t(struct bch_replicas_entry_v1,
-							    devs, BCH_BKEY_PTRS_MAX)];
-	struct bch_replicas_entry_v1	e;
-};
-
 struct stripe {
 	size_t			heap_idx;
 	u16			sectors;
@@ -30,6 +24,28 @@ struct gc_stripe {
 	struct bch_extent_ptr	ptrs[BCH_BKEY_PTRS_MAX];
 
 	union bch_replicas_padded r;
+};
+
+struct bch_fs_ec {
+	struct hlist_head	stripes_new[32];
+	struct hlist_head	stripes_new_buckets[64];
+	spinlock_t		stripes_new_lock;
+
+	struct list_head	stripe_head_list;
+	struct mutex		stripe_head_lock;
+
+	struct list_head	stripe_new_list;
+	struct mutex		stripe_new_lock;
+	wait_queue_head_t	stripe_new_wait;
+
+	struct work_struct	stripe_create_work;
+	u64			stripe_hint;
+
+	struct work_struct	stripe_delete_work;
+
+	struct bio_set		block_bioset;
+
+	GENRADIX(struct gc_stripe) gc_stripes;
 };
 
 #endif /* _BCACHEFS_EC_TYPES_H */

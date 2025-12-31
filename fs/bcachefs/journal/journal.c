@@ -19,6 +19,8 @@
 #include "journal/seq_blacklist.h"
 #include "journal/write.h"
 
+#include "sb/counters.h"
+
 #include "util/enumerated_ref.h"
 
 static bool __journal_entry_is_open(union journal_res_state state)
@@ -108,73 +110,52 @@ static inline bool
 journal_error_check_stuck(struct journal *j, int error, unsigned flags)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-	bool stuck = false;
-	CLASS(printbuf, buf)();
-
-	guard(printbuf_atomic)(&buf);
 
 	if (!(error == -BCH_ERR_journal_full ||
 	      error == -BCH_ERR_journal_pin_full) ||
 	    nr_unwritten_journal_entries(j) ||
 	    (flags & BCH_WATERMARK_MASK) != BCH_WATERMARK_reclaim)
-		return stuck;
+		return false;
 
-	scoped_guard(spinlock, &j->lock) {
-		if (j->can_discard)
-			return stuck;
+	if (j->can_discard)
+		return false;
 
-		stuck = true;
+	CLASS(bch_log_msg, msg)(c);
+	msg.m.suppress = true; /* only print once, when we go ERO */
 
-		/*
-		 * The journal shutdown path will set ->err_seq, but do it here first to
-		 * serialize against concurrent failures and avoid duplicate error
-		 * reports.
-		 */
-		if (j->err_seq)
-			return stuck;
+	prt_printf(&msg.m, "Journal stuck! Hava a pre-reservation but journal full (error %s)",
+		   bch2_err_str(error));
+	bch2_journal_debug_to_text(&msg.m, j);
 
-		j->err_seq = journal_cur_seq(j);
+	prt_printf(&msg.m, "Journal pins:\n");
+	bch2_journal_pins_to_text(&msg.m, j);
 
-		__bch2_journal_debug_to_text(&buf, j);
+	bch2_fs_emergency_read_only(c, &msg.m);
+	return true;
+}
+
+void bch2_journal_do_writes_locked(struct journal *j)
+{
+	lockdep_assert_held(&j->lock);
+
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	u64 seq = journal_last_unallocated_seq(j);
+	struct journal_buf *w = j->buf + (seq & JOURNAL_BUF_MASK);
+
+	if (seq &&
+	    !w->write_started &&
+	    !journal_state_seq_count(j, j->reservations, seq)) {
+		j->seq_write_started = seq;
+		w->write_started = true;
+		closure_get(&c->cl);
+		closure_call(&w->io, bch2_journal_write, j->wq, NULL);
 	}
-	prt_printf(&buf, bch2_fmt(c, "Journal stuck! Hava a pre-reservation but journal full (error %s)"),
-				  bch2_err_str(error));
-	bch2_print_str(c, KERN_ERR, buf.buf);
-
-	printbuf_reset(&buf);
-	bch2_journal_pins_to_text(&buf, j);
-	bch_err(c, "Journal pins:\n%s", buf.buf);
-
-	bch2_fatal_error(c);
-	dump_stack();
-
-	return stuck;
 }
 
 void bch2_journal_do_writes(struct journal *j)
 {
-	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-
-	for (u64 seq = journal_last_unwritten_seq(j);
-	     seq <= journal_cur_seq(j);
-	     seq++) {
-		unsigned idx = seq & JOURNAL_BUF_MASK;
-		struct journal_buf *w = j->buf + idx;
-
-		if (w->write_started && !w->write_allocated)
-			break;
-		if (w->write_started)
-			continue;
-
-		if (!journal_state_seq_count(j, j->reservations, seq)) {
-			j->seq_write_started = seq;
-			w->write_started = true;
-			closure_get(&c->cl);
-			closure_call(&w->io, bch2_journal_write, j->wq, NULL);
-		}
-
-		break;
-	}
+	guard(spinlock)(&j->lock);
+	bch2_journal_do_writes_locked(j);
 }
 
 /*
@@ -187,8 +168,8 @@ void bch2_journal_buf_put_final(struct journal *j, u64 seq)
 	lockdep_assert_held(&j->lock);
 
 	if (__bch2_journal_pin_put(j, seq))
-		bch2_journal_reclaim_fast(j);
-	bch2_journal_do_writes(j);
+		bch2_journal_update_last_seq(j);
+	bch2_journal_do_writes_locked(j);
 
 	/*
 	 * for __bch2_next_write_buffer_flush_journal_buf(), when quiescing an
@@ -235,21 +216,20 @@ static void __journal_entry_close(struct journal *j, unsigned closed_val, bool t
 	/* Close out old buffer: */
 	buf->data->u64s		= cpu_to_le32(old.cur_entry_offset);
 
-	struct journal_entry_pin_list *pin_list =
-		journal_seq_pin(j, journal_cur_seq(j));
-	pin_list->bytes = roundup_pow_of_two(vstruct_bytes(buf->data));
-	j->dirty_entry_bytes += pin_list->bytes;
+	size_t bytes = roundup_pow_of_two(vstruct_bytes(buf->data));
 
-	if (trace_journal_entry_close_enabled() && trace) {
-		CLASS(printbuf, err)();
-		guard(printbuf_atomic)(&err);
+	journal_seq_pin(j, journal_cur_seq(j))->bytes = bytes;
+	j->dirty_entry_bytes += bytes;
 
-		prt_str(&err, "entry size: ");
-		prt_human_readable_u64(&err, vstruct_bytes(buf->data));
-		prt_newline(&err);
-		bch2_prt_task_backtrace(&err, current, 1, GFP_NOWAIT);
-		trace_journal_entry_close(c, err.buf);
-	}
+	if (trace)
+		event_trace(c, journal_entry_close, msg, ({
+			guard(printbuf_atomic)(&msg);
+
+			prt_str(&msg, "entry size: ");
+			prt_human_readable_u64(&msg, vstruct_bytes(buf->data));
+			prt_newline(&msg);
+			bch2_prt_task_backtrace(&msg, current, 1, GFP_NOWAIT);
+		}));
 
 	sectors = vstruct_blocks_plus(buf->data, c->block_bits,
 				      buf->u64s_reserved) << c->block_bits;
@@ -280,7 +260,7 @@ static void __journal_entry_close(struct journal *j, unsigned closed_val, bool t
 	 * contain either what the old pin protected or what the new pin
 	 * protects.
 	 *
-	 * After the old pin is dropped journal_last_seq() won't include the old
+	 * After the old pin is dropped j->last_seq won't include the old
 	 * pin, so we can only write the updated last_seq on the entry that
 	 * contains whatever the new pin protects.
 	 *
@@ -291,7 +271,7 @@ static void __journal_entry_close(struct journal *j, unsigned closed_val, bool t
 	 * Hence, we want update/set last_seq on the current journal entry right
 	 * before we open a new one:
 	 */
-	buf->last_seq		= journal_last_seq(j);
+	buf->last_seq		= j->last_seq;
 	buf->data->last_seq	= cpu_to_le64(buf->last_seq);
 	BUG_ON(buf->last_seq > le64_to_cpu(buf->data->seq));
 
@@ -318,7 +298,7 @@ void bch2_journal_halt(struct journal *j)
 	bch2_journal_halt_locked(j);
 }
 
-static bool journal_entry_want_write(struct journal *j)
+static bool journal_entry_close_locked(struct journal *j)
 {
 	bool ret = !journal_entry_is_open(j) ||
 		journal_cur_seq(j) == journal_last_unwritten_seq(j);
@@ -341,7 +321,7 @@ static bool journal_entry_want_write(struct journal *j)
 bool bch2_journal_entry_close(struct journal *j)
 {
 	guard(spinlock)(&j->lock);
-	return journal_entry_want_write(j);
+	return journal_entry_close_locked(j);
 }
 
 /*
@@ -358,7 +338,6 @@ static int journal_entry_open(struct journal *j)
 
 	lockdep_assert_held(&j->lock);
 	BUG_ON(journal_entry_is_open(j));
-	BUG_ON(c->sb.clean);
 
 	if (j->blocked)
 		return bch_err_throw(c, journal_blocked);
@@ -378,9 +357,10 @@ static int journal_entry_open(struct journal *j)
 		return bch_err_throw(c, journal_max_open);
 
 	if (unlikely(journal_cur_seq(j) >= JOURNAL_SEQ_MAX)) {
-		bch_err(c, "cannot start: journal seq overflow");
-		if (bch2_fs_emergency_read_only_locked(c))
-			bch_err(c, "fatal error - emergency read only");
+		CLASS(bch_log_msg, msg)(c);
+		msg.m.suppress = true;
+		prt_printf(&msg.m, "cannot start: journal seq overflow");
+		bch2_fs_emergency_read_only_locked(c, &msg.m);
 		return bch_err_throw(c, journal_shutdown);
 	}
 
@@ -416,16 +396,17 @@ static int journal_entry_open(struct journal *j)
 
 	/*
 	 * The fifo_push() needs to happen at the same time as j->seq is
-	 * incremented for journal_last_seq() to be calculated correctly
+	 * incremented for j->last_seq to be calculated correctly
 	 */
 	atomic64_inc(&j->seq);
 	journal_pin_list_init(fifo_push_ref(&j->pin), 1);
 
 	if (unlikely(bch2_journal_seq_is_blacklisted(c, journal_cur_seq(j), false))) {
-		bch_err(c, "attempting to open blacklisted journal seq %llu",
-			journal_cur_seq(j));
-		if (bch2_fs_emergency_read_only_locked(c))
-			bch_err(c, "fatal error - emergency read only");
+		CLASS(bch_log_msg, msg)(c);
+		msg.m.suppress = true;
+		prt_printf(&msg.m, "attempting to open blacklisted journal seq %llu",
+			   journal_cur_seq(j));
+		bch2_fs_emergency_read_only_locked(c, &msg.m);
 		return bch_err_throw(c, journal_shutdown);
 	}
 
@@ -435,13 +416,16 @@ static int journal_entry_open(struct journal *j)
 
 	bkey_extent_init(&buf->key);
 	buf->noflush		= false;
-	buf->must_flush		= false;
+	/* if filesystem is clean, the first journal write must be a flush */
+	buf->must_flush		= c->sb.clean;
 	buf->separate_flush	= false;
 	buf->flush_time		= 0;
+	buf->failed.nr		= 0;
 	buf->need_flush_to_write_buffer = true;
 	buf->write_started	= false;
 	buf->write_allocated	= false;
 	buf->write_done		= false;
+	buf->empty		= false;
 
 	memset(buf->data, 0, sizeof(*buf->data));
 	buf->data->seq	= cpu_to_le64(journal_cur_seq(j));
@@ -488,10 +472,11 @@ static int journal_entry_open(struct journal *j)
 
 static bool journal_quiesced(struct journal *j)
 {
+	guard(spinlock)(&j->lock);
 	bool ret = atomic64_read(&j->seq) == j->seq_ondisk;
 
 	if (!ret)
-		bch2_journal_entry_close(j);
+		journal_entry_close_locked(j);
 	return ret;
 }
 
@@ -610,37 +595,19 @@ out:
 	if (journal_error_check_stuck(j, ret, flags))
 		ret = bch_err_throw(c, journal_stuck);
 
-	if (ret == -BCH_ERR_journal_max_in_flight &&
-	    track_event_change(&c->times[BCH_TIME_blocked_journal_max_in_flight], true) &&
-	    trace_journal_entry_full_enabled()) {
-		CLASS(printbuf, buf)();
+	if ((ret == -BCH_ERR_journal_max_in_flight &&
+	     track_event_change(&c->times[BCH_TIME_blocked_journal_max_in_flight], true)) ||
+	    (ret == -BCH_ERR_journal_max_open &&
+	     track_event_change(&c->times[BCH_TIME_blocked_journal_max_open], true)))
+		event_inc_trace(c, journal_entry_full, buf, ({
+			prt_printf(&buf, "%s\n", bch2_err_str(ret));
+			bch2_printbuf_make_room(&buf, 4096);
 
-		bch2_printbuf_make_room(&buf, 4096);
-
-		scoped_guard(spinlock, &j->lock) {
-			prt_printf(&buf, "seq %llu\n", journal_cur_seq(j));
-			bch2_journal_bufs_to_text(&buf, j);
-		}
-
-		trace_journal_entry_full(c, buf.buf);
-		count_event(c, journal_entry_full);
-	}
-
-	if (ret == -BCH_ERR_journal_max_open &&
-	    track_event_change(&c->times[BCH_TIME_blocked_journal_max_open], true) &&
-	    trace_journal_entry_full_enabled()) {
-		CLASS(printbuf, buf)();
-
-		bch2_printbuf_make_room(&buf, 4096);
-
-		scoped_guard(spinlock, &j->lock) {
-			prt_printf(&buf, "seq %llu\n", journal_cur_seq(j));
-			bch2_journal_bufs_to_text(&buf, j);
-		}
-
-		trace_journal_entry_full(c, buf.buf);
-		count_event(c, journal_entry_full);
-	}
+			scoped_guard(spinlock, &j->lock) {
+				prt_printf(&buf, "seq %llu\n", journal_cur_seq(j));
+				bch2_journal_bufs_to_text(&buf, j);
+			}
+		}));
 
 	/*
 	 * Journal is full - can't rely on reclaim from work item due to
@@ -669,7 +636,7 @@ static unsigned max_dev_latency(struct bch_fs *c)
 	u64 nsecs = 0;
 
 	guard(rcu)();
-	for_each_member_device_rcu(c, ca, &c->rw_devs[BCH_DATA_journal])
+	for_each_member_device_rcu(c, ca, &c->allocator.rw_devs[BCH_DATA_journal])
 		nsecs = max(nsecs, ca->io_latency[WRITE].stats.max_duration);
 
 	return nsecs_to_jiffies(nsecs);
@@ -817,11 +784,14 @@ recheck_need_open:
 
 		seq = res.seq;
 		buf = journal_seq_to_buf(j, seq);
-		buf->must_flush = true;
 
-		if (!buf->flush_time) {
-			buf->flush_time	= local_clock() ?: 1;
-			buf->expires = jiffies;
+		scoped_guard(spinlock, &j->lock) {
+			buf->must_flush = true;
+
+			if (!buf->flush_time) {
+				buf->flush_time	= local_clock() ?: 1;
+				buf->expires = jiffies;
+			}
 		}
 
 		if (parent && !closure_wait(&buf->wait, parent))
@@ -850,7 +820,7 @@ recheck_need_open:
 		BUG();
 want_write:
 	if (seq == journal_cur_seq(j))
-		journal_entry_want_write(j);
+		journal_entry_close_locked(j);
 out:
 	spin_unlock(&j->lock);
 	return ret;
@@ -933,11 +903,14 @@ int __bch2_journal_meta(struct journal *j)
 	try(bch2_journal_res_get(j, &res, jset_u64s(0), 0, NULL));
 
 	struct journal_buf *buf = j->buf + (res.seq & JOURNAL_BUF_MASK);
-	buf->must_flush = true;
 
-	if (!buf->flush_time) {
-		buf->flush_time	= local_clock() ?: 1;
-		buf->expires = jiffies;
+	scoped_guard(spinlock, &j->lock) {
+		buf->must_flush = true;
+
+		if (!buf->flush_time) {
+			buf->flush_time	= local_clock() ?: 1;
+			buf->expires = jiffies;
+		}
 	}
 
 	bch2_journal_res_put(j, &res);
@@ -1091,9 +1064,10 @@ void __bch2_journal_debug_to_text(struct printbuf *out, struct journal *j)
 	prt_printf(out, "dirty journal entries:\t%llu/%llu\n",	fifo_used(&j->pin), j->pin.size);
 	prt_printf(out, "seq:\t%llu\n",				journal_cur_seq(j));
 	prt_printf(out, "seq_ondisk:\t%llu\n",			j->seq_ondisk);
-	prt_printf(out, "last_seq:\t%llu\n",			journal_last_seq(j));
+	prt_printf(out, "last_seq:\t%llu\n",			j->last_seq);
 	prt_printf(out, "last_seq_ondisk:\t%llu\n",		j->last_seq_ondisk);
 	prt_printf(out, "flushed_seq_ondisk:\t%llu\n",		j->flushed_seq_ondisk);
+	prt_printf(out, "last_empty_seq:\t%llu\n",		j->last_empty_seq);
 	prt_printf(out, "watermark:\t%s\n",			bch2_watermarks[j->watermark]);
 	prt_printf(out, "each entry reserved:\t%u\n",		j->entry_u64s_reserved);
 	prt_printf(out, "nr flush writes:\t%llu\n",		j->nr_flush_writes);
@@ -1146,7 +1120,7 @@ void __bch2_journal_debug_to_text(struct printbuf *out, struct journal *j)
 		       j->space[journal_space_total].total);
 	}
 
-	for_each_member_device_rcu(c, ca, &c->rw_devs[BCH_DATA_journal]) {
+	for_each_member_device_rcu(c, ca, &c->allocator.rw_devs[BCH_DATA_journal]) {
 		struct journal_device *ja = &ca->journal;
 		if (!ja->nr)
 			continue;

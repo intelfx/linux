@@ -42,15 +42,8 @@
 
 #include <trace/events/writeback.h>
 
-struct nocow_flush {
-	struct closure	*cl;
-	struct bch_dev	*ca;
-	struct bio	bio;
-};
-
 static void nocow_flush_endio(struct bio *_bio)
 {
-
 	struct nocow_flush *bio = container_of(_bio, struct nocow_flush, bio);
 
 	closure_put(bio->cl);
@@ -63,19 +56,16 @@ void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
 					 struct bch_inode_info *inode,
 					 struct closure *cl)
 {
-	struct nocow_flush *bio;
-	struct bch_dev *ca;
-	struct bch_devs_mask devs;
-	unsigned dev;
-
-	dev = find_first_bit(inode->ei_devs_need_flush.d, BCH_SB_MEMBERS_MAX);
+	unsigned dev = find_first_bit(inode->ei_devs_need_flush.d, BCH_SB_MEMBERS_MAX);
 	if (dev == BCH_SB_MEMBERS_MAX)
 		return;
 
-	devs = inode->ei_devs_need_flush;
+	struct bch_devs_mask devs = inode->ei_devs_need_flush;
 	memset(&inode->ei_devs_need_flush, 0, sizeof(inode->ei_devs_need_flush));
 
 	for_each_set_bit(dev, devs.d, BCH_SB_MEMBERS_MAX) {
+		struct bch_dev *ca;
+
 		scoped_guard(rcu) {
 			ca = rcu_dereference(c->devs[dev]);
 			if (ca && !enumerated_ref_tryget(&ca->io_ref[WRITE],
@@ -86,11 +76,11 @@ void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
 		if (!ca)
 			continue;
 
-		bio = container_of(bio_alloc_bioset(ca->disk_sb.bdev, 0,
-						    REQ_OP_WRITE|REQ_PREFLUSH,
-						    GFP_KERNEL,
-						    &c->nocow_flush_bioset),
-				   struct nocow_flush, bio);
+		struct nocow_flush *bio = container_of(bio_alloc_bioset(ca->disk_sb.bdev, 0,
+									REQ_OP_WRITE|REQ_PREFLUSH,
+									GFP_KERNEL,
+									&c->vfs.nocow_flush_bioset),
+						       struct nocow_flush, bio);
 		bio->cl			= cl;
 		bio->ca			= ca;
 		bio->bio.bi_end_io	= nocow_flush_endio;
@@ -101,12 +91,8 @@ void bch2_inode_flush_nocow_writes_async(struct bch_fs *c,
 static int bch2_inode_flush_nocow_writes(struct bch_fs *c,
 					 struct bch_inode_info *inode)
 {
-	struct closure cl;
-
-	closure_init_stack(&cl);
+	CLASS(closure_stack, cl)();
 	bch2_inode_flush_nocow_writes_async(c, inode, &cl);
-	closure_sync(&cl);
-
 	return 0;
 }
 
@@ -153,15 +139,12 @@ void __bch2_i_sectors_acct(struct bch_fs *c, struct bch_inode_info *inode,
 			   struct quota_res *quota_res, s64 sectors)
 {
 	if (unlikely((s64) inode->v.i_blocks + sectors < 0)) {
-		CLASS(printbuf, buf)();
-		bch2_log_msg_start(c, &buf);
-		prt_printf(&buf, "inode %lu i_blocks underflow: %llu + %lli < 0 (ondisk %lli)",
+		CLASS(bch_log_msg, msg)(c);
+		prt_printf(&msg.m, "inode %lu i_blocks underflow: %llu + %lli < 0 (ondisk %lli)",
 			   inode->v.i_ino, (u64) inode->v.i_blocks, sectors,
 			   inode->ei_inode.bi_sectors);
 
-		bool print = bch2_count_fsck_err(c, vfs_inode_i_blocks_underflow, &buf);
-		if (print)
-			bch2_print_str(c, KERN_ERR, buf.buf);
+		msg.m.suppress = !bch2_count_fsck_err(c, vfs_inode_i_blocks_underflow, &msg.m);
 
 		if (sectors < 0)
 			sectors = -inode->v.i_blocks;
@@ -240,9 +223,8 @@ int bch2_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
 	struct bch_inode_info *inode = file_bch_inode(file);
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
+	u64 start_time = ktime_get_ns();
 	int ret, err;
-
-	trace_bch2_fsync(file, datasync);
 
 	ret = file_write_and_wait_range(file, start, end);
 	if (ret)
@@ -259,6 +241,14 @@ out:
 	err = file_check_and_advance_wb_err(file);
 	if (!ret)
 		ret = err;
+
+	event_inc_trace(c, fsync, buf, ({
+		prt_printf(&buf, "journal_flush_disabled: %u\n", c->opts.journal_flush_disabled);
+		prt_printf(&buf, "datasync: %u\n", datasync);
+		prt_printf(&buf, "duration: ");
+		bch2_pr_time_units(&buf, ktime_get_ns() - start_time);
+		prt_newline(&buf);
+	}));
 
 	return ret;
 }
@@ -289,7 +279,7 @@ static inline int range_has_data(struct bch_fs *c, u32 subvol,
 	CLASS(btree_trans, trans)(c);
 	return for_each_btree_key_in_subvolume_max(trans, iter, BTREE_ID_extents, start, end,
 						    subvol, 0, k, ({
-		bkey_extent_is_data(k.k) && !bkey_extent_is_unwritten(k);
+		bkey_extent_is_data(k.k) && !bkey_extent_is_unwritten(c, k);
 	}));
 }
 
@@ -539,16 +529,13 @@ int bchfs_truncate(struct mnt_idmap *idmap,
 
 	if (unlikely(!inode->v.i_size && inode->v.i_blocks &&
 		     !bch2_journal_error(&c->journal))) {
-		CLASS(printbuf, buf)();
-		bch2_log_msg_start(c, &buf);
-		prt_printf(&buf,
+		CLASS(bch_log_msg, msg)(c);
+		prt_printf(&msg.m,
 			   "inode %lu truncated to 0 but i_blocks %llu (ondisk %lli)",
 			   inode->v.i_ino, (u64) inode->v.i_blocks,
 			   inode->ei_inode.bi_sectors);
 
-		bool print = bch2_count_fsck_err(c, vfs_inode_i_blocks_not_zero_at_truncate, &buf);
-		if (print)
-			bch2_print_str(c, KERN_ERR, buf.buf);
+		msg.m.suppress = !bch2_count_fsck_err(c, vfs_inode_i_blocks_not_zero_at_truncate, &msg.m);
 	}
 
 	ret = bch2_setattr_nonsize(idmap, inode, iattr);
@@ -683,8 +670,8 @@ static noinline int __bchfs_fallocate(struct bch_inode_info *inode, int mode,
 		is_allocation	= bkey_extent_is_allocation(k.k);
 
 		/* already reserved */
-		if (bkey_extent_is_reservation(k) &&
-		    bch2_bkey_nr_ptrs_fully_allocated(k) >= opts.data_replicas) {
+		if (bkey_extent_is_reservation(c, k) &&
+		    bch2_bkey_nr_ptrs_fully_allocated(c, k) >= opts.data_replicas) {
 			bch2_btree_iter_advance(&iter);
 			continue;
 		}
@@ -1084,20 +1071,6 @@ loff_t bch2_llseek(struct file *file, loff_t offset, int whence)
 	}
 
 	return bch2_err_class(ret);
-}
-
-void bch2_fs_fsio_exit(struct bch_fs *c)
-{
-	bioset_exit(&c->nocow_flush_bioset);
-}
-
-int bch2_fs_fsio_init(struct bch_fs *c)
-{
-	if (bioset_init(&c->nocow_flush_bioset,
-			1, offsetof(struct nocow_flush, bio), 0))
-		return -BCH_ERR_ENOMEM_nocow_flush_bioset_init;
-
-	return 0;
 }
 
 #endif /* NO_BCACHEFS_FS */

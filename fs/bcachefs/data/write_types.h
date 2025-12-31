@@ -49,7 +49,7 @@ struct bch_write_bio {
 	u64			inode_offset;
 	u64			nocow_bucket;
 
-	struct bch_devs_list	failed;
+	struct bch_io_failures	failed;
 	u8			dev;
 
 	unsigned		split:1,
@@ -110,8 +110,6 @@ struct bch_write_op {
 
 	u64			new_i_size;
 	s64			i_sectors_delta;
-
-	struct bch_devs_mask	failed;
 
 	struct keylist		insert_keys;
 	u64			inline_keys[BKEY_EXTENT_U64s_MAX * 2];

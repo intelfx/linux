@@ -47,27 +47,7 @@ struct bch_hash_info {
 	SIPHASH_KEY	siphash_key;
 };
 
-static inline struct bch_hash_info
-bch2_hash_info_init(struct bch_fs *c, const struct bch_inode_unpacked *bi)
-{
-	struct bch_hash_info info = {
-		.inum_snapshot	= bi->bi_snapshot,
-		.type		= INODE_STR_HASH(bi),
-		.is_31bit	= bi->bi_flags & BCH_INODE_31bit_dirent_offset,
-		.cf_encoding	= bch2_inode_casefold(c, bi) ? c->cf_encoding : NULL,
-		.siphash_key	= { .k0 = bi->bi_hash_seed }
-	};
-
-	if (unlikely(info.type == BCH_STR_HASH_siphash_old)) {
-		u8 digest[SHA256_DIGEST_SIZE];
-
-		sha256((const u8 *)&bi->bi_hash_seed,
-		       sizeof(bi->bi_hash_seed), digest);
-		memcpy(&info.siphash_key, digest, sizeof(info.siphash_key));
-	}
-
-	return info;
-}
+int bch2_hash_info_init(struct bch_fs *, const struct bch_inode_unpacked *, struct bch_hash_info *);
 
 struct bch_str_hash_ctx {
 	union {
@@ -386,39 +366,51 @@ int bch2_hash_delete(struct btree_trans *trans,
 	return bch2_hash_delete_at(trans, desc, info, &iter, 0);
 }
 
-int bch2_repair_inode_hash_info(struct btree_trans *, struct bch_inode_unpacked *);
+int bch2_repair_inode_hash_info(struct btree_trans *,
+				struct bch_inode_unpacked *,
+				struct bch_inode_unpacked *);
 
 struct snapshots_seen;
-int bch2_str_hash_repair_key(struct btree_trans *,
-			     struct snapshots_seen *,
-			     const struct bch_hash_desc *,
-			     struct bch_hash_info *,
-			     struct btree_iter *, struct bkey_s_c,
-			     struct btree_iter *, struct bkey_s_c,
-			     bool *);
-
 int __bch2_str_hash_check_key(struct btree_trans *,
 			      struct snapshots_seen *,
 			      const struct bch_hash_desc *,
 			      struct bch_hash_info *,
-			      struct btree_iter *, struct bkey_s_c,
-			      bool *);
+			      struct bkey_s_c,
+			      bool *, bool *);
+
+static inline bool str_hash_key_needs_check(const struct bch_hash_desc *desc,
+					    struct bch_hash_info *info,
+					    struct bkey_s_c k)
+{
+	if (k.k->type != desc->key_type)
+		return false;
+
+	if (unlikely(desc->hash_bkey(info, k) != k.k->p.offset))
+		return true;
+
+	switch (k.k->type) {
+	case KEY_TYPE_dirent:
+		if (bkey_s_c_to_dirent(k).v->d_casefold != !!info->cf_encoding)
+			return true;
+		break;
+	}
+
+	return false;
+}
+
 
 static inline int bch2_str_hash_check_key(struct btree_trans *trans,
 			    struct snapshots_seen *s,
 			    const struct bch_hash_desc *desc,
 			    struct bch_hash_info *hash_info,
-			    struct btree_iter *k_iter, struct bkey_s_c hash_k,
-			    bool *updated_before_k_pos)
+			    struct bkey_s_c hash_k,
+			    bool *updated_before_k_pos,
+			    bool *repaired_inode)
 {
-	if (hash_k.k->type != desc->key_type)
-		return 0;
-
-	if (likely(desc->hash_bkey(hash_info, hash_k) == hash_k.k->p.offset))
-		return 0;
-
-	return __bch2_str_hash_check_key(trans, s, desc, hash_info, k_iter, hash_k,
-					 updated_before_k_pos);
+	return str_hash_key_needs_check(desc, hash_info, hash_k)
+		? __bch2_str_hash_check_key(trans, s, desc, hash_info, hash_k,
+					    updated_before_k_pos, repaired_inode)
+		: 0;
 }
 
 #endif /* _BCACHEFS_STR_HASH_H */

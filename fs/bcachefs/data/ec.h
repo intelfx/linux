@@ -191,14 +191,21 @@ enum ec_stripe_ref {
 	STRIPE_REF_NR
 };
 
+struct ec_stripe_new_bucket {
+	struct hlist_node	hash;
+	u64			dev_bucket;
+};
+
+struct ec_stripe_handle {
+	struct hlist_node	hash;
+	u64			idx;
+};
+
 struct ec_stripe_new {
 	struct bch_fs		*c;
 	struct ec_stripe_head	*h;
 	struct mutex		lock;
 	struct list_head	list;
-
-	struct hlist_node	hash;
-	u64			idx;
 
 	struct closure		iodone;
 
@@ -210,15 +217,20 @@ struct ec_stripe_new {
 	u8			nr_parity;
 	bool			allocated;
 	bool			pending;
-	bool			have_existing_stripe;
+	bool			have_old_stripe;
 
 	unsigned long		blocks_gotten[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
 	unsigned long		blocks_allocated[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
 	open_bucket_idx_t	blocks[BCH_BKEY_PTRS_MAX];
 	struct disk_reservation	res;
 
+	struct ec_stripe_new_bucket buckets[BCH_BKEY_PTRS_MAX];
+
 	struct ec_stripe_buf	new_stripe;
-	struct ec_stripe_buf	existing_stripe;
+	struct ec_stripe_buf	old_stripe;
+
+	struct ec_stripe_handle	new_stripe_handle;
+	struct ec_stripe_handle	old_stripe_handle;
 };
 
 struct ec_stripe_head {
@@ -247,6 +259,8 @@ struct ec_stripe_head {
 };
 
 int bch2_ec_read_extent(struct btree_trans *, struct bch_read_bio *, struct bkey_s_c);
+
+bool bch2_bucket_has_new_stripe(struct bch_fs *, u64);
 
 void *bch2_writepoint_ec_buf(struct bch_fs *, struct write_point *);
 

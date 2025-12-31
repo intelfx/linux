@@ -145,7 +145,7 @@ static long bch2_ioctl_disk_remove(struct bch_fs *c, struct bch_ioctl_disk arg)
 	CLASS(printbuf, err)();
 	int ret = bch2_dev_remove(c, ca, arg.flags, &err);
 	if (ret)
-		bch_err(ca, "%s", err.buf);
+		bch_err_dev(ca, "%s", err.buf);
 	return ret;
 }
 
@@ -221,7 +221,7 @@ static long bch2_ioctl_disk_offline(struct bch_fs *c, struct bch_ioctl_disk arg)
 	CLASS(printbuf, err)();
 	int ret = bch2_dev_offline(c, ca, arg.flags, &err);
 	if (ret)
-		bch_err(ca, "%s", err.buf);
+		bch_err_dev(ca, "%s", err.buf);
 	return ret;
 }
 
@@ -265,7 +265,7 @@ static long bch2_ioctl_disk_set_state(struct bch_fs *c,
 
 	CLASS(printbuf, err)();
 	int ret = bch2_dev_set_state(c, ca, arg.new_state, arg.flags, &err);
-	bch_err_msg(ca, ret, "setting device state");
+	bch_err_msg_dev(ca, ret, "setting device state");
 	return ret;
 }
 
@@ -425,9 +425,9 @@ static noinline_for_stack long bch2_ioctl_fs_usage(struct bch_fs *c,
 		return ret;
 
 	struct bch_fs_usage_short u = bch2_fs_usage_read_short(c);
-	arg.capacity		= c->capacity;
+	arg.capacity		= c->capacity.capacity;
 	arg.used		= u.used;
-	arg.online_reserved	= percpu_u64_get(c->online_reserved);
+	arg.online_reserved	= percpu_u64_get(&c->capacity.pcpu->online_reserved);
 	arg.replica_entries_bytes = replicas.nr;
 
 	for (unsigned i = 0; i < BCH_REPLICAS_MAX; i++) {
@@ -458,9 +458,9 @@ static long bch2_ioctl_query_accounting(struct bch_fs *c,
 	if (ret)
 		return ret;
 
-	arg.capacity		= c->capacity;
+	arg.capacity		= c->capacity.capacity;
 	arg.used		= bch2_fs_usage_read_short(c).used;
-	arg.online_reserved	= percpu_u64_get(c->online_reserved);
+	arg.online_reserved	= percpu_u64_get(&c->capacity.pcpu->online_reserved);
 	arg.accounting_u64s	= accounting.nr / sizeof(u64);
 
 	return copy_to_user_errcode(user_arg, &arg, sizeof(arg));
@@ -605,7 +605,7 @@ static long bch2_ioctl_disk_resize(struct bch_fs *c,
 	CLASS(printbuf, err)();
 	int ret = bch2_dev_resize(c, ca, arg.nbuckets, &err);
 	if (ret)
-		bch_err(ca, "%s", err.buf);
+		bch_err_dev(ca, "%s", err.buf);
 	return ret;
 }
 
@@ -784,13 +784,13 @@ int bch2_fs_chardev_init(struct bch_fs *c)
 {
 	c->minor = idr_alloc(&bch_chardev_minor, c, 0, 0, GFP_KERNEL);
 	if (c->minor < 0)
-		return c->minor;
+		return bch_err_throw(c, chardev_init_error);
 
 	c->chardev = device_create(&bch_chardev_class, NULL,
 				   MKDEV(bch_chardev_major, c->minor), c,
 				   "bcachefs%u-ctl", c->minor);
 	if (IS_ERR(c->chardev))
-		return PTR_ERR(c->chardev);
+		return bch_err_throw(c, chardev_init_error);
 
 	return 0;
 }

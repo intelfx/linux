@@ -9,7 +9,9 @@
 #include "journal/seq_blacklist.h"
 
 #include "alloc/foreground.h"
+#include "alloc/replicas.h"
 #include "btree/update.h"
+#include "init/error.h"
 
 /* allocate journal on a device: */
 
@@ -47,7 +49,7 @@ static int bch2_set_nr_journal_buckets_iter(struct bch_dev *ca, unsigned nr,
 		if (ret == -BCH_ERR_bucket_alloc_blocked)
 			ret = bch_err_throw(c, freelist_empty);
 		if (ret == -BCH_ERR_freelist_empty) /* don't if we're actually out of buckets */
-			closure_wake_up(&c->freelist_wait);
+			closure_wake_up(&c->allocator.freelist_wait);
 
 		if (ret)
 			break;
@@ -153,8 +155,7 @@ static int bch2_set_nr_journal_buckets_loop(struct bch_fs *c, struct bch_dev *ca
 	struct journal_device *ja = &ca->journal;
 	int ret = 0;
 
-	struct closure cl;
-	closure_init_stack(&cl);
+	CLASS(closure_stack, cl)();
 
 	/* don't handle reducing nr of buckets yet: */
 	if (nr < ja->nr)
@@ -212,7 +213,7 @@ int bch2_dev_journal_bucket_delete(struct bch_dev *ca, u64 b)
 			break;
 
 	if (pos == ja->nr) {
-		bch_err(ca, "journal bucket %llu not found when deleting", b);
+		bch_err_dev(ca, "journal bucket %llu not found when deleting", b);
 		return -EINVAL;
 	}
 
@@ -293,7 +294,7 @@ int bch2_dev_journal_alloc(struct bch_dev *ca, bool new_fs)
 
 	ret = bch2_set_nr_journal_buckets_loop(c, ca, nr, new_fs);
 err:
-	bch_err_fn(ca, ret);
+	bch_err_fn_dev(ca, ret);
 	return ret;
 }
 
@@ -318,6 +319,8 @@ int bch2_fs_journal_alloc(struct bch_fs *c)
 
 static bool bch2_journal_writing_to_device(struct journal *j, unsigned dev_idx)
 {
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+
 	guard(spinlock)(&j->lock);
 
 	for (u64 seq = journal_last_unwritten_seq(j);
@@ -325,7 +328,7 @@ static bool bch2_journal_writing_to_device(struct journal *j, unsigned dev_idx)
 	     seq++) {
 		struct journal_buf *buf = journal_seq_to_buf(j, seq);
 
-		if (bch2_bkey_has_device_c(bkey_i_to_s_c(&buf->key), dev_idx))
+		if (bch2_bkey_has_device_c(c, bkey_i_to_s_c(&buf->key), dev_idx))
 			return true;
 	}
 
@@ -366,29 +369,30 @@ void bch2_fs_journal_stop(struct journal *j)
 		clear_bit(JOURNAL_running, &j->flags);
 }
 
-int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
+int bch2_fs_journal_start(struct journal *j, struct journal_start_info info)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	struct journal_entry_pin_list *p;
 	struct journal_replay *i, **_i;
 	struct genradix_iter iter;
 	bool had_entries = false;
+	int ret = 0;
 
 	/*
 	 *
 	 * XXX pick most recent non blacklisted sequence number
 	 */
 
-	cur_seq = max(cur_seq, bch2_journal_last_blacklisted_seq(c));
+	info.start_seq = max(info.start_seq, bch2_journal_last_blacklisted_seq(c));
 
-	if (cur_seq >= JOURNAL_SEQ_MAX) {
+	if (info.start_seq >= JOURNAL_SEQ_MAX) {
 		bch_err(c, "cannot start: journal seq overflow");
 		return -EINVAL;
 	}
 
 	/* Clean filesystem? */
-	if (!last_seq)
-		last_seq = cur_seq;
+	u64 cur_seq	= info.start_seq;
+	u64 last_seq	= info.seq_read_start ?: info.start_seq;
 
 	u64 nr = cur_seq - last_seq;
 	if (nr * sizeof(struct journal_entry_pin_list) > 1U << 30) {
@@ -418,6 +422,7 @@ int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
 	j->seq_write_started	= cur_seq - 1;
 	j->seq_ondisk		= cur_seq - 1;
 	j->pin.front		= last_seq;
+	j->last_seq		= last_seq;
 	j->pin.back		= cur_seq;
 	atomic64_set(&j->seq, cur_seq - 1);
 
@@ -440,11 +445,26 @@ int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
 		if (journal_entry_empty(&i->j))
 			j->last_empty_seq = le64_to_cpu(i->j.seq);
 
-		p = journal_seq_pin(j, seq);
+		if (!info.clean) {
+			struct bch_devs_list seq_devs = {};
+			darray_for_each(i->ptrs, ptr)
+				seq_devs.data[seq_devs.nr++] = ptr->dev;
 
-		p->devs.nr = 0;
-		darray_for_each(i->ptrs, ptr)
-			bch2_dev_list_add_dev(&p->devs, ptr->dev);
+			p = journal_seq_pin(j, seq);
+			bch2_devlist_to_replicas(&p->devs.e, BCH_DATA_journal, seq_devs);
+
+			CLASS(printbuf, buf)();
+			bch2_replicas_entry_to_text(&buf, &p->devs.e);
+
+			fsck_err_on(!test_bit(JOURNAL_degraded, &j->flags) &&
+				    !bch2_replicas_marked(c, &p->devs.e),
+				    c, journal_entry_replicas_not_marked,
+				    "superblock not marked as containing replicas for journal entry %llu\n%s",
+				    le64_to_cpu(i->j.seq), buf.buf);
+
+			if (bch2_replicas_entry_get(c, &p->devs.e))
+				p->devs.e.nr_devs = 0;
+		}
 
 		had_entries = true;
 	}
@@ -455,10 +475,11 @@ int bch2_fs_journal_start(struct journal *j, u64 last_seq, u64 cur_seq)
 	scoped_guard(spinlock, &j->lock) {
 		j->last_flush_write = jiffies;
 		j->reservations.idx = journal_cur_seq(j);
-		c->last_bucket_seq_cleanup = journal_cur_seq(j);
 	}
 
-	return 0;
+	try(bch2_replicas_gc_reffed(c));
+fsck_err:
+	return ret;
 }
 
 void bch2_journal_set_replay_done(struct journal *j)

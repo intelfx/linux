@@ -10,6 +10,8 @@
 #include "btree/cache.h"
 #include "btree/bset.h"
 
+#include "sb/counters.h"
+
 #include "util/eytzinger.h"
 #include "util/util.h"
 
@@ -52,13 +54,24 @@ struct bset_tree *bch2_bkey_to_bset(struct btree *b, struct bkey_packed *k)
  * by the time we actually do the insert will all be deleted.
  */
 
-void bch2_dump_bset(struct bch_fs *c, struct btree *b,
-		    struct bset *i, unsigned set)
+void bch2_btree_node_keys_to_text(struct printbuf *out, struct bch_fs *c, struct btree *b)
+{
+	struct bkey_s_c k;
+	struct bkey unpacked;
+	struct btree_node_iter iter;
+	for_each_btree_node_key_unpack(b, k, &iter, &unpacked) {
+		bch2_bkey_val_to_text(out, c, k);
+		prt_newline(out);
+	}
+}
+
+void bch2_bset_to_text(struct printbuf *out,
+		       struct bch_fs *c, struct btree *b,
+		       struct bset *i, unsigned set)
 {
 	struct bkey_packed *_k, *_n;
 	struct bkey uk, n;
 	struct bkey_s_c k;
-	CLASS(printbuf, buf)();
 
 	if (!i->u64s)
 		return;
@@ -76,13 +89,12 @@ void bch2_dump_bset(struct bch_fs *c, struct btree *b,
 
 		k = bkey_disassemble(b, _k, &uk);
 
-		printbuf_reset(&buf);
+		prt_printf(out, "block %u key %5zu: ", set, _k->_data - i->_data);
 		if (c)
-			bch2_bkey_val_to_text(&buf, c, k);
+			bch2_bkey_val_to_text(out, c, k);
 		else
-			bch2_bkey_to_text(&buf, k.k);
-		printk(KERN_ERR "block %u key %5zu: %s\n", set,
-		       _k->_data - i->_data, buf.buf);
+			bch2_bkey_to_text(out, k.k);
+		prt_newline(out);
 
 		if (_n == vstruct_last(i))
 			continue;
@@ -99,33 +111,31 @@ void bch2_dump_bset(struct bch_fs *c, struct btree *b,
 	}
 }
 
-void bch2_dump_btree_node(struct bch_fs *c, struct btree *b)
+static void bch2_btree_node_bsets_to_text(struct printbuf *out, struct bch_fs *c, struct btree *b)
 {
-	console_lock();
 	for_each_bset(b, t)
-		bch2_dump_bset(c, b, bset(b, t), t - b->set);
-	console_unlock();
+		bch2_bset_to_text(out, c, b, bset(b, t), t - b->set);
 }
 
 void bch2_dump_btree_node_iter(struct btree *b,
 			      struct btree_node_iter *iter)
 {
-	struct btree_node_iter_set *set;
 	CLASS(printbuf, buf)();
 
-	printk(KERN_ERR "btree node iter with %u/%u sets:\n",
-	       __btree_node_iter_used(iter), b->nsets);
+	prt_printf(&buf, "btree node iter with %u/%u sets:\n",
+		   __btree_node_iter_used(iter), b->nsets);
 
 	btree_node_iter_for_each(iter, set) {
 		struct bkey_packed *k = __btree_node_offset_to_key(b, set->k);
 		struct bset_tree *t = bch2_bkey_to_bset(b, k);
 		struct bkey uk = bkey_unpack_key(b, k);
 
-		printbuf_reset(&buf);
+		prt_printf(&buf, "set %zu key %u: ", t - b->set, set->k);
 		bch2_bkey_to_text(&buf, &uk);
-		printk(KERN_ERR "set %zu key %u: %s\n",
-		       t - b->set, set->k, buf.buf);
+		prt_newline(&buf);
 	}
+
+	printk(KERN_ERR "%s", buf.buf);
 }
 
 struct btree_nr_keys bch2_btree_node_count_keys(struct btree *b)
@@ -161,33 +171,44 @@ static void __bch2_btree_node_iter_next_check(struct btree_node_iter *_iter,
 
 	if (n &&
 	    bkey_iter_cmp(b, k, n) > 0) {
-		struct btree_node_iter_set *set;
 		struct bkey ku = bkey_unpack_key(b, k);
 		struct bkey nu = bkey_unpack_key(b, n);
-		struct printbuf buf1 = PRINTBUF;
-		struct printbuf buf2 = PRINTBUF;
 
-		bch2_dump_btree_node(NULL, b);
-		bch2_bkey_to_text(&buf1, &ku);
-		bch2_bkey_to_text(&buf2, &nu);
-		printk(KERN_ERR "out of order/overlapping:\n%s\n%s\n",
-		       buf1.buf, buf2.buf);
-		printk(KERN_ERR "iter was:");
+		CLASS(printbuf, buf)();
+
+		bch2_btree_node_bsets_to_text(&buf, NULL, b);
+		prt_str(&buf, "out of order/overlapping:\n");
+
+		bch2_bkey_to_text(&buf, &ku);
+		prt_newline(&buf);
+		bch2_bkey_to_text(&buf, &nu);
+		prt_newline(&buf);
+
+		prt_str(&buf, "iter was:");
 
 		btree_node_iter_for_each(_iter, set) {
 			struct bkey_packed *k2 = __btree_node_offset_to_key(b, set->k);
 			struct bset_tree *t = bch2_bkey_to_bset(b, k2);
-			printk(" [%zi %zi]", t - b->set,
-			       k2->_data - bset(b, t)->_data);
+			prt_printf(&buf, " [%zi %zi]", t - b->set,
+				   k2->_data - bset(b, t)->_data);
 		}
-		panic("\n");
+
+		bch2_print_string_as_lines(KERN_ERR, buf.buf);
+		panic("%s\n", __func__);
 	}
+}
+
+static struct bset_tree *bset_tree_find(struct btree *b, unsigned end_offset)
+{
+	for_each_bset(b, t)
+		if (t->end_offset == end_offset)
+			return t;
+	return NULL;
 }
 
 void __bch2_btree_node_iter_verify(struct btree_node_iter *iter,
 				   struct btree *b)
 {
-	struct btree_node_iter_set *set, *s2;
 	struct bkey_packed *k, *p;
 
 	if (bch2_btree_node_iter_end(iter))
@@ -202,15 +223,11 @@ void __bch2_btree_node_iter_verify(struct btree_node_iter *iter,
 
 	/* Verify that set->end is correct: */
 	btree_node_iter_for_each(iter, set) {
-		for_each_bset(b, t)
-			if (set->end == t->end_offset) {
-				BUG_ON(set->k < btree_bkey_first_offset(t) ||
-				       set->k >= t->end_offset);
-				goto found;
-			}
-		BUG();
-found:
-		do {} while (0);
+		struct bset_tree *t = bset_tree_find(b, set->end);
+
+		BUG_ON(!t ||
+		       set->k < btree_bkey_first_offset(t) ||
+		       set->k >= t->end_offset);
 	}
 
 	/* Verify iterator is sorted: */
@@ -237,25 +254,31 @@ static void __bch2_verify_insert_pos(struct btree *b, struct bkey_packed *where,
 	struct bset_tree *t = bch2_bkey_to_bset(b, where);
 	struct bkey_packed *prev = bch2_bkey_prev_all(b, t, where);
 	struct bkey_packed *next = (void *) ((u64 *) where->_data + clobber_u64s);
-	struct printbuf buf1 = PRINTBUF;
-	struct printbuf buf2 = PRINTBUF;
 #if 0
 	BUG_ON(prev &&
 	       bkey_iter_cmp(b, prev, insert) > 0);
 #else
 	if (prev &&
 	    bkey_iter_cmp(b, prev, insert) > 0) {
+		CLASS(printbuf, buf)();
+
+		bch2_btree_node_bsets_to_text(&buf, NULL, b);
+
+		prt_str(&buf, "prev > insert:\n");
+
+		prt_str(&buf, "prev    key ");
 		struct bkey k1 = bkey_unpack_key(b, prev);
+		bch2_bkey_to_text(&buf, &k1);
+		prt_newline(&buf);
+
+		prt_str(&buf, "insert  key ");
 		struct bkey k2 = bkey_unpack_key(b, insert);
+		bch2_bkey_to_text(&buf, &k2);
+		prt_newline(&buf);
 
-		bch2_dump_btree_node(NULL, b);
-		bch2_bkey_to_text(&buf1, &k1);
-		bch2_bkey_to_text(&buf2, &k2);
 
-		panic("prev > insert:\n"
-		      "prev    key %s\n"
-		      "insert  key %s\n",
-		      buf1.buf, buf2.buf);
+		bch2_print_string_as_lines(KERN_ERR, buf.buf);
+		panic("%s\n", __func__);
 	}
 #endif
 #if 0
@@ -264,17 +287,25 @@ static void __bch2_verify_insert_pos(struct btree *b, struct bkey_packed *where,
 #else
 	if (next != btree_bkey_last(b, t) &&
 	    bkey_iter_cmp(b, insert, next) > 0) {
-		struct bkey k1 = bkey_unpack_key(b, insert);
-		struct bkey k2 = bkey_unpack_key(b, next);
+		CLASS(printbuf, buf)();
 
-		bch2_dump_btree_node(NULL, b);
-		bch2_bkey_to_text(&buf1, &k1);
-		bch2_bkey_to_text(&buf2, &k2);
+		bch2_btree_node_bsets_to_text(&buf, NULL, b);
 
-		panic("insert > next:\n"
-		      "insert  key %s\n"
-		      "next    key %s\n",
-		      buf1.buf, buf2.buf);
+		prt_str(&buf, "insert > next:\n");
+
+		prt_str(&buf, "prev    key ");
+		struct bkey k1 = bkey_unpack_key(b, prev);
+		bch2_bkey_to_text(&buf, &k1);
+		prt_newline(&buf);
+
+		prt_str(&buf, "insert  key ");
+		struct bkey k2 = bkey_unpack_key(b, insert);
+		bch2_bkey_to_text(&buf, &k2);
+		prt_newline(&buf);
+
+
+		bch2_print_string_as_lines(KERN_ERR, buf.buf);
+		panic("%s\n", __func__);
 	}
 #endif
 }
@@ -945,23 +976,20 @@ static void rw_aux_tree_insert_entry(struct btree *b,
 	}
 }
 
-static void bch2_bset_fix_lookup_table(struct btree *b,
-				       struct bset_tree *t,
-				       struct bkey_packed *_where,
-				       unsigned clobber_u64s,
-				       unsigned new_u64s)
+static void __bch2_bset_fix_lookup_table(struct btree *b,
+					 struct bset_tree *t,
+					 struct bkey_packed *_where,
+					 unsigned clobber_u64s,
+					 unsigned new_u64s)
 {
 	int shift = new_u64s - clobber_u64s;
 	unsigned idx, j, where = __btree_node_key_to_offset(b, _where);
 
 	EBUG_ON(bset_has_ro_aux_tree(t));
 
-	if (!bset_has_rw_aux_tree(t))
-		return;
-
 	if (where > rw_aux_tree(b, t)[t->size - 1].offset) {
 		rw_aux_tree_insert_entry(b, t, t->size);
-		goto verify;
+		return;
 	}
 
 	/* returns first entry >= where */
@@ -975,7 +1003,7 @@ static void bch2_bset_fix_lookup_table(struct btree *b,
 		} else {
 			EBUG_ON(where != t->end_offset);
 			rw_aux_tree_insert_entry(b, t, --t->size);
-			goto verify;
+			return;
 		}
 	}
 
@@ -998,10 +1026,19 @@ static void bch2_bset_fix_lookup_table(struct btree *b,
 		rw_aux_tree(b, t)[idx - 1].offset);
 
 	rw_aux_tree_insert_entry(b, t, idx);
+}
 
-verify:
-	bch2_bset_verify_rw_aux_tree(b, t);
-	bset_aux_tree_verify(b);
+static void bch2_bset_fix_lookup_table(struct btree *b,
+				       struct bset_tree *t,
+				       struct bkey_packed *_where,
+				       unsigned clobber_u64s,
+				       unsigned new_u64s)
+{
+	if (bset_has_rw_aux_tree(t)) {
+		__bch2_bset_fix_lookup_table(b, t, _where, clobber_u64s, new_u64s);
+		bch2_bset_verify_rw_aux_tree(b, t);
+		bset_aux_tree_verify(b);
+	}
 }
 
 void bch2_bset_insert(struct btree *b,
@@ -1124,36 +1161,32 @@ static struct bkey_packed *bset_search_tree(const struct btree *b,
 {
 	struct ro_aux_tree *base = ro_aux_tree_base(b, t);
 	struct bkey_float *f;
-	struct bkey_packed *k;
-	unsigned inorder, n = 1, l, r;
-	int cmp;
+	unsigned n = 1;
 
 	do {
 		if (likely(n << 4 < t->size))
 			prefetch(&base->f[n << 4]);
 
 		f = &base->f[n];
-		if (unlikely(f->exponent >= BFLOAT_FAILED))
-			goto slowpath;
+		if (likely(f->exponent < BFLOAT_FAILED)) {
+			unsigned l = f->mantissa;
+			unsigned r = bkey_mantissa(packed_search, f);
 
-		l = f->mantissa;
-		r = bkey_mantissa(packed_search, f);
+			if (likely(l != r) || !bkey_mantissa_bits_dropped(b, f)) {
+				n = n * 2 + (l < r);
+				continue;
+			}
+		}
 
-		if (unlikely(l == r) && bkey_mantissa_bits_dropped(b, f))
-			goto slowpath;
-
-		n = n * 2 + (l < r);
-		continue;
-slowpath:
-		k = tree_to_bkey(b, t, n);
-		cmp = bkey_cmp_p_or_unp(b, k, packed_search, search);
+		struct bkey_packed *k = tree_to_bkey(b, t, n);
+		int cmp = bkey_cmp_p_or_unp(b, k, packed_search, search);
 		if (!cmp)
 			return k;
 
 		n = n * 2 + (cmp < 0);
 	} while (n < t->size);
 
-	inorder = __eytzinger1_to_inorder(n >> 1, t->size - 1, t->extra);
+	unsigned inorder = __eytzinger1_to_inorder(n >> 1, t->size - 1, t->extra);
 
 	/*
 	 * n would have been the node we recursed to - the low bit tells us if
@@ -1242,10 +1275,8 @@ static inline void __bch2_btree_node_iter_push(struct btree_node_iter *iter,
 			      const struct bkey_packed *end)
 {
 	if (k != end) {
-		struct btree_node_iter_set *pos;
-
-		btree_node_iter_for_each(iter, pos)
-			;
+		struct btree_node_iter_set *pos =
+			&iter->data[__btree_node_iter_used(iter)];
 
 		BUG_ON(pos >= iter->data + ARRAY_SIZE(iter->data));
 		*pos = (struct btree_node_iter_set) {
@@ -1265,12 +1296,17 @@ void bch2_btree_node_iter_push(struct btree_node_iter *iter,
 }
 
 noinline __flatten __cold
-static void btree_node_iter_init_pack_failed(struct btree_node_iter *iter,
-			      struct btree *b, struct bpos *search)
+static void btree_node_iter_init_pack_failed(struct bch_fs *c, struct btree *b,
+					     struct btree_node_iter *iter,
+					     struct bpos *search)
 {
 	struct bkey_packed *k;
 
-	trace_bkey_pack_pos_fail(search);
+	event_inc_trace(c, bkey_pack_pos_fail, buf, ({
+		bch2_btree_node_to_text(&buf, c, b);
+		prt_printf(&buf, "failed to pack ");
+		bch2_bpos_to_text(&buf, *search);
+	}));
 
 	bch2_btree_node_iter_init_from_start(iter, b);
 
@@ -1283,8 +1319,9 @@ static void btree_node_iter_init_pack_failed(struct btree_node_iter *iter,
  * bch2_btree_node_iter_init - initialize a btree node iterator, starting from a
  * given position
  *
- * @iter:	iterator to initialize
+ * @c:		filesystem object
  * @b:		btree node to search
+ * @iter:	iterator to initialize
  * @search:	search key
  *
  * Main entry point to the lookup code for individual btree nodes:
@@ -1324,8 +1361,9 @@ static void btree_node_iter_init_pack_failed(struct btree_node_iter *iter,
  *    past any extents that compare equal to the position we searched for.
  */
 __flatten
-void bch2_btree_node_iter_init(struct btree_node_iter *iter,
-			       struct btree *b, struct bpos *search)
+void bch2_btree_node_iter_init(struct bch_fs *c, struct btree *b,
+			       struct btree_node_iter *iter,
+			       struct bpos *search)
 {
 	struct bkey_packed p, *packed_search = NULL;
 	struct btree_node_iter_set *pos = iter->data;
@@ -1346,7 +1384,7 @@ void bch2_btree_node_iter_init(struct btree_node_iter *iter,
 		packed_search = NULL;
 		break;
 	case BKEY_PACK_POS_FAIL:
-		btree_node_iter_init_pack_failed(iter, b, search);
+		btree_node_iter_init_pack_failed(c, b, iter, search);
 		return;
 	}
 
@@ -1387,13 +1425,11 @@ struct bkey_packed *bch2_btree_node_iter_bset_pos(struct btree_node_iter *iter,
 						  struct btree *b,
 						  struct bset_tree *t)
 {
-	struct btree_node_iter_set *set;
+	struct btree_node_iter_set *set = btree_node_iter_set_find(iter, t->end_offset);
 
-	btree_node_iter_for_each(iter, set)
-		if (set->end == t->end_offset)
-			return __btree_node_offset_to_key(b, set->k);
-
-	return btree_bkey_last(b, t);
+	return set
+		? __btree_node_offset_to_key(b, set->k)
+		: btree_bkey_last(b, t);
 }
 
 static inline bool btree_node_iter_sort_two(struct btree_node_iter *iter,
@@ -1478,7 +1514,6 @@ struct bkey_packed *bch2_btree_node_iter_prev_all(struct btree_node_iter *iter,
 						  struct btree *b)
 {
 	struct bkey_packed *k, *prev = NULL;
-	struct btree_node_iter_set *set;
 	unsigned end = 0;
 
 	bch2_btree_node_iter_verify(iter, b);
@@ -1501,12 +1536,9 @@ struct bkey_packed *bch2_btree_node_iter_prev_all(struct btree_node_iter *iter,
 	 * prev we picked ends up in slot 0 - sort won't necessarily put it
 	 * there because of duplicate deleted keys:
 	 */
-	btree_node_iter_for_each(iter, set)
-		if (set->end == end)
-			goto found;
+	struct btree_node_iter_set *set = btree_node_iter_set_find(iter, end) ?:
+		&iter->data[__btree_node_iter_used(iter)];
 
-	BUG_ON(set != &iter->data[__btree_node_iter_used(iter)]);
-found:
 	BUG_ON(set >= iter->data + ARRAY_SIZE(iter->data));
 
 	memmove(&iter->data[1],

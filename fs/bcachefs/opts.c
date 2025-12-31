@@ -11,7 +11,7 @@
 
 #include "data/compress.h"
 #include "data/copygc.h"
-#include "data/rebalance.h"
+#include "data/reconcile.h"
 
 #include "init/dev.h"
 #include "init/error.h"
@@ -108,6 +108,16 @@ static const char * const __bch2_fs_usage_types[] = {
 	NULL
 };
 
+const char * const __bch2_reconcile_accounting_types[] = {
+	BCH_REBALANCE_ACCOUNTING()
+	NULL
+};
+
+static const char * const __bch2_key_type_error_reasons[] = {
+	KEY_TYPE_ERRORS()
+	NULL
+};
+
 #undef x
 
 static void prt_str_opt_boundscheck(struct printbuf *out, const char * const opts[],
@@ -132,6 +142,8 @@ PRT_STR_OPT_BOUNDSCHECKED(csum_opt,		enum bch_csum_opt);
 PRT_STR_OPT_BOUNDSCHECKED(csum_type,		enum bch_csum_type);
 PRT_STR_OPT_BOUNDSCHECKED(compression_type,	enum bch_compression_type);
 PRT_STR_OPT_BOUNDSCHECKED(str_hash_type,	enum bch_str_hash_type);
+PRT_STR_OPT_BOUNDSCHECKED(reconcile_accounting_type,	enum bch_reconcile_accounting_type);
+PRT_STR_OPT_BOUNDSCHECKED(key_type_error_reason,enum bch_key_type_errors);
 
 static int bch2_opt_fix_errors_parse(struct bch_fs *c, const char *val, u64 *res,
 				     struct printbuf *err)
@@ -525,6 +537,50 @@ void bch2_opts_to_text(struct printbuf *out,
 	}
 }
 
+static int opt_hook_io(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum bch_opt_id id,
+		       u64 v, bool post)
+{
+	if (!test_bit(BCH_FS_started, &c->flags))
+		return 0;
+
+	switch (id) {
+	case Opt_foreground_target:
+	case Opt_background_target:
+	case Opt_promote_target:
+	case Opt_compression:
+	case Opt_background_compression:
+	case Opt_data_checksum:
+	case Opt_data_replicas:
+	case Opt_erasure_code: {
+		struct reconcile_scan s = {
+			.type = !inum ? RECONCILE_SCAN_fs : RECONCILE_SCAN_inum,
+			.inum = inum,
+		};
+
+		try(bch2_set_reconcile_needs_scan(c, s, post));
+		break;
+	}
+	case Opt_metadata_target:
+	case Opt_metadata_checksum:
+	case Opt_metadata_replicas:
+		try(bch2_set_reconcile_needs_scan(c,
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_metadata, .dev = inum }, post));
+		break;
+	case Opt_durability:
+		if (!post && v > ca->mi.durability)
+			try(bch2_set_reconcile_needs_scan(c,
+				(struct reconcile_scan) { .type = RECONCILE_SCAN_pending}, post));
+
+		try(bch2_set_reconcile_needs_scan(c,
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = inum }, post));
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
 int bch2_opt_hook_pre_set(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum bch_opt_id id, u64 v,
 			  bool change)
 {
@@ -542,20 +598,18 @@ int bch2_opt_hook_pre_set(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum b
 		if (v)
 			bch2_check_set_feature(c, BCH_FEATURE_ec);
 		break;
+	case Opt_casefold_disabled:
+		if (v && (c->sb.features & BIT_ULL(BCH_FEATURE_casefolding))) {
+			bch_err(c, "cannot mount with casefolding disabled: casefolding already in use");
+			return bch_err_throw(c, casefolding_in_use);
+		}
+		break;
 	default:
 		break;
 	}
 
-	if (change &&
-	    test_bit(BCH_FS_started, &c->flags) &&
-	    (id == Opt_foreground_target ||
-	     id == Opt_background_target ||
-	     id == Opt_promote_target ||
-	     id == Opt_compression ||
-	     id == Opt_background_compression ||
-	     id == Opt_data_checksum ||
-	     id == Opt_data_replicas))
-		try(bch2_set_rebalance_needs_scan(c, inum));
+	if (change)
+		try(opt_hook_io(c, ca, inum, id, v, false));
 
 	return 0;
 }
@@ -571,21 +625,11 @@ int bch2_opts_hooks_pre_set(struct bch_fs *c)
 void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 			    enum bch_opt_id id, u64 v)
 {
-	if (test_bit(BCH_FS_started, &c->flags) &&
-	    (id == Opt_foreground_target ||
-	     id == Opt_background_target ||
-	     id == Opt_promote_target ||
-	     id == Opt_compression ||
-	     id == Opt_background_compression ||
-	     id == Opt_data_checksum ||
-	     id == Opt_data_replicas)) {
-		bch2_set_rebalance_needs_scan(c, inum);
-		bch2_rebalance_wakeup(c);
-	}
+	opt_hook_io(c, ca, inum, id, v, true);
 
 	switch (id) {
-	case Opt_rebalance_enabled:
-		bch2_rebalance_wakeup(c);
+	case Opt_reconcile_enabled:
+		bch2_reconcile_wakeup(c);
 		break;
 	case Opt_copygc_enabled:
 		bch2_copygc_wakeup(c);
@@ -607,8 +651,9 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 		    ca &&
 		    bch2_dev_is_online(ca) &&
 		    ca->mi.state == BCH_MEMBER_STATE_rw) {
-			guard(rcu)();
-			bch2_dev_allocator_set_rw(c, ca, true);
+			scoped_guard(rcu)
+				bch2_dev_allocator_set_rw(c, ca, true);
+			bch2_recalc_capacity(c);
 		}
 		break;
 	case Opt_version_upgrade:
@@ -619,6 +664,9 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 		 */
 		if (v == BCH_VERSION_UPGRADE_incompatible)
 			bch2_sb_upgrade_incompat(c);
+		break;
+	case Opt_read_only:
+		bch2_reconcile_wakeup(c);
 		break;
 	default:
 		break;
@@ -822,6 +870,15 @@ bool bch2_opt_set_sb(struct bch_fs *c, struct bch_dev *ca,
 	return changed;
 }
 
+const __maybe_unused struct bch_opts bch2_opts_default = {
+#define x(_name, _bits, _mode, _type, _sb_opt, _default, ...)		\
+	._name##_defined = true,					\
+	._name = _default,						\
+
+	BCH_OPTS()
+#undef x
+};
+
 /* io opts: */
 
 void bch2_inode_opts_get(struct bch_fs *c, struct bch_inode_opts *ret, bool metadata)
@@ -838,6 +895,9 @@ void bch2_inode_opts_get(struct bch_fs *c, struct bch_inode_opts *ret, bool meta
 		ret->background_target	= c->opts.metadata_target ?: c->opts.foreground_target;
 		ret->data_replicas	= c->opts.metadata_replicas;
 		ret->data_checksum	= c->opts.metadata_checksum;
+		ret->compression	= 0;
+		ret->background_compression = 0;
+		ret->erasure_code	= false;
 	} else {
 		bch2_io_opts_fixups(ret);
 	}
@@ -857,4 +917,17 @@ bool bch2_opt_is_inode_opt(enum bch_opt_id id)
 			return true;
 
 	return false;
+}
+
+void bch2_inode_opts_to_text(struct printbuf *out, struct bch_fs *c, struct bch_inode_opts opts)
+{
+	bool first = true;
+
+#define x(_name, _bits)			\
+	if (!first)			\
+		prt_char(out, ',');	\
+	first = false;			\
+	bch2_opt_to_text(out, c, c->disk_sb.sb, &bch2_opt_table[Opt_##_name], opts._name, 0);
+	BCH_INODE_OPTS()
+#undef x
 }

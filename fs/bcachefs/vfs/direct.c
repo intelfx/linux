@@ -13,6 +13,8 @@
 #include "vfs/direct.h"
 #include "vfs/pagecache.h"
 
+#include "vendor/bio_iov_iter.h"
+
 #include "util/enumerated_ref.h"
 
 #include <linux/kthread.h>
@@ -21,14 +23,6 @@
 #include <linux/task_io_accounting_ops.h>
 
 /* O_DIRECT reads */
-
-struct dio_read {
-	struct closure			cl;
-	struct kiocb			*req;
-	long				ret;
-	bool				should_dirty;
-	struct bch_read_bio		rbio;
-};
 
 static void bio_check_or_release(struct bio *bio, bool check_dirty)
 {
@@ -50,10 +44,11 @@ static CLOSURE_CALLBACK(bch2_dio_read_complete)
 
 static void bch2_direct_IO_read_endio(struct bio *bio)
 {
+	struct bch_read_bio *rbio = to_rbio(bio);
 	struct dio_read *dio = bio->bi_private;
 
-	if (bio->bi_status)
-		dio->ret = blk_status_to_errno(bio->bi_status);
+	if (rbio->ret)
+		dio->ret = bch2_err_class(rbio->ret);
 
 	closure_put(&dio->cl);
 }
@@ -86,7 +81,7 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
 
 	/* bios must be 512 byte aligned: */
 	if ((offset|iter->count) & (SECTOR_SIZE - 1))
-		return -EINVAL;
+		return bch_err_throw(c, unaligned_io);
 
 	ret = min_t(loff_t, iter->count,
 		    max_t(loff_t, 0, i_size_read(&inode->v) - offset));
@@ -103,7 +98,7 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
 			       bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),
 			       REQ_OP_READ,
 			       GFP_KERNEL,
-			       &c->dio_read_bioset);
+			       &c->vfs.dio_read_bioset);
 
 	dio = container_of(bio, struct dio_read, rbio.bio);
 	closure_init(&dio->cl, NULL);
@@ -148,14 +143,10 @@ start:
 		bio->bi_iter.bi_sector	= offset >> 9;
 		bio->bi_private		= dio;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
-		ret = bio_iov_iter_get_pages(bio, iter);
-#else
-		ret = bio_iov_iter_get_pages(bio, iter, 0);
-#endif
+		ret = bch2_bio_iov_iter_get_pages(bio, iter, 0);
 		if (ret < 0) {
 			/* XXX: fault inject this path */
-			bio->bi_status = BLK_STS_RESOURCE;
+			to_rbio(bio)->ret = ret;
 			bio_endio(bio);
 			break;
 		}
@@ -234,26 +225,6 @@ out:
 
 /* O_DIRECT writes */
 
-struct dio_write {
-	struct kiocb			*req;
-	struct address_space		*mapping;
-	struct bch_inode_info		*inode;
-	struct mm_struct		*mm;
-	const struct iovec		*iov;
-	unsigned			loop:1,
-					extending:1,
-					sync:1,
-					flush:1;
-	struct quota_res		quota_res;
-	u64				written;
-
-	struct iov_iter			iter;
-	struct iovec			inline_vecs[2];
-
-	/* must be last: */
-	struct bch_write_op		op;
-};
-
 static bool bch2_check_range_allocated(struct bch_fs *c, subvol_inum inum,
 				       u64 offset, u64 size,
 				       unsigned nr_replicas, bool compressed)
@@ -280,7 +251,7 @@ retry:
 
 		if (k.k->p.snapshot != snapshot ||
 		    nr_replicas > bch2_bkey_replicas(c, k) ||
-		    (!compressed && bch2_bkey_sectors_compressed(k)))
+		    (!compressed && bch2_bkey_sectors_compressed(c, k)))
 			return false;
 	}
 err:
@@ -465,11 +436,7 @@ static __always_inline long bch2_dio_write_loop(struct dio_write *dio)
 		EBUG_ON(current->faults_disabled_mapping);
 		current->faults_disabled_mapping = mapping;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
-		ret = bio_iov_iter_get_pages(bio, &dio->iter);
-#else
-		ret = bio_iov_iter_get_pages(bio, &dio->iter, 0);
-#endif
+		ret = bch2_bio_iov_iter_get_pages(bio, &dio->iter, 0);
 
 		dropped_locks = fdm_dropped_locks();
 
@@ -627,7 +594,7 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 		goto err_put_write_ref;
 
 	if (unlikely((req->ki_pos|iter->count) & (block_bytes(c) - 1))) {
-		ret = -EINVAL;
+		ret = bch_err_throw(c, unaligned_io);
 		goto err_put_write_ref;
 	}
 
@@ -644,7 +611,7 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 			       bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS),
 			       REQ_OP_WRITE | REQ_SYNC | REQ_IDLE,
 			       GFP_KERNEL,
-			       &c->dio_write_bioset);
+			       &c->vfs.dio_write_bioset);
 	dio = container_of(bio, struct dio_write, op.wbio.bio);
 	dio->req		= req;
 	dio->mapping		= mapping;
@@ -680,27 +647,6 @@ err_put_bio:
 err_put_write_ref:
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_dio_write);
 	goto out;
-}
-
-void bch2_fs_fs_io_direct_exit(struct bch_fs *c)
-{
-	bioset_exit(&c->dio_write_bioset);
-	bioset_exit(&c->dio_read_bioset);
-}
-
-int bch2_fs_fs_io_direct_init(struct bch_fs *c)
-{
-	if (bioset_init(&c->dio_read_bioset,
-			4, offsetof(struct dio_read, rbio.bio),
-			BIOSET_NEED_BVECS))
-		return -BCH_ERR_ENOMEM_dio_read_bioset_init;
-
-	if (bioset_init(&c->dio_write_bioset,
-			4, offsetof(struct dio_write, op.wbio.bio),
-			BIOSET_NEED_BVECS))
-		return -BCH_ERR_ENOMEM_dio_write_bioset_init;
-
-	return 0;
 }
 
 #endif /* NO_BCACHEFS_FS */

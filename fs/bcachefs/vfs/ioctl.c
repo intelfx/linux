@@ -47,13 +47,15 @@ static int bch2_ioc_reinherit_attrs(struct bch_fs *c,
 				    struct bch_inode_info *src,
 				    const char __user *name)
 {
-	struct bch_hash_info hash = bch2_hash_info_init(c, &src->ei_inode);
 	struct bch_inode_info *dst;
 	struct inode *vinode = NULL;
 	char *kname = NULL;
 	struct qstr qstr;
 	int ret = 0;
 	subvol_inum inum;
+
+	struct bch_hash_info hash;
+	try(bch2_hash_info_init(c, &src->ei_inode, &hash));
 
 	kname = kmalloc(BCH_NAME_MAX, GFP_KERNEL);
 	if (!kname)
@@ -70,7 +72,7 @@ static int bch2_ioc_reinherit_attrs(struct bch_fs *c,
 	if (ret)
 		goto err1;
 
-	vinode = bch2_vfs_inode_get(c, inum);
+	vinode = bch2_vfs_inode_get(c, inum, true);
 	ret = PTR_ERR_OR_ZERO(vinode);
 	if (ret)
 		goto err1;
@@ -170,41 +172,35 @@ static int bch2_ioc_setlabel(struct bch_fs *c,
 
 static int bch2_ioc_goingdown(struct bch_fs *c, u32 __user *arg)
 {
-	u32 flags;
-	int ret = 0;
-
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	if (get_user(flags, arg))
-		return -EFAULT;
+	u32 flags;
+	try(get_user(flags, arg));
 
-	CLASS(printbuf, buf)();
-	bch2_log_msg_start(c, &buf);
+	CLASS(bch_log_msg, msg)(c);
+	msg.m.suppress = true; /* cleared by ERO */
 
-	prt_printf(&buf, "shutdown by ioctl type %u", flags);
+	prt_printf(&msg.m, "shutdown by ioctl type %u", flags);
 
 	switch (flags) {
 	case FSOP_GOING_FLAGS_DEFAULT:
-		ret = bdev_freeze(c->vfs_sb->s_bdev);
-		if (ret)
-			break;
+		try(bdev_freeze(c->vfs_sb->s_bdev));
+
 		bch2_journal_flush(&c->journal);
-		bch2_fs_emergency_read_only2(c, &buf);
+		bch2_fs_emergency_read_only(c, &msg.m);
+
 		bdev_thaw(c->vfs_sb->s_bdev);
-		break;
+		return 0;
 	case FSOP_GOING_FLAGS_LOGFLUSH:
 		bch2_journal_flush(&c->journal);
 		fallthrough;
 	case FSOP_GOING_FLAGS_NOLOGFLUSH:
-		bch2_fs_emergency_read_only2(c, &buf);
-		break;
+		bch2_fs_emergency_read_only(c, &msg.m);
+		return 0;
 	default:
 		return -EINVAL;
 	}
-
-	bch2_print_str(c, KERN_ERR, buf.buf);
-	return ret;
 }
 
 static long __bch2_ioctl_subvolume_create(struct bch_fs *c, struct file *filp,
@@ -312,7 +308,7 @@ static long __bch2_ioctl_subvolume_create(struct bch_fs *c, struct file *filp,
 	    !arg.src_ptr)
 		snapshot_src.subvol = inode_inum(to_bch_ei(dir)).subvol;
 
-	scoped_guard(rwsem_write, &c->snapshot_create_lock)
+	scoped_guard(rwsem_write, &c->snapshots.create_lock)
 		inode = __bch2_create(file_mnt_idmap(filp), to_bch_ei(dir),
 				      dst_dentry, arg.mode|S_IFDIR,
 				      0, snapshot_src, create_flags);
@@ -404,7 +400,7 @@ static long bch2_ioctl_subvolume_destroy(struct bch_fs *c, struct file *filp,
 
 	CLASS(printbuf, err)();
 	long ret = __bch2_ioctl_subvolume_destroy(c, filp, arg_v2, &err);
-	if (ret)
+	if (ret && err.buf)
 		bch_err_msg(c, ret, "%s", err.buf);
 	return ret;
 }

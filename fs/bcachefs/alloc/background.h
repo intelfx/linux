@@ -242,17 +242,12 @@ void __bch2_alloc_to_v4(struct bkey_s_c, struct bch_alloc_v4 *);
 
 static inline const struct bch_alloc_v4 *bch2_alloc_to_v4(struct bkey_s_c k, struct bch_alloc_v4 *convert)
 {
-	const struct bch_alloc_v4 *ret;
+	if (likely(k.k->type == KEY_TYPE_alloc_v4)) {
+		const struct bch_alloc_v4 *ret = bkey_s_c_to_alloc_v4(k).v;
+		if (BCH_ALLOC_V4_BACKPOINTERS_START(ret) == BCH_ALLOC_V4_U64s)
+			return ret;
+	}
 
-	if (unlikely(k.k->type != KEY_TYPE_alloc_v4))
-		goto slowpath;
-
-	ret = bkey_s_c_to_alloc_v4(k).v;
-	if (BCH_ALLOC_V4_BACKPOINTERS_START(ret) != BCH_ALLOC_V4_U64s)
-		goto slowpath;
-
-	return ret;
-slowpath:
 	__bch2_alloc_to_v4(k, convert);
 	return convert;
 }
@@ -269,7 +264,7 @@ int bch2_alloc_v3_validate(struct bch_fs *, struct bkey_s_c,
 			   struct bkey_validate_context);
 int bch2_alloc_v4_validate(struct bch_fs *, struct bkey_s_c,
 			   struct bkey_validate_context);
-void bch2_alloc_v4_swab(struct bkey_s);
+void bch2_alloc_v4_swab(const struct bch_fs *, struct bkey_s);
 void bch2_alloc_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 void bch2_alloc_v4_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 
@@ -376,5 +371,8 @@ void bch2_dev_allocator_background_exit(struct bch_dev *);
 void bch2_dev_allocator_background_init(struct bch_dev *);
 
 void bch2_fs_allocator_background_init(struct bch_fs *);
+
+void bch2_fs_capacity_exit(struct bch_fs *);
+int bch2_fs_capacity_init(struct bch_fs *);
 
 #endif /* _BCACHEFS_ALLOC_BACKGROUND_H */

@@ -9,7 +9,10 @@
 #include "alloc/replicas_types.h"
 
 #include "btree/bbpos_types.h"
+#include "btree/interior_types.h"
 #include "btree/key_cache_types.h"
+#include "btree/node_scan_types.h"
+#include "btree/write_buffer_types.h"
 
 #include "journal/types.h"
 
@@ -57,11 +60,6 @@ struct bset_tree {
 
 struct btree_write {
 	struct journal_entry_pin	journal;
-};
-
-struct btree_alloc {
-	struct open_buckets	ob;
-	__BKEY_PADDED(k, BKEY_BTREE_PTR_VAL_U64s_MAX);
 };
 
 struct btree_bkey_cached_common {
@@ -166,7 +164,21 @@ struct btree_cache_list {
 	size_t			nr;
 };
 
-struct btree_cache {
+struct btree_root {
+	struct btree		*b;
+
+	/* On disk root - see async splits: */
+	__BKEY_PADDED(key, BKEY_BTREE_PTR_VAL_U64s_MAX);
+	u8			level;
+	u8			alive;
+	s16			error;
+};
+
+struct bch_fs_btree_cache {
+	struct btree_root	roots_known[BTREE_ID_NR];
+	DARRAY(struct btree_root) roots_extra;
+	struct mutex		root_lock;
+
 	struct rhashtable	table;
 	bool			table_init_done;
 	/*
@@ -188,6 +200,7 @@ struct btree_cache {
 	struct list_head	freed_nonpcpu;
 	struct btree_cache_list	live[2];
 
+	size_t			nr_vmalloc;
 	size_t			nr_freeable;
 	size_t			nr_reserve;
 	size_t			nr_by_btree[BTREE_ID_NR];
@@ -403,6 +416,7 @@ struct bkey_cached {
 
 	unsigned long		flags;
 	u16			u64s;
+	bool			needs_immediate_flush:1;
 	struct bkey_cached_key	key;
 
 	struct rhash_head	hash;
@@ -526,6 +540,7 @@ struct btree_trans {
 	bool			journal_transaction_names:1;
 	bool			journal_replay_not_finished:1;
 	bool			notrace_relock_fail:1;
+	bool			has_interior_updates:1;
 	enum bch_errcode	restarted:16;
 	u32			restart_count;
 #ifdef CONFIG_BCACHEFS_INJECT_TRANSACTION_RESTARTS
@@ -560,7 +575,7 @@ struct btree_trans {
 	struct bch_fs_usage_base fs_usage_delta;
 
 	unsigned		journal_u64s;
-	unsigned		extra_disk_res; /* XXX kill */
+	u64			extra_disk_res;
 
 	__BKEY_PADDED(btree_path_down, BKEY_BTREE_PTR_VAL_U64s_MAX);
 
@@ -577,6 +592,37 @@ struct btree_trans {
 	struct btree_path	_paths[BTREE_ITER_INITIAL];
 	btree_path_idx_t	_sorted[BTREE_ITER_INITIAL + 4];
 	struct btree_insert_entry _updates[BTREE_ITER_INITIAL];
+};
+
+struct btree_trans_buf {
+	struct btree_trans	*trans;
+};
+
+struct btree_transaction_stats {
+	struct bch2_time_stats	duration;
+	struct bch2_time_stats	lock_hold_times;
+	struct mutex		lock;
+	unsigned		nr_max_paths;
+	unsigned		max_mem;
+#ifdef CONFIG_BCACHEFS_TRANS_KMALLOC_TRACE
+	darray_trans_kmalloc_trace trans_kmalloc_trace;
+#endif
+	char			*max_paths_text;
+};
+
+#define BCH_TRANSACTIONS_NR 128
+
+struct bch_fs_btree_trans {
+	struct seqmutex			lock;
+	struct list_head		list;
+	mempool_t			pool;
+	mempool_t			malloc_pool;
+	struct btree_trans_buf		__percpu *bufs;
+
+	struct srcu_struct		barrier;
+	bool				barrier_initialized;
+
+	struct btree_transaction_stats	stats[BCH_TRANSACTIONS_NR];
 };
 
 static inline struct btree_path *btree_iter_path(struct btree_trans *trans, struct btree_iter *iter)
@@ -662,6 +708,37 @@ enum btree_node_rewrite_reason {
 #define x(n)	BTREE_NODE_REWRITE_##n,
 	BTREE_NODE_REWRITE_REASON()
 #undef x
+};
+
+struct bch_fs_btree {
+	u16					foreground_merge_threshold;
+
+	mempool_t				bounce_pool;
+
+	struct btree_write_stats {
+		atomic64_t	nr;
+		atomic64_t	bytes;
+	}			write_stats[BTREE_WRITE_TYPE_NR];
+
+	struct bio_set				bio;
+	mempool_t				fill_iter;
+	struct workqueue_struct			*read_complete_wq;
+	struct ratelimit_state			read_errors_soft;
+	struct ratelimit_state			read_errors_hard;
+
+	struct workqueue_struct			*write_submit_wq;
+	struct workqueue_struct			*write_complete_wq;
+
+	struct journal_entry_res		root_journal_res;
+
+	struct bch_fs_btree_cache		cache;
+	struct bch_fs_btree_key_cache		key_cache;
+	struct bch_fs_btree_write_buffer	write_buffer;
+	struct bch_fs_btree_trans		trans;
+	struct bch_fs_btree_reserve_cache	reserve_cache;
+	struct bch_fs_btree_interior_updates	interior_updates;
+	struct bch_fs_btree_node_rewrites	node_rewrites;
+	struct find_btree_nodes			node_scan;
 };
 
 static inline enum btree_node_rewrite_reason btree_node_rewrite_reason(struct btree *b)
@@ -922,16 +999,6 @@ static inline u8 btree_trigger_order(enum btree_id btree)
 		return btree;
 	}
 }
-
-struct btree_root {
-	struct btree		*b;
-
-	/* On disk root - see async splits: */
-	__BKEY_PADDED(key, BKEY_BTREE_PTR_VAL_U64s_MAX);
-	u8			level;
-	u8			alive;
-	s16			error;
-};
 
 enum btree_gc_coalesce_fail_reason {
 	BTREE_GC_COALESCE_FAIL_RESERVE_GET,

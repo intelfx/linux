@@ -71,7 +71,7 @@ enum printbuf_si {
 	PRINTBUF_UNITS_10,	/* use powers of 10^3 (standard SI) */
 };
 
-#define PRINTBUF_INLINE_TABSTOPS	6
+#define PRINTBUF_INLINE_TABSTOPS	8
 
 struct printbuf {
 	char			*buf;
@@ -87,10 +87,11 @@ struct printbuf {
 	bool			allocation_failure:1;
 	bool			heap_allocated:1;
 	bool			overflow:1;
+	bool			suppress:1; /* Ratelimited or already printed */
 	enum printbuf_si	si_units:1;
 	bool			human_readable_units:1;
 	bool			has_indent_or_tabstops:1;
-	bool			suppress_indent_tabstop_handling:1;
+	bool			may_vmalloc:1;
 	u8			nr_tabstops;
 
 	/*
@@ -101,6 +102,26 @@ struct printbuf {
 	u8			_tabstops[PRINTBUF_INLINE_TABSTOPS];
 };
 
+struct printbuf_restore {
+	unsigned		pos;
+	u8			cur_tabstop;
+};
+
+static inline struct printbuf_restore printbuf_state_save(struct printbuf *buf)
+{
+	return (struct printbuf_restore) {
+		.pos = buf->pos, .cur_tabstop = buf->cur_tabstop
+	};
+}
+
+static inline void printbuf_state_restore(struct printbuf *buf,
+					  struct printbuf_restore s)
+{
+	buf->pos		= s.pos;
+	buf->cur_tabstop	= s.cur_tabstop;
+}
+
+int bch2_printbuf_make_room_gfp(struct printbuf *, unsigned, gfp_t);
 int bch2_printbuf_make_room(struct printbuf *, unsigned);
 __printf(2, 3) void bch2_prt_printf(struct printbuf *out, const char *fmt, ...);
 __printf(2, 0) void bch2_prt_vprintf(struct printbuf *out, const char *fmt, va_list);
@@ -236,11 +257,6 @@ static inline void prt_bytes(struct printbuf *out, const void *b, unsigned n)
 
 static inline void prt_str(struct printbuf *out, const char *str)
 {
-	prt_bytes(out, str, strlen(str));
-}
-
-static inline void prt_str_indented(struct printbuf *out, const char *str)
-{
 	bch2_prt_bytes_indented(out, str, strlen(str));
 }
 
@@ -268,6 +284,9 @@ static inline void printbuf_reset_keep_tabstops(struct printbuf *buf)
 	buf->last_field		= 0;
 	buf->indent		= 0;
 	buf->cur_tabstop	= 0;
+
+	if (buf->size)
+		printbuf_nul_terminate_reserved(buf);
 }
 
 /**
@@ -299,18 +318,12 @@ DEFINE_GUARD(printbuf_atomic, struct printbuf *,
 	     printbuf_atomic_inc(_T),
 	     printbuf_atomic_dec(_T));
 
-static inline void printbuf_indent_add_2(struct printbuf *out)
-{
-	bch2_printbuf_indent_add(out, 2);
-}
-
-static inline void printbuf_indent_sub_2(struct printbuf *out)
-{
-	bch2_printbuf_indent_sub(out, 2);
-}
-
 DEFINE_GUARD(printbuf_indent, struct printbuf *,
-	     printbuf_indent_add_2(_T),
-	     printbuf_indent_sub_2(_T));
+	     bch2_printbuf_indent_add(_T, 2),
+	     bch2_printbuf_indent_sub(_T, 2));
+
+DEFINE_GUARD(printbuf_indent_nextline, struct printbuf *,
+	     bch2_printbuf_indent_add_nextline(_T, 2),
+	     bch2_printbuf_indent_sub(_T, 2));
 
 #endif /* _BCACHEFS_PRINTBUF_H */

@@ -370,7 +370,7 @@ static inline unsigned fract_exp_two(unsigned x, unsigned fract_bits)
 }
 
 void bch2_bio_map(struct bio *bio, void *base, size_t);
-int bch2_bio_alloc_pages(struct bio *, size_t, gfp_t);
+int bch2_bio_alloc_pages(struct bio *, unsigned, size_t, gfp_t);
 
 #define closure_bio_submit(bio, cl)					\
 do {									\
@@ -704,7 +704,6 @@ static inline bool qstr_eq(const struct qstr l, const struct qstr r)
 	return l.len == r.len && !memcmp(l.name, r.name, l.len);
 }
 
-void bch2_darray_str_exit(darray_const_str *);
 int bch2_split_devs(const char *, darray_const_str *);
 
 #ifdef __KERNEL__
@@ -814,5 +813,15 @@ do {									\
 		return PTR_ERR(_ret);					\
 	_ret;								\
 })
+
+#include <linux/sched/mm.h>
+
+struct memalloc_flags { unsigned flags; };
+
+DEFINE_CLASS(memalloc_flags, struct memalloc_flags,
+	     memalloc_flags_restore(_T.flags),
+	     (struct memalloc_flags) { memalloc_flags_save(_flags) },
+	     unsigned _flags)
+
 
 #endif /* _BCACHEFS_UTIL_H */

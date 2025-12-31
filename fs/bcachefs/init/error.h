@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _BCACHEFS_ERROR_H
-#define _BCACHEFS_ERROR_H
+#ifndef _BCACHEFS_INIT_ERROR_H
+#define _BCACHEFS_INIT_ERROR_H
 
 #include <linux/list.h>
 #include <linux/printk.h>
@@ -17,13 +17,6 @@ struct work_struct;
  */
 
 /* Error messages: */
-
-void __bch2_log_msg_start(const char *, struct printbuf *);
-
-static inline void bch2_log_msg_start(struct bch_fs *c, struct printbuf *out)
-{
-	__bch2_log_msg_start(c->name, out);
-}
 
 /*
  * Inconsistency errors: The on disk data is inconsistent. If these occur during
@@ -153,6 +146,34 @@ void bch2_free_fsck_errs(struct bch_fs *);
 	_ret;								\
 })
 
+#define ret_fsck_err_wrap(_do)						\
+({									\
+	int _ret = _do;							\
+	if (!bch2_err_matches(_ret, BCH_ERR_fsck_fix) &&		\
+	    !bch2_err_matches(_ret, BCH_ERR_fsck_ignore))		\
+		return _ret;						\
+									\
+	bch2_err_matches(_ret, BCH_ERR_fsck_fix);			\
+})
+
+#define __ret_fsck_err(...)	ret_fsck_err_wrap(bch2_fsck_err(__VA_ARGS__))
+
+#define __ret_fsck_err_on(cond, c, _flags, _err_type, ...)		\
+({									\
+	might_sleep();							\
+									\
+	if (type_is(c, struct bch_fs *))				\
+		WARN_ON(bch2_current_has_btree_trans((struct bch_fs *) c));\
+									\
+	(unlikely(cond) ? __ret_fsck_err(c, _flags, _err_type, __VA_ARGS__) : false);\
+})
+
+#define ret_fsck_err(c, _err_type, ...)					\
+	__ret_fsck_err(c, FSCK_CAN_FIX|FSCK_CAN_IGNORE, _err_type, __VA_ARGS__)
+
+#define ret_fsck_err_on(cond, c, _err_type, ...)			\
+	__ret_fsck_err_on(cond, c, FSCK_CAN_FIX|FSCK_CAN_IGNORE, _err_type, __VA_ARGS__)
+
 enum bch_validate_flags;
 __printf(5, 6)
 int __bch2_bkey_fsck_err(struct bch_fs *,
@@ -189,13 +210,11 @@ do {									\
  * mode - pretty much just due to metadata IO errors:
  */
 
-void bch2_fatal_error(struct bch_fs *);
+__printf(3, 4)
+void bch2_fatal_error(struct bch_fs *c, const char *func, const char *fmt, ...);
 
-#define bch2_fs_fatal_error(c, _msg, ...)				\
-do {									\
-	bch_err(c, "%s(): fatal error " _msg, __func__, ##__VA_ARGS__);	\
-	bch2_fatal_error(c);						\
-} while (0)
+#define bch2_fs_fatal_error(c, ...)					\
+	bch2_fatal_error(c, __func__, __VA_ARGS__)
 
 #define bch2_fs_fatal_err_on(cond, c, ...)				\
 ({									\
@@ -252,4 +271,8 @@ static inline void bch2_account_io_completion(struct bch_dev *ca,
 int bch2_inum_offset_err_msg_trans_norestart(struct btree_trans *, struct printbuf *, u32, struct bpos);
 void bch2_inum_offset_err_msg_trans(struct btree_trans *, struct printbuf *, u32, struct bpos);
 
-#endif /* _BCACHEFS_ERROR_H */
+void bch2_fs_errors_exit(struct bch_fs *);
+void bch2_fs_errors_init_early(struct bch_fs *);
+int bch2_fs_errors_init(struct bch_fs *);
+
+#endif /* _BCACHEFS_INIT_ERROR_H */

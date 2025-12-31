@@ -5,8 +5,13 @@
 #include <linux/cache.h>
 #include <linux/workqueue.h>
 
+#include "alloc/replicas_types.h"
 #include "alloc/types.h"
+
+#include "data/extents_types.h"
+
 #include "init/dev_types.h"
+
 #include "util/fifo.h"
 
 /* btree write buffer steals 8 bits for its own purposes: */
@@ -30,6 +35,7 @@ struct journal_buf {
 
 	__BKEY_PADDED(key, BCH_REPLICAS_MAX);
 	struct bch_devs_list	devs_written;
+	struct bch_io_failures	failed;
 
 	struct closure_waitlist	wait;
 	u64			last_seq;	/* copy of data->last_seq */
@@ -48,6 +54,7 @@ struct journal_buf {
 	bool			write_started:1;
 	bool			write_allocated:1;
 	bool			write_done:1;
+	bool			empty:1;
 	u8			idx;
 };
 
@@ -70,7 +77,7 @@ struct journal_entry_pin_list {
 	struct list_head		unflushed[JOURNAL_PIN_TYPE_NR];
 	struct list_head		flushed[JOURNAL_PIN_TYPE_NR];
 	atomic_t			count;
-	struct bch_devs_list		devs;
+	union bch_replicas_padded	devs;
 	size_t				bytes;
 };
 
@@ -113,7 +120,14 @@ union journal_res_state {
 
 /* bytes: */
 #define JOURNAL_ENTRY_SIZE_MIN		(64U << 10) /* 64k */
-#define JOURNAL_ENTRY_SIZE_MAX		(4U  << 22) /* 16M */
+
+/*
+ * The block layer is fragile with large bios - it should be able to process any
+ * IO incrementally, but...
+ *
+ * 4MB corresponds to bio_kmalloc() -> UIO_MAXIOV
+ */
+#define JOURNAL_ENTRY_SIZE_MAX		(4U  << 20) /* 4M */
 
 /*
  * We stash some journal state as sentinal values in cur_entry_offset:
@@ -140,6 +154,7 @@ enum journal_space_from {
 };
 
 #define JOURNAL_FLAGS()			\
+	x(degraded)			\
 	x(replay_done)			\
 	x(running)			\
 	x(may_skip_flush)		\
@@ -256,6 +271,8 @@ struct journal {
 		u64 front, back, size, mask;
 		struct journal_entry_pin_list *data;
 	}			pin;
+	u64			last_seq;
+
 	size_t			dirty_entry_bytes;
 
 	struct journal_space	space[journal_space_nr];
@@ -341,6 +358,13 @@ struct journal_device {
  */
 struct journal_entry_res {
 	unsigned		u64s;
+};
+
+struct journal_start_info {
+	u64	seq_read_start;
+	u64	seq_read_end;
+	u64	start_seq;
+	bool	clean;
 };
 
 #endif /* _BCACHEFS_JOURNAL_TYPES_H */

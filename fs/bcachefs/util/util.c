@@ -73,39 +73,31 @@ static int bch2_pow(u64 n, u64 p, u64 *res)
 
 static int parse_unit_suffix(const char *cp, u64 *res)
 {
-	const char *start = cp;
-	u64 base = 1024;
-	unsigned u;
+	unsigned adv = *cp == ' ';
+	cp += adv;
 
-	if (*cp == ' ')
-		cp++;
-
-	for (u = 1; u < strlen(si_units); u++)
+	for (unsigned u = 1; u < strlen(si_units); u++)
 		if (*cp == si_units[u]) {
-			cp++;
-			goto got_unit;
+			try(bch2_pow(1024, u, res));
+			return adv + 1;
 		}
 
-	for (u = 0; u < ARRAY_SIZE(units_2); u++)
+	for (unsigned u = 0; u < ARRAY_SIZE(units_2); u++)
 		if (!strncmp(cp, units_2[u], strlen(units_2[u]))) {
-			cp += strlen(units_2[u]);
-			goto got_unit;
+			try(bch2_pow(1024, u, res));
+			return adv + strlen(units_2[u]);
 		}
 
-	for (u = 0; u < ARRAY_SIZE(units_10); u++)
+	for (unsigned u = 0; u < ARRAY_SIZE(units_10); u++)
 		if (!strncmp(cp, units_10[u], strlen(units_10[u]))) {
-			cp += strlen(units_10[u]);
-			base = 1000;
-			goto got_unit;
+			try(bch2_pow(1000, u, res));
+			return adv + strlen(units_10[u]);
 		}
 
 	*res = 1;
 	return 0;
-got_unit:
-	try(bch2_pow(base, u, res));
-
-	return cp - start;
 }
+
 
 #define parse_or_ret(cp, _f)			\
 do {						\
@@ -612,21 +604,31 @@ void bch2_bio_map(struct bio *bio, void *base, size_t size)
 		bio_add_virt_nofail(bio, base, size);
 }
 
-int bch2_bio_alloc_pages(struct bio *bio, size_t size, gfp_t gfp_mask)
+int bch2_bio_alloc_pages(struct bio *bio, unsigned bs, size_t size, gfp_t gfp_mask)
 {
-	while (size) {
-		struct page *page = alloc_pages(gfp_mask, 0);
-		unsigned len = min_t(size_t, PAGE_SIZE, size);
+	BUG_ON(!is_power_of_2(bs));
+	BUG_ON(size & (bs - 1));
 
-		if (!page)
+	unsigned max_alloc = max(bs, PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER);
+
+	while (bio->bi_iter.bi_size < size) {
+		unsigned b = min(size - bio->bi_iter.bi_size, max_alloc);
+
+		BUG_ON(b & (bs - 1));
+
+#ifdef __KERNEL__
+		/*
+		 * we don't know the device dma alignment, so in kernel make
+		 * sure allocations are page aligned
+		 */
+		void *p = (void *) __get_free_pages(gfp_mask, get_order(b));
+#else
+		void *p = kmalloc(b, gfp_mask);
+#endif
+		if (!p)
 			return -ENOMEM;
 
-		if (unlikely(!bio_add_page(bio, page, len, 0))) {
-			__free_page(page);
-			break;
-		}
-
-		size -= len;
+		bio_add_virt_nofail(bio, p, b);
 	}
 
 	return 0;
@@ -659,9 +661,8 @@ void memcpy_to_bio(struct bio *dst, struct bvec_iter dst_iter, const void *src)
 	struct bvec_iter iter;
 
 	__bio_for_each_segment(bv, dst, iter, dst_iter) {
-		void *dstp = kmap_local_page(bv.bv_page);
-
-		memcpy(dstp + bv.bv_offset, src, bv.bv_len);
+		void *dstp = bvec_kmap_local(&bv);
+		memcpy(dstp, src, bv.bv_len);
 		kunmap_local(dstp);
 
 		src += bv.bv_len;
@@ -674,9 +675,8 @@ void memcpy_from_bio(void *dst, struct bio *src, struct bvec_iter src_iter)
 	struct bvec_iter iter;
 
 	__bio_for_each_segment(bv, src, iter, src_iter) {
-		void *srcp = kmap_local_page(bv.bv_page);
-
-		memcpy(dst, srcp + bv.bv_offset, bv.bv_len);
+		void *srcp = bvec_kmap_local(&bv);
+		memcpy(dst, srcp, bv.bv_len);
 		kunmap_local(srcp);
 
 		dst += bv.bv_len;
@@ -989,13 +989,6 @@ u64 *bch2_acc_percpu_u64s(u64 __percpu *p, unsigned nr)
 	return ret;
 }
 
-void bch2_darray_str_exit(darray_const_str *d)
-{
-	darray_for_each(*d, i)
-		kfree(*i);
-	darray_exit(d);
-}
-
 int bch2_split_devs(const char *_dev_name, darray_const_str *ret)
 {
 	darray_init(ret);
@@ -1019,6 +1012,6 @@ int bch2_split_devs(const char *_dev_name, darray_const_str *ret)
 
 	return 0;
 err:
-	bch2_darray_str_exit(ret);
+	darray_exit_free_item(ret, kfree);
 	return -ENOMEM;
 }

@@ -7,9 +7,11 @@
 #include "alloc/check.h"
 #include "alloc/replicas.h"
 
+#include "btree/interior.h"
+
 #include "data/ec.h"
 #include "data/migrate.h"
-#include "data/rebalance.h"
+#include "data/reconcile.h"
 
 #include "debug/sysfs.h"
 
@@ -33,15 +35,23 @@ const char * const bch2_dev_write_refs[] = {
 };
 #undef x
 
-void bch2_devs_list_to_text(struct printbuf *out, struct bch_devs_list *d)
+void bch2_devs_list_to_text(struct printbuf *out,
+			    struct bch_fs *c,
+			    struct bch_devs_list *d)
 {
-	prt_char(out, '[');
+	bch2_printbuf_make_room(out, 1024);
+	guard(rcu)();
+
 	darray_for_each(*d, i) {
 		if (i != d->data)
 			prt_char(out, ' ');
-		prt_printf(out, "%u", *i);
+
+		struct bch_dev *ca = bch2_dev_rcu_noerror(c, *i);
+		if (ca)
+			prt_str(out, ca->name);
+		else
+			prt_printf(out, "(invalid device %u)", *i);
 	}
-	prt_char(out, ']');
 }
 
 static int bch2_dev_may_add(struct bch_sb *sb, struct bch_fs *c)
@@ -165,7 +175,7 @@ int bch2_dev_in_fs(struct bch_sb_handle *fs,
 void bch2_dev_io_ref_stop(struct bch_dev *ca, int rw)
 {
 	if (rw == READ)
-		clear_bit(ca->dev_idx, ca->fs->online_devs.d);
+		clear_bit(ca->dev_idx, ca->fs->devs_online.d);
 
 	if (!enumerated_ref_is_zero(&ca->io_ref[rw]))
 		enumerated_ref_stop(&ca->io_ref[rw],
@@ -329,6 +339,7 @@ static struct bch_dev *__bch2_dev_alloc(struct bch_fs *c,
 	bch2_time_stats_quantiles_init(&ca->io_latency[WRITE]);
 
 	ca->mi = bch2_mi_to_cpu(member);
+	ca->btree_allocated_bitmap_gc = le64_to_cpu(member->btree_allocated_bitmap);
 
 	for (i = 0; i < ARRAY_SIZE(member->errors); i++)
 		atomic64_set(&ca->errors[i], le64_to_cpu(member->errors[i]));
@@ -397,21 +408,56 @@ int bch2_dev_alloc(struct bch_fs *c, unsigned dev_idx)
 	return 0;
 }
 
-static int __bch2_dev_attach_bdev(struct bch_dev *ca, struct bch_sb_handle *sb,
-				  struct printbuf *err)
+static int read_file_str(const char *path, darray_char *ret)
+{
+	/*
+	 * TODO: unify this with read_file_str() in bcachefs-tools tools-util.c
+	 *
+	 * Unfortunately, we don't have openat() in kernel
+	 */
+#ifdef __KERNEL__
+	struct file *file = errptr_try(filp_open(path, O_RDONLY, 0));
+
+	loff_t pos = 0;
+	ssize_t r = kernel_read(file, ret->data, ret->size, &pos);
+	fput(file);
+#else
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return fd;
+
+	ssize_t r = read(fd, ret->data, ret->size);
+	close(fd);
+#endif
+
+	if (r > 0) {
+		ret->nr = r;
+		if (ret->data[r - 1]) {
+			/* null terminate */
+			if (ret->nr >= ret->size)
+				ret->nr = ret->size -1;
+			ret->data[ret->nr] = '\0';
+		}
+	}
+	return r < 0 ? r : 0;
+}
+
+static int __bch2_dev_attach_bdev(struct bch_fs *c, struct bch_dev *ca,
+				  struct bch_sb_handle *sb, struct printbuf *err)
 {
 	if (bch2_dev_is_online(ca)) {
-		prt_printf(err, "already have device online in slot %u\n",
-			   sb->sb->dev_idx);
+		prt_printf(err, "Cannot attach %s: already have device %s online in slot %u\n",
+			   sb->sb_name, ca->name, sb->sb->dev_idx);
 		return bch_err_throw(ca->fs, device_already_online);
 	}
 
 	if (get_capacity(sb->bdev->bd_disk) <
 	    ca->mi.bucket_size * ca->mi.nbuckets) {
-		prt_printf(err, "cannot online: device too small (capacity %llu filesystem size %llu nbuckets %llu)\n",
-			get_capacity(sb->bdev->bd_disk),
-			ca->mi.bucket_size * ca->mi.nbuckets,
-			ca->mi.nbuckets);
+		prt_printf(err, "Cannot online %s: device too small (capacity %llu filesystem size %llu nbuckets %llu)\n",
+			   sb->sb_name,
+			   get_capacity(sb->bdev->bd_disk),
+			   ca->mi.bucket_size * ca->mi.nbuckets,
+			   ca->mi.nbuckets);
 		return bch_err_throw(ca->fs, device_size_too_small);
 	}
 
@@ -423,6 +469,26 @@ static int __bch2_dev_attach_bdev(struct bch_dev *ca, struct bch_sb_handle *sb,
 	CLASS(printbuf, name)();
 	prt_bdevname(&name, sb->bdev);
 	strscpy(ca->name, name.buf, sizeof(ca->name));
+
+	CLASS(darray_char, model)();
+	darray_make_room(&model, 128);
+
+	CLASS(printbuf, model_path)();
+	prt_printf(&model_path, "/sys/block/%s/device/model", name.buf);
+
+	read_file_str(model_path.buf, &model);
+
+	if (model.nr && model.data[model.nr - 1] == '\n')
+		model.data[--model.nr] = '\0';
+
+	scoped_guard(mutex, &c->sb_lock) {
+		struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
+
+		strtomem_pad(m->device_name, name.buf, '\0');
+
+		if (model.nr)
+			strtomem_pad(m->device_model, model.data, '\0');
+	}
 
 	/* Commit: */
 	ca->disk_sb = *sb;
@@ -447,20 +513,25 @@ int bch2_dev_attach_bdev(struct bch_fs *c, struct bch_sb_handle *sb, struct prin
 	lockdep_assert_held(&c->state_lock);
 
 	if (le64_to_cpu(sb->sb->seq) >
-	    le64_to_cpu(c->disk_sb.sb->seq))
-		bch2_sb_to_fs(c, sb->sb);
+	    le64_to_cpu(c->disk_sb.sb->seq)) {
+		/*
+		 * rewind, we'll lose some updates but it's not safe to call
+		 * bch2_sb_to_fs() after fs is started
+		 */
+		sb->sb->seq = c->disk_sb.sb->seq;
+	}
 
 	BUG_ON(!bch2_dev_exists(c, sb->sb->dev_idx));
 
 	struct bch_dev *ca = bch2_dev_locked(c, sb->sb->dev_idx);
 
-	try(__bch2_dev_attach_bdev(ca, sb, err));
+	try(__bch2_dev_attach_bdev(c, ca, sb, err));
 
-	set_bit(ca->dev_idx, c->online_devs.d);
+	set_bit(ca->dev_idx, c->devs_online.d);
 
 	bch2_dev_sysfs_online(c, ca);
 
-	bch2_rebalance_wakeup(c);
+	bch2_reconcile_wakeup(c);
 	return 0;
 }
 
@@ -479,46 +550,17 @@ bool bch2_dev_state_allowed(struct bch_fs *c, struct bch_dev *ca,
 			    enum bch_member_state new_state, int flags,
 			    struct printbuf *err)
 {
-	struct bch_devs_mask new_online_devs;
-	int nr_rw = 0, required;
-
 	lockdep_assert_held(&c->state_lock);
 
-	switch (new_state) {
-	case BCH_MEMBER_STATE_rw:
-		return true;
-	case BCH_MEMBER_STATE_ro:
-		if (ca->mi.state != BCH_MEMBER_STATE_rw)
-			return true;
+	if (ca->mi.state	== BCH_MEMBER_STATE_rw &&
+	    new_state		!= BCH_MEMBER_STATE_rw) {
+		struct bch_devs_mask new_rw_devs = c->allocator.rw_devs[0];
+		__clear_bit(ca->dev_idx, new_rw_devs.d);
 
-		/* do we have enough devices to write to?  */
-		for_each_member_device(c, ca2)
-			if (ca2 != ca)
-				nr_rw += ca2->mi.state == BCH_MEMBER_STATE_rw;
-
-		required = max(!(flags & BCH_FORCE_IF_METADATA_DEGRADED)
-			       ? c->opts.metadata_replicas
-			       : metadata_replicas_required(c),
-			       !(flags & BCH_FORCE_IF_DATA_DEGRADED)
-			       ? c->opts.data_replicas
-			       : data_replicas_required(c));
-
-		return nr_rw >= required;
-	case BCH_MEMBER_STATE_failed:
-	case BCH_MEMBER_STATE_spare:
-		if (ca->mi.state != BCH_MEMBER_STATE_rw &&
-		    ca->mi.state != BCH_MEMBER_STATE_ro)
-			return true;
-
-		/* do we have enough devices to read from?  */
-		new_online_devs = c->online_devs;
-		__clear_bit(ca->dev_idx, new_online_devs.d);
-
-		return bch2_have_enough_devs(c, new_online_devs, flags, err,
-					     test_bit(BCH_FS_rw, &c->flags));
-	default:
-		BUG();
+		return bch2_can_write_fs_with_devs(c, new_rw_devs, flags, err);
 	}
+
+	return true;
 }
 
 int __bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
@@ -536,7 +578,18 @@ int __bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 	if (new_state != BCH_MEMBER_STATE_rw)
 		__bch2_dev_read_only(c, ca);
 
-	bch_notice(ca, "%s", bch2_member_states[new_state]);
+	bch_notice_dev(ca, "%s", bch2_member_states[new_state]);
+
+	bool do_reconcile_scan =
+		new_state == BCH_MEMBER_STATE_rw ||
+		new_state == BCH_MEMBER_STATE_evacuating;
+
+	struct reconcile_scan s = new_state == BCH_MEMBER_STATE_rw
+		? (struct reconcile_scan) { .type = RECONCILE_SCAN_pending }
+		: (struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = ca->dev_idx };
+
+	if (do_reconcile_scan)
+		try(bch2_set_reconcile_needs_scan(c, s, false));
 
 	scoped_guard(mutex, &c->sb_lock) {
 		struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
@@ -547,7 +600,8 @@ int __bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 	if (new_state == BCH_MEMBER_STATE_rw)
 		__bch2_dev_read_write(c, ca);
 
-	bch2_rebalance_wakeup(c);
+	if (do_reconcile_scan)
+		try(bch2_set_reconcile_needs_scan(c, s, true));
 
 	return ret;
 }
@@ -579,7 +633,7 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags,
 	 */
 	bch2_dev_put(ca);
 
-	try(__bch2_dev_set_state(c, ca, BCH_MEMBER_STATE_failed, flags, err));
+	try(__bch2_dev_set_state(c, ca, BCH_MEMBER_STATE_evacuating, flags, err));
 
 	ret = fast_device_removal
 		? bch2_dev_data_drop_by_backpointers(c, ca->dev_idx, flags, err)
@@ -587,6 +641,8 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags,
 		   bch2_dev_remove_stripes(c, ca->dev_idx, flags, err));
 	if (ret)
 		goto err;
+
+	bch2_btree_interior_updates_flush(c);
 
 	/* Check if device still has data before blowing away alloc info */
 	struct bch_dev_usage usage = bch2_dev_usage_read(ca);
@@ -628,11 +684,16 @@ int bch2_dev_remove(struct bch_fs *c, struct bch_dev *ca, int flags,
 		goto err;
 	}
 
-	ret = bch2_replicas_gc2(c);
+	ret = bch2_replicas_gc_accounted(c);
 	if (ret) {
 		prt_printf(err, "bch2_replicas_gc2() error: %s\n", bch2_err_str(ret));
 		goto err;
 	}
+	/*
+	 * flushing the journal should be sufficient, but it's the write buffer
+	 * flush that kills superblock replicas entries after they've gone to 0
+	 * so bch2_dev_has_data() returns the correct value:
+	 */
 
 	data = bch2_dev_has_data(c, ca);
 	if (data) {
@@ -686,7 +747,7 @@ err:
 int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 {
 	struct bch_opts opts = bch2_opts_empty();
-	struct bch_sb_handle sb = {};
+	struct bch_sb_handle sb __cleanup(bch2_free_super) = {};
 	struct bch_dev *ca = NULL;
 	CLASS(printbuf, label)();
 	int ret = 0;
@@ -731,9 +792,18 @@ int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 		goto err;
 	}
 
-	ret = __bch2_dev_attach_bdev(ca, &sb, err);
+	ret = __bch2_dev_attach_bdev(c, ca, &sb, err);
 	if (ret)
 		goto err;
+
+	struct reconcile_scan s = { .type = RECONCILE_SCAN_pending };
+	if (test_bit(BCH_FS_started, &c->flags)) {
+		/*
+		 * Technically incorrect, but 'bcachefs image update' is the
+		 * only thing that adds a device to a not-started filesystem:
+		 */
+		try(bch2_set_reconcile_needs_scan(c, s, false));
+	}
 
 	scoped_guard(rwsem_write, &c->state_lock) {
 		scoped_guard(mutex, &c->sb_lock) {
@@ -764,7 +834,7 @@ int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 			ca->disk_sb.sb->dev_idx	= dev_idx;
 			bch2_dev_attach(c, ca, dev_idx);
 
-			set_bit(ca->dev_idx, c->online_devs.d);
+			set_bit(ca->dev_idx, c->devs_online.d);
 
 			if (BCH_MEMBER_GROUP(&dev_mi)) {
 				ret = __bch2_dev_group_set(c, ca, label.buf);
@@ -772,6 +842,10 @@ int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 				if (ret)
 					goto err_late;
 			}
+
+
+			bool write_sb = false;
+			__bch2_dev_mi_field_upgrades(c, ca, &write_sb);
 
 			bch2_write_super(c);
 		}
@@ -819,13 +893,15 @@ int bch2_dev_add(struct bch_fs *c, const char *path, struct printbuf *err)
 		};
 		kobject_uevent_env(&ca->disk_sb.bdev->bd_device.kobj, KOBJ_CHANGE, envp);
 	}
+
+	if (test_bit(BCH_FS_started, &c->flags))
+		try(bch2_set_reconcile_needs_scan(c, s, true));
 out:
 	bch_err_fn(c, ret);
 	return ret;
 err:
 	if (ca)
 		bch2_dev_free(ca);
-	bch2_free_super(&sb);
 	goto out;
 err_late:
 	ca = NULL;
@@ -836,9 +912,7 @@ err_late:
 int bch2_dev_online(struct bch_fs *c, const char *path, struct printbuf *err)
 {
 	struct bch_opts opts = bch2_opts_empty();
-	struct bch_sb_handle sb = { NULL };
-	struct bch_dev *ca;
-	unsigned dev_idx;
+	struct bch_sb_handle sb __cleanup(bch2_free_super) = {};
 	int ret;
 
 	guard(rwsem_write)(&c->state_lock);
@@ -849,24 +923,24 @@ int bch2_dev_online(struct bch_fs *c, const char *path, struct printbuf *err)
 		return ret;
 	}
 
-	dev_idx = sb.sb->dev_idx;
+	unsigned dev_idx = sb.sb->dev_idx;
 
 	ret = bch2_dev_in_fs(&c->disk_sb, &sb, &c->opts);
 	if (ret) {
 		prt_printf(err, "device not a member of fs: %s\n", bch2_err_str(ret));
-		goto err;
+		return ret;
 	}
 
-	ret = bch2_dev_attach_bdev(c, &sb, err);
-	if (ret)
-		goto err;
+	try(bch2_dev_attach_bdev(c, &sb, err));
 
-	ca = bch2_dev_locked(c, dev_idx);
+	struct bch_dev *ca = bch2_dev_locked(c, dev_idx);
+
+	bch2_dev_mi_field_upgrades(ca);
 
 	ret = bch2_trans_mark_dev_sb(c, ca, BTREE_TRIGGER_transactional);
 	if (ret) {
 		prt_printf(err, "bch2_trans_mark_dev_sb() error: %s\n", bch2_err_str(ret));
-		goto err;
+		return ret;
 	}
 
 	if (ca->mi.state == BCH_MEMBER_STATE_rw)
@@ -876,7 +950,7 @@ int bch2_dev_online(struct bch_fs *c, const char *path, struct printbuf *err)
 		ret = bch2_dev_freespace_init(c, ca, 0, ca->mi.nbuckets);
 		if (ret) {
 			prt_printf(err, "bch2_dev_freespace_init() error: %s\n", bch2_err_str(ret));
-			goto err;
+			return ret;
 		}
 	}
 
@@ -884,7 +958,7 @@ int bch2_dev_online(struct bch_fs *c, const char *path, struct printbuf *err)
 		ret = bch2_dev_journal_alloc(ca, false);
 		if (ret) {
 			prt_printf(err, "bch2_dev_journal_alloc() error: %s\n", bch2_err_str(ret));
-			goto err;
+			return ret;
 		}
 	}
 
@@ -895,9 +969,24 @@ int bch2_dev_online(struct bch_fs *c, const char *path, struct printbuf *err)
 	}
 
 	return 0;
-err:
-	bch2_free_super(&sb);
-	return ret;
+}
+
+static int bch2_dev_may_offline(struct bch_fs *c, struct bch_dev *ca, int flags, struct printbuf *err)
+{
+	struct bch_devs_mask new_devs = c->devs_online;
+	__clear_bit(ca->dev_idx, new_devs.d);
+
+	struct bch_devs_mask new_rw_devs = c->allocator.rw_devs[0];
+	__clear_bit(ca->dev_idx, new_devs.d);
+
+	if (!bch2_can_read_fs_with_devs(c, new_devs, flags, err) ||
+	    (!c->opts.read_only &&
+	     !bch2_can_write_fs_with_devs(c, new_rw_devs, flags, err))) {
+		prt_printf(err, "Cannot offline required disk\n");
+		return bch_err_throw(c, device_state_not_allowed);
+	}
+
+	return 0;
 }
 
 int bch2_dev_offline(struct bch_fs *c, struct bch_dev *ca, int flags, struct printbuf *err)
@@ -909,10 +998,7 @@ int bch2_dev_offline(struct bch_fs *c, struct bch_dev *ca, int flags, struct pri
 		return 0;
 	}
 
-	if (!bch2_dev_state_allowed(c, ca, BCH_MEMBER_STATE_failed, flags, NULL)) {
-		prt_printf(err, "Cannot offline required disk\n");
-		return bch_err_throw(c, device_state_not_allowed);
-	}
+	try(bch2_dev_may_offline(c, ca, flags, err));
 
 	__bch2_dev_offline(c, ca);
 	return 0;
@@ -930,6 +1016,11 @@ int bch2_dev_resize(struct bch_fs *c, struct bch_dev *ca, u64 nbuckets, struct p
 		prt_printf(err, "Cannot shrink yet\n");
 		return -EINVAL;
 	}
+
+	bool wakeup_reconcile_pending = nbuckets > ca->mi.nbuckets;
+	struct reconcile_scan s = { .type = RECONCILE_SCAN_pending };
+	if (wakeup_reconcile_pending)
+		try(bch2_set_reconcile_needs_scan(c, s, false));
 
 	if (nbuckets > BCH_MEMBER_NBUCKETS_MAX) {
 		prt_printf(err, "New device size too big (%llu greater than max %u)\n",
@@ -974,6 +1065,9 @@ int bch2_dev_resize(struct bch_fs *c, struct bch_dev *ca, u64 nbuckets, struct p
 	}
 
 	bch2_recalc_capacity(c);
+
+	if (wakeup_reconcile_pending)
+		try(bch2_set_reconcile_needs_scan(c, s, true));
 	return 0;
 }
 
@@ -998,8 +1092,10 @@ struct bch_dev *bch2_dev_lookup(struct bch_fs *c, const char *name)
 		name += strlen("/dev/");
 
 	for_each_member_device(c, ca)
-		if (!strcmp(name, ca->name))
+		if (!strcmp(name, ca->name)) {
+			bch2_dev_get(ca);
 			return ca;
+		}
 	return ERR_PTR(-BCH_ERR_ENOENT_dev_not_found);
 }
 
@@ -1029,8 +1125,10 @@ DEFINE_CLASS(bdev_get_fs, struct bch_fs *,
 static struct bch_dev *bdev_to_bch_dev(struct bch_fs *c, struct block_device *bdev)
 {
 	for_each_member_device(c, ca)
-		if (ca->disk_sb.bdev == bdev)
+		if (ca->disk_sb.bdev == bdev) {
+			bch2_dev_get(ca);
 			return ca;
+		}
 	return NULL;
 }
 
@@ -1054,14 +1152,12 @@ static void bch2_fs_bdev_mark_dead(struct block_device *bdev, bool surprise)
 
 	struct bch_dev *ca = bdev_to_bch_dev(c, bdev);
 	if (ca) {
+		bool print = true;
 		CLASS(printbuf, buf)();
 		__bch2_log_msg_start(ca->name, &buf);
 		prt_printf(&buf, "offline from block layer\n");
 
-		bool dev = bch2_dev_state_allowed(c, ca,
-						  BCH_MEMBER_STATE_failed,
-						  BCH_FORCE_IF_DEGRADED,
-						  &buf);
+		bool dev = !bch2_dev_may_offline(c, ca, BCH_FORCE_IF_DEGRADED, &buf);
 		if (!dev && sb) {
 			if (!surprise)
 				sync_filesystem(sb);
@@ -1073,10 +1169,11 @@ static void bch2_fs_bdev_mark_dead(struct block_device *bdev, bool surprise)
 			__bch2_dev_offline(c, ca);
 		} else {
 			bch2_journal_flush(&c->journal);
-			bch2_fs_emergency_read_only2(c, &buf);
+			print = bch2_fs_emergency_read_only(c, &buf);
 		}
 
-		bch2_print_str(c, KERN_ERR, buf.buf);
+		if (print)
+			bch2_print_str(c, KERN_ERR, buf.buf);
 
 		bch2_dev_put(ca);
 	}

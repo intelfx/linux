@@ -44,6 +44,9 @@ void bch2_member_to_text(struct printbuf *, struct bch_member *,
 			 struct bch_sb_field_disk_groups *,
 			 struct bch_sb *, unsigned);
 
+void bch2_member_to_text_short(struct printbuf *, struct bch_fs *, struct bch_dev *);
+void bch2_devs_mask_to_text_locked(struct printbuf *, struct bch_fs *, struct bch_devs_mask *);
+
 static inline bool bch2_dev_is_online(struct bch_dev *ca)
 {
 	return !enumerated_ref_is_zero(&ca->io_ref[READ]);
@@ -61,7 +64,7 @@ static inline bool bch2_dev_idx_is_online(struct bch_fs *c, unsigned dev)
 static inline bool bch2_dev_is_healthy(struct bch_dev *ca)
 {
 	return bch2_dev_is_online(ca) &&
-		ca->mi.state != BCH_MEMBER_STATE_failed;
+		ca->mi.state != BCH_MEMBER_STATE_evacuating;
 }
 
 static inline unsigned dev_mask_nr(const struct bch_devs_mask *devs)
@@ -72,10 +75,7 @@ static inline unsigned dev_mask_nr(const struct bch_devs_mask *devs)
 static inline bool bch2_dev_list_has_dev(struct bch_devs_list devs,
 					 unsigned dev)
 {
-	darray_for_each(devs, i)
-		if (*i == dev)
-			return true;
-	return false;
+	return darray_find(devs, dev) != NULL;
 }
 
 static inline void bch2_dev_list_drop_dev(struct bch_devs_list *devs,
@@ -128,10 +128,10 @@ static inline struct bch_dev *__bch2_next_dev(struct bch_fs *c, struct bch_dev *
 	     (_ca = __bch2_next_dev((_c), _ca, (_mask)));)
 
 #define for_each_online_member_rcu(_c, _ca)				\
-	for_each_member_device_rcu(_c, _ca, &(_c)->online_devs)
+	for_each_member_device_rcu(_c, _ca, &(_c)->devs_online)
 
 #define for_each_rw_member_rcu(_c, _ca)					\
-	for_each_member_device_rcu(_c, _ca, &(_c)->rw_devs[BCH_DATA_free])
+	for_each_member_device_rcu(_c, _ca, &(_c)->allocator.rw_devs[BCH_DATA_free])
 
 static inline void bch2_dev_get(struct bch_dev *ca)
 {
@@ -172,14 +172,8 @@ static inline struct bch_dev *bch2_get_next_dev(struct bch_fs *c, struct bch_dev
 	return ca;
 }
 
-/*
- * If you break early, you must drop your ref on the current device
- */
-#define __for_each_member_device(_c, _ca)				\
-	for (;	(_ca = bch2_get_next_dev(_c, _ca));)
-
 #define for_each_member_device(_c, _ca)					\
-	for (struct bch_dev *_ca = NULL;				\
+	for (struct bch_dev *_ca __free(bch2_dev_put) = NULL;		\
 	     (_ca = bch2_get_next_dev(_c, _ca));)
 
 static inline struct bch_dev *bch2_get_next_online_dev(struct bch_fs *c,
@@ -224,7 +218,8 @@ static inline bool bucket_valid(const struct bch_dev *ca, u64 b)
 
 static inline struct bch_dev *bch2_dev_have_ref(const struct bch_fs *c, unsigned dev)
 {
-	EBUG_ON(!bch2_dev_exists(c, dev));
+	if (WARN(!bch2_dev_exists(c, dev), "nonexistent dev %u (nr_devices %u)", dev, c->sb.nr_devices))
+		return NULL;
 
 	return rcu_dereference_check(c->devs[dev], 1);
 }
@@ -339,8 +334,7 @@ static inline struct bch_dev *bch2_dev_get_ioref(struct bch_fs *c, unsigned dev,
 	if (!ca || !enumerated_ref_tryget(&ca->io_ref[rw], ref_idx))
 		return NULL;
 
-	if (ca->mi.state == BCH_MEMBER_STATE_rw ||
-	    (ca->mi.state == BCH_MEMBER_STATE_ro && rw == READ))
+	if (ca->mi.state == BCH_MEMBER_STATE_rw || rw == READ)
 		return ca;
 
 	enumerated_ref_put(&ca->io_ref[rw], ref_idx);
@@ -384,7 +378,8 @@ static inline struct bch_member_cpu bch2_mi_to_cpu(struct bch_member *mi)
 			: 1,
 		.freespace_initialized = BCH_MEMBER_FREESPACE_INITIALIZED(mi),
 		.resize_on_mount	= BCH_MEMBER_RESIZE_ON_MOUNT(mi),
-		.valid		= bch2_member_alive(mi),
+		.rotational		= BCH_MEMBER_ROTATIONAL(mi),
+		.valid			= bch2_member_alive(mi),
 		.btree_bitmap_shift	= mi->btree_bitmap_shift,
 		.btree_allocated_bitmap = le64_to_cpu(mi->btree_allocated_bitmap),
 	};
@@ -396,7 +391,8 @@ void bch2_sb_members_to_cpu(struct bch_fs *);
 void bch2_dev_io_errors_to_text(struct printbuf *, struct bch_dev *);
 void bch2_dev_errors_reset(struct bch_dev *);
 
-static inline bool bch2_dev_btree_bitmap_marked_sectors(struct bch_dev *ca, u64 start, unsigned sectors)
+static inline bool __bch2_dev_btree_bitmap_marked_sectors(struct bch_dev *ca, u64 start,
+							  unsigned sectors, bool with_gc)
 {
 	u64 end = start + sectors;
 
@@ -406,15 +402,66 @@ static inline bool bch2_dev_btree_bitmap_marked_sectors(struct bch_dev *ca, u64 
 	for (unsigned bit = start >> ca->mi.btree_bitmap_shift;
 	     (u64) bit << ca->mi.btree_bitmap_shift < end;
 	     bit++)
-		if (!(ca->mi.btree_allocated_bitmap & BIT_ULL(bit)))
+		if (!(BIT_ULL(bit) &
+		      ca->mi.btree_allocated_bitmap &
+		      (with_gc
+		       ? ca->btree_allocated_bitmap_gc
+		       : ~0ULL)))
 			return false;
 	return true;
 }
 
+static inline bool bch2_dev_btree_bitmap_marked_sectors(struct bch_dev *ca, u64 start,
+							unsigned sectors)
+{
+	return __bch2_dev_btree_bitmap_marked_sectors(ca, start, sectors, false);
+}
+
+static inline bool bch2_dev_btree_bitmap_marked_sectors_any(struct bch_dev *ca, u64 start, unsigned sectors)
+{
+	u64 end = start + sectors;
+
+	if (start >= 64ULL << ca->mi.btree_bitmap_shift)
+		return false;
+
+	for (unsigned bit = start >> ca->mi.btree_bitmap_shift;
+	     (u64) bit << ca->mi.btree_bitmap_shift < end;
+	     bit++)
+		if (ca->mi.btree_allocated_bitmap & BIT_ULL(bit))
+			return true;
+	return false;
+}
+
 bool bch2_dev_btree_bitmap_marked(struct bch_fs *, struct bkey_s_c);
+bool bch2_dev_btree_bitmap_marked_nogc(struct bch_fs *, struct bkey_s_c);
+
+void bch2_dev_btree_bitmap_mark_locked(struct bch_fs *, struct bkey_s_c, bool *);
 void bch2_dev_btree_bitmap_mark(struct bch_fs *, struct bkey_s_c);
+
+int bch2_btree_bitmap_gc(struct bch_fs *);
+void bch2_maybe_schedule_btree_bitmap_gc_stop(struct bch_fs *);
+void bch2_maybe_schedule_btree_bitmap_gc(struct bch_fs *);
 
 int bch2_sb_member_alloc(struct bch_fs *);
 void bch2_sb_members_clean_deleted(struct bch_fs *);
+
+void __bch2_dev_mi_field_upgrades(struct bch_fs *, struct bch_dev *, bool *);
+void bch2_dev_mi_field_upgrades(struct bch_dev *);
+void bch2_fs_mi_field_upgrades(struct bch_fs *);
+
+static inline void bch2_prt_member_name(struct printbuf *out, struct bch_fs *c, unsigned idx)
+{
+	if (idx == BCH_SB_MEMBER_INVALID) {
+		prt_str(out, "(none)");
+	} else {
+		guard(rcu)();
+		guard(printbuf_atomic)(out);
+		struct bch_dev *ca = c ? bch2_dev_rcu_noerror(c, idx) : NULL;
+		if (ca)
+			prt_str(out, ca->name);
+		else
+			prt_printf(out, "(invalid device %u)", idx);
+	}
+}
 
 #endif /* _BCACHEFS_SB_MEMBERS_H */

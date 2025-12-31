@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "bcachefs.h"
 
+#include "btree/iter.h"
+
 #include "data/checksum.h"
 #include "data/compress.h"
 #include "data/extents.h"
@@ -13,6 +15,12 @@
 #include <linux/lz4.h>
 #include <linux/zlib.h>
 #include <linux/zstd.h>
+
+#include <linux/module.h>
+
+static bool bch2_verify_compress = IS_ENABLED(CONFIG_BCACHEFS_DEBUG);
+module_param_named(verify_compress, bch2_verify_compress, bool, 0644);
+MODULE_PARM_DESC(verify_compress, "Decompress data immediately after compressing, and verify the result");
 
 static inline enum bch_compression_opts bch2_compression_type_to_opt(enum bch_compression_type type)
 {
@@ -34,15 +42,33 @@ static inline enum bch_compression_opts bch2_compression_type_to_opt(enum bch_co
 
 /* Bounce buffer: */
 struct bbuf {
+	struct bch_fs	*c;
 	void		*b;
-	enum {
-		BB_NONE,
-		BB_VMAP,
-		BB_KMALLOC,
-		BB_MEMPOOL,
+	enum bbuf_type {
+		BB_none,
+		BB_vmap,
+		BB_kmalloc,
+		BB_mempool,
 	}		type;
 	int		rw;
 };
+
+static void bbuf_exit(struct bbuf *buf)
+{
+	switch (buf->type) {
+	case BB_none:
+		break;
+	case BB_vmap:
+		vunmap((void *) ((unsigned long) buf->b & PAGE_MASK));
+		break;
+	case BB_kmalloc:
+		kfree(buf->b);
+		break;
+	case BB_mempool:
+		mempool_free(buf->b, &buf->c->compress.bounce[buf->rw]);
+		break;
+	}
+}
 
 static struct bbuf __bounce_alloc(struct bch_fs *c, unsigned size, int rw)
 {
@@ -52,13 +78,22 @@ static struct bbuf __bounce_alloc(struct bch_fs *c, unsigned size, int rw)
 
 	b = kmalloc(size, GFP_NOFS|__GFP_NOWARN);
 	if (b)
-		return (struct bbuf) { .b = b, .type = BB_KMALLOC, .rw = rw };
+		return (struct bbuf) { .c = c, .b = b, .type = BB_kmalloc, .rw = rw };
 
-	b = mempool_alloc(&c->compression_bounce[rw], GFP_NOFS);
+	b = mempool_alloc(&c->compress.bounce[rw], GFP_NOFS);
 	if (b)
-		return (struct bbuf) { .b = b, .type = BB_MEMPOOL, .rw = rw };
+		return (struct bbuf) { .c = c, .b = b, .type = BB_mempool, .rw = rw };
 
 	BUG();
+}
+
+static struct bbuf bio_bounce(struct bch_fs *c, struct bio *bio, struct bvec_iter start, int rw)
+{
+	struct bbuf ret = __bounce_alloc(c, start.bi_size, rw);
+
+	if (rw == READ)
+		memcpy_from_bio(ret.b, bio, start);
+	return ret;
 }
 
 static bool bio_phys_contig(struct bio *bio, struct bvec_iter start)
@@ -68,12 +103,12 @@ static bool bio_phys_contig(struct bio *bio, struct bvec_iter start)
 	void *expected_start = NULL;
 
 	__bio_for_each_bvec(bv, bio, iter, start) {
-		if (expected_start &&
-		    expected_start != page_address(bv.bv_page) + bv.bv_offset)
+		void *bv_addr = bvec_virt(&bv);
+
+		if (expected_start && expected_start != bv_addr)
 			return false;
 
-		expected_start = page_address(bv.bv_page) +
-			bv.bv_offset + bv.bv_len;
+		expected_start = bv_addr + bv.bv_len;
 	}
 
 	return true;
@@ -82,87 +117,70 @@ static bool bio_phys_contig(struct bio *bio, struct bvec_iter start)
 static struct bbuf __bio_map_or_bounce(struct bch_fs *c, struct bio *bio,
 				       struct bvec_iter start, int rw)
 {
-	struct bbuf ret;
+	BUG_ON(start.bi_size > c->opts.encoded_extent_max);
+
+#ifndef CONFIG_HIGHMEM
+	if (bio_phys_contig(bio, start))
+		return (struct bbuf) {
+			.c	= c,
+			.b	= bvec_virt(&bio_iter_iovec(bio, start)),
+			.type	= BB_none,
+			.rw	= rw
+		};
+#endif
+
+#ifdef __KERNEL__
+	/* check if we can map the pages contiguously: */
 	struct bio_vec bv;
 	struct bvec_iter iter;
 	unsigned nr_pages = 0;
-	struct page *stack_pages[16];
-	struct page **pages = NULL;
-	void *data;
 
-	BUG_ON(start.bi_size > c->opts.encoded_extent_max);
-
-	if (!PageHighMem(bio_iter_page(bio, start)) &&
-	    bio_phys_contig(bio, start))
-		return (struct bbuf) {
-			.b = page_address(bio_iter_page(bio, start)) +
-				bio_iter_offset(bio, start),
-			.type = BB_NONE, .rw = rw
-		};
-
-	/* check if we can map the pages contiguously: */
 	__bio_for_each_segment(bv, bio, iter, start) {
+		BUG_ON(bv.bv_offset + bv.bv_len > PAGE_SIZE);
+
 		if (iter.bi_size != start.bi_size &&
 		    bv.bv_offset)
-			goto bounce;
+			return bio_bounce(c, bio, start, rw);
 
 		if (bv.bv_len < iter.bi_size &&
 		    bv.bv_offset + bv.bv_len < PAGE_SIZE)
-			goto bounce;
+			return bio_bounce(c, bio, start, rw);
 
 		nr_pages++;
 	}
 
 	BUG_ON(DIV_ROUND_UP(start.bi_size, PAGE_SIZE) > nr_pages);
 
-	pages = nr_pages > ARRAY_SIZE(stack_pages)
+	struct page *stack_pages[16];
+	struct page **pages = nr_pages > ARRAY_SIZE(stack_pages)
 		? kmalloc_array(nr_pages, sizeof(struct page *), GFP_NOFS)
 		: stack_pages;
 	if (!pages)
-		goto bounce;
+		return bio_bounce(c, bio, start, rw);
 
 	nr_pages = 0;
 	__bio_for_each_segment(bv, bio, iter, start)
 		pages[nr_pages++] = bv.bv_page;
 
-	data = vmap(pages, nr_pages, VM_MAP, PAGE_KERNEL);
+	void *data = vmap(pages, nr_pages, VM_MAP, PAGE_KERNEL);
 	if (pages != stack_pages)
 		kfree(pages);
 
 	if (data)
 		return (struct bbuf) {
-			.b = data + bio_iter_offset(bio, start),
-			.type = BB_VMAP, .rw = rw
+			c,
+			data + bio_iter_offset(bio, start),
+			BB_vmap,
+			rw
 		};
-bounce:
-	ret = __bounce_alloc(c, start.bi_size, rw);
+#endif /* __KERNEL__ */
 
-	if (rw == READ)
-		memcpy_from_bio(ret.b, bio, start);
-
-	return ret;
+	return bio_bounce(c, bio, start, rw);
 }
 
 static struct bbuf bio_map_or_bounce(struct bch_fs *c, struct bio *bio, int rw)
 {
 	return __bio_map_or_bounce(c, bio, bio->bi_iter, rw);
-}
-
-static void bio_unmap_or_unbounce(struct bch_fs *c, struct bbuf buf)
-{
-	switch (buf.type) {
-	case BB_NONE:
-		break;
-	case BB_VMAP:
-		vunmap((void *) ((unsigned long) buf.b & PAGE_MASK));
-		break;
-	case BB_KMALLOC:
-		kfree(buf.b);
-		break;
-	case BB_MEMPOOL:
-		mempool_free(buf.b, &c->compression_bounce[buf.rw]);
-		break;
-	}
 }
 
 static inline void zlib_set_workspace(z_stream *strm, void *workspace)
@@ -172,87 +190,93 @@ static inline void zlib_set_workspace(z_stream *strm, void *workspace)
 #endif
 }
 
-static int __bio_uncompress(struct bch_fs *c, struct bio *src,
-			    void *dst_data, struct bch_extent_crc_unpacked crc)
+static int buf_uncompress(struct bch_fs *c,
+			  void *dst, void *src,
+			  struct bch_extent_crc_unpacked crc)
 {
-	struct bbuf src_data = { NULL };
-	size_t src_len = src->bi_iter.bi_size;
-	size_t dst_len = crc.uncompressed_size << 9;
-	void *workspace;
-	int ret = 0, ret2;
-
 	enum bch_compression_opts opt = bch2_compression_type_to_opt(crc.compression_type);
-	mempool_t *workspace_pool = &c->compress_workspace[opt];
+	mempool_t *workspace_pool = &c->compress.workspace[opt];
 	if (unlikely(!mempool_initialized(workspace_pool))) {
-		if (fsck_err(c, compression_type_not_marked_in_sb,
+		if (ret_fsck_err(c, compression_type_not_marked_in_sb,
 			     "compression type %s set but not marked in superblock",
 			     __bch2_compression_types[crc.compression_type]))
-			ret = bch2_check_set_has_compressed_data(c, opt);
+			try(bch2_check_set_has_compressed_data(c, opt));
 		else
-			ret = bch_err_throw(c, compression_workspace_not_initialized);
-		if (ret)
-			goto err;
+			return bch_err_throw(c, compression_workspace_not_initialized);
 	}
 
-	src_data = bio_map_or_bounce(c, src, READ);
+	size_t src_len = crc.compressed_size << 9;
+	size_t dst_len = crc.uncompressed_size << 9;
 
 	switch (crc.compression_type) {
 	case BCH_COMPRESSION_TYPE_lz4_old:
-	case BCH_COMPRESSION_TYPE_lz4:
-		ret2 = LZ4_decompress_safe_partial(src_data.b, dst_data,
-						   src_len, dst_len, dst_len);
-		if (ret2 != dst_len)
-			ret = bch_err_throw(c, decompress_lz4);
+	case BCH_COMPRESSION_TYPE_lz4: {
+		int ret = LZ4_decompress_safe_partial(src, dst, src_len, dst_len, dst_len);
+		if (ret != dst_len)
+			return bch_err_throw(c, decompress_lz4);
 		break;
+	}
 	case BCH_COMPRESSION_TYPE_gzip: {
 		z_stream strm = {
-			.next_in	= src_data.b,
+			.next_in	= src,
 			.avail_in	= src_len,
-			.next_out	= dst_data,
+			.next_out	= dst,
 			.avail_out	= dst_len,
 		};
 
-		workspace = mempool_alloc(workspace_pool, GFP_NOFS);
+		void *workspace = mempool_alloc(workspace_pool, GFP_NOFS);
 
 		zlib_set_workspace(&strm, workspace);
 		zlib_inflateInit2(&strm, -MAX_WBITS);
-		ret2 = zlib_inflate(&strm, Z_FINISH);
+		int ret = zlib_inflate(&strm, Z_FINISH);
 
 		mempool_free(workspace, workspace_pool);
 
-		if (ret2 != Z_STREAM_END)
-			ret = bch_err_throw(c, decompress_gzip);
+		if (ret != Z_STREAM_END)
+			return bch_err_throw(c, decompress_gzip);
 		break;
 	}
 	case BCH_COMPRESSION_TYPE_zstd: {
 		ZSTD_DCtx *ctx;
-		size_t real_src_len = le32_to_cpup(src_data.b);
+		size_t real_src_len = le32_to_cpup(src);
 
-		if (real_src_len > src_len - 4) {
-			ret = bch_err_throw(c, decompress_zstd_src_len_bad);
-			goto err;
-		}
+		if (real_src_len > src_len - 4)
+			return bch_err_throw(c, decompress_zstd_src_len_bad);
 
-		workspace = mempool_alloc(workspace_pool, GFP_NOFS);
+		void *workspace = mempool_alloc(workspace_pool, GFP_NOFS);
 		ctx = zstd_init_dctx(workspace, zstd_dctx_workspace_bound());
 
-		ret2 = zstd_decompress_dctx(ctx,
-				dst_data,	dst_len,
-				src_data.b + 4, real_src_len);
+		size_t ret = zstd_decompress_dctx(ctx,
+				dst,	dst_len,
+				src + 4, real_src_len);
 
 		mempool_free(workspace, workspace_pool);
 
-		if (ret2 != dst_len)
-			ret = bch_err_throw(c, decompress_zstd);
+		if (ret != dst_len) {
+			if (zstd_is_error(ret))
+				return __bch2_err_throw(c, zstd_err_to_bch_err(zstd_get_error_code(ret)));
+			else {
+				bch_err(c, "zstd decompress error: expected %zu bytes, got %zu", dst_len, ret);
+				return bch_err_throw(c, decompress_zstd_size_mismatch);
+			}
+		}
 		break;
 	}
 	default:
 		BUG();
 	}
-err:
-fsck_err:
-	bio_unmap_or_unbounce(c, src_data);
-	return ret;
+
+	return 0;
+}
+
+static int __bio_uncompress(struct bch_fs *c, struct bio *src,
+			    void *dst_data, struct bch_extent_crc_unpacked crc)
+{
+	BUG_ON(src->bi_iter.bi_size != crc.compressed_size << 9);
+
+	struct bbuf src_data __cleanup(bbuf_exit) = bio_map_or_bounce(c, src, READ);
+
+	return buf_uncompress(c, dst_data, src_data.b, crc);
 }
 
 int bch2_bio_uncompress_inplace(struct bch_write_op *op,
@@ -260,31 +284,27 @@ int bch2_bio_uncompress_inplace(struct bch_write_op *op,
 {
 	struct bch_fs *c = op->c;
 	struct bch_extent_crc_unpacked *crc = &op->crc;
-	struct bbuf data = { NULL };
 	size_t dst_len = crc->uncompressed_size << 9;
-	int ret = 0;
 
 	/* bio must own its pages: */
 	BUG_ON(!bio->bi_vcnt);
 	BUG_ON(DIV_ROUND_UP(crc->live_size, PAGE_SECTORS) > bio->bi_max_vecs);
 
 	if (crc->uncompressed_size << 9	> c->opts.encoded_extent_max) {
-		bch2_write_op_error(op, op->pos.offset,
+		bch2_write_op_error(op, false, op->pos.offset,
 				    "extent too big to decompress (%u > %u)",
 				    crc->uncompressed_size << 9, c->opts.encoded_extent_max);
 		return bch_err_throw(c, decompress_exceeded_max_encoded_extent);
 	}
 
-	data = __bounce_alloc(c, dst_len, WRITE);
+	struct bbuf data __cleanup(bbuf_exit) = __bounce_alloc(c, dst_len, WRITE);
 
-	ret = __bio_uncompress(c, bio, data.b, *crc);
-
+	int ret = __bio_uncompress(c, bio, data.b, *crc);
 	if (c->opts.no_data_io)
 		ret = 0;
-
 	if (ret) {
-		bch2_write_op_error(op, op->pos.offset, "%s", bch2_err_str(ret));
-		goto err;
+		bch2_write_op_error(op, false, op->pos.offset, "%s", bch2_err_str(ret));
+		return ret;
 	}
 
 	/*
@@ -301,37 +321,29 @@ int bch2_bio_uncompress_inplace(struct bch_write_op *op,
 	crc->uncompressed_size	= crc->live_size;
 	crc->offset		= 0;
 	crc->csum		= (struct bch_csum) { 0, 0 };
-err:
-	bio_unmap_or_unbounce(c, data);
-	return ret;
+	return 0;
 }
 
 int bch2_bio_uncompress(struct bch_fs *c, struct bio *src,
 		       struct bio *dst, struct bvec_iter dst_iter,
 		       struct bch_extent_crc_unpacked crc)
 {
-	struct bbuf dst_data = { NULL };
 	size_t dst_len = crc.uncompressed_size << 9;
-	int ret;
 
 	if (crc.uncompressed_size << 9	> c->opts.encoded_extent_max ||
 	    crc.compressed_size << 9	> c->opts.encoded_extent_max)
 		return bch_err_throw(c, decompress_exceeded_max_encoded_extent);
 
-	dst_data = dst_len == dst_iter.bi_size
+	struct bbuf dst_data __cleanup(bbuf_exit) = dst_len == dst_iter.bi_size
 		? __bio_map_or_bounce(c, dst, dst_iter, WRITE)
 		: __bounce_alloc(c, dst_len, WRITE);
 
-	ret = __bio_uncompress(c, src, dst_data.b, crc);
-	if (ret)
-		goto err;
+	try(__bio_uncompress(c, src, dst_data.b, crc));
 
-	if (dst_data.type != BB_NONE &&
-	    dst_data.type != BB_VMAP)
+	if (dst_data.type != BB_none &&
+	    dst_data.type != BB_vmap)
 		memcpy_to_bio(dst, dst_iter, dst_data.b + (crc.offset << 9));
-err:
-	bio_unmap_or_unbounce(c, dst_data);
-	return ret;
+	return 0;
 }
 
 static int attempt_compress(struct bch_fs *c,
@@ -342,6 +354,9 @@ static int attempt_compress(struct bch_fs *c,
 {
 	enum bch_compression_type compression_type =
 		__bch2_compression_opt_to_type[compression.type];
+
+	BUG_ON(src_len & 511);
+	BUG_ON(dst_len & 511);
 
 	switch (compression_type) {
 	case BCH_COMPRESSION_TYPE_lz4:
@@ -397,7 +412,7 @@ static int attempt_compress(struct bch_fs *c,
 		 */
 		unsigned level = min((compression.level * 3) / 2, zstd_max_clevel());
 		ZSTD_parameters params = zstd_get_params(level, c->opts.encoded_extent_max);
-		ZSTD_CCtx *ctx = zstd_init_cctx(workspace, c->zstd_workspace_size);
+		ZSTD_CCtx *ctx = zstd_init_cctx(workspace, c->compress.zstd_workspace_size);
 
 		/*
 		 * ZSTD requires that when we decompress we pass in the exact
@@ -425,24 +440,29 @@ static int attempt_compress(struct bch_fs *c,
 	}
 }
 
-static unsigned __bio_compress(struct bch_fs *c,
-			       struct bio *dst, size_t *dst_len,
-			       struct bio *src, size_t *src_len,
-			       union bch_compression_opt compression)
+static unsigned bch2_compress(struct bch_fs *c,
+			      void *dst, size_t *dst_len,
+			      void *src, size_t *src_len,
+			      unsigned compression_opt,
+			      struct bpos write_pos)
 {
-	struct bbuf src_data = { NULL }, dst_data = { NULL };
-	void *workspace;
+	union bch_compression_opt compression =
+		(union bch_compression_opt) { .value = compression_opt };
+
+	/* If it's only one block, don't bother trying to compress: */
+	if (*src_len <= c->opts.block_size)
+		return BCH_COMPRESSION_TYPE_incompressible;
+
 	enum bch_compression_type compression_type =
 		__bch2_compression_opt_to_type[compression.type];
-	unsigned pad;
 	int ret = 0;
 
 	/* bch2_compression_decode catches unknown compression types: */
 	BUG_ON(compression.type >= BCH_COMPRESSION_OPT_NR);
 
-	mempool_t *workspace_pool = &c->compress_workspace[compression.type];
+	mempool_t *workspace_pool = &c->compress.workspace[compression.type];
 	if (unlikely(!mempool_initialized(workspace_pool))) {
-		if (fsck_err(c, compression_opt_not_marked_in_sb,
+		if (ret_fsck_err(c, compression_opt_not_marked_in_sb,
 			     "compression opt %s set but not marked in superblock",
 			     bch2_compression_opts[compression.type])) {
 			ret = bch2_check_set_has_compressed_data(c, compression.type);
@@ -453,17 +473,7 @@ static unsigned __bio_compress(struct bch_fs *c,
 		}
 	}
 
-	/* If it's only one block, don't bother trying to compress: */
-	if (src->bi_iter.bi_size <= c->opts.block_size)
-		return BCH_COMPRESSION_TYPE_incompressible;
-
-	dst_data = bio_map_or_bounce(c, dst, WRITE);
-	src_data = bio_map_or_bounce(c, src, READ);
-
-	workspace = mempool_alloc(workspace_pool, GFP_NOFS);
-
-	*src_len = src->bi_iter.bi_size;
-	*dst_len = dst->bi_iter.bi_size;
+	void *workspace = mempool_alloc(workspace_pool, GFP_NOFS);
 
 	/*
 	 * XXX: this algorithm sucks when the compression code doesn't tell us
@@ -476,8 +486,8 @@ static unsigned __bio_compress(struct bch_fs *c,
 		}
 
 		ret = attempt_compress(c, workspace,
-				       dst_data.b,	*dst_len,
-				       src_data.b,	*src_len,
+				       dst, *dst_len,
+				       src, *src_len,
 				       compression);
 		if (ret > 0) {
 			*dst_len = ret;
@@ -506,59 +516,89 @@ static unsigned __bio_compress(struct bch_fs *c,
 	mempool_free(workspace, workspace_pool);
 
 	if (ret)
-		goto err;
+		return BCH_COMPRESSION_TYPE_incompressible;
 
 	/* Didn't get smaller: */
 	if (round_up(*dst_len, block_bytes(c)) >= *src_len)
-		goto err;
+		return BCH_COMPRESSION_TYPE_incompressible;
 
-	pad = round_up(*dst_len, block_bytes(c)) - *dst_len;
+	unsigned pad = round_up(*dst_len, block_bytes(c)) - *dst_len;
 
-	memset(dst_data.b + *dst_len, 0, pad);
+	memset(dst + *dst_len, 0, pad);
 	*dst_len += pad;
 
-	if (dst_data.type != BB_NONE &&
-	    dst_data.type != BB_VMAP)
-		memcpy_to_bio(dst, dst->bi_iter, dst_data.b);
+	if (unlikely(bch2_verify_compress)) {
+		struct bch_extent_crc_unpacked crc = {
+			.compressed_size	= *dst_len >> 9,
+			.uncompressed_size	= *src_len >> 9,
+			.compression_type	= compression_type,
+		};
 
-	BUG_ON(!*dst_len || *dst_len > dst->bi_iter.bi_size);
-	BUG_ON(!*src_len || *src_len > src->bi_iter.bi_size);
+		struct bbuf verify __cleanup(bbuf_exit) = __bounce_alloc(c, *src_len, WRITE);
+		ret = buf_uncompress(c, verify.b, dst, crc);
+		BUG_ON(ret);
+
+		if (memcmp(verify.b, src, *src_len)) {
+			CLASS(bch_log_msg, msg)(c);
+			prt_printf(&msg.m, "Decompressing compressed data did not produce the same result (%s)",
+				   __bch2_compression_types[compression_type]);
+
+			CLASS(btree_trans, trans)(c);
+			bch2_inum_offset_err_msg_trans(trans, &msg.m, 0, write_pos);
+			prt_printf(&msg.m, " len %zu\n", *src_len);
+
+			msg.m.suppress = bch2_count_fsck_err(c, compression_error, &msg.m);
+			return BCH_COMPRESSION_TYPE_incompressible;
+		}
+	}
+
 	BUG_ON(*dst_len & (block_bytes(c) - 1));
 	BUG_ON(*src_len & (block_bytes(c) - 1));
-	ret = compression_type;
-out:
-	bio_unmap_or_unbounce(c, src_data);
-	bio_unmap_or_unbounce(c, dst_data);
-	return ret;
-err:
-	ret = BCH_COMPRESSION_TYPE_incompressible;
-	goto out;
-fsck_err:
-	ret = 0;
-	goto out;
+	return compression_type;
 }
 
 unsigned bch2_bio_compress(struct bch_fs *c,
 			   struct bio *dst, size_t *dst_len,
 			   struct bio *src, size_t *src_len,
-			   unsigned compression_opt)
+			   unsigned compression_opt,
+			   struct bpos write_pos,
+			   bool bounce_source)
 {
-	unsigned orig_dst = dst->bi_iter.bi_size;
-	unsigned orig_src = src->bi_iter.bi_size;
-	unsigned compression_type;
-
 	/* Don't consume more than BCH_ENCODED_EXTENT_MAX from @src: */
-	src->bi_iter.bi_size = min_t(unsigned, src->bi_iter.bi_size,
-				     c->opts.encoded_extent_max);
+	unsigned consume_src = min(src->bi_iter.bi_size, c->opts.encoded_extent_max);
 	/* Don't generate a bigger output than input: */
-	dst->bi_iter.bi_size = min(dst->bi_iter.bi_size, src->bi_iter.bi_size);
+	unsigned consume_dst = min(dst->bi_iter.bi_size, consume_src);
 
-	compression_type =
-		__bio_compress(c, dst, dst_len, src, src_len,
-			       (union bch_compression_opt){ .value = compression_opt });
+	swap(dst->bi_iter.bi_size, consume_dst);
+	swap(src->bi_iter.bi_size, consume_src);
 
-	dst->bi_iter.bi_size = orig_dst;
-	src->bi_iter.bi_size = orig_src;
+	*src_len = src->bi_iter.bi_size;
+	*dst_len = dst->bi_iter.bi_size;
+
+	struct bbuf dst_data __cleanup(bbuf_exit) = bio_map_or_bounce(c, dst, WRITE);
+	struct bbuf src_data __cleanup(bbuf_exit) = bounce_source
+		? bio_bounce(c, src, src->bi_iter, READ)
+		: bio_map_or_bounce(c, src, READ);
+
+	unsigned compression_type =
+		bch2_compress(c,
+			      dst_data.b, dst_len,
+			      src_data.b, src_len,
+			      compression_opt,
+			      write_pos);
+
+	if (compression_type != BCH_COMPRESSION_TYPE_none &&
+	    compression_type != BCH_COMPRESSION_TYPE_incompressible) {
+		if (dst_data.type != BB_none &&
+		    dst_data.type != BB_vmap)
+			memcpy_to_bio(dst, dst->bi_iter, dst_data.b);
+
+		BUG_ON(!*dst_len || *dst_len > dst->bi_iter.bi_size);
+		BUG_ON(!*src_len || *src_len > src->bi_iter.bi_size);
+	}
+
+	swap(dst->bi_iter.bi_size, consume_dst);
+	swap(src->bi_iter.bi_size, consume_src);
 	return compression_type;
 }
 
@@ -609,10 +649,10 @@ void bch2_fs_compress_exit(struct bch_fs *c)
 {
 	unsigned i;
 
-	for (i = 0; i < ARRAY_SIZE(c->compress_workspace); i++)
-		mempool_exit(&c->compress_workspace[i]);
-	mempool_exit(&c->compression_bounce[WRITE]);
-	mempool_exit(&c->compression_bounce[READ]);
+	for (i = 0; i < ARRAY_SIZE(c->compress.workspace); i++)
+		mempool_exit(&c->compress.workspace[i]);
+	mempool_exit(&c->compress.bounce[WRITE]);
+	mempool_exit(&c->compress.bounce[READ]);
 }
 
 static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
@@ -620,7 +660,7 @@ static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 	ZSTD_parameters params = zstd_get_params(zstd_max_clevel(),
 						 c->opts.encoded_extent_max);
 
-	c->zstd_workspace_size = zstd_cctx_workspace_bound(&params.cParams);
+	c->compress.zstd_workspace_size = zstd_cctx_workspace_bound(&params.cParams);
 
 	struct {
 		unsigned			feature;
@@ -633,7 +673,7 @@ static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 			max(zlib_deflate_workspacesize(MAX_WBITS, DEF_MEM_LEVEL),
 			    zlib_inflate_workspacesize()) },
 		{ BCH_FEATURE_zstd, BCH_COMPRESSION_OPT_zstd,
-			max(c->zstd_workspace_size,
+			max(c->compress.zstd_workspace_size,
 			    zstd_dctx_workspace_bound()) },
 	}, *i;
 	bool have_compressed = false;
@@ -646,13 +686,13 @@ static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 	if (!have_compressed)
 		return 0;
 
-	if (!mempool_initialized(&c->compression_bounce[READ]) &&
-	    mempool_init_kvmalloc_pool(&c->compression_bounce[READ],
+	if (!mempool_initialized(&c->compress.bounce[READ]) &&
+	    mempool_init_kvmalloc_pool(&c->compress.bounce[READ],
 				       1, c->opts.encoded_extent_max))
 		return bch_err_throw(c, ENOMEM_compression_bounce_read_init);
 
-	if (!mempool_initialized(&c->compression_bounce[WRITE]) &&
-	    mempool_init_kvmalloc_pool(&c->compression_bounce[WRITE],
+	if (!mempool_initialized(&c->compress.bounce[WRITE]) &&
+	    mempool_init_kvmalloc_pool(&c->compress.bounce[WRITE],
 				       1, c->opts.encoded_extent_max))
 		return bch_err_throw(c, ENOMEM_compression_bounce_write_init);
 
@@ -662,11 +702,11 @@ static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 		if (!(features & (1 << i->feature)))
 			continue;
 
-		if (mempool_initialized(&c->compress_workspace[i->type]))
+		if (mempool_initialized(&c->compress.workspace[i->type]))
 			continue;
 
 		if (mempool_init_kvmalloc_pool(
-				&c->compress_workspace[i->type],
+				&c->compress.workspace[i->type],
 				1, i->compress_workspace))
 			return bch_err_throw(c, ENOMEM_compression_workspace_init);
 	}

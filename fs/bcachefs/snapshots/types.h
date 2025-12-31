@@ -3,7 +3,7 @@
 #define _BCACHEFS_SNAPSHOT_TYPES_H
 
 #include "btree/bbpos_types.h"
-#include "subvolume_types.h"
+#include "init/progress.h"
 #include "util/darray.h"
 
 DEFINE_DARRAY_NAMED(snapshot_id_list, u32);
@@ -42,16 +42,34 @@ struct snapshot_interior_delete {
 DEFINE_DARRAY_NAMED(interior_delete_list, struct snapshot_interior_delete);
 
 struct snapshot_delete {
-	struct mutex		lock;
-	struct work_struct	work;
+	struct mutex			lock;
+	struct work_struct		work;
 
-	struct mutex		progress_lock;
-	snapshot_id_list	deleting_from_trees;
-	snapshot_id_list	delete_leaves;
-	interior_delete_list	delete_interior;
+	struct mutex			progress_lock;
+	snapshot_id_list		deleting_from_trees;
+	snapshot_id_list		delete_leaves;
+	interior_delete_list		delete_interior;
+	interior_delete_list		no_keys;
 
-	bool			running;
-	struct bbpos		pos;
+	bool				running;
+	unsigned			version;
+	struct progress_indicator	progress;
 };
+
+struct bch_fs_snapshots {
+	struct snapshot_table __rcu		*table;
+	struct mutex				table_lock;
+	struct rw_semaphore			create_lock;
+	struct snapshot_delete			delete;
+	struct work_struct			wait_for_pagecache_and_delete_work;
+	snapshot_id_list			unlinked;
+	struct mutex				unlinked_lock;
+};
+
+typedef struct {
+	/* we can't have padding in this struct: */
+	u64		subvol;
+	u64		inum;
+} subvol_inum;
 
 #endif /* _BCACHEFS_SNAPSHOT_TYPES_H */

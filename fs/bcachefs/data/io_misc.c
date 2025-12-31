@@ -14,7 +14,7 @@
 #include "data/extents.h"
 #include "data/extent_update.h"
 #include "data/io_misc.h"
-#include "data/rebalance.h"
+#include "data/reconcile.h"
 #include "data/write.h"
 
 #include "fs/inode.h"
@@ -48,14 +48,13 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 	struct bkey_buf new __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&new);
 
-	struct closure cl;
-	closure_init_stack(&cl);
+	CLASS(closure_stack, cl)();
 
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(iter));
 
 	sectors = min_t(u64, sectors, k.k->p.offset - iter->pos.offset);
 	new_replicas = max(0, (int) opts.data_replicas -
-			   (int) bch2_bkey_nr_ptrs_fully_allocated(k));
+			   (int) bch2_bkey_nr_ptrs_fully_allocated(c, k));
 
 	/*
 	 * Get a disk reservation before (in the nocow case) calling
@@ -302,7 +301,7 @@ int bch2_truncate(struct bch_fs *c, subvol_inum inum, u64 new_i_size, u64 *i_sec
 	 * snapshot while they're in progress, then crashing, will result in the
 	 * resume only proceeding in one of the snapshots
 	 */
-	guard(rwsem_read)(&c->snapshot_create_lock);
+	guard(rwsem_read)(&c->snapshots.create_lock);
 	CLASS(btree_trans, trans)(c);
 	try(bch2_logged_op_start(trans, &op.k_i));
 	int ret = __bch2_resume_logged_op_truncate(trans, &op.k_i, i_sectors_delta);
@@ -429,12 +428,12 @@ case LOGGED_OP_FINSERT_shift_extents:
 
 		if (insert &&
 		    bkey_lt(bkey_start_pos(k.k), src_pos)) {
-			bch2_cut_front(src_pos, copy);
+			bch2_cut_front(c, src_pos, copy);
 
 			/* Splitting compressed extent? */
 			bch2_disk_reservation_add(c, &disk_res,
 					copy->k.size *
-					bch2_bkey_nr_ptrs_allocated(bkey_i_to_s_c(copy)),
+					bch2_bkey_nr_ptrs_allocated(c, bkey_i_to_s_c(copy)),
 					BCH_DISK_RESERVATION_NOFAIL);
 		}
 
@@ -510,7 +509,7 @@ int bch2_fcollapse_finsert(struct bch_fs *c, subvol_inum inum,
 	 * snapshot while they're in progress, then crashing, will result in the
 	 * resume only proceeding in one of the snapshots
 	 */
-	guard(rwsem_read)(&c->snapshot_create_lock);
+	guard(rwsem_read)(&c->snapshots.create_lock);
 	CLASS(btree_trans, trans)(c);
 	try(bch2_logged_op_start(trans, &op.k_i));
 	int ret = __bch2_resume_logged_op_finsert(trans, &op.k_i, i_sectors_delta);

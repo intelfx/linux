@@ -549,7 +549,7 @@ int bch2_dirent_lookup_trans(struct btree_trans *trans,
 					     hash_info, dir, &lookup_name, flags));
 
 	int ret = bch2_dirent_read_target(trans, dir, bkey_s_c_to_dirent(k), inum);
-	return ret > 0 ? -ENOENT : 0;
+	return ret > 0 ? -ENOENT : ret;
 }
 
 u64 bch2_dirent_lookup(struct bch_fs *c, subvol_inum dir,
@@ -630,9 +630,10 @@ int bch2_readdir(struct bch_fs *c, subvol_inum inum,
 
 			subvol_inum target;
 
-			bool need_second_pass = false;
+			bool need_second_pass = false, repaired_inode = false;
 			int ret2 = bch2_str_hash_check_key(trans, NULL, &bch2_dirent_hash_desc,
-							   hash_info, &iter, k, &need_second_pass) ?:
+							   hash_info, k,
+							   &need_second_pass, &repaired_inode) ?:
 				bch2_dirent_read_target(trans, inum, dirent, &target);
 			if (ret2 > 0)
 				continue;
@@ -649,6 +650,7 @@ static int lookup_first_inode(struct btree_trans *trans, u64 inode_nr,
 			      struct bch_inode_unpacked *inode)
 {
 	struct bkey_s_c k;
+	bool found = false;
 	int ret;
 
 	for_each_btree_key_norestart(trans, iter, BTREE_ID_inodes, POS(0, inode_nr),
@@ -658,10 +660,11 @@ static int lookup_first_inode(struct btree_trans *trans, u64 inode_nr,
 		if (!bkey_is_inode(k.k))
 			continue;
 		ret = bch2_inode_unpack(k, inode);
-		goto found;
+		found = true;
+		break;
 	}
-	ret = bch_err_throw(trans->c, ENOENT_inode);
-found:
+	if (!ret && !found)
+		ret = bch_err_throw(trans->c, ENOENT_inode);
 	bch_err_msg(trans->c, ret, "fetching inode %llu", inode_nr);
 	return ret;
 }
@@ -671,21 +674,16 @@ int bch2_fsck_remove_dirent(struct btree_trans *trans, struct bpos pos)
 	struct bch_fs *c = trans->c;
 
 	struct bch_inode_unpacked dir_inode;
-	int ret = lookup_first_inode(trans, pos.inode, &dir_inode);
-	if (ret)
-		goto err;
+	try(lookup_first_inode(trans, pos.inode, &dir_inode));
 
-	{
-		struct bch_hash_info dir_hash_info = bch2_hash_info_init(c, &dir_inode);
+	struct bch_hash_info dir_hash_info;
+	(bch2_hash_info_init(c, &dir_inode, &dir_hash_info));
 
-		CLASS(btree_iter, iter)(trans, BTREE_ID_dirents, pos, BTREE_ITER_intent);
+	CLASS(btree_iter, iter)(trans, BTREE_ID_dirents, pos, BTREE_ITER_intent);
 
-		ret =   bch2_btree_iter_traverse(&iter) ?:
-			bch2_hash_delete_at(trans, bch2_dirent_hash_desc,
-					    &dir_hash_info, &iter,
-					    BTREE_UPDATE_internal_snapshot_node);
-	}
-err:
-	bch_err_fn(c, ret);
-	return ret;
+	try(bch2_btree_iter_traverse(&iter));
+	try(bch2_hash_delete_at(trans, bch2_dirent_hash_desc,
+				&dir_hash_info, &iter,
+				BTREE_UPDATE_internal_snapshot_node));
+	return 0;
 }

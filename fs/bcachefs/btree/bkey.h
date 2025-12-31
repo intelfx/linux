@@ -203,13 +203,18 @@ static __always_inline bool bversion_eq(struct bversion l, struct bversion r)
 		l.lo == r.lo;
 }
 
+static inline bool bkey_fields_eq(const struct bkey l, const struct bkey r)
+{
+	return (l.u64s == r.u64s &&
+		l.type == r.type &&
+		bpos_eq(l.p, r.p) &&
+		bversion_eq(l.bversion, r.bversion) &&
+		l.size == r.size);
+}
+
 static inline bool bkey_and_val_eq(struct bkey_s_c l, struct bkey_s_c r)
 {
-	return  l.k->u64s == r.k->u64s &&
-		l.k->type == r.k->type &&
-		bpos_eq(l.k->p, r.k->p) &&
-		bversion_eq(l.k->bversion, r.k->bversion) &&
-		l.k->size == r.k->size &&
+	return bkey_fields_eq(*l.k, *r.k) &&
 		!memcmp(l.v, r.v, bkey_val_bytes(l.k));
 }
 

@@ -25,6 +25,7 @@ extern const char * const __bch2_str_hash_types[];
 extern const char * const bch2_str_hash_opts[];
 extern const char * const __bch2_data_types[];
 extern const char * const bch2_member_states[];
+extern const char * const __bch2_reconcile_accounting_types[];
 extern const char * const bch2_d_types[];
 
 void bch2_prt_jset_entry_type(struct printbuf *,	enum bch_jset_entry_type);
@@ -34,6 +35,8 @@ void bch2_prt_csum_opt(struct printbuf *,		enum bch_csum_opt);
 void bch2_prt_csum_type(struct printbuf *,		enum bch_csum_type);
 void bch2_prt_compression_type(struct printbuf *,	enum bch_compression_type);
 void bch2_prt_str_hash_type(struct printbuf *,		enum bch_str_hash_type);
+void bch2_prt_reconcile_accounting_type(struct printbuf *, enum bch_reconcile_accounting_type);
+void bch2_prt_key_type_error_reason(struct printbuf *,	enum bch_key_type_errors);
 
 static inline const char *bch2_d_type_str(unsigned d_type)
 {
@@ -250,11 +253,6 @@ enum fsck_err_opts {
 	  OPT_UINT(0, 8),						\
 	  BCH_SB_SHARD_INUMS_NBITS,	0,				\
 	  NULL,		"Shard new inode numbers by CPU id")		\
-	x(inodes_use_key_cache,	u8,					\
-	  OPT_FS|OPT_FORMAT|OPT_MOUNT,					\
-	  OPT_BOOL(),							\
-	  BCH_SB_INODES_USE_KEY_CACHE,	true,				\
-	  NULL,		"Use the btree key cache for the inodes btree")	\
 	x(btree_node_mem_ptr_optimization, u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_BOOL(),							\
@@ -317,6 +315,11 @@ enum fsck_err_opts {
 	  OPT_STR(bch2_degraded_actions),				\
 	  BCH_SB_DEGRADED_ACTION,	BCH_DEGRADED_ask,		\
 	  NULL,		"Allow mounting in degraded mode")		\
+	x(mount_trusts_udev,		u8,				\
+	  OPT_MOUNT,							\
+	  OPT_BOOL(),							\
+	  BCH2_NO_SB_OPT,		true,				\
+	  NULL,		"Trust udev when scanning for member devices")	\
 	x(no_splitbrain_check,		u8,				\
 	  OPT_FS|OPT_MOUNT,						\
 	  OPT_BOOL(),							\
@@ -349,6 +352,11 @@ enum fsck_err_opts {
 	  OPT_UINT(0, U32_MAX),						\
 	  BCH_SB_JOURNAL_RECLAIM_DELAY,	100,				\
 	  NULL,		"Delay in milliseconds before automatic journal reclaim")\
+	x(writeback_timeout,		u16,				\
+	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
+	  OPT_UINT(0, U16_MAX),						\
+	  BCH_SB_WRITEBACK_TIMEOUT,	0,				\
+	  NULL,		"Delay seconds before writing back dirty data, overriding vm sysctls")\
 	x(move_bytes_in_flight,		u32,				\
 	  OPT_HUMAN_READABLE|OPT_FS|OPT_MOUNT|OPT_RUNTIME,		\
 	  OPT_UINT(1024, U32_MAX),					\
@@ -500,17 +508,17 @@ enum fsck_err_opts {
 	  BCH2_NO_SB_OPT,			true,			\
 	  NULL,		"Enable copygc: disable for debugging, or to\n"\
 			"quiet the system when doing performance testing\n")\
-	x(rebalance_enabled,		u8,				\
+	x(reconcile_enabled,		u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_BOOL(),							\
 	  BCH2_NO_SB_OPT,			true,			\
-	  NULL,		"Enable rebalance: disable for debugging, or to\n"\
+	  NULL,		"Enable reconcile: disable for debugging, or to\n"\
 			"quiet the system when doing performance testing\n")\
-	x(rebalance_on_ac_only,		u8,				\
+	x(reconcile_on_ac_only,		u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_BOOL(),							\
 	  BCH_SB_REBALANCE_AC_ONLY,		false,			\
-	  NULL,		"Enable rebalance while on mains power only\n")	\
+	  NULL,		"Enable reconcile while on mains power only\n")	\
 	x(auto_snapshot_deletion,	u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_BOOL(),							\
@@ -549,6 +557,11 @@ enum fsck_err_opts {
 	  OPT_BOOL(),							\
 	  BCH_MEMBER_DISCARD,		true,				\
 	  NULL,		"Enable discard/TRIM support")			\
+	x(rotational,			u8,				\
+	  OPT_DEVICE|OPT_RUNTIME,					\
+	  OPT_BOOL(),							\
+	  BCH_MEMBER_ROTATIONAL,	false,				\
+	  NULL,		"Disk is rotational; different behaviour for reconcile")\
 	x(btree_node_prefetch,		u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_RUNTIME,					\
 	  OPT_BOOL(),							\
@@ -573,14 +586,7 @@ struct bch2_opts_parse {
 	struct printbuf parse_later;
 };
 
-static const __maybe_unused struct bch_opts bch2_opts_default = {
-#define x(_name, _bits, _mode, _type, _sb_opt, _default, ...)		\
-	._name##_defined = true,					\
-	._name = _default,						\
-
-	BCH_OPTS()
-#undef x
-};
+extern const struct bch_opts bch2_opts_default;
 
 #define opt_defined(_opts, _name)	((_opts)._name##_defined)
 
@@ -697,5 +703,6 @@ static inline void bch2_io_opts_fixups(struct bch_inode_opts *opts)
 
 void bch2_inode_opts_get(struct bch_fs *, struct bch_inode_opts *, bool);
 bool bch2_opt_is_inode_opt(enum bch_opt_id);
+void bch2_inode_opts_to_text(struct printbuf *, struct bch_fs *, struct bch_inode_opts);
 
 #endif /* _BCACHEFS_OPTS_H */

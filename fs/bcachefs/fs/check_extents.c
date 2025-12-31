@@ -181,7 +181,11 @@ static int overlapping_extents_found(struct btree_trans *trans,
 				 BTREE_ITER_not_extents);
 	struct bkey_s_c k1 = bkey_try(bch2_btree_iter_peek_max(&iter1, POS(pos1.inode, U64_MAX)));
 
+	prt_printf(&buf, "overlapping extents in ");
+	try(bch2_inum_snapshot_to_path(trans, pos1.inode,
+				       min(pos1.snapshot, pos2.p.snapshot), NULL, &buf));
 	prt_newline(&buf);
+
 	bch2_bkey_val_to_text(&buf, c, k1);
 
 	if (!bpos_eq(pos1, k1.k->p)) {
@@ -216,8 +220,7 @@ static int overlapping_extents_found(struct btree_trans *trans,
 	prt_printf(&buf, "\noverwriting %s extent",
 		   pos1.snapshot >= pos2.p.snapshot ? "first" : "second");
 
-	if (fsck_err(trans, extent_overlapping,
-		     "overlapping extents%s", buf.buf)) {
+	if (fsck_err(trans, extent_overlapping, "%s", buf.buf)) {
 		struct btree_iter *old_iter = &iter1;
 
 		if (pos1.snapshot < pos2.p.snapshot) {
@@ -225,7 +228,7 @@ static int overlapping_extents_found(struct btree_trans *trans,
 			swap(k1, k2);
 		}
 
-		trans->extra_disk_res += bch2_bkey_sectors_compressed(k2);
+		trans->extra_disk_res += bch2_bkey_sectors_compressed(c, k2);
 
 		try(bch2_trans_update_extent_overwrite(trans, old_iter,
 					BTREE_UPDATE_internal_snapshot_node,
@@ -329,8 +332,14 @@ static int check_extent(struct btree_trans *trans, struct btree_iter *iter,
 	int ret = 0;
 
 	ret = bch2_check_key_has_snapshot(trans, iter, k);
+	if (ret < 0)
+		return ret;
+	/*
+	 * We can't use for_each_btree_key_commit() here because we have work to
+	 * do after the commit that can't handle a transaction restart
+	 */
 	if (ret)
-		return ret < 0 ? ret : 0;
+		return bch2_trans_commit(trans, res, NULL, BCH_TRANS_COMMIT_no_enospc);
 
 	if (inode->last_pos.inode != k.k->p.inode && inode->have_inodes)
 		try(check_i_sectors(trans, inode));
@@ -361,7 +370,7 @@ static int check_extent(struct btree_trans *trans, struct btree_iter *iter,
 			u64 last_block = round_up(i->inode.bi_size, block_bytes(c)) >> 9;
 
 			if (fsck_err_on(k.k->p.offset > last_block &&
-					!bkey_extent_is_reservation(k),
+					!bkey_extent_is_reservation(c, k),
 					trans, extent_past_end_of_inode,
 					"extent type past end of inode %llu:%u, i_size %llu\n%s",
 					i->inode.bi_inum, i->inode.bi_snapshot, i->inode.bi_size,
@@ -415,14 +424,14 @@ int bch2_check_extents(struct bch_fs *c)
 	CLASS(inode_walker, w)();
 	CLASS(extent_ends, extent_ends)();
 
-	struct progress_indicator_state progress;
-	bch2_progress_init(&progress, c, BIT_ULL(BTREE_ID_extents));
+	struct progress_indicator progress;
+	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_extents), 0);
 
 	return for_each_btree_key(trans, iter, BTREE_ID_extents,
 				POS(BCACHEFS_ROOT_INO, 0),
 				BTREE_ITER_prefetch|BTREE_ITER_all_snapshots, k, ({
 		bch2_disk_reservation_put(c, &res.r);
-		progress_update_iter(trans, &progress, &iter) ?:
+		bch2_progress_update_iter(trans, &progress, &iter) ?:
 		check_extent(trans, &iter, k, &w, &s, &extent_ends, &res.r);
 	})) ?:
 	check_i_sectors_notnested(trans, &w);
@@ -433,8 +442,8 @@ int bch2_check_indirect_extents(struct bch_fs *c)
 	CLASS(disk_reservation, res)(c);
 	CLASS(btree_trans, trans)(c);
 
-	struct progress_indicator_state progress;
-	bch2_progress_init(&progress, c, BIT_ULL(BTREE_ID_reflink));
+	struct progress_indicator progress;
+	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_reflink), 0);
 
 	return for_each_btree_key_commit(trans, iter, BTREE_ID_reflink,
 				POS_MIN,
@@ -442,7 +451,7 @@ int bch2_check_indirect_extents(struct bch_fs *c)
 				&res.r, NULL,
 				BCH_TRANS_COMMIT_no_enospc, ({
 		bch2_disk_reservation_put(c, &res.r);
-		progress_update_iter(trans, &progress, &iter) ?:
+		bch2_progress_update_iter(trans, &progress, &iter) ?:
 		check_extent_overbig(trans, &iter, k) ?:
 		bch2_bkey_drop_stale_ptrs(trans, &iter, k);
 	}));

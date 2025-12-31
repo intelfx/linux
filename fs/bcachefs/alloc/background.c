@@ -24,6 +24,8 @@
 #include "init/progress.h"
 #include "init/recovery.h"
 
+#include "sb/counters.h"
+
 #include "util/clock.h"
 #include "util/enumerated_ref.h"
 #include "util/varint.h"
@@ -249,7 +251,7 @@ int bch2_alloc_v4_validate(struct bch_fs *c, struct bkey_s_c k,
 	struct bch_alloc_v4 a;
 	int ret = 0;
 
-	bkey_val_copy(&a, bkey_s_c_to_alloc_v4(k));
+	bkey_val_copy_pad(&a, bkey_s_c_to_alloc_v4(k));
 
 	bkey_fsck_err_on(alloc_v4_u64s_noerror(&a) > bkey_val_u64s(k.k),
 			 c, alloc_v4_val_size_bad,
@@ -311,12 +313,6 @@ int bch2_alloc_v4_validate(struct bch_fs *c, struct bkey_s_c k,
 				 a.stripe,
 				 c, alloc_key_cached_inconsistency,
 				 "data type inconsistency");
-
-		bkey_fsck_err_on(!a.io_time[READ] &&
-				 !(c->recovery.passes_to_run &
-				   BIT_ULL(BCH_RECOVERY_PASS_check_alloc_to_lru_refs)),
-				 c, alloc_key_cached_but_read_time_zero,
-				 "cached bucket with read_time == 0");
 		break;
 	case BCH_DATA_stripe:
 		break;
@@ -325,7 +321,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_alloc_v4_swab(struct bkey_s k)
+void bch2_alloc_v4_swab(const struct bch_fs *c, struct bkey_s k)
 {
 	struct bch_alloc_v4 *a = bkey_s_to_alloc_v4(k).v;
 
@@ -348,7 +344,6 @@ static inline void __bch2_alloc_v4_to_text(struct printbuf *out, struct bch_fs *
 	struct bch_dev *ca = c ? bch2_dev_tryget_noerror(c, k.k->p.inode) : NULL;
 
 	prt_newline(out);
-	guard(printbuf_indent)(out);
 
 	prt_printf(out, "gen %u oldest_gen %u data_type ", a->gen, a->oldest_gen);
 	bch2_prt_data_type(out, a->data_type);
@@ -364,7 +359,6 @@ static inline void __bch2_alloc_v4_to_text(struct printbuf *out, struct bch_fs *
 		prt_printf(out, "stripe_sectors       %u\n",	a->stripe_sectors);
 	prt_printf(out, "cached_sectors       %u\n",	a->cached_sectors);
 	prt_printf(out, "stripe               %u\n",	a->stripe);
-	prt_printf(out, "stripe_redundancy    %u\n",	a->stripe_redundancy);
 	prt_printf(out, "io_time[READ]        %llu\n",	a->io_time[READ]);
 	prt_printf(out, "io_time[WRITE]       %llu\n",	a->io_time[WRITE]);
 
@@ -393,7 +387,7 @@ void __bch2_alloc_to_v4(struct bkey_s_c k, struct bch_alloc_v4 *out)
 	if (k.k->type == KEY_TYPE_alloc_v4) {
 		void *src, *dst;
 
-		bkey_val_copy(out, bkey_s_c_to_alloc_v4(k));
+		bkey_val_copy_pad(out, bkey_s_c_to_alloc_v4(k));
 
 		src = alloc_v4_backpointers(out);
 		SET_BCH_ALLOC_V4_BACKPOINTERS_START(out, BCH_ALLOC_V4_U64s);
@@ -412,7 +406,6 @@ void __bch2_alloc_to_v4(struct bkey_s_c k, struct bch_alloc_v4 *out)
 			.gen			= u.gen,
 			.oldest_gen		= u.oldest_gen,
 			.data_type		= u.data_type,
-			.stripe_redundancy	= u.stripe_redundancy,
 			.dirty_sectors		= u.dirty_sectors,
 			.cached_sectors		= u.cached_sectors,
 			.io_time[READ]		= u.read_time,
@@ -538,53 +531,55 @@ void bch2_bucket_gens_to_text(struct printbuf *out, struct bch_fs *c, struct bke
 	}
 }
 
+static int bucket_gens_init_iter(struct btree_trans *trans, struct bkey_s_c k,
+				 struct bkey_i_bucket_gens *g,
+				 bool *have_bucket_gens_key)
+{
+	/*
+	 * Not a fsck error because this is checked/repaired by
+	 * bch2_check_alloc_key() which runs later:
+	 */
+	if (!bch2_dev_bucket_exists(trans->c, k.k->p))
+		return 0;
+
+	unsigned offset;
+	struct bpos pos = alloc_gens_pos(k.k->p, &offset);
+
+	if (*have_bucket_gens_key && !bkey_eq(g->k.p, pos)) {
+		try(bch2_btree_insert_trans(trans, BTREE_ID_bucket_gens, &g->k_i, 0));
+		try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
+
+		*have_bucket_gens_key = false;
+	}
+
+	if (!*have_bucket_gens_key) {
+		bkey_bucket_gens_init(&g->k_i);
+		g->k.p = pos;
+		*have_bucket_gens_key = true;
+	}
+
+	struct bch_alloc_v4 a;
+	g->v.gens[offset] = bch2_alloc_to_v4(k, &a)->gen;
+	return 0;
+}
+
 int bch2_bucket_gens_init(struct bch_fs *c)
 {
 	struct bkey_i_bucket_gens g;
 	bool have_bucket_gens_key = false;
-	int ret;
 
 	CLASS(btree_trans, trans)(c);
-	ret = for_each_btree_key(trans, iter, BTREE_ID_alloc, POS_MIN,
+	try(for_each_btree_key(trans, iter, BTREE_ID_alloc, POS_MIN,
 				 BTREE_ITER_prefetch, k, ({
-		/*
-		 * Not a fsck error because this is checked/repaired by
-		 * bch2_check_alloc_key() which runs later:
-		 */
-		if (!bch2_dev_bucket_exists(c, k.k->p))
-			continue;
+		bucket_gens_init_iter(trans, k, &g, &have_bucket_gens_key);
+	})));
 
-		struct bch_alloc_v4 a;
-		u8 gen = bch2_alloc_to_v4(k, &a)->gen;
-		unsigned offset;
-		struct bpos pos = alloc_gens_pos(iter.pos, &offset);
-		int ret2 = 0;
-
-		if (have_bucket_gens_key && !bkey_eq(g.k.p, pos)) {
-			ret2 =  bch2_btree_insert_trans(trans, BTREE_ID_bucket_gens, &g.k_i, 0) ?:
-				bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc);
-			if (ret2)
-				goto iter_err;
-			have_bucket_gens_key = false;
-		}
-
-		if (!have_bucket_gens_key) {
-			bkey_bucket_gens_init(&g.k_i);
-			g.k.p = pos;
-			have_bucket_gens_key = true;
-		}
-
-		g.v.gens[offset] = gen;
-iter_err:
-		ret2;
-	}));
-
-	if (have_bucket_gens_key && !ret)
-		ret = commit_do(trans, NULL, NULL,
+	if (have_bucket_gens_key)
+		try(commit_do(trans, NULL, NULL,
 				BCH_TRANS_COMMIT_no_enospc,
-			bch2_btree_insert_trans(trans, BTREE_ID_bucket_gens, &g.k_i, 0));
+			bch2_btree_insert_trans(trans, BTREE_ID_bucket_gens, &g.k_i, 0)));
 
-	return ret;
+	return 0;
 }
 
 int bch2_alloc_read(struct bch_fs *c)
@@ -768,13 +763,21 @@ int bch2_alloc_key_to_dev_counters(struct btree_trans *trans, struct bch_dev *ca
 	return 0;
 }
 
+static noinline int inval_bucket_key(struct btree_trans *trans, struct bkey_s_c k)
+{
+	struct bch_fs *c = trans->c;
+	CLASS(printbuf, buf)();
+	bch2_fs_inconsistent(c, "reference to invalid bucket\n%s",
+			     (bch2_bkey_val_to_text(&buf, c, k), buf.buf));
+	return bch_err_throw(c, trigger_alloc);
+}
+
 int bch2_trigger_alloc(struct btree_trans *trans,
 		       enum btree_id btree, unsigned level,
 		       struct bkey_s_c old, struct bkey_s new,
 		       enum btree_iter_update_trigger_flags flags)
 {
 	struct bch_fs *c = trans->c;
-	CLASS(printbuf, buf)();
 	int ret = 0;
 
 	CLASS(bch2_dev_bucket_tryget, ca)(c, new.k->p);
@@ -851,6 +854,7 @@ int bch2_trigger_alloc(struct btree_trans *trans,
 		u64 transaction_seq = trans->journal_res.seq;
 		BUG_ON(!transaction_seq);
 
+		CLASS(printbuf, buf)();
 		if (log_fsck_err_on(transaction_seq && new_a->journal_seq_nonempty > transaction_seq,
 				    trans, alloc_key_journal_seq_in_future,
 				    "bucket journal seq in future (currently at %llu)\n%s",
@@ -903,7 +907,7 @@ int bch2_trigger_alloc(struct btree_trans *trans,
 			guard(rcu)();
 			u8 *gen = bucket_gen(ca, new.k->p.offset);
 			if (unlikely(!gen))
-				goto invalid_bucket;
+				return inval_bucket_key(trans, new.s_c);
 			*gen = new_a->gen;
 		}
 
@@ -913,7 +917,7 @@ int bch2_trigger_alloc(struct btree_trans *trans,
 
 		if (statechange(a->data_type == BCH_DATA_free) &&
 		    bucket_flushed(new_a))
-			closure_wake_up(&c->freelist_wait);
+			closure_wake_up(&c->allocator.freelist_wait);
 
 		if (statechange(a->data_type == BCH_DATA_need_discard) &&
 		    !bch2_bucket_is_open_safe(c, new.k->p.inode, new.k->p.offset) &&
@@ -933,16 +937,12 @@ int bch2_trigger_alloc(struct btree_trans *trans,
 		guard(rcu)();
 		struct bucket *g = gc_bucket(ca, new.k->p.offset);
 		if (unlikely(!g))
-			goto invalid_bucket;
+			return inval_bucket_key(trans, new.s_c);
 		g->gen_valid	= 1;
 		g->gen		= new_a->gen;
 	}
 fsck_err:
 	return ret;
-invalid_bucket:
-	bch2_fs_inconsistent(c, "reference to invalid bucket\n%s",
-			     (bch2_bkey_val_to_text(&buf, c, new.s_c), buf.buf));
-	return bch_err_throw(c, trigger_alloc);
 }
 
 static int discard_in_flight_add(struct bch_dev *ca, u64 bucket, bool in_progress)
@@ -969,6 +969,28 @@ static void discard_in_flight_remove(struct bch_dev *ca, u64 bucket)
 	BUG_ON(!i || !i->in_progress);
 
 	darray_remove_item(&ca->discard_buckets_in_flight, i);
+}
+
+struct discard_buckets_state {
+	u64		seen;
+	u64		open;
+	u64		need_journal_commit;
+	u64		commit_in_flight;
+	u64		bad_data_type;
+	u64		already_discarding;
+	u64		discarded;
+};
+
+static void discard_buckets_state_to_text(struct printbuf *out, struct discard_buckets_state *s)
+{
+	printbuf_tabstop_push(out, 20);
+	prt_printf(out, "seen:\t%llu\n",		s->seen);
+	prt_printf(out, "open:\t%llu\n",		s->open);
+	prt_printf(out, "need_journal_commit:\t%llu\n",	s->need_journal_commit);
+	prt_printf(out, "commit_in_flight:\t%llu\n",	s->commit_in_flight);
+	prt_printf(out, "bad_data_type:\t%llu\n",	s->bad_data_type);
+	prt_printf(out, "already_discarding:\t%llu\n",	s->already_discarding);
+	prt_printf(out, "discarded:\t%llu\n",		s->discarded);
 }
 
 static int bch2_discard_one_bucket(struct btree_trans *trans,
@@ -1002,6 +1024,10 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
 
 	CLASS(btree_iter, iter)(trans, BTREE_ID_alloc, need_discard_iter->pos, BTREE_ITER_cached);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
+
+	struct bkey_buf orig_k __cleanup(bch2_bkey_buf_exit);
+	bch2_bkey_buf_init(&orig_k);
+	bch2_bkey_buf_reassemble(&orig_k, k);
 
 	struct bkey_i_alloc_v4 *a = errptr_try(bch2_alloc_to_v4_mut(trans, k));
 
@@ -1060,9 +1086,11 @@ commit:
 		goto out;
 
 	if (!fastpath)
-		count_event(c, bucket_discard);
+		event_inc_trace(c, bucket_discard, buf,
+			bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(orig_k.k)));
 	else
-		count_event(c, bucket_discard_fast);
+		event_inc_trace(c, bucket_discard_fast, buf,
+			bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(orig_k.k)));
 out:
 fsck_err:
 	if (discard_locked)
@@ -1092,7 +1120,10 @@ static void __bch2_dev_do_discards(struct bch_dev *ca)
 	if (s.need_journal_commit > dev_buckets_available(ca, BCH_WATERMARK_normal))
 		bch2_journal_flush_async(&c->journal, NULL);
 
-	trace_discard_buckets(c, &s, bch2_err_str(ret));
+	event_inc_trace(c, bucket_discard_worker, buf, ({
+		prt_printf(&buf, "ret %s\ndev %s\n", bch2_err_str(ret), ca->name);
+		discard_buckets_state_to_text(&buf, &s);
+	}));
 
 	enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_dev_do_discards);
 }
@@ -1196,7 +1227,10 @@ static void bch2_do_discards_fast_work(struct work_struct *work)
 			break;
 	}
 
-	trace_discard_buckets_fast(c, &s, bch2_err_str(ret));
+	event_inc_trace(c, bucket_discard_fast_worker, buf, ({
+		prt_printf(&buf, "ret %s\ndev %s\n", bch2_err_str(ret), ca->name);
+		discard_buckets_state_to_text(&buf, &s);
+	}));
 
 	bch2_trans_put(trans);
 	enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_discard_one_bucket_fast);
@@ -1229,6 +1263,8 @@ static int invalidate_one_bp(struct btree_trans *trans,
 			     struct bkey_s_c_backpointer bp,
 			     struct wb_maybe_flush *last_flushed)
 {
+	struct bch_fs *c = trans->c;
+
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bkey_s_c k = bkey_try(bch2_backpointer_get_key(trans, bp, &iter, 0, last_flushed));
 	if (!k.k)
@@ -1237,7 +1273,11 @@ static int invalidate_one_bp(struct btree_trans *trans,
 	struct bkey_i *n = errptr_try(bch2_bkey_make_mut(trans, &iter, &k,
 						BTREE_UPDATE_internal_snapshot_node));
 
-	bch2_bkey_drop_device(bkey_i_to_s(n), ca->dev_idx);
+	bch2_bkey_drop_device_noerror(c, bkey_i_to_s(n), ca->dev_idx);
+
+	if (!bch2_bkey_can_read(c, bkey_i_to_s_c(n)))
+		bch2_set_bkey_error(c, n, KEY_TYPE_ERROR_device_removed);
+
 	return 0;
 }
 
@@ -1278,15 +1318,13 @@ static int invalidate_one_bucket(struct btree_trans *trans,
 				 s64 *nr_to_invalidate)
 {
 	struct bch_fs *c = trans->c;
-	CLASS(printbuf, buf)();
 	struct bpos bucket = u64_to_bucket(lru_k.k->p.offset);
-	int ret = 0;
 
 	if (*nr_to_invalidate <= 0)
 		return 1;
 
 	if (!bch2_dev_bucket_exists(c, bucket)) {
-		if (fsck_err(trans, lru_entry_to_invalid_bucket,
+		if (ret_fsck_err(trans, lru_entry_to_invalid_bucket,
 			     "lru key points to nonexistent device:bucket %llu:%llu",
 			     bucket.inode, bucket.offset))
 			return bch2_btree_bit_mod_buffered(trans, BTREE_ID_lru, lru_iter->pos, false);
@@ -1296,58 +1334,58 @@ static int invalidate_one_bucket(struct btree_trans *trans,
 	if (bch2_bucket_is_open_safe(c, bucket.inode, bucket.offset))
 		return 0;
 
-	{
-		CLASS(btree_iter, alloc_iter)(trans, BTREE_ID_alloc, bucket, BTREE_ITER_cached);
-		struct bkey_s_c alloc_k = bkey_try(bch2_btree_iter_peek_slot(&alloc_iter));
+	CLASS(btree_iter, alloc_iter)(trans, BTREE_ID_alloc, bucket, BTREE_ITER_cached);
+	struct bkey_s_c alloc_k = bkey_try(bch2_btree_iter_peek_slot(&alloc_iter));
 
-		struct bch_alloc_v4 a_convert;
-		const struct bch_alloc_v4 *a = bch2_alloc_to_v4(alloc_k, &a_convert);
+	struct bch_alloc_v4 a_convert;
+	const struct bch_alloc_v4 *a = bch2_alloc_to_v4(alloc_k, &a_convert);
 
-		/* We expect harmless races here due to the btree write buffer: */
-		if (lru_pos_time(lru_iter->pos) != alloc_lru_idx_read(*a))
-			return 0;
+	/* We expect harmless races here due to the btree write buffer: */
+	if (lru_pos_time(lru_iter->pos) != alloc_lru_idx_read(*a))
+		return 0;
 
-		/*
-		 * Impossible since alloc_lru_idx_read() only returns nonzero if the
-		 * bucket is supposed to be on the cached bucket LRU (i.e.
-		 * BCH_DATA_cached)
-		 *
-		 * bch2_lru_validate() also disallows lru keys with lru_pos_time() == 0
-		 */
-		BUG_ON(a->data_type != BCH_DATA_cached);
-		BUG_ON(a->dirty_sectors);
+	/*
+	 * Impossible since alloc_lru_idx_read() only returns nonzero if the
+	 * bucket is supposed to be on the cached bucket LRU (i.e.
+	 * BCH_DATA_cached)
+	 *
+	 * bch2_lru_validate() also disallows lru keys with lru_pos_time() == 0
+	 */
+	BUG_ON(a->data_type != BCH_DATA_cached);
+	BUG_ON(a->dirty_sectors);
 
-		if (!a->cached_sectors) {
-			bch2_check_bucket_backpointer_mismatch(trans, ca, bucket.offset,
-							       true, last_flushed);
-			return 0;
-		}
-
-		unsigned cached_sectors = a->cached_sectors;
-		u8 gen = a->gen;
-
-		try(invalidate_one_bucket_by_bps(trans, ca, bucket, gen, last_flushed));
-
-		trace_and_count(c, bucket_invalidate, c, bucket.inode, bucket.offset, cached_sectors);
-		--*nr_to_invalidate;
+	if (!a->cached_sectors) {
+		bch2_check_bucket_backpointer_mismatch(trans, ca, bucket.offset,
+						       true, last_flushed);
+		return 0;
 	}
-fsck_err:
-	return ret;
+
+	u8 gen = a->gen;
+
+	struct bkey_buf orig_alloc_k __cleanup(bch2_bkey_buf_exit);
+	bch2_bkey_buf_init(&orig_alloc_k);
+	bch2_bkey_buf_reassemble(&orig_alloc_k, alloc_k);
+
+	try(invalidate_one_bucket_by_bps(trans, ca, bucket, gen, last_flushed));
+
+	event_inc_trace(c, bucket_invalidate, buf,
+		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(orig_alloc_k.k)));
+
+	--*nr_to_invalidate;
+	return 0;
 }
 
 static struct bkey_s_c next_lru_key(struct btree_trans *trans, struct btree_iter *iter,
 				    struct bch_dev *ca, bool *wrapped)
 {
-	struct bkey_s_c k;
-again:
-	k = bch2_btree_iter_peek_max(iter, lru_pos(ca->dev_idx, U64_MAX, LRU_TIME_MAX));
-	if (!k.k && !*wrapped) {
+	while (true) {
+		struct bkey_s_c k = bch2_btree_iter_peek_max(iter, lru_pos(ca->dev_idx, U64_MAX, LRU_TIME_MAX));
+		if (k.k || *wrapped)
+			return k;
+
 		bch2_btree_iter_set_pos(iter, lru_pos(ca->dev_idx, 0, 0));
 		*wrapped = true;
-		goto again;
 	}
-
-	return k;
 }
 
 static void __bch2_do_invalidates(struct bch_dev *ca)
@@ -1450,7 +1488,7 @@ int bch2_dev_remove_alloc(struct bch_fs *c, struct bch_dev *ca)
 		bch2_btree_delete_range(c, BTREE_ID_alloc, start, end,
 					BTREE_TRIGGER_norun) ?:
 		bch2_dev_usage_remove(c, ca);
-	bch_err_msg(ca, ret, "removing dev alloc info");
+	bch_err_msg_dev(ca, ret, "removing dev alloc info");
 	return ret;
 }
 
@@ -1502,6 +1540,9 @@ void bch2_recalc_capacity(struct bch_fs *c)
 		if (ca->mi.state != BCH_MEMBER_STATE_rw)
 			continue;
 
+		if (!ca->mi.durability)
+			continue;
+
 		u64 dev_reserve = 0;
 
 		/*
@@ -1549,13 +1590,13 @@ void bch2_recalc_capacity(struct bch_fs *c)
 
 	reserved_sectors = min(reserved_sectors, capacity);
 
-	c->reserved = reserved_sectors;
-	c->capacity = capacity - reserved_sectors;
+	c->capacity.reserved = reserved_sectors;
+	c->capacity.capacity = capacity - reserved_sectors;
 
-	c->bucket_size_max = bucket_size_max;
+	c->capacity.bucket_size_max = bucket_size_max;
 
 	/* Wake up case someone was waiting for buckets */
-	closure_wake_up(&c->freelist_wait);
+	closure_wake_up(&c->allocator.freelist_wait);
 }
 
 u64 bch2_min_rw_member_capacity(struct bch_fs *c)
@@ -1572,8 +1613,8 @@ static bool bch2_dev_has_open_write_point(struct bch_fs *c, struct bch_dev *ca)
 {
 	struct open_bucket *ob;
 
-	for (ob = c->open_buckets;
-	     ob < c->open_buckets + ARRAY_SIZE(c->open_buckets);
+	for (ob = c->allocator.open_buckets;
+	     ob < c->allocator.open_buckets + ARRAY_SIZE(c->allocator.open_buckets);
 	     ob++) {
 		scoped_guard(spinlock, &ob->lock) {
 			if (ob->valid && !ob->on_partial_list &&
@@ -1589,7 +1630,7 @@ void bch2_dev_allocator_set_rw(struct bch_fs *c, struct bch_dev *ca, bool rw)
 {
 	/* BCH_DATA_free == all rw devs */
 
-	for (unsigned i = 0; i < ARRAY_SIZE(c->rw_devs); i++) {
+	for (unsigned i = 0; i < ARRAY_SIZE(c->allocator.rw_devs); i++) {
 		bool data_type_rw = rw;
 
 		if (i != BCH_DATA_free &&
@@ -1601,10 +1642,10 @@ void bch2_dev_allocator_set_rw(struct bch_fs *c, struct bch_dev *ca, bool rw)
 		    !ca->mi.durability)
 			data_type_rw = false;
 
-		mod_bit(ca->dev_idx, c->rw_devs[i].d, data_type_rw);
+		mod_bit(ca->dev_idx, c->allocator.rw_devs[i].d, data_type_rw);
 	}
 
-	c->rw_devs_change_count++;
+	c->allocator.rw_devs_change_count++;
 }
 
 /* device goes ro: */
@@ -1626,7 +1667,7 @@ void bch2_dev_allocator_remove(struct bch_fs *c, struct bch_dev *ca)
 	 * Wake up threads that were blocked on allocation, so they can notice
 	 * the device can no longer be removed and the capacity has changed:
 	 */
-	closure_wake_up(&c->freelist_wait);
+	closure_wake_up(&c->allocator.freelist_wait);
 
 	/*
 	 * journal_res_get() can block waiting for free space in the journal -
@@ -1636,7 +1677,7 @@ void bch2_dev_allocator_remove(struct bch_fs *c, struct bch_dev *ca)
 
 	/* Now wait for any in flight writes: */
 
-	closure_wait_event(&c->open_buckets_wait,
+	closure_wait_event(&c->allocator.open_buckets_wait,
 			   !bch2_dev_has_open_write_point(c, ca));
 }
 
@@ -1646,7 +1687,7 @@ void bch2_dev_allocator_add(struct bch_fs *c, struct bch_dev *ca)
 	lockdep_assert_held(&c->state_lock);
 
 	bch2_dev_allocator_set_rw(c, ca, true);
-	c->rw_devs_change_count++;
+	c->allocator.rw_devs_change_count++;
 }
 
 void bch2_dev_allocator_background_exit(struct bch_dev *ca)
@@ -1664,5 +1705,31 @@ void bch2_dev_allocator_background_init(struct bch_dev *ca)
 
 void bch2_fs_allocator_background_init(struct bch_fs *c)
 {
-	spin_lock_init(&c->freelist_lock);
+	spin_lock_init(&c->allocator.freelist_lock);
+}
+
+void bch2_fs_capacity_exit(struct bch_fs *c)
+{
+	percpu_free_rwsem(&c->capacity.mark_lock);
+	if (c->capacity.pcpu) {
+		u64 v = percpu_u64_get(&c->capacity.pcpu->online_reserved);
+		WARN(v, "online_reserved not 0 at shutdown: %lli", v);
+	}
+
+	free_percpu(c->capacity.pcpu);
+	free_percpu(c->capacity.usage);
+}
+
+int bch2_fs_capacity_init(struct bch_fs *c)
+{
+	mutex_init(&c->capacity.sectors_available_lock);
+	seqcount_init(&c->capacity.usage_lock);
+
+	try(percpu_init_rwsem(&c->capacity.mark_lock));
+
+	if (!(c->capacity.pcpu = alloc_percpu(struct bch_fs_capacity_pcpu)) ||
+	    !(c->capacity.usage = alloc_percpu(struct bch_fs_usage_base)))
+		return bch_err_throw(c, ENOMEM_fs_other_alloc);
+
+	return 0;
 }

@@ -6,7 +6,7 @@
 #include "btree/update.h"
 
 #include "data/extents.h"
-#include "data/rebalance.h"
+#include "data/reconcile.h"
 
 #include "fs/acl.h"
 #include "fs/dirent.h"
@@ -145,7 +145,9 @@ void bch2_xattr_to_text(struct printbuf *out, struct bch_fs *c,
 static int bch2_xattr_get_trans(struct btree_trans *trans, struct bch_inode_info *inode,
 				const char *name, void *buffer, size_t size, int type)
 {
-	struct bch_hash_info hash = bch2_hash_info_init(trans->c, &inode->ei_inode);
+	struct bch_hash_info hash;
+	try(bch2_hash_info_init(trans->c, &inode->ei_inode, &hash));
+
 	struct xattr_search_key search = X_SEARCH(type, name, strlen(name));
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bkey_s_c k = bkey_try(bch2_hash_lookup(trans, &iter, bch2_xattr_hash_desc, &hash,
@@ -163,7 +165,6 @@ static int bch2_xattr_get_trans(struct btree_trans *trans, struct bch_inode_info
 
 int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 		   struct bch_inode_unpacked *inode_u,
-		   const struct bch_hash_info *hash_info,
 		   const char *name, const void *value, size_t size,
 		   int type, int flags)
 {
@@ -182,6 +183,9 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 	inode_u->bi_ctime = bch2_current_time(c);
 
 	try(bch2_inode_write(trans, &inode_iter, inode_u));
+
+	struct bch_hash_info hash_info;
+	try(bch2_hash_info_init(c, inode_u, &hash_info));
 
 	int ret;
 	if (value) {
@@ -205,7 +209,7 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 		memcpy(xattr->v.x_name_and_value, name, namelen);
 		memcpy(xattr_val(&xattr->v), value, size);
 
-		ret = bch2_hash_set(trans, bch2_xattr_hash_desc, hash_info,
+		ret = bch2_hash_set(trans, bch2_xattr_hash_desc, &hash_info,
 			      inum, &xattr->k_i,
 			      (flags & XATTR_CREATE ? STR_HASH_must_create : 0)|
 			      (flags & XATTR_REPLACE ? STR_HASH_must_replace : 0));
@@ -214,7 +218,7 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 			X_SEARCH(type, name, strlen(name));
 
 		ret = bch2_hash_delete(trans, bch2_xattr_hash_desc,
-				       hash_info, inum, &search);
+				       &hash_info, inum, &search);
 	}
 
 	if (bch2_err_matches(ret, ENOENT))
@@ -348,14 +352,12 @@ static int bch2_xattr_set_handler(const struct xattr_handler *handler,
 {
 	struct bch_inode_info *inode = to_bch_ei(vinode);
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
-	struct bch_hash_info hash = bch2_hash_info_init(c, &inode->ei_inode);
 	struct bch_inode_unpacked inode_u;
-	int ret;
 
 	CLASS(btree_trans, trans)(c);
-	ret = commit_do(trans, NULL, NULL, 0,
+	int ret = commit_do(trans, NULL, NULL, 0,
 			bch2_xattr_set(trans, inode_inum(inode), &inode_u,
-				       &hash, name, value, size,
+				       name, value, size,
 				       handler->flags, flags)) ?:
 		(bch2_inode_update_after_write(trans, inode, &inode_u, ATTR_CTIME), 0);
 
@@ -473,11 +475,8 @@ static int inode_opt_set_fn(struct btree_trans *trans,
 {
 	struct inode_opt_set *s = p;
 
-	if (s->id == Inode_opt_casefold) {
-		int ret = bch2_inode_set_casefold(trans, inode_inum(inode), bi, s->v);
-		if (ret)
-			return ret;
-	}
+	if (s->id == Inode_opt_casefold)
+		try(bch2_inode_set_casefold(trans, inode_inum(inode), bi, s->v));
 
 	if (s->id == Inode_opt_inodes_32bit &&
 	    !bch2_request_incompat_feature(trans->c, bcachefs_metadata_version_31bit_dirent_offset)) {
@@ -485,9 +484,7 @@ static int inode_opt_set_fn(struct btree_trans *trans,
 		 * Make sure the dir is empty, as otherwise we'd need to
 		 * rehash everything and update the dirent keys.
 		 */
-		int ret = bch2_empty_dir_trans(trans, inode_inum(inode));
-		if (ret < 0)
-			return ret;
+		try(bch2_empty_dir_trans(trans, inode_inum(inode)));
 
 		if (s->defined)
 			bi->bi_flags |= BCH_INODE_31bit_dirent_offset;
@@ -505,29 +502,26 @@ static int inode_opt_set_fn(struct btree_trans *trans,
 	return 0;
 }
 
-static int bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
-				   struct mnt_idmap *idmap,
-				   struct dentry *dentry, struct inode *vinode,
-				   const char *name, const void *value,
-				   size_t size, int flags)
+static int __bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
+				     struct mnt_idmap *idmap,
+				     struct dentry *dentry, struct inode *vinode,
+				     const char *name, const void *value,
+				     size_t size, int flags)
 {
 	struct bch_inode_info *inode = to_bch_ei(vinode);
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
-	const struct bch_option *opt;
-	struct inode_opt_set s;
-	int opt_id, inode_opt_id, ret;
 
-	opt_id = bch2_opt_lookup(name);
+	int opt_id = bch2_opt_lookup(name);
 	if (opt_id < 0)
 		return -EINVAL;
 
-	opt = bch2_opt_table + opt_id;
+	const struct bch_option *opt = bch2_opt_table + opt_id;
 
-	inode_opt_id = opt_to_inode_opt(opt_id);
+	int inode_opt_id = opt_to_inode_opt(opt_id);
 	if (inode_opt_id < 0)
 		return -EINVAL;
 
-	s.id = inode_opt_id;
+	struct inode_opt_set s = { .id = inode_opt_id, .defined = value != NULL };
 	u64 v = 0;
 
 	if (value) {
@@ -537,16 +531,11 @@ static int bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
 		memcpy(buf, value, size);
 		buf[size] = '\0';
 
-		ret = bch2_opt_parse(c, opt, buf, &v, NULL);
-		if (ret < 0)
-			goto err;
+		try(bch2_opt_parse(c, opt, buf, &v, NULL));
+		try(bch2_opt_hook_pre_set(c, NULL, inode->ei_inode.bi_inum, opt_id, v, true));
 
-		ret = bch2_opt_hook_pre_set(c, NULL, inode->ei_inode.bi_inum, opt_id, v, true);
-		if (ret < 0)
-			goto err;
-
+		/* +1 bias for inode options: */
 		s.v = v + 1;
-		s.defined = true;
 	} else {
 		/*
 		 * Check if this option was set on the parent - if so, switched
@@ -561,30 +550,32 @@ static int bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
 				to_bch_ei(d_inode(dentry->d_parent));
 
 			s.v = bch2_inode_opt_get(&dir->ei_inode, inode_opt_id);
-		} else {
-			s.v = 0;
 		}
-
-		s.defined = false;
 	}
 
 	scoped_guard(mutex, &inode->ei_update_lock) {
-		if (inode_opt_id == Inode_opt_project) {
-			/*
-			 * inode fields accessible via the xattr interface are stored
-			 * with a +1 bias, so that 0 means unset:
-			 */
-			ret = bch2_set_projid(c, inode, s.v ? s.v - 1 : 0);
-			if (ret)
-				goto err;
-		}
+		/*
+		 * inode fields accessible via the xattr interface are stored
+		 * with a +1 bias, so that 0 means unset:
+		 */
+		if (inode_opt_id == Inode_opt_project)
+			try(bch2_set_projid(c, inode, s.v ? s.v - 1 : 0));
 
-		ret = bch2_write_inode(c, inode, inode_opt_set_fn, &s, 0);
+		try(bch2_write_inode(c, inode, inode_opt_set_fn, &s, 0));
 	}
 
 	bch2_opt_hook_post_set(c, NULL, inode->ei_inode.bi_inum, opt_id, v);
-err:
-	return bch2_err_class(ret);
+	return 0;
+}
+
+static int bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
+				   struct mnt_idmap *idmap,
+				   struct dentry *dentry, struct inode *vinode,
+				   const char *name, const void *value,
+				   size_t size, int flags)
+{
+	return bch2_err_class(__bch2_xattr_bcachefs_set(handler, idmap, dentry, vinode,
+							name, value, size, flags));
 }
 
 static const struct xattr_handler bch_xattr_bcachefs_handler = {

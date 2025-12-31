@@ -2,7 +2,71 @@
 #ifndef _BCACHEFS_ERRCODE_H
 #define _BCACHEFS_ERRCODE_H
 
+/* we're getting away from reusing bi_status, this should go away */
+#define BLK_STS_REMOVED		((__force blk_status_t)128)
+
+#define BLK_ERRS()				\
+	BLK_STS(NOTSUPP)			\
+	BLK_STS(TIMEOUT)			\
+	BLK_STS(NOSPC)				\
+	BLK_STS(TRANSPORT)			\
+	BLK_STS(TARGET)				\
+	BLK_STS(RESV_CONFLICT)			\
+	BLK_STS(MEDIUM)				\
+	BLK_STS(PROTECTION)			\
+	BLK_STS(RESOURCE)			\
+	BLK_STS(IOERR)				\
+	BLK_STS(DM_REQUEUE)			\
+	BLK_STS(AGAIN)				\
+	BLK_STS(DEV_RESOURCE)			\
+	BLK_STS(ZONE_OPEN_RESOURCE)		\
+	BLK_STS(ZONE_ACTIVE_RESOURCE)		\
+	BLK_STS(OFFLINE)			\
+	BLK_STS(DURATION_LIMIT)			\
+	BLK_STS(INVAL)				\
+	BLK_STS(REMOVED)			\
+
+#define BLK_STS(n)				\
+	x(BCH_ERR_blockdev_io_error,	BLK_STS_##n)
+
+#define ZSTD_ERRS()					\
+	ZSTD_error(GENERIC)				\
+	ZSTD_error(prefix_unknown)			\
+	ZSTD_error(version_unsupported)			\
+	ZSTD_error(frameParameter_unsupported)		\
+	ZSTD_error(frameParameter_windowTooLarge)	\
+	ZSTD_error(corruption_detected)			\
+	ZSTD_error(checksum_wrong)			\
+	ZSTD_error(dictionary_corrupted)		\
+	ZSTD_error(dictionary_wrong)			\
+	ZSTD_error(dictionaryCreation_failed)		\
+	ZSTD_error(parameter_unsupported)		\
+	ZSTD_error(parameter_outOfBound)		\
+	ZSTD_error(tableLog_tooLarge)			\
+	ZSTD_error(maxSymbolValue_tooLarge)		\
+	ZSTD_error(maxSymbolValue_tooSmall)		\
+	ZSTD_error(stage_wrong)				\
+	ZSTD_error(init_missing)			\
+	ZSTD_error(memory_allocation)			\
+	ZSTD_error(workSpace_tooSmall)			\
+	ZSTD_error(dstSize_tooSmall)			\
+	ZSTD_error(srcSize_wrong)			\
+	ZSTD_error(dstBuffer_null)			\
+	ZSTD_error(frameIndex_tooLarge)			\
+	ZSTD_error(seekableIO)				\
+	ZSTD_error(dstBuffer_wrong)			\
+	ZSTD_error(srcBuffer_wrong)
+
+#define ZSTD_error(n)					\
+	x(BCH_ERR_zstd_error,	ZSTD_error_##n)
+
 #define BCH_ERRCODES()								\
+	x(EIO,				blockdev_io_error)			\
+	BLK_ERRS()								\
+	x(BCH_ERR_blockdev_io_error,	BLK_STS_UNKNOWN)			\
+	x(EIO,				zstd_error)				\
+	ZSTD_ERRS()								\
+	x(BCH_ERR_zstd_error,		ZSTD_error_unknown)			\
 	x(ERANGE,			ERANGE_option_too_small)		\
 	x(ERANGE,			ERANGE_option_too_big)			\
 	x(ERANGE,			projid_too_big)				\
@@ -48,6 +112,7 @@
 	x(ENOMEM,			ENOMEM_bio_read_init)			\
 	x(ENOMEM,			ENOMEM_bio_read_split_init)		\
 	x(ENOMEM,			ENOMEM_bio_write_init)			\
+	x(ENOMEM,			ENOMEM_promote_limit_init)		\
 	x(ENOMEM,			ENOMEM_bio_bounce_pages_init)		\
 	x(ENOMEM,			ENOMEM_writepage_bioset_init)		\
 	x(ENOMEM,			ENOMEM_dio_read_bioset_init)		\
@@ -107,6 +172,7 @@
 	x(ENOSPC,			ENOSPC_sb_replicas)			\
 	x(ENOSPC,			ENOSPC_sb_members)			\
 	x(ENOSPC,			ENOSPC_sb_members_v2)			\
+	x(ENOSPC,			ENOSPC_sb_extent_type_u64s)		\
 	x(ENOSPC,			ENOSPC_sb_crypt)			\
 	x(ENOSPC,			ENOSPC_sb_downgrade)			\
 	x(ENOSPC,			ENOSPC_btree_slot)			\
@@ -155,6 +221,7 @@
 	x(BCH_ERR_transaction_restart,	transaction_restart_key_cache_raced)	\
 	x(BCH_ERR_transaction_restart,	transaction_restart_lock_root_race)	\
 	x(BCH_ERR_transaction_restart,	transaction_restart_split_race)		\
+	x(BCH_ERR_transaction_restart,	transaction_restart_split_with_interior_updates)\
 	x(BCH_ERR_transaction_restart,	transaction_restart_write_buffer_flush)	\
 	x(BCH_ERR_transaction_restart,	transaction_restart_nested)		\
 	x(BCH_ERR_transaction_restart,	transaction_restart_commit)		\
@@ -213,6 +280,8 @@
 	x(EINVAL,			device_already_online)			\
 	x(EINVAL,			filesystem_uuid_already_open)		\
 	x(EINVAL,			insufficient_devices_to_start)		\
+	x(EINVAL,			chardev_init_error)			\
+	x(EINVAL,			sysfs_init_error)			\
 	x(EINVAL,			invalid)				\
 	x(EINVAL,			internal_fsck_err)			\
 	x(EINVAL,			opt_parse_error)			\
@@ -226,6 +295,7 @@
 	x(EINVAL,			erasure_coding_found_btree_node)	\
 	x(EINVAL,			option_negative)			\
 	x(EINVAL,			topology_repair)			\
+	x(EINVAL,			unaligned_io)				\
 	x(BCH_ERR_topology_repair,	topology_repair_drop_this_node)		\
 	x(BCH_ERR_topology_repair,	topology_repair_drop_prev_node)		\
 	x(BCH_ERR_topology_repair,	topology_repair_did_fill_from_scan)	\
@@ -234,6 +304,8 @@
 	x(EOPNOTSUPP,			no_casefolding_without_utf8)		\
 	x(EOPNOTSUPP,			casefolding_disabled)			\
 	x(EOPNOTSUPP,			casefold_opt_is_dir_only)		\
+	x(EOPNOTSUPP,			casefolding_in_use)			\
+	x(EOPNOTSUPP,			casefold_dir_but_disabled)		\
 	x(EOPNOTSUPP,			unsupported_fsx_flag)			\
 	x(EOPNOTSUPP,			unsupported_fa_flag)			\
 	x(EOPNOTSUPP,			unsupported_fallocate_mode)		\
@@ -248,6 +320,7 @@
 	x(EROFS,			erofs_filesystem_full)			\
 	x(EROFS,			insufficient_devices)			\
 	x(EROFS,			erofs_recovery_cancelled)		\
+	x(ESHUTDOWN,			btree_not_started)			\
 	x(0,				operation_blocked)			\
 	x(BCH_ERR_operation_blocked,	btree_cache_cannibalize_lock_blocked)	\
 	x(BCH_ERR_operation_blocked,	journal_res_blocked)			\
@@ -294,12 +367,14 @@
 	x(BCH_ERR_invalid_sb,		invalid_sb_opt_compression)		\
 	x(BCH_ERR_invalid_sb,		invalid_sb_ext)				\
 	x(BCH_ERR_invalid_sb,		invalid_sb_downgrade)			\
+	x(BCH_ERR_invalid_sb,		invalid_sb_extent_type_u64s)		\
 	x(BCH_ERR_invalid,		invalid_bkey)				\
 	x(BCH_ERR_operation_blocked,    nocow_lock_blocked)			\
 	x(EROFS,			journal_shutdown)			\
 	x(EIO,				journal_flush_err)			\
 	x(EIO,				journal_write_err)			\
 	x(EIO,				btree_node_read_err)			\
+	x(EIO,				btree_node_validate_err)		\
 	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_cached)		\
 	x(EIO,				sb_not_downgraded)			\
 	x(EIO,				btree_node_write_all_failed)		\
@@ -323,18 +398,18 @@
 	x(EIO,				ec_block_read)				\
 	x(EIO,				ec_block_write)				\
 	x(EIO,				recompute_checksum)			\
-	x(EIO,				decompress)				\
+	x(BCH_ERR_data_read_retry_avoid,decompress)				\
 	x(BCH_ERR_decompress,		decompress_exceeded_max_encoded_extent)	\
 	x(BCH_ERR_decompress,		decompress_lz4)				\
 	x(BCH_ERR_decompress,		decompress_gzip)			\
 	x(BCH_ERR_decompress,		decompress_zstd_src_len_bad)		\
-	x(BCH_ERR_decompress,		decompress_zstd)			\
+	x(BCH_ERR_decompress,		decompress_zstd_size_mismatch)		\
 	x(EIO,				data_write)				\
 	x(BCH_ERR_data_write,		data_write_io)				\
 	x(BCH_ERR_data_write,		data_write_csum)			\
 	x(BCH_ERR_data_write,		data_write_invalid_ptr)			\
 	x(BCH_ERR_data_write,		data_write_misaligned)			\
-	x(BCH_ERR_decompress,		data_read)				\
+	x(EIO,				data_read)				\
 	x(BCH_ERR_data_read,		no_device_to_read_from)			\
 	x(BCH_ERR_data_read,		no_devices_valid)			\
 	x(BCH_ERR_data_read,		data_read_io_err)			\
@@ -346,25 +421,21 @@
 	x(BCH_ERR_data_read_retry_avoid,data_read_retry_ec_reconstruct_err)	\
 	x(BCH_ERR_data_read_retry_avoid,data_read_retry_csum_err)		\
 	x(BCH_ERR_data_read_retry,	data_read_retry_csum_err_maybe_userspace)\
-	x(BCH_ERR_data_read,		data_read_decompress_err)		\
-	x(BCH_ERR_data_read,		data_read_decrypt_err)			\
+	x(BCH_ERR_data_read_retry_avoid,data_read_decompress_err)		\
+	x(BCH_ERR_data_read_retry_avoid,data_read_decrypt_err)			\
 	x(BCH_ERR_data_read,		data_read_ptr_stale_race)		\
 	x(BCH_ERR_data_read_retry,	data_read_ptr_stale_retry)		\
+	x(BCH_ERR_data_read_retry,	data_read_ptr_stale_dirty)		\
 	x(BCH_ERR_data_read,		data_read_no_encryption_key)		\
 	x(BCH_ERR_data_read,		data_read_buffer_too_small)		\
 	x(BCH_ERR_data_read,		data_read_key_overwritten)		\
 	x(0,				rbio_narrow_crcs_fail)			\
-	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_fixable)		\
-	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_want_retry)		\
-	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_must_retry)		\
-	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_bad_node)		\
-	x(BCH_ERR_btree_node_read_err,	btree_node_read_err_incompatible)	\
 	x(0,				nopromote)				\
-	x(BCH_ERR_nopromote,		nopromote_may_not)			\
 	x(BCH_ERR_nopromote,		nopromote_no_rewrites)			\
 	x(BCH_ERR_nopromote,		nopromote_already_promoted)		\
 	x(BCH_ERR_nopromote,		nopromote_unwritten)			\
 	x(BCH_ERR_nopromote,		nopromote_congested)			\
+	x(BCH_ERR_nopromote,		nopromote_ratelimited)			\
 	x(BCH_ERR_nopromote,		nopromote_in_flight)			\
 	x(BCH_ERR_nopromote,		nopromote_no_writes)			\
 	x(BCH_ERR_nopromote,		nopromote_enomem)			\
@@ -374,7 +445,11 @@
 	x(0,				nocow_trylock_fail)			\
 	x(BCH_ERR_nocow_trylock_fail,	nocow_trylock_contended)		\
 	x(BCH_ERR_nocow_trylock_fail,	nocow_trylock_bucket_full)		\
-	x(EINTR,			recovery_cancelled)
+	x(EINTR,			recovery_cancelled)			\
+	x(0,				shutdown_with_errors)			\
+	x(BCH_ERR_shutdown_with_errors,	shutdown_with_errors_fixed)		\
+	x(BCH_ERR_shutdown_with_errors,	shutdown_with_errors_unfixed)		\
+	x(BCH_ERR_shutdown_with_errors,	shutdown_with_emergency_ro)
 
 enum bch_errcode {
 	BCH_ERR_START		= 2048,
@@ -407,9 +482,12 @@ static inline long bch2_err_class(long err)
 	return err < 0 ? __bch2_err_class(err) : err;
 }
 
-#define BLK_STS_REMOVED		((__force blk_status_t)128)
-
 #include <linux/blk_types.h>
 const char *bch2_blk_status_to_str(blk_status_t);
+enum bch_errcode blk_status_to_bch_err(blk_status_t);
+
+#include <linux/zstd_errors.h>
+
+enum bch_errcode zstd_err_to_bch_err(ZSTD_ErrorCode);
 
 #endif /* _BCACHFES_ERRCODE_H */

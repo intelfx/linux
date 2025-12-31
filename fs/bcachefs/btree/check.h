@@ -71,9 +71,9 @@ static inline bool gc_visited(struct bch_fs *c, struct gc_pos pos)
 	bool ret;
 
 	do {
-		seq = read_seqcount_begin(&c->gc_pos_lock);
-		ret = gc_pos_cmp(pos, c->gc_pos) <= 0;
-	} while (read_seqcount_retry(&c->gc_pos_lock, seq));
+		seq = read_seqcount_begin(&c->gc.pos_lock);
+		ret = gc_pos_cmp(pos, c->gc.pos) <= 0;
+	} while (read_seqcount_retry(&c->gc.pos_lock, seq));
 
 	return ret;
 }
@@ -82,6 +82,8 @@ void bch2_gc_pos_to_text(struct printbuf *, struct gc_pos *);
 
 int bch2_gc_gens(struct bch_fs *);
 void bch2_gc_gens_async(struct bch_fs *);
+
+int bch2_merge_btree_nodes(struct bch_fs *c);
 
 void bch2_fs_btree_gc_init_early(struct bch_fs *);
 

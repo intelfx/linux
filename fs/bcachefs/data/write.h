@@ -9,18 +9,18 @@
 	container_of((_bio), struct bch_write_bio, bio)
 
 void bch2_bio_free_pages_pool(struct bch_fs *, struct bio *);
-void bch2_bio_alloc_pages_pool(struct bch_fs *, struct bio *, size_t);
+void bch2_bio_alloc_pages_pool(struct bch_fs *, struct bio *, unsigned, size_t);
 
 void bch2_submit_wbio_replicas(struct bch_write_bio *, struct bch_fs *,
 			       enum bch_data_type, const struct bkey_i *, bool);
 
-__printf(3, 4)
-void bch2_write_op_error(struct bch_write_op *op, u64, const char *, ...);
+__printf(4, 5)
+void bch2_write_op_error(struct bch_write_op *op, bool, u64, const char *, ...);
 
 static inline struct workqueue_struct *index_update_wq(struct bch_write_op *op)
 {
 	return op->watermark == BCH_WATERMARK_copygc
-		? op->c->copygc_wq
+		? op->c->copygc.wq
 		: op->c->btree_update_wq;
 }
 
@@ -70,6 +70,7 @@ static inline struct bch_write_bio *wbio_init(struct bio *bio)
 	return wbio;
 }
 
+void __bch2_write_op_to_text(struct printbuf *, struct bch_write_op *);
 void bch2_write_op_to_text(struct printbuf *, struct bch_write_op *);
 
 void bch2_fs_io_write_exit(struct bch_fs *);

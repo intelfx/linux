@@ -137,16 +137,29 @@ static inline int bch2_inode_peek(struct btree_trans *trans,
 
 int bch2_inode_find_by_inum_snapshot(struct btree_trans *, u64, u32,
 				     struct bch_inode_unpacked *, unsigned);
-int bch2_inode_find_by_inum_nowarn_trans(struct btree_trans *,
-				  subvol_inum,
-				  struct bch_inode_unpacked *);
-int bch2_inode_find_by_inum_trans(struct btree_trans *, subvol_inum,
-				  struct bch_inode_unpacked *);
+
+int __bch2_inode_find_by_inum_trans(struct btree_trans *, subvol_inum,
+				    struct bch_inode_unpacked *, bool);
+
+static inline int bch2_inode_find_by_inum_trans(struct btree_trans *trans,
+				  subvol_inum inum,
+				  struct bch_inode_unpacked *inode)
+{
+	return __bch2_inode_find_by_inum_trans(trans, inum, inode, true);
+}
+
+static inline int bch2_inode_find_by_inum_nowarn_trans(struct btree_trans *trans,
+				  subvol_inum inum,
+				  struct bch_inode_unpacked *inode)
+{
+	return __bch2_inode_find_by_inum_trans(trans, inum, inode, false);
+}
+
 int bch2_inode_find_by_inum(struct bch_fs *, subvol_inum,
 			    struct bch_inode_unpacked *);
 
-int bch2_inode_find_snapshot_root(struct btree_trans *trans, u64 inum,
-				  struct bch_inode_unpacked *root);
+int bch2_inode_find_oldest_snapshot(struct btree_trans *trans, u64 inum, u32 snapshot,
+				    struct bch_inode_unpacked *root);
 
 int bch2_inode_write_flags(struct btree_trans *, struct btree_iter *,
 		     struct bch_inode_unpacked *, enum btree_iter_update_trigger_flags);
@@ -292,14 +305,14 @@ void bch2_inode_opts_get_inode(struct bch_fs *, struct bch_inode_unpacked *, str
 int bch2_inode_set_casefold(struct btree_trans *, subvol_inum,
 			    struct bch_inode_unpacked *, unsigned);
 
-#include "data/rebalance.h"
+#include "data/reconcile.h"
 
-static inline struct bch_extent_rebalance
-bch2_inode_rebalance_opts_get(struct bch_fs *c, struct bch_inode_unpacked *inode)
+static inline struct bch_extent_reconcile
+bch2_inode_reconcile_opts_get(struct bch_fs *c, struct bch_inode_unpacked *inode)
 {
 	struct bch_inode_opts io_opts;
 	bch2_inode_opts_get_inode(c, inode, &io_opts);
-	return io_opts_to_rebalance_opts(c, &io_opts);
+	return io_opts_to_reconcile_opts(c, &io_opts);
 }
 
 #define BCACHEFS_ROOT_SUBVOL_INUM					\
@@ -312,5 +325,6 @@ static inline bool subvol_inum_eq(subvol_inum a, subvol_inum b)
 
 int bch2_inode_rm_snapshot(struct btree_trans *, u64, u32);
 int bch2_delete_dead_inodes(struct bch_fs *);
+int bch2_kill_i_generation_keys(struct bch_fs *);
 
 #endif /* _BCACHEFS_INODE_H */

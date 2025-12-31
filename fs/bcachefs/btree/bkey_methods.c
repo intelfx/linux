@@ -22,6 +22,8 @@
 
 #include "init/error.h"
 
+#include "sb/io.h"
+
 #include "snapshots/snapshot.h"
 #include "snapshots/subvolume.h"
 
@@ -63,9 +65,41 @@ fsck_err:
 	return ret;
 }
 
+static int key_type_error_validate(struct bch_fs *c, struct bkey_s_c k,
+				   struct bkey_validate_context from)
+{
+	return 0;
+}
+
+static void key_type_error_to_text(struct printbuf *out, struct bch_fs *c,
+				    struct bkey_s_c k)
+{
+	struct bch_error e;
+	bkey_val_copy_pad(&e, bkey_s_c_to_error(k));
+
+	bch2_prt_key_type_error_reason(out, e.err);
+}
+
 #define bch2_bkey_ops_error ((struct bkey_ops) {	\
-	.key_validate = empty_val_key_validate,		\
+	.key_validate	= key_type_error_validate,	\
+	.val_to_text	= key_type_error_to_text,	\
 })
+
+void bch2_set_bkey_error(struct bch_fs *c, struct bkey_i *k, enum bch_key_type_errors err)
+{
+	k->k.type = KEY_TYPE_error;
+
+	if (!bch2_request_incompat_feature(c, bcachefs_metadata_version_extented_key_type_error)) {
+		set_bkey_val_bytes(&k->k, sizeof(struct bch_error));
+
+		struct bkey_i_error *e = bkey_i_to_error(k);
+
+		memset(e, 0, sizeof(*e));
+		e->v.err = err;
+	} else {
+		set_bkey_val_bytes(&k->k, 0);
+	}
+}
 
 static int key_type_cookie_validate(struct bch_fs *c, struct bkey_s_c k,
 				    struct bkey_validate_context from)
@@ -336,17 +370,18 @@ void bch2_bkey_val_to_text(struct printbuf *out, struct bch_fs *c,
 	bch2_bkey_to_text(out, k.k);
 
 	if (bkey_val_bytes(k.k)) {
+		guard(printbuf_indent)(out);
 		prt_printf(out, ": ");
 		bch2_val_to_text(out, c, k);
 	}
 }
 
-void bch2_bkey_swab_val(struct bkey_s k)
+void bch2_bkey_swab_val(const struct bch_fs *c, struct bkey_s k)
 {
 	const struct bkey_ops *ops = bch2_bkey_type_ops(k.k->type);
 
 	if (ops->swab)
-		ops->swab(k);
+		ops->swab(c, k);
 }
 
 bool bch2_bkey_merge(struct bch_fs *c, struct bkey_s l, struct bkey_s_c r)
@@ -395,7 +430,8 @@ void bch2_bkey_renumber(enum btree_node_type btree_node_type,
 		}
 }
 
-void __bch2_bkey_compat(unsigned level, enum btree_id btree_id,
+void __bch2_bkey_compat(const struct bch_fs *c,
+			unsigned level, enum btree_id btree_id,
 			unsigned version, unsigned big_endian,
 			int write,
 			struct bkey_format *f,
@@ -483,7 +519,7 @@ void __bch2_bkey_compat(unsigned level, enum btree_id btree_id,
 		}
 
 		if (big_endian != CPU_BIG_ENDIAN)
-			bch2_bkey_swab_val(u);
+			bch2_bkey_swab_val(c, u);
 
 		ops = bch2_bkey_type_ops(k->type);
 

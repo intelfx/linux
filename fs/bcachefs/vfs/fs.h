@@ -41,6 +41,8 @@ struct bch_inode_info {
 
 	/* copy of inode in btree: */
 	struct bch_inode_unpacked ei_inode;
+
+	struct delayed_work	ei_writeback_timer;
 };
 
 #define bch2_pagecache_add_put(i)	bch2_two_state_unlock(&(i)->ei_pagecache_lock, 0)
@@ -176,7 +178,7 @@ static inline int bch2_set_projid(struct bch_fs *c,
 				      KEY_TYPE_QUOTA_PREALLOC);
 }
 
-struct inode *bch2_vfs_inode_get(struct bch_fs *, subvol_inum);
+struct inode *bch2_vfs_inode_get(struct bch_fs *, subvol_inum, bool);
 
 /* returns 0 if we want to do the update, or error is passed up */
 typedef int (*inode_set_fn)(struct btree_trans *,
@@ -201,9 +203,17 @@ int bch2_fiemap(struct inode *, struct fiemap_extent_info *, u64, u64);
 
 void bch2_fs_vfs_exit(struct bch_fs *);
 int bch2_fs_vfs_init(struct bch_fs *);
+int bch2_fs_vfs_init_rw(struct bch_fs *);
 
 void bch2_vfs_exit(void);
 int bch2_vfs_init(void);
+
+static inline void bch2_dirty_inode(struct bch_fs *c, struct bch_inode_info *inode)
+{
+	if (c->opts.writeback_timeout)
+		queue_delayed_work(c->vfs.writeback_wq, &inode->ei_writeback_timer,
+				   c->opts.writeback_timeout * HZ);
+}
 
 #else
 
@@ -216,6 +226,7 @@ static inline void bch2_evict_subvolume_inodes(struct bch_fs *c,
 
 static inline void bch2_fs_vfs_exit(struct bch_fs *c) {}
 static inline int bch2_fs_vfs_init(struct bch_fs *c) { return 0; }
+static inline int bch2_fs_vfs_init_rw(struct bch_fs *c) { return 0; }
 
 static inline void bch2_vfs_exit(void) {}
 static inline int bch2_vfs_init(void) { return 0; }

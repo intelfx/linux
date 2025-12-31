@@ -32,7 +32,7 @@
 #include "data/ec.h"
 #include "data/move.h"
 #include "data/nocow_locking.h"
-#include "data/rebalance.h"
+#include "data/reconcile.h"
 
 #include "debug/sysfs.h"
 #include "debug/tests.h"
@@ -46,6 +46,7 @@
 #include "journal/journal.h"
 #include "journal/reclaim.h"
 
+#include "sb/counters.h"
 #include "sb/errors.h"
 #include "sb/io.h"
 
@@ -163,6 +164,8 @@ write_attribute(trigger_btree_write_buffer_flush);
 write_attribute(trigger_btree_updates);
 write_attribute(trigger_freelist_wakeup);
 write_attribute(trigger_recalc_capacity);
+write_attribute(trigger_reconcile_wakeup);
+write_attribute(trigger_reconcile_pending_wakeup);
 write_attribute(trigger_delete_dead_snapshots);
 write_attribute(trigger_emergency_read_only);
 read_attribute(gc_gens_pos);
@@ -196,6 +199,7 @@ read_attribute(btree_reserve_cache);
 read_attribute(open_buckets);
 read_attribute(open_buckets_partial);
 read_attribute(nocow_lock_table);
+read_attribute(replicas);
 
 read_attribute(read_refs);
 read_attribute(write_refs);
@@ -207,7 +211,8 @@ read_attribute(has_data);
 read_attribute(alloc_debug);
 read_attribute(usage_base);
 
-#define x(t, n, ...) read_attribute(t);
+#define x(t, n, ...)							\
+	static struct attribute sysfs_counter_##t = { .name = #t, .mode = 0644 };
 BCH_PERSISTENT_COUNTERS()
 #undef x
 
@@ -215,8 +220,8 @@ rw_attribute(label);
 
 read_attribute(copy_gc_wait);
 
-sysfs_pd_controller_attribute(rebalance);
-read_attribute(rebalance_status);
+read_attribute(reconcile_status);
+read_attribute(reconcile_scan_pending);
 read_attribute(snapshot_delete_status);
 read_attribute(recovery_status);
 
@@ -226,6 +231,8 @@ read_attribute(io_timers_read);
 read_attribute(io_timers_write);
 
 read_attribute(moving_ctxts);
+
+read_attribute(recent_counters);
 
 #ifdef CONFIG_BCACHEFS_TESTS
 write_attribute(perf_test);
@@ -239,7 +246,7 @@ write_attribute(perf_test);
 
 static size_t bch2_btree_cache_size(struct bch_fs *c)
 {
-	struct btree_cache *bc = &c->btree_cache;
+	struct bch_fs_btree_cache *bc = &c->btree.cache;
 	size_t ret = 0;
 	struct btree *b;
 
@@ -294,9 +301,7 @@ static int bch2_compression_stats_to_text(struct printbuf *out, struct bch_fs *c
 
 static void bch2_gc_gens_pos_to_text(struct printbuf *out, struct bch_fs *c)
 {
-	bch2_btree_id_to_text(out, c->gc_gens_btree);
-	prt_printf(out, ": ");
-	bch2_bpos_to_text(out, c->gc_gens_pos);
+	bch2_bbpos_to_text(out, c->gc_gens.pos);
 	prt_printf(out, "\n");
 }
 
@@ -304,7 +309,7 @@ static void bch2_fs_usage_base_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct bch_fs_usage_base b = {};
 
-	acc_u64s_percpu(&b.hidden, &c->usage->hidden, sizeof(b) / sizeof(u64));
+	acc_u64s_percpu(&b.hidden, &c->capacity.usage->hidden, sizeof(b) / sizeof(u64));
 
 	prt_printf(out, "hidden:\t\t%llu\n",	b.hidden);
 	prt_printf(out, "btree:\t\t%llu\n",	b.btree);
@@ -331,13 +336,14 @@ SHOW(bch2_fs)
 	if (attr == &sysfs_gc_gens_pos)
 		bch2_gc_gens_pos_to_text(out, c);
 
-	sysfs_pd_controller_show(rebalance,	&c->rebalance.pd); /* XXX */
-
 	if (attr == &sysfs_copy_gc_wait)
 		bch2_copygc_wait_to_text(out, c);
 
-	if (attr == &sysfs_rebalance_status)
-		bch2_rebalance_status_to_text(out, c);
+	if (attr == &sysfs_reconcile_status)
+		bch2_reconcile_status_to_text(out, c);
+
+	if (attr == &sysfs_reconcile_scan_pending)
+		bch2_reconcile_scan_pending_to_text(out, c);
 
 	if (attr == &sysfs_snapshot_delete_status)
 		bch2_snapshot_delete_status_to_text(out, c);
@@ -351,10 +357,10 @@ SHOW(bch2_fs)
 		bch2_journal_debug_to_text(out, &c->journal);
 
 	if (attr == &sysfs_btree_cache)
-		bch2_btree_cache_to_text(out, &c->btree_cache);
+		bch2_btree_cache_to_text(out, &c->btree.cache);
 
 	if (attr == &sysfs_btree_key_cache)
-		bch2_btree_key_cache_to_text(out, &c->btree_key_cache);
+		bch2_btree_key_cache_to_text(out, &c->btree.key_cache);
 
 	if (attr == &sysfs_btree_reserve_cache)
 		bch2_btree_reserve_cache_to_text(out, c);
@@ -383,11 +389,17 @@ SHOW(bch2_fs)
 	if (attr == &sysfs_moving_ctxts)
 		bch2_fs_moving_ctxts_to_text(out, c);
 
+	if (attr == &sysfs_recent_counters)
+		bch2_sb_recent_counters_to_text(out, &c->counters);
+
 	if (attr == &sysfs_write_refs)
 		enumerated_ref_to_text(out, &c->writes, bch2_write_refs);
 
 	if (attr == &sysfs_nocow_lock_table)
 		bch2_nocow_locks_to_text(out, &c->nocow_locks);
+
+	if (attr == &sysfs_replicas)
+		bch2_cpu_replicas_to_text(out, &c->replicas);
 
 	if (attr == &sysfs_disk_groups)
 		bch2_disk_groups_to_text(out, c);
@@ -405,8 +417,6 @@ STORE(bch2_fs)
 {
 	struct bch_fs *c = container_of(kobj, struct bch_fs, kobj);
 
-	sysfs_pd_controller_store(rebalance,	&c->rebalance.pd);
-
 	/* Debugging: */
 
 	if (!test_bit(BCH_FS_started, &c->flags))
@@ -415,13 +425,13 @@ STORE(bch2_fs)
 	/* Debugging: */
 
 	if (attr == &sysfs_trigger_btree_updates)
-		queue_work(c->btree_interior_update_worker, &c->btree_interior_update_work);
+		queue_work(c->btree.interior_updates.worker, &c->btree.interior_updates.work);
 
 	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_sysfs))
 		return -EROFS;
 
 	if (attr == &sysfs_trigger_btree_cache_shrink) {
-		struct btree_cache *bc = &c->btree_cache;
+		struct bch_fs_btree_cache *bc = &c->btree.cache;
 		struct shrink_control sc;
 
 		sc.gfp_mask = GFP_KERNEL;
@@ -434,7 +444,7 @@ STORE(bch2_fs)
 
 		sc.gfp_mask = GFP_KERNEL;
 		sc.nr_to_scan = strtoul_or_return(buf);
-		c->btree_key_cache.shrink->scan_objects(c->btree_key_cache.shrink, &sc);
+		c->btree.key_cache.shrink->scan_objects(c->btree.key_cache.shrink, &sc);
 	}
 
 	if (attr == &sysfs_trigger_btree_write_buffer_flush)
@@ -463,24 +473,27 @@ STORE(bch2_fs)
 		bch2_journal_do_writes(&c->journal);
 
 	if (attr == &sysfs_trigger_freelist_wakeup)
-		closure_wake_up(&c->freelist_wait);
+		closure_wake_up(&c->allocator.freelist_wait);
 
 	if (attr == &sysfs_trigger_recalc_capacity) {
 		guard(rwsem_read)(&c->state_lock);
 		bch2_recalc_capacity(c);
 	}
 
+	if (attr == &sysfs_trigger_reconcile_wakeup)
+		bch2_reconcile_wakeup(c);
+
+	if (attr == &sysfs_trigger_reconcile_pending_wakeup)
+		bch2_reconcile_pending_wakeup(c);
+
 	if (attr == &sysfs_trigger_delete_dead_snapshots)
 		__bch2_delete_dead_snapshots(c);
 
 	if (attr == &sysfs_trigger_emergency_read_only) {
-		struct printbuf buf = PRINTBUF;
-		bch2_log_msg_start(c, &buf);
+		CLASS(bch_log_msg, msg)(c);
 
-		prt_printf(&buf, "shutdown by sysfs\n");
-		bch2_fs_emergency_read_only2(c, &buf);
-		bch2_print_str(c, KERN_ERR, buf.buf);
-		printbuf_exit(&buf);
+		prt_printf(&msg.m, "shutdown by sysfs\n");
+		bch2_fs_emergency_read_only(c, &msg.m);
 	}
 
 #ifdef CONFIG_BCACHEFS_TESTS
@@ -512,7 +525,8 @@ struct attribute *bch2_fs_files[] = {
 	&sysfs_btree_cache_size,
 	&sysfs_btree_write_stats,
 
-	&sysfs_rebalance_status,
+	&sysfs_reconcile_status,
+	&sysfs_reconcile_scan_pending,
 	&sysfs_snapshot_delete_status,
 	&sysfs_recovery_status,
 
@@ -536,9 +550,9 @@ SHOW(bch2_fs_counters)
 	printbuf_tabstop_push(out, 32);
 
 	#define x(t, n, f, ...) \
-		if (attr == &sysfs_##t) {					\
-			counter             = percpu_u64_get(&c->counters[BCH_COUNTER_##t]);\
-			counter_since_mount = counter - c->counters_on_mount[BCH_COUNTER_##t];\
+		if (attr == &sysfs_counter_##t) {					\
+			counter             = percpu_u64_get(&c->counters.now[BCH_COUNTER_##t]);\
+			counter_since_mount = counter - c->counters.mount[BCH_COUNTER_##t];\
 			if (f & TYPE_SECTORS) {					\
 				counter <<= 9;					\
 				counter_since_mount <<= 9;			\
@@ -567,7 +581,7 @@ SYSFS_OPS(bch2_fs_counters);
 
 struct attribute *bch2_fs_counters_files[] = {
 #define x(t, ...) \
-	&sysfs_##t,
+	&sysfs_counter_##t,
 	BCH_PERSISTENT_COUNTERS()
 #undef x
 	NULL
@@ -600,6 +614,7 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_open_buckets_partial,
 	&sysfs_write_refs,
 	&sysfs_nocow_lock_table,
+	&sysfs_replicas,
 	&sysfs_io_timers_read,
 	&sysfs_io_timers_write,
 
@@ -615,6 +630,8 @@ struct attribute *bch2_fs_internal_files[] = {
 	&sysfs_trigger_btree_updates,
 	&sysfs_trigger_freelist_wakeup,
 	&sysfs_trigger_recalc_capacity,
+	&sysfs_trigger_reconcile_wakeup,
+	&sysfs_trigger_reconcile_pending_wakeup,
 	&sysfs_trigger_delete_dead_snapshots,
 	&sysfs_trigger_emergency_read_only,
 
@@ -622,9 +639,8 @@ struct attribute *bch2_fs_internal_files[] = {
 
 	&sysfs_copy_gc_wait,
 
-	sysfs_pd_controller_files(rebalance),
-
 	&sysfs_moving_ctxts,
+	&sysfs_recent_counters,
 
 	&sysfs_internal_uuid,
 

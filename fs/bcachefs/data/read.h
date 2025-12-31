@@ -7,6 +7,8 @@
 #include "extents_types.h"
 #include "data/reflink.h"
 
+#define BIO_BOUNCE_BUF_POOL_LEN	(PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER)
+
 #ifndef CONFIG_BCACHEFS_NO_LATENCY_ACCT
 void bch2_dev_congested_to_text(struct printbuf *, struct bch_dev *);
 #endif
@@ -42,6 +44,7 @@ struct bch_read_bio {
 	union {
 	struct {
 	u16			data_update:1,
+				data_update_verify_decompress:1,
 				promote:1,
 				bounce:1,
 				split:1,

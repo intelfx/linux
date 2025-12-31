@@ -59,7 +59,6 @@ static struct bkey_i *btree_root_find(struct bch_fs *c,
 				      struct jset *j,
 				      enum btree_id id, unsigned *level)
 {
-	struct bkey_i *k;
 	struct jset_entry *entry, *start, *end;
 
 	if (clean) {
@@ -73,16 +72,16 @@ static struct bkey_i *btree_root_find(struct bch_fs *c,
 	for (entry = start; entry < end; entry = vstruct_next(entry))
 		if (entry->type == BCH_JSET_ENTRY_btree_root &&
 		    entry->btree_id == id)
-			goto found;
+			break;
 
-	return NULL;
-found:
+	if (entry >= end)
+		return NULL;
+
 	if (!entry->u64s)
 		return ERR_PTR(-EINVAL);
 
-	k = entry->start;
 	*level = entry->level;
-	return k;
+	return entry->start;
 }
 
 int bch2_verify_superblock_clean(struct bch_fs *c,
@@ -227,7 +226,9 @@ static int bch2_sb_clean_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_clean_to_text(struct printbuf *out, struct bch_sb *sb,
+static void bch2_sb_clean_to_text(struct printbuf *out,
+				  struct bch_fs *c,
+				  struct bch_sb *sb,
 				  struct bch_sb_field *f)
 {
 	struct bch_sb_field_clean *clean = field_to_type(f, clean);
@@ -246,7 +247,7 @@ static void bch2_sb_clean_to_text(struct printbuf *out, struct bch_sb *sb,
 		    !entry->u64s)
 			continue;
 
-		bch2_journal_entry_to_text(out, NULL, entry);
+		bch2_journal_entry_to_text(out, c, entry);
 		prt_newline(out);
 	}
 }
@@ -256,18 +257,10 @@ const struct bch_sb_field_ops bch_sb_field_ops_clean = {
 	.to_text	= bch2_sb_clean_to_text,
 };
 
-int bch2_fs_mark_dirty(struct bch_fs *c)
+void bch2_fs_mark_dirty(struct bch_fs *c)
 {
-	/*
-	 * Unconditionally write superblock, to verify it hasn't changed before
-	 * we go rw:
-	 */
-
-	guard(mutex)(&c->sb_lock);
 	SET_BCH_SB_CLEAN(c->disk_sb.sb, false);
 	c->disk_sb.sb->features[0] |= cpu_to_le64(BCH_SB_FEATURES_ALWAYS);
-
-	return bch2_write_super(c);
 }
 
 void bch2_fs_mark_clean(struct bch_fs *c)
@@ -277,7 +270,6 @@ void bch2_fs_mark_clean(struct bch_fs *c)
 	unsigned u64s;
 	int ret;
 
-	guard(mutex)(&c->sb_lock);
 	if (BCH_SB_CLEAN(c->disk_sb.sb))
 		return;
 
@@ -285,8 +277,6 @@ void bch2_fs_mark_clean(struct bch_fs *c)
 
 	c->disk_sb.sb->compat[0] |= cpu_to_le64(1ULL << BCH_COMPAT_alloc_info);
 	c->disk_sb.sb->compat[0] |= cpu_to_le64(1ULL << BCH_COMPAT_alloc_metadata);
-	c->disk_sb.sb->features[0] &= cpu_to_le64(~(1ULL << BCH_FEATURE_extents_above_btree_updates));
-	c->disk_sb.sb->features[0] &= cpu_to_le64(~(1ULL << BCH_FEATURE_btree_updates_journalled));
 
 	u64s = sizeof(*sb_clean) / sizeof(u64) + c->journal.entry_u64s_reserved;
 
@@ -321,6 +311,4 @@ void bch2_fs_mark_clean(struct bch_fs *c)
 	}
 
 	bch2_journal_pos_from_member_info_set(c);
-
-	bch2_write_super(c);
 }

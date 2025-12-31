@@ -6,12 +6,17 @@
 #include "btree/sort.h"
 #include "btree/write.h"
 
+#include "data/reconcile.h"
 #include "data/write.h"
 
 #include "debug/async_objs.h"
 #include "debug/debug.h"
 
+#include "init/dev.h"
 #include "init/error.h"
+#include "init/fs.h"
+
+#include "sb/counters.h"
 
 #include "journal/reclaim.h"
 
@@ -100,17 +105,26 @@ static int btree_node_write_update_key(struct btree_trans *trans,
 	if (ret)
 		return ret == -BCH_ERR_btree_node_dying ? 0 : ret;
 
-	struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans, bkey_bytes(&b->key.k)));
+	struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans, bkey_bytes(&b->key.k) +
+					      sizeof(struct bch_extent_reconcile) +
+					      sizeof(struct bch_extent_ptr) * BCH_REPLICAS_MAX));
 	bkey_copy(n, &b->key);
 
 	bkey_i_to_btree_ptr_v2(n)->v.sectors_written =
 		bkey_i_to_btree_ptr_v2(&wbio->key)->v.sectors_written;
 
-	bch2_bkey_drop_ptrs(bkey_i_to_s(n), p, entry,
-		bch2_dev_list_has_dev(wbio->wbio.failed, p.ptr.dev));
+	bch2_bkey_drop_ptrs_noerror(bkey_i_to_s(n), p, entry,
+		bch2_dev_io_failures(&wbio->wbio.failed, p.ptr.dev));
 
-	if (!bch2_bkey_nr_dirty_ptrs(bkey_i_to_s_c(n)))
+	if (!bch2_bkey_nr_dirty_ptrs(c, bkey_i_to_s_c(n)))
 		return bch_err_throw(c, btree_node_write_all_failed);
+
+	if (wbio->wbio.failed.nr) {
+		struct bch_inode_opts opts;
+		try(bch2_bkey_get_io_opts(trans, NULL, bkey_i_to_s_c(n), &opts));
+		try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, n,
+						  SET_NEEDS_REBALANCE_opt_change, 0));
+	}
 
 	return bch2_btree_node_update_key(trans, &iter, b, n,
 					  BCH_WATERMARK_interior_updates|
@@ -135,14 +149,32 @@ static void btree_node_write_work(struct work_struct *work)
 
 	if (!wbio->wbio.first_btree_write || wbio->wbio.failed.nr) {
 		int ret = bch2_trans_do(c, btree_node_write_update_key(trans, wbio, b));
-		if (ret) {
+		if (ret)
 			set_btree_node_noevict(b);
 
-			if (!bch2_err_matches(ret, EROFS)) {
-				CLASS(printbuf, buf)();
-				prt_printf(&buf, "writing btree node: %s\n  ", bch2_err_str(ret));
-				bch2_btree_pos_to_text(&buf, c, b);
-				bch2_fs_fatal_error(c, "%s", buf.buf);
+		if ((ret && !bch2_err_matches(ret, EROFS)) ||
+		    wbio->wbio.failed.nr) {
+			CLASS(bch_log_msg, msg)(c);
+
+			/* Separate ratelimit_states for hard and soft errors */
+			msg.m.suppress = !ret
+				? bch2_ratelimit(c)
+				: bch2_ratelimit(c);
+
+			prt_printf(&msg.m, "error writing btree node at ");
+			bch2_btree_pos_to_text(&msg.m, c, b);
+			prt_newline(&msg.m);
+
+			bch2_io_failures_to_text(&msg.m, c, &wbio->wbio.failed);
+
+			if (!ret) {
+				prt_printf(&msg.m, "wrote degraded to ");
+				struct bch_devs_list d = bch2_bkey_devs(c, bkey_i_to_s_c(&b->key));
+				bch2_devs_list_to_text(&msg.m, c, &d);
+				prt_newline(&msg.m);
+			} else {
+				prt_printf(&msg.m, "error %s\n", bch2_err_str(ret));
+				bch2_fs_emergency_read_only(c, &msg.m);
 			}
 		}
 	}
@@ -162,25 +194,15 @@ static void btree_node_write_endio(struct bio *bio)
 	struct btree *b			= wbio->bio.bi_private;
 	struct bch_dev *ca		= wbio->have_ioref ? bch2_dev_have_ref(c, wbio->dev) : NULL;
 
+	/* XXX: ca can be null, stash dev_idx */
+
 	bch2_account_io_completion(ca, BCH_MEMBER_ERROR_write,
 				   wbio->submit_time, !bio->bi_status);
 
-	if (ca && bio->bi_status) {
-		CLASS(printbuf, buf)();
-		guard(printbuf_atomic)(&buf);
-		__bch2_log_msg_start(ca->name, &buf);
-
-		prt_printf(&buf, "btree write error: %s\n",
-			   bch2_blk_status_to_str(bio->bi_status));
-		bch2_btree_pos_to_text(&buf, c, b);
-		bch2_print_str_ratelimited(c, KERN_ERR, buf.buf);
-	}
-
-	if (bio->bi_status) {
-		unsigned long flags;
-		spin_lock_irqsave(&c->btree_write_error_lock, flags);
-		bch2_dev_list_add_dev(&orig->failed, wbio->dev);
-		spin_unlock_irqrestore(&c->btree_write_error_lock, flags);
+	if (unlikely(bio->bi_status)) {
+		guard(spinlock_irqsave)(&c->write_error_lock);
+		bch2_dev_io_failures_mut(&orig->failed, wbio->dev)->errcode =
+			__bch2_err_throw(c, -blk_status_to_bch_err(bio->bi_status));
 	}
 
 	/*
@@ -201,7 +223,7 @@ static void btree_node_write_endio(struct bio *bio)
 	smp_mb__after_atomic();
 	wake_up_bit(&b->flags, BTREE_NODE_write_in_flight_inner);
 	INIT_WORK(&wb->work, btree_node_write_work);
-	queue_work(c->btree_write_complete_wq, &wb->work);
+	queue_work(c->btree.write_complete_wq, &wb->work);
 }
 
 static int validate_bset_for_write(struct bch_fs *c, struct btree *b,
@@ -219,7 +241,7 @@ static int validate_bset_for_write(struct bch_fs *c, struct btree *b,
 		return ret;
 	}
 
-	ret = bch2_validate_bset_keys(c, b, i, WRITE, NULL, NULL) ?:
+	ret = bch2_validate_bset_keys(c, NULL, b, i, WRITE, NULL, NULL) ?:
 		bch2_validate_bset(c, NULL, b, i, b->written, WRITE, NULL, NULL);
 	if (ret) {
 		bch2_inconsistent_error(c);
@@ -232,6 +254,7 @@ static int validate_bset_for_write(struct bch_fs *c, struct btree *b,
 static void btree_write_submit(struct work_struct *work)
 {
 	struct btree_write_bio *wbio = container_of(work, struct btree_write_bio, work);
+	struct bch_fs *c	= wbio->wbio.c;
 	BKEY_PADDED_ONSTACK(k, BKEY_BTREE_PTR_VAL_U64s_MAX) tmp;
 
 	bkey_copy(&tmp.k, &wbio->key);
@@ -311,7 +334,7 @@ void __bch2_btree_node_write(struct bch_fs *c, struct btree *b, unsigned flags)
 do_write:
 	BUG_ON((type == BTREE_WRITE_initial) != (b->written == 0));
 
-	atomic_long_dec(&c->btree_cache.nr_dirty);
+	atomic_long_dec(&c->btree.cache.nr_dirty);
 
 	BUG_ON(btree_node_fake(b));
 	BUG_ON((b->will_make_reachable != 0) != !b->written);
@@ -455,17 +478,13 @@ do_write:
 	    c->opts.nochanges)
 		goto err;
 
-	if (trace_btree_node_write_enabled()) {
-		CLASS(printbuf, buf)();
-		guard(printbuf_indent)(&buf);
+	event_inc_trace(c, btree_node_write, buf, ({
 		prt_printf(&buf, "offset %u sectors %u bytes %u\n",
 			   b->written,
 			   sectors_to_write,
 			   bytes_to_write);
 		bch2_btree_pos_to_text(&buf, c, b);
-		trace_btree_node_write(c, buf.buf);
-	}
-	count_event(c, btree_node_write);
+	}));
 
 	/*
 	 * blk-wbt.c throttles all writes except those that have both REQ_SYNC
@@ -476,7 +495,7 @@ do_write:
 				buf_pages(data, sectors_to_write << 9),
 				REQ_OP_WRITE|REQ_META|REQ_SYNC|REQ_IDLE,
 				GFP_NOFS,
-				&c->btree_bio),
+				&c->btree.bio),
 			    struct btree_write_bio, wbio.bio);
 	wbio_init(&wbio->wbio.bio);
 	wbio->data			= data;
@@ -499,13 +518,13 @@ do_write:
 		bkey_i_to_btree_ptr_v2(&wbio->key)->v.sectors_written =
 			cpu_to_le16(b->written);
 
-	atomic64_inc(&c->btree_write_stats[type].nr);
-	atomic64_add(bytes_to_write, &c->btree_write_stats[type].bytes);
+	atomic64_inc(&c->btree.write_stats[type].nr);
+	atomic64_add(bytes_to_write, &c->btree.write_stats[type].bytes);
 
 	async_object_list_add(c, btree_write_bio, wbio, &wbio->list_idx);
 
 	INIT_WORK(&wbio->work, btree_write_submit);
-	queue_work(c->btree_write_submit_wq, &wbio->work);
+	queue_work(c->btree.write_submit_wq, &wbio->work);
 	return;
 err:
 	set_btree_node_noevict(b);
@@ -715,8 +734,8 @@ void bch2_btree_write_stats_to_text(struct printbuf *out, struct bch_fs *c)
 	prt_printf(out, "\tnr\tsize\n");
 
 	for (unsigned i = 0; i < BTREE_WRITE_TYPE_NR; i++) {
-		u64 nr		= atomic64_read(&c->btree_write_stats[i].nr);
-		u64 bytes	= atomic64_read(&c->btree_write_stats[i].bytes);
+		u64 nr		= atomic64_read(&c->btree.write_stats[i].nr);
+		u64 bytes	= atomic64_read(&c->btree.write_stats[i].bytes);
 
 		prt_printf(out, "%s:\t%llu\t", bch2_btree_write_types[i], nr);
 		prt_human_readable_u64(out, nr ? div64_u64(bytes, nr) : 0);

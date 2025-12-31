@@ -129,11 +129,6 @@ static inline bool journal_low_on_space(struct journal *j)
 
 /* Sequence number of oldest dirty journal entry */
 
-static inline u64 journal_last_seq(struct journal *j)
-{
-	return j->pin.front;
-}
-
 static inline u64 journal_cur_seq(struct journal *j)
 {
 	return atomic64_read(&j->seq);
@@ -142,6 +137,16 @@ static inline u64 journal_cur_seq(struct journal *j)
 static inline u64 journal_last_unwritten_seq(struct journal *j)
 {
 	return j->seq_ondisk + 1;
+}
+
+static inline u64 journal_last_unallocated_seq(struct journal *j)
+{
+	for (u64 seq = journal_last_unwritten_seq(j);
+	     seq <= journal_cur_seq(j);
+	     seq++)
+		if (!j->buf[seq & JOURNAL_BUF_MASK].write_allocated)
+			return seq;
+	return 0;
 }
 
 static inline bool journal_seq_unwritten(struct journal *j, u64 seq)
@@ -300,6 +305,8 @@ static inline union journal_res_state journal_state_buf_put(struct journal *j, u
 }
 
 bool bch2_journal_entry_close(struct journal *);
+
+void bch2_journal_do_writes_locked(struct journal *);
 void bch2_journal_do_writes(struct journal *);
 void bch2_journal_buf_put_final(struct journal *, u64);
 
@@ -410,20 +417,14 @@ static inline int bch2_journal_res_get(struct journal *j, struct journal_res *re
 				       unsigned u64s, unsigned flags,
 				       struct btree_trans *trans)
 {
-	int ret;
-
 	EBUG_ON(res->ref);
 	EBUG_ON(!test_bit(JOURNAL_running, &j->flags));
 
 	res->u64s = u64s;
 
-	if (journal_res_get_fast(j, res, flags))
-		goto out;
+	if (!journal_res_get_fast(j, res, flags))
+		try(bch2_journal_res_get_slowpath(j, res, flags, trans));
 
-	ret = bch2_journal_res_get_slowpath(j, res, flags, trans);
-	if (ret)
-		return ret;
-out:
 	if (!(flags & JOURNAL_RES_GET_CHECK)) {
 		lock_acquire_shared(&j->res_map, 0,
 				    (flags & JOURNAL_RES_GET_NONBLOCK) != 0,

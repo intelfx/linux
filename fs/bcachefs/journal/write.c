@@ -11,6 +11,7 @@
 
 #include "data/checksum.h"
 
+#include "init/dev.h"
 #include "init/error.h"
 #include "init/fs.h"
 
@@ -20,6 +21,7 @@
 #include "journal/write.h"
 
 #include "sb/clean.h"
+#include "sb/counters.h"
 
 #include <linux/ioprio.h>
 
@@ -75,7 +77,7 @@ static void __journal_write_alloc(struct journal *j,
 		 * it:
 		 */
 		if (!ja->nr ||
-		    bch2_bkey_has_device_c(bkey_i_to_s_c(&w->key), ca->dev_idx) ||
+		    bch2_bkey_has_device_c(c, bkey_i_to_s_c(&w->key), ca->dev_idx) ||
 		    sectors > ja->sectors_free) {
 			enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_journal_write);
 			continue;
@@ -83,7 +85,7 @@ static void __journal_write_alloc(struct journal *j,
 
 		bch2_dev_stripe_increment(ca, &j->wp.stripe);
 
-		bch2_bkey_append_ptr(&w->key,
+		bch2_bkey_append_ptr(c, &w->key,
 			(struct bch_extent_ptr) {
 				  .offset = bucket_to_sector(ca,
 					ja->buckets[ja->cur_idx]) +
@@ -183,87 +185,156 @@ static void journal_buf_realloc(struct journal *j, struct journal_buf *buf)
 	kvfree(new_buf);
 }
 
+static void replicas_refs_put(struct bch_fs *c, darray_replicas_entry_refs *refs)
+{
+	darray_for_each(*refs, i)
+		bch2_replicas_entry_put_many(c, &i->replicas.e, i->nr_refs);
+	refs->nr = 0;
+}
+
+static inline u64 last_uncompleted_write_seq(struct journal *j, u64 seq_completing)
+{
+	u64 seq = journal_last_unwritten_seq(j);
+
+	if (seq <= journal_cur_seq(j) &&
+	    (j->buf[seq & JOURNAL_BUF_MASK].write_done ||
+	     seq == seq_completing))
+		return seq;
+
+	return 0;
+}
+
 static CLOSURE_CALLBACK(journal_write_done)
 {
 	closure_type(w, struct journal_buf, io);
 	struct journal *j = container_of(w, struct journal, buf[w->idx]);
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-	union bch_replicas_padded replicas;
-	u64 seq = le64_to_cpu(w->data->seq);
+	u64 seq_wrote = le64_to_cpu(w->data->seq);
 	int err = 0;
 
 	bch2_time_stats_update(!JSET_NO_FLUSH(w->data)
 			       ? j->flush_write_time
 			       : j->noflush_write_time, j->write_start_time);
 
-	if (!w->devs_written.nr) {
-		err = bch_err_throw(c, journal_write_err);
-	} else {
-		bch2_devlist_to_replicas(&replicas.e, BCH_DATA_journal,
-					 w->devs_written);
-		err = bch2_mark_replicas(c, &replicas.e);
+	struct bch_replicas_entry_v1 *r = &journal_seq_pin(j, seq_wrote)->devs.e;
+
+	if (unlikely(w->failed.nr)) {
+		bch2_replicas_entry_put(c, r);
+		r->nr_devs = 0;
 	}
 
-	if (err && !bch2_journal_error(j)) {
-		CLASS(printbuf, buf)();
-		bch2_log_msg_start(c, &buf);
+	if (!r->nr_devs && !w->empty) {
+		bch2_devlist_to_replicas(r, BCH_DATA_journal, w->devs_written);
+		err = bch2_replicas_entry_get(c, r);
+		if (err)
+			r->nr_devs = 0;
+	}
 
-		if (err == -BCH_ERR_journal_write_err)
-			prt_printf(&buf, "unable to write journal to sufficient devices\n");
-		else
-			prt_printf(&buf, "journal write error marking replicas: %s\n",
-				   bch2_err_str(err));
+	if (unlikely(w->failed.nr || err)) {
+		CLASS(bch_log_msg, msg)(c);
 
-		bch2_fs_emergency_read_only2(c, &buf);
+		/* Separate ratelimit_states for hard and soft errors */
+		msg.m.suppress = !err
+			? bch2_ratelimit(c)
+			: bch2_ratelimit(c);
 
-		bch2_print_str(c, KERN_ERR, buf.buf);
+		prt_printf(&msg.m, "error writing journal entry %llu\n", seq_wrote);
+		bch2_io_failures_to_text(&msg.m, c, &w->failed);
+
+		if (!w->devs_written.nr)
+			err = bch_err_throw(c, journal_write_err);
+
+		if (!err) {
+			prt_printf(&msg.m, "wrote degraded to ");
+			bch2_devs_list_to_text(&msg.m, c, &w->devs_written);
+			prt_newline(&msg.m);
+		} else {
+			prt_printf(&msg.m, "error %s\n", bch2_err_str(err));
+			bch2_fs_emergency_read_only(c, &msg.m);
+		}
 	}
 
 	closure_debug_destroy(cl);
 
+	CLASS(darray_replicas_entry_refs, replicas_refs)();
+
 	spin_lock(&j->lock);
-	if (seq >= j->pin.front)
-		journal_seq_pin(j, seq)->devs = w->devs_written;
-	if (err && (!j->err_seq || seq < j->err_seq))
-		j->err_seq	= seq;
-	w->write_done = true;
+	BUG_ON(seq_wrote < j->pin.front);
+	if (err && (!j->err_seq || seq_wrote < j->err_seq))
+		j->err_seq = seq_wrote;
 
 	if (!j->free_buf || j->free_buf_size < w->buf_size) {
 		swap(j->free_buf,	w->data);
 		swap(j->free_buf_size,	w->buf_size);
 	}
 
-	if (w->data) {
-		void *buf = w->data;
-		w->data = NULL;
-		w->buf_size = 0;
-
-		spin_unlock(&j->lock);
-		kvfree(buf);
-		spin_lock(&j->lock);
-	}
+	/* kvfree can allocate memory, and can't be called under j->lock */
+	void *buf_to_free __free(kvfree) = w->data;
+	w->data = NULL;
+	w->buf_size = 0;
 
 	bool completed = false;
-	bool do_discards = false;
+	bool last_seq_ondisk_updated = false;
 
-	for (seq = journal_last_unwritten_seq(j);
-	     seq <= journal_cur_seq(j);
-	     seq++) {
+	u64 seq;
+	while ((seq = last_uncompleted_write_seq(j, seq_wrote))) {
 		w = j->buf + (seq & JOURNAL_BUF_MASK);
-		if (!w->write_done)
-			break;
 
 		if (!j->err_seq && !w->noflush) {
-			j->flushed_seq_ondisk = seq;
-			j->last_seq_ondisk = w->last_seq;
+			BUG_ON(w->empty && w->last_seq != seq);
 
-			closure_wake_up(&c->freelist_wait);
-			bch2_reset_alloc_cursors(c);
-			do_discards = true;
+			if (j->last_seq_ondisk < w->last_seq) {
+				bch2_journal_update_last_seq_ondisk(j,
+						w->last_seq + w->empty, &replicas_refs);
+				/*
+				 * bch2_journal_update_last_seq_ondisk()
+				 * can return an error if appending to
+				 * replicas_refs failed, but we don't
+				 * care - it's a preallocated darray so
+				 * it'll allways be able to do some
+				 * work, and we have to retry anyways,
+				 * because we have to drop j->lock to
+				 * put the replicas refs before updating
+				 * j->flushed_seq_ondisk
+				 */
+
+				/*
+				 * Do this before updating j->last_seq_ondisk,
+				 * or journal flushing breaks:
+				 */
+				if (replicas_refs.nr) {
+					spin_unlock(&j->lock);
+					replicas_refs_put(c, &replicas_refs);
+					spin_lock(&j->lock);
+					continue;
+				}
+
+				BUG_ON(j->last_seq > j->last_seq);
+				j->last_seq_ondisk = w->last_seq;
+				last_seq_ondisk_updated = true;
+			}
+
+			/* replicas refs eed to be put first */
+			j->flushed_seq_ondisk = seq;
 		}
 
+		if (w->empty)
+			j->last_empty_seq = seq;
 		j->seq_ondisk = seq;
 
+		closure_wake_up(&w->wait);
+		completed = true;
+	}
+
+	/*
+	 * Writes might complete out of order, but we have to do the completions
+	 * in order: if we complete out of order we note it here so the next
+	 * write completion will pick it up:
+	 */
+	j->buf[seq_wrote & JOURNAL_BUF_MASK].write_done = true;
+	j->pin.front = min(j->pin.back, j->last_seq_ondisk);
+
+	if (completed) {
 		/*
 		 * Updating last_seq_ondisk may let bch2_journal_reclaim_work() discard
 		 * more buckets:
@@ -274,12 +345,7 @@ static CLOSURE_CALLBACK(journal_write_done)
 		if (j->watermark != BCH_WATERMARK_stripe)
 			journal_reclaim_kick(&c->journal);
 
-		closure_wake_up(&w->wait);
-		completed = true;
-	}
-
-	if (completed) {
-		bch2_journal_reclaim_fast(j);
+		bch2_journal_update_last_seq(j);
 		bch2_journal_space_available(j);
 
 		track_event_change(&c->times[BCH_TIME_blocked_journal_max_in_flight], false);
@@ -306,11 +372,14 @@ static CLOSURE_CALLBACK(journal_write_done)
 	 * allocated, in bch2_journal_write() - but the journal write error path
 	 * is special:
 	 */
-	bch2_journal_do_writes(j);
+	bch2_journal_do_writes_locked(j);
 	spin_unlock(&j->lock);
 
-	if (do_discards)
+	if (last_seq_ondisk_updated) {
+		bch2_reset_alloc_cursors(c);
+		closure_wake_up(&c->allocator.freelist_wait);
 		bch2_do_discards(c);
+	}
 
 	closure_put(&c->cl);
 }
@@ -320,21 +389,17 @@ static void journal_write_endio(struct bio *bio)
 	struct journal_bio *jbio = container_of(bio, struct journal_bio, bio);
 	struct bch_dev *ca = jbio->ca;
 	struct journal *j = &ca->fs->journal;
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	struct journal_buf *w = j->buf + jbio->buf_idx;
 
 	bch2_account_io_completion(ca, BCH_MEMBER_ERROR_write,
 				   jbio->submit_time, !bio->bi_status);
 
 	if (bio->bi_status) {
-		bch_err_dev_ratelimited(ca,
-			       "error writing journal entry %llu: %s",
-			       le64_to_cpu(w->data->seq),
-			       bch2_blk_status_to_str(bio->bi_status));
-
-		unsigned long flags;
-		spin_lock_irqsave(&j->err_lock, flags);
+		guard(spinlock_irqsave)(&j->err_lock);
+		bch2_dev_io_failures_mut(&w->failed, ca->dev_idx)->errcode =
+			__bch2_err_throw(c, -blk_status_to_bch_err(bio->bi_status));
 		bch2_dev_list_drop_dev(&w->devs_written, ca->dev_idx);
-		spin_unlock_irqrestore(&j->err_lock, flags);
 	}
 
 	closure_put(&w->io);
@@ -347,6 +412,11 @@ static CLOSURE_CALLBACK(journal_write_submit)
 	struct journal *j = container_of(w, struct journal, buf[w->idx]);
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	unsigned sectors = vstruct_sectors(w->data, c->block_bits);
+
+	event_inc_trace(c, journal_write, buf, ({
+		prt_printf(&buf, "seq %llu\n", le64_to_cpu(w->data->seq));
+		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&w->key));
+	}));
 
 	extent_for_each_ptr(bkey_i_to_s_extent(&w->key), ptr) {
 		struct bch_dev *ca = bch2_dev_have_ref(c, ptr->dev);
@@ -380,7 +450,6 @@ static CLOSURE_CALLBACK(journal_write_submit)
 
 		bch2_bio_map(bio, w->data, sectors << 9);
 
-		trace_and_count(c, journal_write, bio);
 		closure_bio_submit(bio, cl);
 
 		ja->bucket_seq[ja->cur_idx] = le64_to_cpu(w->data->seq);
@@ -445,6 +514,8 @@ static int bch2_journal_write_prep(struct journal *j, struct journal_buf *w)
 	u64 seq = le64_to_cpu(jset->seq);
 	int ret;
 
+	bool empty = jset->seq == jset->last_seq;
+
 	/*
 	 * Simple compaction, dropping empty jset_entries (from journal
 	 * reservations that weren't fully used) and merging jset_entries that
@@ -459,6 +530,9 @@ static int bch2_journal_write_prep(struct journal *j, struct journal_buf *w)
 		/* Empty entry: */
 		if (!u64s)
 			continue;
+
+		if (i->type == BCH_JSET_ENTRY_btree_keys)
+			empty = false;
 
 		/*
 		 * New btree roots are set by journalling them; when the journal
@@ -504,8 +578,10 @@ static int bch2_journal_write_prep(struct journal *j, struct journal_buf *w)
 		}
 	}
 
-	scoped_guard(spinlock, &c->journal.lock)
+	scoped_guard(spinlock, &c->journal.lock) {
 		w->need_flush_to_write_buffer = false;
+		w->empty = empty;
+	}
 
 	start = end = vstruct_last(jset);
 
@@ -539,7 +615,6 @@ static int bch2_journal_write_checksum(struct journal *j, struct journal_buf *w)
 {
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	struct jset *jset = w->data;
-	u64 seq = le64_to_cpu(jset->seq);
 	bool validate_before_checksum = false;
 	int ret = 0;
 
@@ -548,9 +623,6 @@ static int bch2_journal_write_checksum(struct journal *j, struct journal_buf *w)
 
 	SET_JSET_BIG_ENDIAN(jset, CPU_BIG_ENDIAN);
 	SET_JSET_CSUM_TYPE(jset, bch2_meta_checksum_type(c));
-
-	if (!JSET_NO_FLUSH(jset) && journal_entry_empty(jset))
-		j->last_empty_seq = seq;
 
 	if (bch2_csum_type_is_encryption(JSET_CSUM_TYPE(jset)))
 		validate_before_checksum = true;
@@ -632,14 +704,13 @@ CLOSURE_CALLBACK(bch2_journal_write)
 	closure_type(w, struct journal_buf, io);
 	struct journal *j = container_of(w, struct journal, buf[w->idx]);
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-	union bch_replicas_padded replicas;
-	unsigned nr_rw_members = dev_mask_nr(&c->rw_devs[BCH_DATA_free]);
+	unsigned nr_rw_members = dev_mask_nr(&c->allocator.rw_devs[BCH_DATA_free]);
 	int ret;
 
-	BUG_ON(BCH_SB_CLEAN(c->disk_sb.sb));
 	BUG_ON(!w->write_started);
 	BUG_ON(w->write_allocated);
 	BUG_ON(w->write_done);
+	BUG_ON(journal_last_unallocated_seq(j) != le64_to_cpu(w->data->seq));
 
 	j->write_start_time = local_clock();
 
@@ -672,7 +743,7 @@ CLOSURE_CALLBACK(bch2_journal_write)
 	}
 
 	if (unlikely(ret))
-		goto err_allocate_write;
+		goto err;
 
 	ret = bch2_journal_write_checksum(j, w);
 	if (unlikely(ret))
@@ -692,20 +763,29 @@ CLOSURE_CALLBACK(bch2_journal_write)
 		 * available:
 		 */
 		bch2_journal_space_available(j);
-		bch2_journal_do_writes(j);
+		bch2_journal_do_writes_locked(j);
 	}
 
-	w->devs_written = bch2_bkey_devs(bkey_i_to_s_c(&w->key));
+	w->devs_written = bch2_bkey_devs(c, bkey_i_to_s_c(&w->key));
 
-	/*
-	 * Mark journal replicas before we submit the write to guarantee
-	 * recovery will find the journal entries after a crash.
-	 */
-	bch2_devlist_to_replicas(&replicas.e, BCH_DATA_journal,
-				 w->devs_written);
-	ret = bch2_mark_replicas(c, &replicas.e);
-	if (ret)
-		goto err;
+	if (!c->sb.clean) {
+		/*
+		 * Mark journal replicas before we submit the write to guarantee
+		 * recovery will find the journal entries after a crash.
+		 *
+		 * If the filesystem is clean, we have to defer this until after
+		 * the write completes, so the filesystem isn't marked dirty
+		 * before anything is in the journal:
+		 */
+		struct bch_replicas_entry_v1 *r = &journal_seq_pin(j, le64_to_cpu(w->data->seq))->devs.e;
+		bch2_devlist_to_replicas(r, BCH_DATA_journal, w->devs_written);
+
+		ret = bch2_replicas_entry_get(c, r);
+		if (ret) {
+			r->nr_devs = 0;
+			goto err;
+		}
+	}
 
 	if (c->opts.nochanges)
 		goto no_io;
@@ -715,19 +795,18 @@ CLOSURE_CALLBACK(bch2_journal_write)
 	else
 		continue_at(cl, journal_write_submit, j->wq);
 	return;
-err_allocate_write:
-	if (!bch2_journal_error(j)) {
-		CLASS(printbuf, buf)();
-
-		bch2_journal_debug_to_text(&buf, j);
-		prt_printf(&buf, bch2_fmt(c, "Unable to allocate journal write at seq %llu for %zu sectors: %s"),
-					  le64_to_cpu(w->data->seq),
-					  vstruct_sectors(w->data, c->block_bits),
-					  bch2_err_str(ret));
-		bch2_print_str(c, KERN_ERR, buf.buf);
-	}
 err:
-	bch2_fatal_error(c);
+	if (1) {
+		CLASS(bch_log_msg, msg)(c);
+		msg.m.suppress = true; /* only print once, when we go ERO */
+
+		prt_printf(&msg.m, "Unable to do journal write at seq %llu for %zu sectors: %s",
+			   le64_to_cpu(w->data->seq),
+			   vstruct_sectors(w->data, c->block_bits),
+			   bch2_err_str(ret));
+		bch2_journal_debug_to_text(&msg.m, j);
+		bch2_fs_emergency_read_only(c, &msg.m);
+	}
 no_io:
 	extent_for_each_ptr(bkey_i_to_s_extent(&w->key), ptr) {
 		struct bch_dev *ca = bch2_dev_have_ref(c, ptr->dev);
