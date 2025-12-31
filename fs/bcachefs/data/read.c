@@ -728,7 +728,7 @@ static void bch2_rbio_error(struct bch_read_bio *rbio, int ret)
 		return;
 
 	if (data_read_err_should_retry(ret)) {
-		bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_unbound_wq);
+		bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_dfl_wq);
 	} else {
 		rbio = bch2_rbio_free(rbio);
 		rbio->ret = ret;
@@ -1451,7 +1451,7 @@ int __bch2_read_extent(struct btree_trans *trans,
 		trans->notrace_relock_fail = true;
 	} else {
 		if (!(flags & BCH_READ_in_retry)) {
-			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_unbound_wq);
+			bch2_rbio_punt(rbio, bch2_rbio_retry, RBIO_CONTEXT_UNBOUND, system_dfl_wq);
 			return 0;
 		}
 
