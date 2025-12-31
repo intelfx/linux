@@ -7,6 +7,14 @@ config BINARY_PRINTF
 	def_bool n
 
 menu "Library routines"
+#
+# Generic algorithms support
+#
+config XOR_BLOCKS
+	tristate "Accelerated block XOR algorithm"
+
+config MIN_HEAP
+	bool "Generic minheap algorithm"
 
 config RAID6_PQ
 	tristate "Reed-solomon RAID5/6 algorithms"
@@ -645,6 +653,3 @@ config FIRMWARE_TABLE
 
 config UNION_FIND
 	bool
-
-config MIN_HEAP
-	bool "Generic minheap algorithm"
