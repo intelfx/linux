@@ -1241,7 +1241,7 @@ int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
 {
 	int err;
 
-	if (!is_power_of_2(src->min_region_sz))
+	if (!is_power_of_2(src->min_sz_region))
 		return -EINVAL;
 
 	err = damon_commit_schemes(dst, src);
