@@ -860,7 +860,7 @@ void cifs_close_all_deferred_files_sb(struct cifs_sb_info *cifs_sb)
 		tcon = tlink_tcon(tlink);
 		if (IS_ERR(tcon))
 			continue;
-		tmp_list = kmalloc_obj(struct tcon_list, GFP_ATOMIC);
+		tmp_list = kmalloc(sizeof(struct tcon_list), GFP_ATOMIC);
 		if (tmp_list == NULL)
 			break;
 		tmp_list->tcon = tcon;
