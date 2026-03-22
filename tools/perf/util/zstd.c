@@ -14,6 +14,50 @@ int zstd_init(struct zstd_data *data, int level)
 	return 0;
 }
 
+static int zstd_init_cstream(struct zstd_data *data)
+{
+	size_t ret;
+
+	if (!data->cstream) {
+		data->cstream = ZSTD_createCStream();
+		if (data->cstream == NULL) {
+			pr_err("zstd: failed to create compression stream\n");
+			return -1;
+		}
+
+		ret = ZSTD_initCStream(data->cstream, data->comp_level);
+		if (ZSTD_isError(ret)) {
+			pr_err("zstd: failed to initialize compression stream: %s\n",
+				ZSTD_getErrorName(ret));
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int zstd_init_dstream(struct zstd_data *data)
+{
+	size_t ret;
+	
+	if (!data->dstream) {
+		data->dstream = ZSTD_createDStream();
+		if (data->dstream == NULL) {
+			pr_err("zstd: failed to create decompression stream\n");
+			return -1;
+		}
+
+		ret = ZSTD_initDStream(data->dstream);
+		if (ZSTD_isError(ret)) {
+			pr_err("zstd: failed to initialize decompression stream: %s\n",
+				ZSTD_getErrorName(ret));
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
 int zstd_fini(struct zstd_data *data)
 {
 	if (data->dstream) {
@@ -33,25 +77,14 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_
 				       void *src, size_t src_size, size_t max_record_size,
 				       size_t process_header(void *record, size_t increment))
 {
-	size_t ret, size, compressed = 0;
+	ssize_t ret, size, compressed = 0;
 	ZSTD_inBuffer input = { src, src_size, 0 };
 	ZSTD_outBuffer output;
 	void *record;
 
-	if (!data->cstream) {
-		data->cstream = ZSTD_createCStream();
-		if (data->cstream == NULL) {
-			pr_err("Couldn't create compression stream.\n");
-			return -1;
-		}
-
-		ret = ZSTD_initCStream(data->cstream, data->comp_level);
-		if (ZSTD_isError(ret)) {
-			pr_err("Failed to initialize compression stream: %s\n",
-				ZSTD_getErrorName(ret));
-			return -1;
-		}
-	}
+	ret = zstd_init_cstream(data);
+	if (ret < 0)
+		return ret;
 
 	while (input.pos < input.size) {
 		record = dst;
@@ -104,24 +137,14 @@ reset:
 size_t zstd_decompress_buffer(struct zstd_data *data, void *src, size_t src_size,
 			      void *dst, size_t dst_size)
 {
-	size_t ret;
+	ssize_t ret;
 	ZSTD_inBuffer input = { src, src_size, 0 };
 	ZSTD_outBuffer output = { dst, dst_size, 0 };
 
-	if (!data->dstream) {
-		data->dstream = ZSTD_createDStream();
-		if (data->dstream == NULL) {
-			pr_err("Couldn't create decompression stream.\n");
-			return 0;
-		}
+	ret = zstd_init_dstream(data);
+	if (ret < 0)
+		return ret;
 
-		ret = ZSTD_initDStream(data->dstream);
-		if (ZSTD_isError(ret)) {
-			pr_err("Failed to initialize decompression stream: %s\n",
-				ZSTD_getErrorName(ret));
-			return 0;
-		}
-	}
 	while (input.pos < input.size) {
 		size_t prev_in = input.pos;
 		size_t prev_out = output.pos;
