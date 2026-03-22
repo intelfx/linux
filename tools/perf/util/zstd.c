@@ -78,7 +78,7 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_
 	return compressed;
 }
 
-size_t zstd_decompress_stream(struct zstd_data *data, void *src, size_t src_size,
+size_t zstd_decompress_buffer(struct zstd_data *data, void *src, size_t src_size,
 			      void *dst, size_t dst_size)
 {
 	size_t ret;
