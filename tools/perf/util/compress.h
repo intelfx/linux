@@ -58,6 +58,9 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_
 
 size_t zstd_decompress_buffer(struct zstd_data *data, void *src, size_t src_size,
 			      void *dst, size_t dst_size);
+int zstd_decompress_stream(struct zstd_data *data, int input_fd, int output_fd);
+int zstd_decompress_to_fd(const char *input, int output_fd);
+bool zstd_is_compressed(const char *input);
 #else /* !HAVE_ZSTD_SUPPORT */
 
 static inline int zstd_init(struct zstd_data *data __maybe_unused, int level __maybe_unused)
@@ -85,6 +88,21 @@ static inline size_t zstd_decompress_buffer(struct zstd_data *data __maybe_unuse
 					    size_t dst_size __maybe_unused)
 {
 	return 0;
+}
+
+static inline int zstd_decompress_stream(struct zstd_data *data, int input_fd, int output_fd)
+{
+	return -1;
+}
+
+static inline int zstd_decompress_to_fd(const char *input, int output_fd)
+{
+	return -1;
+}
+
+static inline bool zstd_is_compressed(const char *input)
+{
+	return false;
 }
 #endif
 
