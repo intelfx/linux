@@ -101,7 +101,7 @@ reset:
 	return -1;
 }
 
-size_t zstd_decompress_stream(struct zstd_data *data, void *src, size_t src_size,
+size_t zstd_decompress_buffer(struct zstd_data *data, void *src, size_t src_size,
 			      void *dst, size_t dst_size)
 {
 	size_t ret;

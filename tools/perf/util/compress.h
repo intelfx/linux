@@ -56,7 +56,7 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_
 				       void *src, size_t src_size, size_t max_record_size,
 				       size_t process_header(void *record, size_t increment));
 
-size_t zstd_decompress_stream(struct zstd_data *data, void *src, size_t src_size,
+size_t zstd_decompress_buffer(struct zstd_data *data, void *src, size_t src_size,
 			      void *dst, size_t dst_size);
 #else /* !HAVE_ZSTD_SUPPORT */
 
@@ -80,7 +80,7 @@ ssize_t zstd_compress_stream_to_records(struct zstd_data *data __maybe_unused,
 	return 0;
 }
 
-static inline size_t zstd_decompress_stream(struct zstd_data *data __maybe_unused, void *src __maybe_unused,
+static inline size_t zstd_decompress_buffer(struct zstd_data *data __maybe_unused, void *src __maybe_unused,
 					    size_t src_size __maybe_unused, void *dst __maybe_unused,
 					    size_t dst_size __maybe_unused)
 {
