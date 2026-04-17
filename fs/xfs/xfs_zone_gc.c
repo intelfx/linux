@@ -1226,7 +1226,7 @@ xfs_zone_gc_mount(
 	return 0;
 
 out_free_gc_data:
-	kfree(data);
+	xfs_zone_gc_data_free(data);
 out_put_gc_zone:
 	xfs_open_zone_put(zi->zi_open_gc_zone);
 out:
