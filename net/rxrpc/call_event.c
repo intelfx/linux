@@ -332,13 +332,7 @@ bool rxrpc_input_call_event(struct rxrpc_call *call)
 
 			saw_ack |= sp->hdr.type == RXRPC_PACKET_TYPE_ACK;
 
-			if (sp->hdr.type == RXRPC_PACKET_TYPE_DATA &&
-			    sp->hdr.securityIndex != 0 &&
-			    skb_ensure_writable(skb, skb->len)) {
-				rxrpc_see_skb(skb, rxrpc_skb_see_unshare_nomem);
-			} else {
-				rxrpc_input_call_packet(call, skb);
-			}
+			rxrpc_input_call_packet(call, skb);
 			rxrpc_free_skb(skb, rxrpc_skb_put_call_rx);
 			did_receive = true;
 		}

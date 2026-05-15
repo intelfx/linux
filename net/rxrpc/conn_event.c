@@ -243,15 +243,22 @@ static void rxrpc_call_is_secure(struct rxrpc_call *call)
 static int rxrpc_verify_response(struct rxrpc_connection *conn,
 				 struct sk_buff *skb)
 {
+	unsigned int len = skb->len - sizeof(struct rxrpc_wire_header);
+	void *buffer;
 	int ret;
 
-	if (skb_ensure_writable(skb, skb->len)) {
-		rxrpc_see_skb(skb, rxrpc_skb_see_unshare_nomem);
+	buffer = kmalloc(len, GFP_NOFS);
+	if (!buffer)
 		return -ENOMEM;
-	}
 
-	ret = conn->security->verify_response(conn, skb);
+	ret = skb_copy_bits(skb, sizeof(struct rxrpc_wire_header), buffer, len);
+	if (ret < 0)
+		goto out;
 
+	ret = conn->security->verify_response(conn, skb, buffer, len);
+
+out:
+	kfree(buffer);
 	return ret;
 }
 
