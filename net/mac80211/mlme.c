@@ -149,6 +149,113 @@ static int ecw2cw(int ecw)
 	return (1 << ecw) - 1;
 }
 
+static const char *ieee80211_chanwidth_text(enum nl80211_chan_width width)
+{
+	switch (width) {
+	case NL80211_CHAN_WIDTH_20_NOHT:
+		return "20-NOHT";
+	case NL80211_CHAN_WIDTH_20:
+		return "20";
+	case NL80211_CHAN_WIDTH_40:
+		return "40";
+	case NL80211_CHAN_WIDTH_80:
+		return "80";
+	case NL80211_CHAN_WIDTH_80P80:
+		return "80+80";
+	case NL80211_CHAN_WIDTH_160:
+		return "160";
+	case NL80211_CHAN_WIDTH_320:
+		return "320";
+	case NL80211_CHAN_WIDTH_5:
+		return "5";
+	case NL80211_CHAN_WIDTH_10:
+		return "10";
+	case NL80211_CHAN_WIDTH_1:
+		return "1";
+	case NL80211_CHAN_WIDTH_2:
+		return "2";
+	case NL80211_CHAN_WIDTH_4:
+		return "4";
+	case NL80211_CHAN_WIDTH_8:
+		return "8";
+	case NL80211_CHAN_WIDTH_16:
+		return "16";
+	}
+	return "<invalid>";
+}
+
+static const char *ieee80211_band_text(enum nl80211_band band)
+{
+	switch (band) {
+	case NL80211_BAND_2GHZ:
+		return "2.4GHz";
+	case NL80211_BAND_5GHZ:
+		return "5GHz";
+	case NL80211_BAND_60GHZ:
+		return "60GHz";
+	case NL80211_BAND_6GHZ:
+		return "6GHz";
+	case NL80211_BAND_S1GHZ:
+		return "S1GHz";
+	case NL80211_BAND_LC:
+		return "LC";
+	default:
+		return "<invalid>";
+	}
+}
+
+/*
+ * Pretty-print every field and state of a struct cfg80211_chan_def into the
+ * caller-provided buffer, for debugging the channel definitions produced by
+ * the ieee80211_chandef_*_oper() helpers. Returns @buf so it can be used
+ * inline as a "%s" printf argument. A buffer of ~120 bytes is plenty.
+ */
+static const char *
+ieee80211_chandef_text(char *buf, size_t len,
+		       const struct cfg80211_chan_def *chandef)
+{
+	char *p = buf, *end = buf + len;
+
+	if (!chandef) {
+		scnprintf(buf, len, "(null)");
+		return buf;
+	}
+
+	p += scnprintf(p, end - p, "width=%s MHz",
+		       ieee80211_chanwidth_text(chandef->width));
+
+	if (chandef->chan)
+		p += scnprintf(p, end - p,
+			       " control=%d.%03d MHz (chan %d, %s)",
+			       chandef->chan->center_freq,
+			       chandef->chan->freq_offset,
+			       chandef->chan->hw_value,
+			       ieee80211_band_text(chandef->chan->band));
+	else
+		p += scnprintf(p, end - p, " control=(none)");
+
+	p += scnprintf(p, end - p, " center1=%d.%03d MHz",
+		       chandef->center_freq1, chandef->freq1_offset);
+
+	if (chandef->width == NL80211_CHAN_WIDTH_80P80)
+		p += scnprintf(p, end - p, " center2=%d MHz",
+			       chandef->center_freq2);
+
+	if (chandef->punctured)
+		p += scnprintf(p, end - p, " punctured=0x%04x",
+			       chandef->punctured);
+
+	if (chandef->edmg.channels || chandef->edmg.bw_config)
+		p += scnprintf(p, end - p, " edmg=ch:0x%02x/bw:%d",
+			       chandef->edmg.channels, chandef->edmg.bw_config);
+
+	if (chandef->chan && chandef->chan->band == NL80211_BAND_S1GHZ)
+		p += scnprintf(p, end - p, " s1g_primary_2mhz=%d",
+			       chandef->s1g_primary_2mhz);
+
+	return buf;
+}
+
 static enum ieee80211_conn_mode
 ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 			    struct ieee80211_channel *channel,
@@ -168,6 +275,14 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 	struct cfg80211_chan_def vht_chandef;
 	bool no_vht = false;
 	u32 ht_cfreq;
+	char dbg[160];
+
+	#define CHANDEF_DBG(var, fmt, ...) \
+		do { \
+			sdata_dbg(sdata, "chandef: " fmt ": %s\n", \
+				  ##__VA_ARGS__, \
+				  ieee80211_chandef_text(dbg, sizeof(dbg), (var))); \
+		} while (0)
 
 	if (ieee80211_hw_check(&sdata->local->hw, STRICT))
 		ignore_ht_channel_mismatch = false;
@@ -178,6 +293,7 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		.center_freq1 = channel->center_freq,
 		.freq1_offset = channel->freq_offset,
 	};
+	CHANDEF_DBG(chandef, "legacy");
 
 	/* get special S1G case out of the way */
 	if (sband->band == NL80211_BAND_S1GHZ) {
@@ -188,6 +304,7 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 			chandef->s1g_primary_2mhz = false;
 		}
 
+		CHANDEF_DBG(chandef, "S1G");
 		return IEEE80211_CONN_MODE_S1G;
 	}
 
@@ -215,6 +332,7 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 			sdata_info(sdata, "bad HE/EHT 6 GHz operation\n");
 			return IEEE80211_CONN_MODE_LEGACY;
 		}
+		CHANDEF_DBG(chandef, "HE 6GHz");
 
 		if (mode <= IEEE80211_CONN_MODE_EHT)
 			return mode;
@@ -249,6 +367,7 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 	}
 
 	ieee80211_chandef_ht_oper(ht_oper, chandef);
+	CHANDEF_DBG(chandef, "HT");
 
 	if (conn->mode < IEEE80211_CONN_MODE_VHT)
 		return IEEE80211_CONN_MODE_HT;
@@ -293,6 +412,8 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		return IEEE80211_CONN_MODE_HT;
 	}
 
+	CHANDEF_DBG(&vht_chandef, "VHT");
+
 	if (!cfg80211_chandef_compatible(chandef, &vht_chandef)) {
 		sdata_info(sdata,
 			   "AP VHT information doesn't match HT, disabling VHT\n");
@@ -327,6 +448,8 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 
 		eht_chandef.punctured =
 			ieee80211_eht_oper_dis_subchan_bitmap(eht_oper);
+
+		CHANDEF_DBG(&eht_chandef, "EHT");
 
 		if (!cfg80211_chandef_valid(&eht_chandef)) {
 			sdata_info(sdata,
@@ -386,6 +509,8 @@ check_uhr:
 			npca_chandef.punctured = npca_punct;
 		}
 
+		CHANDEF_DBG(&npca_chandef, "UHR NPCA");
+
 		/*
 		 * must be a valid puncturing pattern for this channel as
 		 * well as puncturing all subchannels that are already in
@@ -400,6 +525,8 @@ check_uhr:
 	}
 
 	return IEEE80211_CONN_MODE_UHR;
+
+	#undef CHANDEF_DBG
 }
 
 static bool
