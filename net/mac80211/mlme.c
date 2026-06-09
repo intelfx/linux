@@ -415,9 +415,35 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 	CHANDEF_DBG(&vht_chandef, "VHT");
 
 	if (!cfg80211_chandef_compatible(chandef, &vht_chandef)) {
+		/*
+		 * Some APs (notably iPhone personal hotspots) advertise an HT
+		 * secondary channel offset that contradicts the control-channel
+		 * position implied by the VHT channel center, so the HT and VHT
+		 * chandefs come out incompatible. The VHT operation is the more
+		 * authoritative source for the operating width, and the forced
+		 * VHT chandef is self-consistent on its own: everything
+		 * downstream (including the iwlwifi PHY context) re-derives the
+		 * control-channel position from control vs. center frequency and
+		 * never consults the HT secondary offset again. So as long as
+		 * VHT keeps the very same control channel and merely widens it,
+		 * force VHT instead of dropping back to HT.
+		 *
+		 * Note: comparing the control channel and width (rather than the
+		 * segment center) is deliberate. For a properly contained
+		 * narrower channel the centers *should* differ, since the 40 MHz
+		 * lives in one half of the 80 MHz; they coincide here only
+		 * because of the degenerate (and per-spec invalid) alignment
+		 * that triggered the mismatch in the first place.
+		 */
+		if (vht_chandef.chan != chandef->chan ||
+		    vht_chandef.width <= chandef->width) {
+			sdata_notice(sdata,
+				     "AP VHT information doesn't match HT, disabling VHT\n");
+			return IEEE80211_CONN_MODE_HT;
+		}
+
 		sdata_notice(sdata,
-			     "AP VHT information doesn't match HT, disabling VHT\n");
-		return IEEE80211_CONN_MODE_HT;
+			     "AP VHT information doesn't match HT, using VHT anyway\n");
 	}
 
 	*chandef = vht_chandef;
