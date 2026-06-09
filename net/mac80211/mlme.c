@@ -316,8 +316,8 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 			return IEEE80211_CONN_MODE_LEGACY;
 
 		if (!elems->he_6ghz_capa || !elems->he_cap) {
-			sdata_info(sdata,
-				   "HE 6 GHz AP is missing HE/HE 6 GHz band capability\n");
+			sdata_notice(sdata,
+				     "HE 6 GHz AP is missing HE/HE 6 GHz band capability\n");
 			return IEEE80211_CONN_MODE_LEGACY;
 		}
 
@@ -328,7 +328,7 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 
 		if (!ieee80211_chandef_he_6ghz_oper(sdata->local, he_oper,
 						    eht_oper, chandef)) {
-			sdata_info(sdata, "bad HE/EHT 6 GHz operation\n");
+			sdata_notice(sdata, "bad HE/EHT 6 GHz operation\n");
 			return IEEE80211_CONN_MODE_LEGACY;
 		}
 		CHANDEF_DBG(chandef, "HE 6GHz");
@@ -356,10 +356,10 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		 * since we look at probe response/beacon data here
 		 * it should be OK.
 		 */
-		sdata_info(sdata,
-			   "Wrong control channel: center-freq: %d ht-cfreq: %d ht->primary_chan: %d band: %d - Disabling HT\n",
-			   channel->center_freq, ht_cfreq,
-			   ht_oper->primary_chan, channel->band);
+		sdata_notice(sdata,
+			     "Wrong control channel (center-freq: %d, control-freq: %d (chan: %d, band: %d)), disabling HT\n",
+			     channel->center_freq, ht_cfreq,
+			     ht_oper->primary_chan, channel->band);
 		return IEEE80211_CONN_MODE_LEGACY;
 	}
 
@@ -389,8 +389,8 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		if (!ieee80211_chandef_vht_oper(&sdata->local->hw, vht_cap_info,
 						&he_oper_vht_cap, ht_oper,
 						&vht_chandef)) {
-			sdata_info(sdata,
-				   "HE AP VHT information is invalid, disabling HE\n");
+			sdata_notice(sdata,
+				     "HE AP VHT information is invalid, disabling HE\n");
 			/* this will cause us to re-parse as VHT STA */
 			return IEEE80211_CONN_MODE_VHT;
 		}
@@ -407,16 +407,16 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 					       vht_cap_info,
 					       vht_oper, ht_oper,
 					       &vht_chandef)) {
-		sdata_info(sdata,
-			   "AP VHT information is invalid, disabling VHT\n");
+		sdata_notice(sdata,
+			     "AP VHT information is invalid, disabling VHT\n");
 		return IEEE80211_CONN_MODE_HT;
 	}
 
 	CHANDEF_DBG(&vht_chandef, "VHT");
 
 	if (!cfg80211_chandef_compatible(chandef, &vht_chandef)) {
-		sdata_info(sdata,
-			   "AP VHT information doesn't match HT, disabling VHT\n");
+		sdata_notice(sdata,
+			     "AP VHT information doesn't match HT, disabling VHT\n");
 		return IEEE80211_CONN_MODE_HT;
 	}
 
@@ -452,14 +452,14 @@ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
 		CHANDEF_DBG(&eht_chandef, "EHT");
 
 		if (!cfg80211_chandef_valid(&eht_chandef)) {
-			sdata_info(sdata,
-				   "AP EHT information is invalid, disabling EHT\n");
+			sdata_notice(sdata,
+				     "AP EHT information is invalid, disabling EHT\n");
 			return IEEE80211_CONN_MODE_HE;
 		}
 
 		if (!cfg80211_chandef_compatible(chandef, &eht_chandef)) {
-			sdata_info(sdata,
-				   "AP EHT information doesn't match HT/VHT/HE, disabling EHT\n");
+			sdata_notice(sdata,
+				     "AP EHT information doesn't match HT/VHT/HE, disabling EHT\n");
 			return IEEE80211_CONN_MODE_HE;
 		}
 
