@@ -156,6 +156,7 @@
 	x(ENOMEM,                       ENOMEM_journal_read_bucket)             \
 	x(ENOMEM,                       ENOMEM_acl)				\
 	x(ENOMEM,                       ENOMEM_move_extent)			\
+	x(ENOMEM,			ENOMEM_reconcile_scan_in_flight)	\
 	x(ENOSPC,			ENOSPC_disk_reservation)		\
 	x(ENOSPC,			ENOSPC_bucket_alloc)			\
 	x(ENOSPC,			ENOSPC_disk_label_add)			\
@@ -243,6 +244,7 @@
 	x(BCH_ERR_no_btree_node,	no_btree_node_cached)			\
 	x(BCH_ERR_no_btree_node,	no_btree_node_srcu_reset)		\
 	x(BCH_ERR_no_btree_node,	no_btree_node_nofill)			\
+	x(BCH_ERR_no_btree_node,	no_btree_node_reused)			\
 	x(0,				btree_insert_fail)			\
 	x(BCH_ERR_btree_insert_fail,	btree_insert_btree_node_full)		\
 	x(BCH_ERR_btree_insert_fail,	btree_insert_need_mark_replicas)	\
@@ -279,6 +281,8 @@
 	x(BCH_ERR_data_update_fail,	data_update_fail_no_rw_devs)		\
 	x(BCH_ERR_data_update_fail,	data_update_fail_need_copygc)		\
 	x(EPERM,			reflink_p_may_update_options_unset)	\
+	x(EPERM,			EPERM_non_admin)			\
+	x(EPERM,			EPERM_non_admin_or_owner)		\
 	x(EINVAL,			device_state_not_allowed)		\
 	x(EINVAL,			member_info_missing)			\
 	x(EINVAL,			mismatched_block_size)			\

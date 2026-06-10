@@ -635,7 +635,9 @@ recover:
 		 * a thin "lock holder record" that isn't a full path. Either
 		 * is bigger than this commit wants to be.
 		 */
-		btree_node_lock_nopath_nofail(trans, &b->c, SIX_LOCK_read);
+		trans->locking_hash_val = 0;
+		trans->locking_root_id	= -1;
+		btree_node_lock_nopath(trans, &b->c, SIX_LOCK_read, true, _THIS_IP_, false);
 		int ret = btree_check_root_boundaries(trans, b) ?:
 			  bch2_btree_repair_topology_recurse(trans, b);
 		six_unlock_read(&b->c.lock);
@@ -644,7 +646,11 @@ recover:
 			bch2_btree_node_transition_state(&c->btree.cache, b,
 								  BTREE_NODE_CACHE_FREEABLE);
 
-			r->b = NULL;
+			scoped_guard(mutex, &c->btree.cache.root_lock) {
+				r->b = NULL;
+				if (likely(i < BTREE_ID_NR))
+					WRITE_ONCE(c->btree.cache.roots_b[i], 0);
+			}
 
 			if (!reconstructed_root) {
 				r->error = -EIO;
@@ -719,22 +725,7 @@ static int bch2_gc_mark_key(struct btree_trans *trans, enum btree_id btree_id,
 				 buf.buf)))
 		bch2_dev_btree_bitmap_mark(c, k);
 
-	/*
-	 * We require a commit before key_trigger() because
-	 * key_trigger(BTREE_TRIGGER_GC) is not idempotant; we'll calculate the
-	 * wrong result if we run it multiple times.
-	 */
-	unsigned flags = !iter ? BTREE_TRIGGER_is_root : 0;
-
-	struct btree_trigger_op op = {
-		.btree		= btree_id,
-		.level		= level,
-		.old		= old,
-		.new		= unsafe_bkey_s_c_to_s(k),
-		.new_buf_u64s	= k.k->u64s,
-		.flags		= BTREE_TRIGGER_check_repair|flags,
-	};
-	try(bch2_key_trigger(trans, op));
+	try(bch2_bkey_check_repair(trans, iter, btree_id, level, k));
 
 	if (bch2_trans_has_updates(trans)) {
 		CLASS(disk_reservation, res)(c);
@@ -742,7 +733,14 @@ static int bch2_gc_mark_key(struct btree_trans *trans, enum btree_id btree_id,
 			bch_err_throw(c, transaction_restart_commit);
 	}
 
-	op.flags = BTREE_TRIGGER_gc|BTREE_TRIGGER_insert|flags;
+	struct btree_trigger_op op = {
+		.btree		= btree_id,
+		.level		= level,
+		.old		= old,
+		.new		= unsafe_bkey_s_c_to_s(k),
+		.new_buf_u64s	= k.k->u64s,
+		.flags		= BTREE_TRIGGER_gc|BTREE_TRIGGER_insert,
+	};
 	try(bch2_key_trigger(trans, op));
 fsck_err:
 	return ret;

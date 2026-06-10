@@ -77,8 +77,8 @@ void bch2_journal_set_watermark(struct journal *j)
 		? BCH_WATERMARK_reclaim
 		: BCH_WATERMARK_stripe;
 
-	if (track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_space], low_on_space) ||
-	    track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_pin], low_on_pin) ||
+	if (track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_space], low_on_space) |
+	    track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_pin], low_on_pin) |
 	    track_event_change(&c->times[BCH_TIME_blocked_write_buffer_full], low_on_wb))
 		event_inc_trace(c, journal_full, buf, ({
 			guard(printbuf_atomic)(&buf);
@@ -104,10 +104,46 @@ journal_dev_space_available(struct journal *j, struct bch_dev *ca,
 	struct journal_device *ja = &ca->journal;
 	unsigned bucket_size_aligned = round_down(ca->mi.bucket_size, block_sectors(c));
 
+	/*
+	 * Both .total values are capped by the in-memory dirty budget: we
+	 * can't keep more than RAM/4 of journal dirty in memory, so the space
+	 * the watermark sees is bounded by RAM, not by raw device capacity.
+	 * (A global budget, applied per-device; the nr_devs_want-th largest
+	 * pick in __journal_space_available() keeps the aggregate bounded.)
+	 *
+	 * The cap is asymmetric, and that asymmetry is the point: the watermark
+	 * ratio (clean * 4 <= total, see bch2_journal_set_watermark()) has to
+	 * measure how full the dirty budget is, not how big the disk is. So:
+	 *
+	 *  - journal_space_total is capped at a flat RAM/4 - dirty is NOT
+	 *    subtracted, so it's a constant ceiling.
+	 *  - journal_space_clean/_clean_ondisk are capped at RAM/4 - dirty,
+	 *    so they shrink as dirty grows, and the ratio falls as the budget
+	 *    fills. That's the intended soft throttle.
+	 *
+	 * Both halves matter. Leaving journal_space_total at true device
+	 * capacity (as it once was) breaks it the other way: any fs whose
+	 * journal is larger than RAM has clean permanently small vs total, so
+	 * low_on_space is stuck on even when the journal is nearly empty.
+	 * Conversely, subtracting dirty from journal_space_total too would let
+	 * total shrink toward 0 as dirty grows and strangle the journal. A flat
+	 * RAM/4 ceiling for total is what keeps both failure modes away.
+	 *
+	 * Only .total is clamped, not next_entry: .total feeds the watermark
+	 * (a soft throttle - low-priority writers wait, reclaim-priority writes
+	 * still proceed), whereas next_entry feeds cur_entry_sectors, the hard
+	 * reservation limit. Clamping next_entry would let the budget drive
+	 * cur_entry_sectors to 0, blocking even the journal writes that advance
+	 * last_seq and let dirty drain - a self-deadlock. The RAM budget must
+	 * stay a soft limit.
+	 */
+	size_t mem_limit = totalram_pages() * PAGE_SIZE / 4;
+
 	if (from == journal_space_total)
 		return (struct journal_space) {
 			.next_entry	= bucket_size_aligned,
-			.total		= bucket_size_aligned * ja->nr,
+			.total		= min(bucket_size_aligned * ja->nr,
+					      mem_limit >> 9),
 		};
 
 	unsigned buckets = bch2_journal_dev_buckets_available(j, ja, from);
@@ -146,9 +182,11 @@ journal_dev_space_available(struct journal *j, struct bch_dev *ca,
 		sectors = bucket_size_aligned;
 	}
 
+	mem_limit = max_t(ssize_t, 0, mem_limit - j->dirty_entry_bytes);
+
 	return (struct journal_space) {
 		.next_entry	= sectors,
-		.total		= sectors + buckets * bucket_size_aligned,
+		.total		= min(sectors + buckets * bucket_size_aligned, mem_limit >> 9),
 	};
 }
 
@@ -161,9 +199,6 @@ static struct journal_space __journal_space_available(struct journal *j, unsigne
 	unsigned min_bucket_size = U32_MAX;
 
 	BUG_ON(nr_devs_want > ARRAY_SIZE(dev_space));
-
-	size_t mem_limit = max_t(ssize_t, 0,
-			(totalram_pages() * PAGE_SIZE) / 4 - j->dirty_entry_bytes);
 
 	for_each_member_device_rcu(c, ca, &c->allocator.rw_devs[BCH_DATA_journal]) {
 		if (!ca->journal.nr)
@@ -196,7 +231,6 @@ static struct journal_space __journal_space_available(struct journal *j, unsigne
 	 * @nr_devs_want largest devices:
 	 */
 	space = dev_space[nr_devs_want - 1];
-	space.total = min(space.total, mem_limit >> 9);
 	space.next_entry = min(space.next_entry, min_bucket_size);
 	return space;
 }
@@ -246,7 +280,9 @@ void bch2_journal_space_available(struct journal *j)
 		can_discard |= __should_discard_bucket(j, ja);
 
 		if (__should_discard_bucket(j, ja) &&
-		    test_bit(BCH_FS_rw_init_done, &c->flags))
+		    test_bit(BCH_FS_rw_init_done, &c->flags) &&
+		    test_bit(JOURNAL_running, &j->flags) &&
+		    !bch2_journal_error(j))
 			queue_work(j->discard_wq, &ja->discard);
 	}
 
@@ -414,18 +450,23 @@ int bch2_journal_update_last_seq_ondisk(struct journal *j, u64 last_seq_ondisk,
 	return 0;
 }
 
-bool __bch2_journal_pin_put(struct journal *j, u64 seq)
+void bch2_journal_replay_pins_put(struct journal *j, u64 seq)
 {
-	struct journal_entry_pin_list *pin_list = journal_seq_pin(j, seq);
+	BUG_ON(seq < j->replay_journal_seq);
 
-	return atomic_dec_and_test(&pin_list->count);
-}
+	seq = min(seq, j->replay_journal_seq_end);
 
-void bch2_journal_pin_put(struct journal *j, u64 seq)
-{
-	if (__bch2_journal_pin_put(j, seq)) {
-		guard(spinlock)(&j->lock);
-		bch2_journal_update_last_seq(j);
+	while (j->replay_journal_seq < seq) {
+		struct journal_entry_pin_list *pin_list =
+			journal_seq_pin(j, j->replay_journal_seq++);
+
+		BUG_ON(!pin_list->unreplayed);
+		pin_list->unreplayed = false;
+
+		if (atomic_dec_and_test(&pin_list->count)) {
+			guard(spinlock)(&j->lock);
+			bch2_journal_update_last_seq(j);
+		}
 	}
 }
 
@@ -599,6 +640,14 @@ journal_get_next_pin(struct journal *j,
 	struct journal_entry_pin *ret = NULL;
 
 	fifo_for_each_entry_ptr(pin_list, &j->pin, *seq) {
+		/*
+		 * Flushing journal pins (writing btree nodes) requires
+		 * consuming journal space: don't get ahead of journal replay to
+		 * avoid deadlocking
+		 */
+		if (pin_list->unreplayed)
+			break;
+
 		if (*seq > seq_to_flush && !allowed_above_seq)
 			break;
 
@@ -999,7 +1048,7 @@ static int journal_flush_done(struct journal *j, u64 seq_to_flush,
 			return 0;
 		}
 
-	if (seq_to_flush > journal_cur_seq(j))
+	if (seq_to_flush >= journal_cur_seq(j))
 		bch2_journal_entry_close(j);
 
 	/*
@@ -1064,7 +1113,10 @@ bool bch2_journal_seq_pins_to_text(struct printbuf *out, struct journal *j, u64 
 
 	pin_list = journal_seq_pin(j, *seq);
 
-	prt_printf(out, "%llu: count %u\n", *seq, atomic_read(&pin_list->count));
+	prt_printf(out, "%llu: count %u", *seq, atomic_read(&pin_list->count));
+	if (pin_list->unreplayed)
+		prt_str(out, " unreplayed");
+	prt_newline(out);
 	guard(printbuf_indent)(out);
 
 	bch2_replicas_entry_to_text(out, &pin_list->devs.e);

@@ -419,6 +419,7 @@ void bch2_btree_ptr_v2_compat(enum btree_id, unsigned, unsigned,
 	.val_to_text	= bch2_btree_ptr_to_text,		\
 	.swab		= bch2_ptr_swab,			\
 	.trigger	= bch2_trigger_extent,			\
+	.check_repair	= bch2_check_fix_ptrs,			\
 })
 
 #define bch2_bkey_ops_btree_ptr_v2 ((struct bkey_ops) {		\
@@ -427,6 +428,7 @@ void bch2_btree_ptr_v2_compat(enum btree_id, unsigned, unsigned,
 	.swab		= bch2_ptr_swab,			\
 	.compat		= bch2_btree_ptr_v2_compat,		\
 	.trigger	= bch2_trigger_extent,			\
+	.check_repair	= bch2_check_fix_ptrs,			\
 	.min_val_size	= 40,					\
 })
 
@@ -440,6 +442,7 @@ bool bch2_extent_merge(struct bch_fs *, struct bkey_s, struct bkey_s_c);
 	.swab		= bch2_ptr_swab,			\
 	.key_merge	= bch2_extent_merge,			\
 	.trigger	= bch2_trigger_extent,			\
+	.check_repair	= bch2_check_fix_ptrs,			\
 })
 
 /* KEY_TYPE_reservation: */
@@ -606,6 +609,19 @@ static inline struct bch_extent_ptr *bch2_bkey_has_device(const struct bch_fs *c
 							  struct bkey_s k, unsigned dev)
 {
 	return (void *) bch2_bkey_has_device_c(c, k.s_c, dev);
+}
+
+/* Returns the ptr_bit (bit-position-as-mask) of the first ptr matching @dev,
+ * or 0 if no such ptr exists. */
+static inline unsigned bch2_bkey_dev_ptr_bit(struct bch_fs *c, struct bkey_s_c k, unsigned dev)
+{
+	unsigned ptr_bit = 1;
+	bkey_for_each_ptr(bch2_bkey_ptrs_c(k), ptr) {
+		if (ptr->dev == dev)
+			return ptr_bit;
+		ptr_bit <<= 1;
+	}
+	return 0;
 }
 
 bool bch2_bkey_devs_rw(struct bch_fs *, struct bkey_s_c);

@@ -322,20 +322,35 @@ static int stripe_update_extent(struct btree_trans *trans,
 	if (p.has_ec)
 		bch2_bkey_drop_stripe_ptr(c, bkey_i_to_s(n), p.ec.idx);
 
+	if (old_block.dev != new_block.dev)
+		bch2_bkey_drop_device_noerror(c, bkey_i_to_s(n), new_block.dev);
+
 	struct bch_extent_ptr *ec_ptr = bch2_bkey_has_device(c, bkey_i_to_s(n), old_block.dev);
 	ec_ptr->dev	= new_block.dev;
 	ec_ptr->offset	-= old_block.offset;
 	ec_ptr->offset	+= new_block.offset;
 	ec_ptr->gen	= new_block.gen;
 
-	bch2_bkey_drop_ptrs_noerror(bkey_i_to_s(n), p, entry, p.ptr.dev != new_block.dev);
-
 	ec_ptr = bch2_bkey_has_device(c, bkey_i_to_s(n), new_block.dev);
 	__extent_entry_insert(c, n,
 			(union bch_extent_entry *) ec_ptr,
 			(union bch_extent_entry *) &stripe_ptr);
 
-	try(bch2_trans_update_buf(trans, &iter, n, BKEY_EXTENT_U64s_MAX, 0));
+	/*
+	 * Drop excess data replicas (down to data_replicas), preferentially
+	 * keeping ec_ptr — the one we just migrated.
+	 */
+	unsigned ec_ptr_bit = bch2_bkey_dev_ptr_bit(c, bkey_i_to_s_c(n), new_block.dev);
+
+	struct bch_inode_opts opts;
+	try(bch2_bkey_get_io_opts(trans, NULL, bkey_i_to_s_c(n), &opts));
+	try(bch2_bkey_drop_extra_durability(trans, &opts, n, ~ec_ptr_bit, true));
+	try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(n),
+					  BKEY_EXTENT_U64s_MAX,
+					  SET_NEEDS_RECONCILE_other, 0));
+
+	try(bch2_trans_update_buf(trans, &iter, n, BKEY_EXTENT_U64s_MAX,
+				  BTREE_TRIGGER_set_needs_reconcile_done));
 	try(bch2_trans_commit(trans, res, NULL,
 			BCH_TRANS_COMMIT_no_check_rw|
 			BCH_TRANS_COMMIT_no_enospc));
@@ -804,6 +819,35 @@ unsigned bch2_disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
 		if (ca->mi.bucket_size != blocksize)
 			__clear_bit(ca->dev_idx, devs->d);
 	return blocksize;
+}
+
+/*
+ * Can a stripe with @redundancy parity blocks be formed in @target right now?
+ *
+ * Minimum stripe size is redundancy + 1 (one data block + parity), and all
+ * blocks in a stripe must share a single bucket_size. So we need at least
+ * redundancy + 1 RW devices in the target that agree on bucket_size.
+ *
+ * bch2_disk_label_ec_devs already returns the filtered device mask (RW members
+ * with durability > 0, narrowed to the picked best bucket_size).
+ *
+ * Used by reconcile to avoid queueing EC work that can't make progress —
+ * otherwise reconcile spins re-queueing data_update_fail forever.
+ */
+bool bch2_can_form_ec_stripe(struct bch_fs *c, unsigned target, unsigned redundancy)
+{
+	if (!redundancy)
+		return false;
+
+	struct target t = target_decode(target);
+	unsigned disk_label = t.type == TARGET_GROUP && t.group <= U8_MAX
+		? t.group + 1
+		: 0;
+
+	struct bch_devs_mask devs;
+	bch2_disk_label_ec_devs(c, disk_label, &devs, 0);
+
+	return dev_mask_nr(&devs) >= redundancy + 1;
 }
 
 /*
@@ -1787,12 +1831,15 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 
 		for (unsigned i = 0; i < need_evacuate; i++) {
 			const struct bch_extent_ptr *ptr = old_s->ptrs + blocks_used[i];
+			u64 end = ptr->offset + le16_to_cpu(old_s->sectors);
 
-			u64 dev = ptr->dev != BCH_SB_MEMBER_INVALID
-				? ptr->dev
-				: bp_dev_for_ec_removed_dev(s.k->p.offset, blocks_used[i]);
-
-			try(bch2_evacuate_data(ctxt, dev, ptr->offset, ptr->offset + le16_to_cpu(old_s->sectors)));
+			if (ptr->dev != BCH_SB_MEMBER_INVALID)
+				try(bch2_evacuate_data(ctxt, ptr->dev,
+						       ptr->offset, end));
+			else
+				try(bch2_evacuate_ec_orphan(ctxt,
+						s.k->p.offset, blocks_used[i],
+						ptr->offset, end));
 		}
 
 		return bch_err_throw(c, stripe_needs_block_evacuate);
@@ -1857,7 +1904,7 @@ int bch2_stripe_repair(struct moving_context *ctxt,
 			mutex_unlock(&dev_stripe->lock);
 
 		if (bch2_err_matches(ret2, BCH_ERR_operation_blocked)) {
-			bch2_wait_on_allocator(trans, c, req, ret2, &cl);
+			bch2_wait_on_allocator(trans, req, ret2, &cl);
 			ret2 = bch_err_throw(c, transaction_restart_nested);
 		}
 		ret2;

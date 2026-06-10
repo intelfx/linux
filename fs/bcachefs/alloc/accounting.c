@@ -122,8 +122,8 @@ int bch2_disk_accounting_mod(struct btree_trans *trans,
 		for (a = btree_trans_subbuf_base(trans, &trans->accounting);
 		     a != btree_trans_subbuf_top(trans, &trans->accounting);
 		     a = (void *) bkey_next(&a->k_i))
-			if (bpos_eq(a->k.p, pos)) {
-				BUG_ON(nr != bch2_accounting_counters(&a->k));
+			if (bpos_eq(a->k.p, pos) &&
+			    bch2_accounting_counters(&a->k) == nr) {
 				acc_u64s(a->v.d, d, nr);
 
 				if (bch2_accounting_key_is_zero(accounting_i_to_s_c(a))) {
@@ -1257,13 +1257,33 @@ int bch2_dev_usage_init(struct bch_dev *ca, bool gc)
 {
 	struct bch_fs *c = ca->fs;
 	CLASS(btree_trans, trans)(c);
-	u64 v[3] = { ca->mi.nbuckets - ca->mi.first_bucket, 0, 0 };
-
 	int ret = lockrestart_do(trans, ({
-		bch2_disk_accounting_mod2(trans, gc,
-					  v, dev_data_type,
-					  .dev = ca->dev_idx,
-					  .data_type = BCH_DATA_free) ?:
+		/*
+		 * Set, not add: subtract whatever's currently accounted so the
+		 * free count lands at exactly nbuckets. This makes
+		 * dev_usage_init idempotent, so it's safe to re-run when a
+		 * half-finished device add is resumed during recovery.
+		 *
+		 * gc accounting is rebuilt from a cleared state, and read_key2
+		 * only sees the non-gc counters, so the gc path keeps the plain
+		 * delta-add (cur stays zero).
+		 */
+		u64 v[3] = { ca->mi.nbuckets - ca->mi.first_bucket, 0, 0 };
+		u64 cur[3] = {};
+
+		(gc
+		 ? 0
+		 : bch2_fs_accounting_read_key2(trans, cur, dev_data_type,
+						.dev = ca->dev_idx,
+						.data_type = BCH_DATA_free)) ?:
+		({
+			for (unsigned i = 0; i < 3; i++)
+				v[i] -= cur[i];
+
+			bch2_disk_accounting_mod2(trans, gc, v, dev_data_type,
+						  .dev = ca->dev_idx,
+						  .data_type = BCH_DATA_free);
+		}) ?:
 		(!gc ? bch2_trans_commit(trans, NULL, NULL, 0) : 0);
 	}));
 	bch_err_fn(c, ret);

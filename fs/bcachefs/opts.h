@@ -248,7 +248,7 @@ enum fsck_err_opts {
 	  NULL,		"Constrain inode numbers to 32 bits")		\
 	x(shard_inode_numbers_bits,	u8,				\
 	  OPT_FS|OPT_FORMAT,						\
-	  OPT_UINT(0, 8),						\
+	  OPT_UINT(0, 16),						\
 	  BCH_SB_SHARD_INUMS_NBITS,	0,				\
 	  NULL,		"Shard new inode numbers by CPU id")		\
 	x(btree_node_mem_ptr_optimization, u8,				\
@@ -699,7 +699,9 @@ void bch2_opts_to_text(struct printbuf *,
 		       struct bch_opts_mask *,
 		       unsigned, unsigned, unsigned);
 
-int bch2_opt_hook_pre_set(struct bch_fs *, struct bch_dev *, u64, enum bch_opt_id, u64, bool);
+struct opt_change_scope;
+int bch2_opt_hook_pre_set(struct bch_fs *, struct bch_dev *, u64, enum bch_opt_id, u64, bool,
+			  struct opt_change_scope *);
 int bch2_opts_hooks_pre_set(struct bch_fs *);
 void bch2_opt_hook_post_set(struct bch_fs *, struct bch_dev *, u64, enum bch_opt_id, u64);
 

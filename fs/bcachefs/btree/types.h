@@ -20,6 +20,7 @@
 #include "util/darray.h"
 #include "util/six.h"
 
+struct bio;
 struct open_bucket;
 struct btree_update;
 struct btree_trans;
@@ -224,6 +225,19 @@ struct btree_root {
 };
 
 struct bch_fs_btree_cache {
+	/*
+	 * Hot path: btree_path_lock_root reads root pointer + level per
+	 * btree_id. We pack the level into the low 3 bits of the pointer so a
+	 * single load yields both atomically (no torn read between b and
+	 * b->c.level, no extra cacheline miss into the btree node to read
+	 * level). See bch2_btree_root_{pack,unpack_b,unpack_level} in cache.h.
+	 *
+	 * Splitting this out of struct btree_root also keeps the read-side
+	 * working set in a few cache lines instead of the full ~88 lines of
+	 * roots_known[].
+	 */
+	unsigned long		roots_b[BTREE_ID_NR];
+
 	struct btree_root	roots_known[BTREE_ID_NR];
 	DARRAY(struct btree_root) roots_extra;
 	struct mutex		root_lock;
@@ -346,11 +360,9 @@ struct btree_node_iter {
 	x(norun)				\
 	x(transactional)			\
 	x(atomic)				\
-	x(check_repair)				\
 	x(gc)					\
 	x(insert)				\
 	x(overwrite)				\
-	x(is_root)				\
 	x(is_discard)				\
 	x(set_needs_reconcile_done)
 
@@ -635,6 +647,7 @@ struct btree_trans {
 	bool			locked:1;
 	bool			write_locked:1;
 	bool			srcu_held:1;
+	bool			btree_cache_cannibalize_locked:1;
 	bool			pf_memalloc_nofs:1;
 	bool			used_mempool:1;
 	bool			in_traverse_all:1;
@@ -650,7 +663,6 @@ struct btree_trans {
 	u32			restart_count_this_trans;
 #endif
 
-	u64			last_begin_time_nonrestarted;
 	u64			last_begin_time;
 	unsigned long		last_begin_ip;
 	unsigned long		last_restarted_ip;
@@ -659,11 +671,28 @@ struct btree_trans {
 #endif
 	unsigned long		last_unlock_ip;
 	unsigned long		srcu_lock_time;
+	int			srcu_idx;
+	enum btree_id		locking_root_id;
+
+	u64			locking_hash_val;
+	struct btree_bkey_cached_common *locking;
+	/*
+	 * Snapshot of locking->{btree}.hash_val at lock-attempt time, used by
+	 * bch2_six_check_for_deadlock() to detect that the node identity
+	 * rotated while we were about to sleep on it. 0 for cached entries.
+	 */
+	struct six_lock_waiter	locking_wait;
+
+	/*
+	 * btree node writes issued in this trans's context are queued here
+	 * (singly linked via bi_next) instead of being submitted directly —
+	 * no block layer work happens while we hold btree node locks.
+	 * Submitted when the trans unlocks, and before waiting on btree
+	 * node IO (see bch2_btree_node_wait_on_write()).
+	 */
+	struct bio		*queued_write_bios;
 
 	const char		*fn;
-	struct btree_bkey_cached_common *locking;
-	struct six_lock_waiter	locking_wait;
-	int			srcu_idx;
 
 	/* update path: */
 	struct btree_trans_subbuf journal_entries;
@@ -707,6 +736,7 @@ struct btree_trans_buf {
 struct btree_transaction_stats {
 	struct bch2_time_stats	duration;
 	struct bch2_time_stats	lock_hold_times;
+	struct bch2_time_stats	lock_wait_times;
 	struct mutex		lock;
 	unsigned		nr_max_paths;
 	unsigned		max_mem;
@@ -857,7 +887,6 @@ struct bch_fs_btree {
 	struct ratelimit_state			read_errors_soft;
 	struct ratelimit_state			read_errors_hard;
 
-	struct workqueue_struct			*write_submit_wq;
 	struct workqueue_struct			*write_complete_wq;
 
 	struct journal_entry_res		root_journal_res;

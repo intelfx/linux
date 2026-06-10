@@ -19,6 +19,7 @@
 #include "journal/journal.h"
 #include "journal/read.h"
 #include "journal/reclaim.h"
+#include "journal/validate.h"
 
 #include "init/error.h"
 #include "init/fs.h"
@@ -475,7 +476,8 @@ static int btree_key_can_insert_cached(struct btree_trans *trans, unsigned flags
 
 	if (watermark < BCH_WATERMARK_reclaim &&
 	    !test_bit(BKEY_CACHED_DIRTY, &ck->flags) &&
-	    bch2_btree_key_cache_must_wait(c))
+	    bch2_btree_key_cache_must_wait(c) &&
+	    test_bit(JOURNAL_replay_done, &c->journal.flags))
 		return bch_err_throw(c, btree_insert_need_journal_reclaim);
 
 	/*
@@ -1161,6 +1163,13 @@ revert_fs_usage:
 static noinline int bch2_trans_commit_btree_write_ratelimit(struct btree_trans *trans)
 {
 	struct bch_fs_btree_cache *bc = &trans->c->btree.cache;
+
+	/*
+	 * Journal reclaim doesn't run ahead of journal replay, to avoid journal
+	 * deadlocks - it'll be blocked if replay isn't done:
+	 */
+	if (unlikely(!test_bit(JOURNAL_replay_done, &trans->c->journal.flags)))
+		return 0;
 
 	return drop_locks_do(trans, ({
 		trans_wait_event(trans, &bc->nr_in_flight_wait,

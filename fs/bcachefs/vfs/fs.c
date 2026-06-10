@@ -49,23 +49,6 @@
 #include <linux/version.h>
 #include <linux/xattr.h>
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,19,0)
-static inline unsigned inode_state_read(struct inode *inode)
-{
-	return inode->i_state;
-}
-
-static inline unsigned inode_state_read_once(struct inode *inode)
-{
-	return READ_ONCE(inode->i_state);
-}
-
-static inline void inode_state_set_raw(struct inode *inode, unsigned flags)
-{
-	WRITE_ONCE(inode->i_state, inode->i_state|flags);
-}
-#endif
-
 static struct kmem_cache *bch2_inode_cache;
 
 static void bch2_vfs_inode_init(struct btree_trans *, subvol_inum,
@@ -434,8 +417,7 @@ retry:
 
 		inode_sb_list_add(&inode->v);
 
-		scoped_guard(mutex, &c->vfs.inodes_lock)
-			list_add(&inode->ei_vfs_inode_list, &c->vfs.inodes_list);
+		fast_list_set(&c->vfs.inodes, inode->ei_inodes_idx, inode);
 		return inode;
 	}
 }
@@ -462,16 +444,23 @@ static struct bch_inode_info *__bch2_new_inode(struct bch_fs *c, gfp_t gfp)
 	if (!inode)
 		return NULL;
 
+	int idx = fast_list_get_idx(&c->vfs.inodes, gfp);
+	if (idx < 0) {
+		kmem_cache_free(bch2_inode_cache, inode);
+		return NULL;
+	}
+
 	inode_init_once(&inode->v);
 	mutex_init(&inode->ei_update_lock);
 	two_state_lock_init(&inode->ei_pagecache_lock);
-	INIT_LIST_HEAD(&inode->ei_vfs_inode_list);
+	inode->ei_inodes_idx = idx;
 	inode->ei_flags = 0;
 	mutex_init(&inode->ei_quota_lock);
 	memset(&inode->ei_devs_need_flush, 0, sizeof(inode->ei_devs_need_flush));
 	INIT_DELAYED_WORK(&inode->ei_writeback_timer, bch2_vfs_writeback_fn);
 
 	if (unlikely(inode_init_always_gfp(c->vfs_sb, &inode->v, gfp))) {
+		fast_list_put_idx(&c->vfs.inodes, idx);
 		kmem_cache_free(bch2_inode_cache, inode);
 		return NULL;
 	}
@@ -490,6 +479,7 @@ static struct bch_inode_info *bch2_new_inode(struct btree_trans *trans)
 		int ret = drop_locks_do(trans, (inode = __bch2_new_inode(trans->c, GFP_NOFS)) ? 0 : -ENOMEM);
 		if (ret && inode) {
 			__destroy_inode(&inode->v);
+			fast_list_put_idx(&trans->c->vfs.inodes, inode->ei_inodes_idx);
 			kmem_cache_free(bch2_inode_cache, inode);
 		}
 		if (ret)
@@ -1141,10 +1131,24 @@ int bch2_setattr_nonsize(struct mnt_idmap *idmap,
 		qid.q[QTYP_GRP] = from_kgid(i_user_ns(&inode->v), kgid);
 	}
 
+	struct bch_qid old_qid = inode->ei_qid;
+
 	try(bch2_fs_quota_transfer(c, inode, qid, ~0, KEY_TYPE_QUOTA_PREALLOC));
 
 	CLASS(btree_trans, trans)(c);
-	return lockrestart_do(trans, bch2_setattr_nonsize_trans(trans, idmap, inode, attr));
+	int ret = lockrestart_do(trans, bch2_setattr_nonsize_trans(trans, idmap, inode, attr));
+	if (unlikely(ret))
+		/*
+		 * Roll back the in-memory quota transfer: the btree commit
+		 * failed, so the inode on disk still has the old qid. Without
+		 * this rollback, in-memory quota counts diverge from what an
+		 * inode scan would compute - generic/270 catches it.
+		 *
+		 * NOCHECK because we're returning to a qid we just came from;
+		 * it had room.
+		 */
+		bch2_fs_quota_transfer(c, inode, old_qid, ~0, KEY_TYPE_QUOTA_NOCHECK);
+	return ret;
 }
 
 static int bch2_getattr(struct mnt_idmap *idmap,
@@ -1938,73 +1942,65 @@ static void bch2_evict_inode(struct inode *vinode)
 		bch2_inode_hash_remove(c, inode);
 	}
 
-	scoped_guard(mutex, &c->vfs.inodes_lock)
-		list_del_init(&inode->ei_vfs_inode_list);
+	fast_list_remove(&c->vfs.inodes, inode->ei_inodes_idx);
+	inode->ei_inodes_idx = 0;
 }
 
 void bch2_evict_subvolume_inodes(struct bch_fs *c, snapshot_id_list *s)
 {
-	struct bch_inode_info *inode;
-	DARRAY(struct bch_inode_info *) grabbed;
-	bool clean_pass = false, this_pass_clean;
-
 	/*
 	 * Initially, we scan for inodes without I_DONTCACHE, then mark them to
 	 * be pruned with d_mark_dontcache().
 	 *
 	 * Once we've had a clean pass where we didn't find any inodes without
-	 * I_DONTCACHE, we wait for them to be freed:
+	 * I_DONTCACHE, we wait for them to be freed.
+	 *
+	 * fast_list_iter tracks position by integer index, so we can drop rcu
+	 * around the dcache work (held safe by our igrab ref) and resume from
+	 * the same slot on the next iteration.
 	 */
+	rcu_read_lock();
+	struct genradix_iter iter;
+	struct bch_inode_info *inode;
 
-	darray_init(&grabbed);
-	darray_make_room(&grabbed, 1024);
-again:
-	cond_resched();
-	this_pass_clean = true;
-
-	mutex_lock(&c->vfs.inodes_lock);
-	list_for_each_entry(inode, &c->vfs.inodes_list, ei_vfs_inode_list) {
+	fast_list_for_each(&c->vfs.inodes, iter, inode) {
 		if (!snapshot_list_has_id(s, inode->ei_inum.subvol))
 			continue;
 
-		if (!(inode_state_read_once(&inode->v) & (I_DONTCACHE|I_FREEING)) &&
+		if (!(inode_state_read_once(&inode->v) & I_DONTCACHE) &&
 		    igrab(&inode->v)) {
-			this_pass_clean = false;
+			rcu_read_unlock();
 
-			if (darray_push_gfp(&grabbed, inode, GFP_ATOMIC|__GFP_NOWARN)) {
-				iput(&inode->v);
-				break;
-			}
-		} else if (clean_pass && this_pass_clean) {
+			d_mark_dontcache(&inode->v);
+			d_prune_aliases(&inode->v);
+			iput(&inode->v);
+
+			rcu_read_lock();
+		}
+	}
+
+	bool found = false;
+	do {
+		found = false;
+
+		fast_list_for_each(&c->vfs.inodes, iter, inode) {
+			if (!snapshot_list_has_id(s, inode->ei_inum.subvol))
+				continue;
+
+			found = true;
+
 			struct wait_bit_queue_entry wqe;
-			struct wait_queue_head *wq_head;
-
-			wq_head = inode_bit_waitqueue(&wqe, &inode->v, __I_NEW);
+			struct wait_queue_head *wq_head = inode_bit_waitqueue(&wqe, &inode->v, __I_NEW);
 			prepare_to_wait_event(wq_head, &wqe.wq_entry,
 					      TASK_UNINTERRUPTIBLE);
-			mutex_unlock(&c->vfs.inodes_lock);
+			rcu_read_unlock();
 
 			schedule();
 			finish_wait(wq_head, &wqe.wq_entry);
-			goto again;
+			rcu_read_lock();
 		}
-	}
-	mutex_unlock(&c->vfs.inodes_lock);
-
-	darray_for_each(grabbed, i) {
-		inode = *i;
-		d_mark_dontcache(&inode->v);
-		d_prune_aliases(&inode->v);
-		iput(&inode->v);
-	}
-	grabbed.nr = 0;
-
-	if (!clean_pass || !this_pass_clean) {
-		clean_pass = this_pass_clean;
-		goto again;
-	}
-
-	darray_exit(&grabbed);
+	} while (found);
+	rcu_read_unlock();
 }
 
 static int bch2_statfs(struct dentry *dentry, struct kstatfs *buf)
@@ -2489,13 +2485,13 @@ void bch2_fs_vfs_exit(struct bch_fs *c)
 		rhltable_destroy(&c->vfs.inodes_by_inum_table);
 	if (c->vfs.inodes_table.tbl)
 		rhashtable_destroy(&c->vfs.inodes_table);
+	fast_list_exit(&c->vfs.inodes);
 }
 
 int bch2_fs_vfs_init(struct bch_fs *c)
 {
 	fdm_init(&c->fdm_table);
-	INIT_LIST_HEAD(&c->vfs.inodes_list);
-	mutex_init(&c->vfs.inodes_lock);
+	try(fast_list_init(&c->vfs.inodes));
 
 	try(rhashtable_init(&c->vfs.inodes_table, &bch2_vfs_inodes_params));
 	try(rhltable_init(&c->vfs.inodes_by_inum_table, &bch2_vfs_inodes_by_inum_params));

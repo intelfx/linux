@@ -36,10 +36,52 @@
 #define FSOP_GOING_FLAGS_LOGFLUSH	0x1	/* flush log but not data */
 #define FSOP_GOING_FLAGS_NOLOGFLUSH	0x2	/* don't flush log nor data */
 
+/*
+ * The VFS gained start_removing_user_path_at()/end_removing_path() in 6.18.
+ * The create-side helpers map straight onto user_path_create()/
+ * done_path_create(), which already bundle the mount write ref — but the
+ * removal side needs a real wrapper: user_path_locked_at() only does the
+ * locked lookup, leaving the write ref to the caller.
+ */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
 #define start_creating_user_path	user_path_create
 #define end_creating_path		done_path_create
-#define start_removing_user_path_at	user_path_locked_at
+#define end_removing_path		done_path_create
+
+static inline struct dentry *
+start_removing_user_path_at(int dfd, const char __user *name, struct path *path)
+{
+	struct dentry *victim = user_path_locked_at(dfd, name, path);
+	if (IS_ERR(victim))
+		return victim;
+
+	struct inode *dir = path->dentry->d_inode;
+
+	/*
+	 * sb_writers nests outside i_rwsem: drop the parent lock that
+	 * user_path_locked_at() took, acquire the write ref, relock, and
+	 * revalidate the victim across the unlocked window. (>=6.18's
+	 * start_removing_user_path_at() takes the write ref before the
+	 * locked lookup and so has no such window.)
+	 */
+	inode_unlock(dir);
+	int ret = mnt_want_write(path->mnt);
+	inode_lock(dir);
+
+	if (!ret && (d_unhashed(victim) || victim->d_parent != path->dentry)) {
+		mnt_drop_write(path->mnt);
+		ret = -ENOENT;
+	}
+
+	if (ret) {
+		inode_unlock(dir);
+		dput(victim);
+		path_put(path);
+		return ERR_PTR(ret);
+	}
+
+	return victim;
+}
 #endif
 
 static int bch2_reinherit_attrs_fn(struct btree_trans *trans,
@@ -155,7 +197,7 @@ static int bch2_ioc_setlabel(struct bch_fs *c,
 			     const char __user *user_label)
 {
 	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
+		return bch_err_throw(c, EPERM_non_admin);
 
 	char label[BCH_SB_LABEL_SIZE];
 	if (copy_from_user(label, user_label, sizeof(label)))
@@ -184,7 +226,7 @@ static int bch2_ioc_setlabel(struct bch_fs *c,
 static int bch2_ioc_goingdown(struct bch_fs *c, u32 __user *arg)
 {
 	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
+		return bch_err_throw(c, EPERM_non_admin);
 
 	u32 flags;
 	try(get_user(flags, arg));
@@ -247,12 +289,6 @@ static long __bch2_ioctl_subvolume_create(struct bch_fs *c, struct file *filp,
 
 	if (arg.flags & BCH_SUBVOL_SNAPSHOT_RO)
 		create_flags |= BCH_CREATE_SNAPSHOT_RO;
-
-	if (arg.flags & BCH_SUBVOL_SNAPSHOT_CREATE) {
-		/* sync_inodes_sb enforce s_umount is locked */
-		guard(rwsem_read)(&c->vfs_sb->s_umount);
-		sync_inodes_sb(c->vfs_sb);
-	}
 
 	if (arg.src_ptr) {
 		error = user_path_at(arg.dirfd,
@@ -319,10 +355,23 @@ static long __bch2_ioctl_subvolume_create(struct bch_fs *c, struct file *filp,
 	    !arg.src_ptr)
 		snapshot_src.subvol = inode_inum(to_bch_ei(dir)).subvol;
 
-	scoped_guard(rwsem_write, &c->snapshots.create_lock)
-		inode = __bch2_create(file_mnt_idmap(filp), to_bch_ei(dir),
-				      dst_dentry, arg.mode|S_IFDIR,
-				      0, snapshot_src, create_flags);
+	/*
+	 * Atomicity: take create_lock as a writer to block new page-cache
+	 * dirtiers (write_iter, page_mkwrite), then flush existing dirty
+	 * pages. Writeback's folio_clear_dirty_for_io path WPs every PTE
+	 * pointing at a dirty folio (via folio_mkclean), so when sync
+	 * returns no writable PTE remains — any subsequent mmap store
+	 * traps to page_mkwrite, which then blocks on the writer.
+	 */
+	percpu_down_write(&c->snapshots.create_lock);
+	if (arg.flags & BCH_SUBVOL_SNAPSHOT_CREATE) {
+		scoped_guard(rwsem_read, &c->vfs_sb->s_umount)
+			sync_inodes_sb(c->vfs_sb);
+	}
+	inode = __bch2_create(file_mnt_idmap(filp), to_bch_ei(dir),
+			      dst_dentry, arg.mode|S_IFDIR,
+			      0, snapshot_src, create_flags);
+	percpu_up_write(&c->snapshots.create_lock);
 	error = PTR_ERR_OR_ZERO(inode);
 	if (error)
 		goto err3;
@@ -368,54 +417,33 @@ static long __bch2_ioctl_subvolume_destroy(struct bch_fs *c, struct file *filp,
 					   struct bch_ioctl_subvolume_v2 arg,
 					   struct printbuf *err)
 {
-	const char __user *name = (void __user *)(unsigned long)arg.dst_ptr;
-	struct path path;
-	struct inode *dir;
-	struct dentry *victim;
 	int ret = 0;
 
 	if (arg.flags)
 		return bch_err_throw(c, EINVAL_subvol_destroy_bad_flags);
 
-	victim = start_removing_user_path_at(arg.dirfd, name, &path);
-	if (IS_ERR(victim))
-		return PTR_ERR(victim);
+	const char __user *name = (void __user *)(unsigned long)arg.dst_ptr;
+	struct path path;
+	struct dentry *victim = errptr_try(start_removing_user_path_at(arg.dirfd, name, &path));
 
-	dir = d_inode(path.dentry);
+	struct inode *dir = d_inode(path.dentry);
 	if (victim->d_sb->s_fs_info != c) {
 		ret = -EXDEV;
 		goto err;
 	}
 
 	/*
-	 * Must acquire sb_writers before inode_lock to match the ordering used
-	 * by the create path (user_path_create → mnt_want_write → inode_lock).
-	 * Drop and reacquire inode_lock around mnt_want_write(), then
-	 * revalidate the victim dentry.
+	 * start_removing_user_path_at() returns with the parent locked and
+	 * the mount write ref held; end_removing_path() drops both.
 	 */
-	inode_unlock(dir);
-	ret = mnt_want_write(path.mnt);
-	inode_lock(dir);
-	if (ret)
-		goto err;
-
-	if (d_unhashed(victim) || victim->d_parent != path.dentry) {
-		ret = -ENOENT;
-		goto err_write;
-	}
-
 	ret =   inode_permission(file_mnt_idmap(filp), d_inode(victim), MAY_WRITE) ?:
 		__bch2_unlink(dir, victim, true);
 	if (!ret) {
 		fsnotify_rmdir(dir, victim);
 		d_invalidate(victim);
 	}
-err_write:
-	mnt_drop_write(path.mnt);
 err:
-	inode_unlock(dir);
-	dput(victim);
-	path_put(&path);
+	end_removing_path(&path, victim);
 	return ret;
 }
 
@@ -692,7 +720,7 @@ static long bch2_ioctl_snapshot_tree(struct bch_fs *c, struct file *filp,
 
 	/* Querying a specific tree by ID requires CAP_SYS_ADMIN */
 	if (arg.tree_id && !capable(CAP_SYS_ADMIN))
-		return -EPERM;
+		return bch_err_throw(c, EPERM_non_admin);
 
 	u32 tree_id = arg.tree_id;
 	struct bch_snapshot_tree st;
@@ -797,7 +825,7 @@ static long bch2_ioc_set_reflink_p_may_update_opts(struct bch_fs *c,
 						   struct bch_inode_info *inode)
 {
 	if (!capable(CAP_SYS_ADMIN))
-		return -EPERM;
+		return bch_err_throw(c, EPERM_non_admin);
 
 	try(bch2_request_incompat_feature(c, bcachefs_metadata_version_reflink_p_may_update_opts));
 
@@ -839,7 +867,7 @@ static long bch2_ioc_propagate_reflink_p_opts(struct bch_fs *c,
 {
 	if (!inode_owner_or_capable(file_mnt_idmap(file), &inode->v) &&
 	    !capable(CAP_SYS_ADMIN))
-		return -EPERM;
+		return bch_err_throw(c, EPERM_non_admin_or_owner);
 
 	subvol_inum inum = inode_inum(inode);
 
@@ -871,6 +899,7 @@ static long bch2_ioc_pread_raw(struct file *file,
 			       struct bch_ioctl_pread_raw __user *uarg)
 {
 	struct bch_ioctl_pread_raw arg;
+	struct bch_fs *c = file->f_inode->i_sb->s_fs_info;
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
@@ -883,7 +912,7 @@ static long bch2_ioc_pread_raw(struct file *file,
 	if (!(file->f_flags & O_DIRECT))
 		return -EINVAL;
 	if (!inode_owner_or_capable(file_mnt_idmap(file), &inode->v))
-		return -EPERM;
+		return bch_err_throw(c, EPERM_non_admin_or_owner);
 
 	loff_t pos = arg.offset;
 	int ret = rw_verify_area(READ, file, &pos, arg.len);
@@ -967,7 +996,7 @@ static long bch2_ioc_unpoison(struct bch_fs *c, struct file *file,
 		return 0;
 
 	if (!inode_owner_or_capable(file_mnt_idmap(file), &inode->v))
-		return -EPERM;
+		return bch_err_throw(c, EPERM_non_admin_or_owner);
 
 	subvol_inum inum = inode_inum(inode);
 	struct bpos start = POS(inum.inum, arg.offset >> 9);

@@ -15,6 +15,7 @@
 
 #include "btree/bset.h"
 #include "btree/check.h"
+#include "btree/interior.h"
 #include "btree/update.h"
 
 #include "data/copygc.h"
@@ -26,6 +27,7 @@
 
 #include "journal/init.h"
 
+#include "init/dev.h"
 #include "init/error.h"
 #include "init/recovery.h"
 #include "init/passes.h"
@@ -335,9 +337,8 @@ static int bch2_no_valid_pointers_repair(struct btree_trans *trans,
 	return 0;
 }
 
-int bch2_check_fix_ptrs(struct btree_trans *trans,
-			enum btree_id btree, unsigned level, struct bkey_s_c k,
-			enum btree_iter_update_trigger_flags flags)
+int bch2_check_fix_ptrs(struct btree_trans *trans, struct btree_iter *iter,
+			enum btree_id btree, unsigned level, struct bkey_s_c k)
 {
 	struct bch_fs *c = trans->c;
 
@@ -393,34 +394,18 @@ int bch2_check_fix_ptrs(struct btree_trans *trans,
 						  BKEY_EXTENT_U64s_MAX,
 						  SET_NEEDS_RECONCILE_opt_change, 0));
 
-		if (!(flags & BTREE_TRIGGER_is_root)) {
-			CLASS(btree_node_iter, iter)(trans, btree, new->k.p, 0, level,
-						     BTREE_ITER_intent|BTREE_ITER_all_snapshots);
-
-			try(bch2_btree_iter_traverse(&iter));
-			try(bch2_trans_update(trans, &iter, new,
+		if (!level) {
+			try(bch2_trans_update(trans, iter, new,
 					      BTREE_UPDATE_internal_snapshot_node|
 					      BTREE_TRIGGER_norun));
-
-			if (level)
-				bch2_btree_node_update_key_early(trans, btree, level - 1, k, new);
 		} else {
-			struct jset_entry *e = errptr_try(bch2_trans_jset_entry_alloc(trans,
-							       jset_u64s(new->k.u64s)));
+			CLASS(btree_node_iter, node_iter)(trans, btree, k.k->p,
+							  0, level - 1, BTREE_ITER_intent);
+			struct btree *b = errptr_try(bch2_btree_iter_peek_node(&node_iter));
 
-			journal_entry_set(e,
-					  BCH_JSET_ENTRY_btree_root,
-					  btree, level - 1,
-					  new, new->k.u64s);
-
-			/*
-			 * no locking, we're single threaded and not rw yet, see
-			 * the big assertino above that we repeat here:
-			 */
-			BUG_ON(test_bit(BCH_FS_rw, &c->flags));
-
-			struct btree *b = bch2_btree_id_root(c, btree)->b;
-			bkey_copy(&b->key, new);
+			return bch2_btree_node_update_key(trans, &node_iter, b, new,
+							  BCH_TRANS_COMMIT_no_enospc, false) ?:
+				bch_err_throw(c, transaction_restart_commit);
 		}
 	}
 
@@ -889,9 +874,6 @@ int bch2_trigger_extent(struct btree_trans *trans, struct btree_trigger_op op)
 	unsigned new_ptrs_bytes = (void *) new_ptrs.end - (void *) new_ptrs.start;
 	unsigned old_ptrs_bytes = (void *) old_ptrs.end - (void *) old_ptrs.start;
 
-	if (unlikely(op.flags & BTREE_TRIGGER_check_repair))
-		return bch2_check_fix_ptrs(trans, op.btree, op.level, op.new.s_c, op.flags);
-
 	/* if pointers aren't changing - nothing to do: */
 	if (new_ptrs_bytes == old_ptrs_bytes &&
 	    !memcmp(new_ptrs.start,
@@ -1126,7 +1108,14 @@ int bch2_trans_mark_dev_sbs_flags(struct bch_fs *c,
 			enum btree_iter_update_trigger_flags flags)
 {
 	for_each_online_member(c, ca, BCH_DEV_READ_REF_trans_mark_dev_sbs) {
-		int ret = bch2_trans_mark_dev_sb(c, ca, flags);
+		/* We unconditionally call bch2_trans_mark_dev_sb() again for an
+		 * extra bit of safety; it's harmless if it wasn't needed, and
+		 * double allocating a superblock or journal bucket would be
+		 * particularly painful
+		 */
+
+		int ret = bch2_dev_add_initialize(c, ca) ?:
+			  bch2_trans_mark_dev_sb(c, ca, flags);
 		if (ret) {
 			enumerated_ref_put(&ca->io_ref[READ], BCH_DEV_READ_REF_trans_mark_dev_sbs);
 			return ret;
@@ -1174,7 +1163,7 @@ static int disk_reservation_recalc_sectors_available(struct bch_fs *c,
 			struct disk_reservation *res,
 			u64 sectors, enum bch_reservation_flags flags)
 {
-	guard(mutex)(&c->capacity.sectors_available_lock);
+	guard(spinlock)(&c->capacity.sectors_available_lock);
 
 	percpu_u64_set(&c->capacity.pcpu->sectors_available, 0);
 	u64 sectors_available = avail_factor(__bch2_fs_usage_read_short(c).free);
@@ -1198,23 +1187,18 @@ static int disk_reservation_recalc_sectors_available(struct bch_fs *c,
 int __bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
 				u64 sectors, enum bch_reservation_flags flags)
 {
-	struct bch_fs_capacity_pcpu *pcpu;
-	u64 old, get;
-
-	guard(percpu_read)(&c->capacity.mark_lock);
-	preempt_disable();
-	pcpu = this_cpu_ptr(c->capacity.pcpu);
+	guard(preempt)();
+	struct bch_fs_capacity_pcpu *pcpu = this_cpu_ptr(c->capacity.pcpu);
 
 	if (unlikely(sectors > pcpu->sectors_available)) {
-		old = atomic64_read(&c->capacity.sectors_available);
+		u64 get, old = atomic64_read(&c->capacity.sectors_available);
+
 		do {
 			get = min((u64) sectors + SECTORS_CACHE, old);
 
-			if (unlikely(get < sectors)) {
-				preempt_enable();
+			if (unlikely(get < sectors))
 				return disk_reservation_recalc_sectors_available(c,
 								res, sectors, flags);
-			}
 		} while (!atomic64_try_cmpxchg(&c->capacity.sectors_available,
 					       &old, old - get));
 
@@ -1224,7 +1208,6 @@ int __bch2_disk_reservation_add(struct bch_fs *c, struct disk_reservation *res,
 	pcpu->sectors_available		-= sectors;
 	pcpu->online_reserved		+= sectors;
 	res->sectors			+= sectors;
-	preempt_enable();
 	return 0;
 }
 

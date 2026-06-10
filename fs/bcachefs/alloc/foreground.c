@@ -49,6 +49,7 @@
 #include <linux/math64.h>
 #include <linux/rculist.h>
 #include <linux/rcupdate.h>
+#include <linux/sched/signal.h>
 
 static void bch2_trans_mutex_lock_norelock(struct btree_trans *trans,
 					   struct mutex *lock)
@@ -611,8 +612,8 @@ static bool req_alloc_should_bail(struct bch_fs *c, struct alloc_request *req)
  *
  * Returns:	an open_bucket on success, or an ERR_PTR() on failure.
  */
-static struct open_bucket *bch2_bucket_alloc_trans(struct btree_trans *trans,
-						   struct alloc_request *req)
+struct open_bucket *bch2_bucket_alloc_trans(struct btree_trans *trans,
+					    struct alloc_request *req)
 {
 	struct bch_fs *c = trans->c;
 	struct bch_dev *ca = req->ca;
@@ -710,26 +711,6 @@ err:
 
 	alloc_trace_add(req, ca->dev_idx, ret, wake_counter_snapshot);
 
-	return ob;
-}
-
-struct open_bucket *bch2_bucket_alloc(struct bch_fs *c, struct bch_dev *ca,
-				      enum bch_watermark watermark,
-				      enum bch_data_type data_type,
-				      struct closure *cl)
-{
-	struct open_bucket *ob;
-	struct alloc_request req = {
-		.cl		= cl,
-		.watermark	= watermark,
-		.data_type	= data_type,
-		.ca		= ca,
-	};
-	darray_init(&req.trace);
-
-	CLASS(btree_trans, trans)(c);
-	lockrestart_do(trans, PTR_ERR_OR_ZERO(ob = bch2_bucket_alloc_trans(trans, &req)));
-	darray_exit(&req.trace);
 	return ob;
 }
 
@@ -867,7 +848,7 @@ static int add_new_bucket(struct bch_fs *c,
 
 	ob_push(c, &req->ptrs, ob);
 
-	if (req->nr_effective >= req->nr_replicas)
+	if (req->nr_effective >= req->nr_replicas || (req->flags & BCH_WRITE_cached))
 		return 1;
 	if (ob->ec)
 		return 1;
@@ -1335,7 +1316,7 @@ retry:
 	req->trace_alloc_failed		= false;
 	req->ptrs.nr			= 0;
 	req->nr_effective		= 0;
-	req->have_cache			= req->flags & BCH_WRITE_move;
+	req->have_cache			= (req->flags & BCH_WRITE_move) && !(req->flags & BCH_WRITE_cached);
 	req->trace.nr			= 0;
 	write_points_nr			= a->write_points_nr;
 
@@ -1430,7 +1411,7 @@ retry:
 		if (ret)
 			goto err;
 
-		BUG_ON(!req->nr_effective);
+		BUG_ON(!req->nr_effective && !(req->flags & BCH_WRITE_cached));
 		break;
 	}
 
@@ -1677,8 +1658,12 @@ void bch2_fs_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 	for (struct open_bucket *ob = a->open_buckets;
 	     ob < a->open_buckets + ARRAY_SIZE(a->open_buckets);
 	     ob++)
-		if (atomic_read(&ob->pin))
-			nr[ob->data_type]++;
+		if (atomic_read(&ob->pin)) {
+			unsigned t = ob->data_type;
+			barrier(); /* can't READ_ONCE() a bitfield */
+			if (t < BCH_DATA_NR)
+				nr[t]++;
+		}
 
 	prt_printf(out, "open buckets allocated\t%i\n",		OPEN_BUCKETS_COUNT - a->open_buckets_nr_free);
 	prt_printf(out, "open buckets total\t%u\n",		OPEN_BUCKETS_COUNT);
@@ -1721,8 +1706,12 @@ void bch2_dev_alloc_debug_to_text(struct printbuf *out, struct bch_dev *ca)
 
 	memset(nr, 0, sizeof(nr));
 
-	for (unsigned i = 0; i < ARRAY_SIZE(a->open_buckets); i++)
-		nr[a->open_buckets[i].data_type]++;
+	for (unsigned i = 0; i < ARRAY_SIZE(a->open_buckets); i++) {
+		unsigned t = a->open_buckets[i].data_type;
+		barrier(); /* can't READ_ONCE() a bitfield */
+		if (t < BCH_DATA_NR)
+			nr[t]++;
+	}
 
 	bch2_dev_usage_to_text(out, ca, &stats);
 
@@ -1803,6 +1792,52 @@ static void alloc_trace_to_text(struct printbuf *out, struct bch_fs *c,
 		}
 }
 
+void bch2_alloc_request_to_text(struct printbuf *out, struct bch_fs *c,
+				struct alloc_request *req)
+{
+	prt_printf(out, "nr_replicas:\t%u\n", req->nr_replicas);
+	prt_str(out, "target:\t");
+	bch2_target_to_text(out, c, req->target);
+	prt_newline(out);
+
+	prt_printf(out, "watermark:\t%s\n", bch2_watermarks[req->watermark]);
+	prt_printf(out, "data_type:\t%s\n", bch2_data_type_str(req->data_type));
+
+	prt_str(out, "flags:\t");
+	prt_bitflags(out, bch2_write_flags, req->flags);
+	prt_newline(out);
+
+	prt_printf(out, "ec:\t%u\n", req->ec);
+	prt_printf(out, "will_retry_all_devices:\t%u\n", req->will_retry_all_devices);
+	prt_printf(out, "will_retry_target_devices:\t%u\n", req->will_retry_target_devices);
+	prt_printf(out, "will_retry_set_devices:\t%u\n", req->will_retry_set_devices);
+	prt_printf(out, "copygc_can_make_progress:\t%u\n", req->copygc_can_make_progress);
+	prt_printf(out, "have_cl:\t%u\n", req->cl != NULL);
+
+	if (req->devs_have && req->devs_have->nr) {
+		prt_printf(out, "devs_have:\t");
+		bch2_devs_list_to_text(out, c, req->devs_have);
+		prt_newline(out);
+	}
+
+	prt_printf(out, "devs_may_alloc:\t");
+	{
+		unsigned i;
+		for_each_set_bit(i, req->devs_may_alloc.d, BCH_SB_MEMBERS_MAX)
+			prt_printf(out, "%u ", i);
+	}
+	prt_newline(out);
+
+	prt_printf(out, "devs_sorted:\t");
+	darray_for_each(req->devs_sorted, i)
+		prt_printf(out, "%u ", *i);
+	prt_newline(out);
+
+	prt_printf(out, "allocated:\t%u\n", req->nr_effective);
+
+	alloc_trace_to_text(out, c, req);
+}
+
 static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_request *req, int err)
 {
 	CLASS(printbuf, buf)();
@@ -1815,47 +1850,7 @@ static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_r
 		printbuf_tabstop_push(&buf, 28);
 		prt_str(&buf, "Allocation:\n");
 		guard(printbuf_indent)(&buf);
-		prt_printf(&buf, "nr_replicas:\t%u\n", req->nr_replicas);
-		prt_str(&buf, "target:\t");
-		bch2_target_to_text(&buf, c, req->target);
-		prt_newline(&buf);
-
-		prt_printf(&buf, "watermark:\t%s\n", bch2_watermarks[req->watermark]);
-		prt_printf(&buf, "data_type:\t%s\n", bch2_data_type_str(req->data_type));
-
-		prt_str(&buf, "flags:\t");
-		prt_bitflags(&buf, bch2_write_flags, req->flags);
-		prt_newline(&buf);
-
-		prt_printf(&buf, "ec:\t%u\n", req->ec);
-		prt_printf(&buf, "will_retry_all_devices:\t%u\n", req->will_retry_all_devices);
-		prt_printf(&buf, "will_retry_target_devices:\t%u\n", req->will_retry_target_devices);
-		prt_printf(&buf, "will_retry_set_devices:\t%u\n", req->will_retry_set_devices);
-		prt_printf(&buf, "copygc_can_make_progress:\t%u\n", req->copygc_can_make_progress);
-		prt_printf(&buf, "have_cl:\t%u\n", req->cl != NULL);
-
-		if (req->devs_have && req->devs_have->nr) {
-			prt_printf(&buf, "devs_have:\t");
-			bch2_devs_list_to_text(&buf, c, req->devs_have);
-			prt_newline(&buf);
-		}
-
-		prt_printf(&buf, "devs_may_alloc:\t");
-		{
-			unsigned i;
-			for_each_set_bit(i, req->devs_may_alloc.d, BCH_SB_MEMBERS_MAX)
-				prt_printf(&buf, "%u ", i);
-		}
-		prt_newline(&buf);
-
-		prt_printf(&buf, "devs_sorted:\t");
-		darray_for_each(req->devs_sorted, i)
-			prt_printf(&buf, "%u ", *i);
-		prt_newline(&buf);
-
-		prt_printf(&buf, "allocated:\t%u\n", req->nr_effective);
-
-		alloc_trace_to_text(&buf, c, req);
+		bch2_alloc_request_to_text(&buf, c, req);
 		prt_newline(&buf);
 	}
 
@@ -1953,14 +1948,14 @@ static bool alloc_wait_advanced(struct bch_fs *c, struct alloc_request *req)
 	return false;
 }
 
-void __bch2_wait_on_allocator(struct btree_trans *trans, struct bch_fs *c,
+void __bch2_wait_on_allocator(struct btree_trans *trans,
 			      struct alloc_request *req,
 			      int err, struct closure *cl)
 {
+	struct bch_fs *c = trans->c;
 	unsigned long until = jiffies + c->opts.allocator_stuck_timeout * HZ;
 
-	if (trans)
-		bch2_trans_unlock(trans);
+	bch2_trans_unlock(trans);
 
 	while (1) {
 		long t = until - jiffies;

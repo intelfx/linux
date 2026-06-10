@@ -10,6 +10,7 @@
 #include "btree/iter.h"
 #include "btree/locking.h"
 #include "btree/read.h"
+#include "btree/write.h"
 #include "btree/sort.h"
 #include "btree/update.h"
 
@@ -73,11 +74,23 @@ void bch2_btree_node_io_lock(struct btree *b)
 
 void bch2_btree_node_wait_on_read(struct btree_trans *trans, struct btree *b)
 {
+	if (unlikely(trans->queued_write_bios))
+		bch2_trans_submit_write_bios(trans);
+
 	trans_wait_on_bit_io(trans, &b->flags, BTREE_NODE_read_in_flight);
 }
 
 void bch2_btree_node_wait_on_write(struct btree_trans *trans, struct btree *b)
 {
+	/*
+	 * The write we're about to wait on may be sitting unsubmitted on
+	 * our own queued_write_bios (e.g. the btree cache cannibalize and
+	 * evict paths write a node and immediately wait on it) — submit
+	 * before sleeping, or we'd wait on ourselves forever:
+	 */
+	if (unlikely(trans->queued_write_bios))
+		bch2_trans_submit_write_bios(trans);
+
 	trans_wait_on_bit_io(trans, &b->flags, BTREE_NODE_write_in_flight);
 }
 
@@ -175,7 +188,7 @@ static int __btree_err(enum bch_fsck_flags flags,
 	true;								\
 })
 
-#define btree_err_on(cond, ...)	((cond) ? btree_err(__VA_ARGS__) : false)
+#define btree_err_on(cond, ...)	(unlikely(cond) ? btree_err(__VA_ARGS__) : false)
 
 /*
  * When btree topology repair changes the start or end of a node, that might
@@ -490,9 +503,9 @@ int bch2_validate_bset_keys(struct bch_fs *c,
 		u = __bkey_disassemble(b, k, &tmp);
 
 		ret = bset_key_validate(c, b, u.s_c, updated_range, write);
-		if (ret == -BCH_ERR_fsck_delete_bkey)
+		if (unlikely(ret == -BCH_ERR_fsck_delete_bkey))
 			goto drop_this_key;
-		if (ret)
+		if (unlikely(ret))
 			goto fsck_err;
 
 		if (write)
@@ -500,7 +513,8 @@ int bch2_validate_bset_keys(struct bch_fs *c,
 				    BSET_BIG_ENDIAN(i), write,
 				    &b->format, k);
 
-		if (prev && btree_node_read_bkey_cmp(b, prev, k) >= 0) {
+		if (prev &&
+		    unlikely(btree_node_read_bkey_cmp(b, prev, k) >= 0)) {
 			struct bkey up = bkey_unpack_key(b, prev);
 
 			printbuf_reset(&buf);
@@ -794,12 +808,17 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 
 	b->data->keys.u64s = sorted->keys.u64s;
 	*sorted = *b->data;
-	swap(sorted, b->data);
+
+	if (!mem_alloc_profiling_enabled()) {
+		swap(sorted, b->data);
+		btree_node_buf_swap_account(c, sorted, b->data);
+	} else {
+		memcpy(b->data, sorted, vstruct_bytes(b->data));
+	}
+
 	set_btree_bset(b, b->set, &b->data->keys);
 	b->nsets = 1;
 	b->data->keys.journal_seq = cpu_to_le64(max_journal_seq);
-
-	btree_node_buf_swap_account(c, sorted, b->data);
 
 	BUG_ON(b->nr.live_u64s != le16_to_cpu(b->data->keys.u64s));
 

@@ -16,13 +16,6 @@
 
 #include "journal/journal.h"
 
-static bool discard_opt_enabled_idx(struct bch_fs *c, unsigned dev)
-{
-	guard(rcu)();
-	struct bch_dev *ca = bch2_dev_rcu_noerror(c, dev);
-	return ca && bch2_discard_opt_enabled(c, ca);
-}
-
 static u32 dev_bucket_size(struct bch_fs *c, unsigned dev)
 {
 	guard(rcu)();
@@ -76,6 +69,20 @@ void bch2_discards_to_text(struct printbuf *out, struct bch_fs *c, struct discar
 	prt_printf(out, "journal seq:\t%llu\n",			journal_cur_seq(j));
 	prt_printf(out, "journal flushed seq:\t%llu -> %llu\n",	j->flushing_seq, j->flushed_seq_ondisk);
 	prt_printf(out, "journal rewind seq:\t%llu -> %llu\n",	j->rewind_seq, j->rewind_seq_ondisk);
+
+	prt_printf(out, "In flight:\n");
+	struct bch_fs_discards *d = &c->discards;
+	guard(printbuf_indent)(out);
+	guard(printbuf_atomic)(out);
+	guard(spinlock_irq)(&d->lock);
+	darray_for_each(d->in_flight, i) {
+		prt_printf(out, "%s:%llu", i->ca->name, u64_to_bucket(i->dev_bucket).offset);
+		if (i->complete)
+			prt_str(out, " complete");
+		if (i->marking_free)
+			prt_str(out, " marking_free");
+		prt_newline(out);
+	}
 }
 
 struct discard_bio {
@@ -178,6 +185,8 @@ static int __discard_mark_free(struct btree_trans *trans,
 	/* Bit kept in sync for downgrade compat; alloc_data_type() no longer reads it. */
 	SET_BCH_ALLOC_V4_NEED_DISCARD(&a->v, false);
 	a->v.data_type = BCH_DATA_free;
+	a->v.journal_seq_nonempty = 0;
+	a->v.journal_seq_empty = 0;
 	alloc_data_type_set(&a->v, a->v.data_type);
 
 	try(bch2_trans_update(trans, iter, &a->k_i, BTREE_TRIGGER_is_discard));
@@ -327,23 +336,24 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
 		return 0;
 	}
 
-	if (discard_opt_enabled_idx(c, bucket.inode) && !c->opts.nochanges) {
-		struct bch_dev *ca = bch2_dev_get_ioref(trans->c, bucket.inode, WRITE,
-							BCH_DEV_WRITE_REF_discard_bucket);
-		if (!ca) {
-			s->not_rw += bucket_size;
-			return 0;
-		}
+	struct bch_dev *ca = bch2_dev_get_ioref(trans->c, bucket.inode, WRITE,
+						BCH_DEV_WRITE_REF_discard_bucket);
+	if (!ca) {
+		s->not_rw += bucket_size;
+		return 0;
+	}
 
+	if (bch2_discard_opt_enabled(c, ca) &&
+	    bdev_max_discard_sectors(ca->disk_sb.bdev) &&
+	    !c->opts.nochanges) {
 		ret = discard_in_flight_add(c, ca, bucket, fastpath, false);
 		if (!ret) {
 			bch2_trans_unlock(trans);
+			/* consumes ioref */
 			discard_submit(ca, bucket, fastpath);
 			s->discarded += bucket_size;
 			return 0;
 		}
-
-		enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_discard_bucket);
 
 		if (ret == -EEXIST) {
 			s->eexist += bucket_size;
@@ -351,10 +361,13 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
 		} else {
 			s->eagain += bucket_size;
 		}
-		return ret;
 	} else {
-		return __discard_mark_free(trans, s, fastpath, &iter, a);
+		ret = __discard_mark_free(trans, s, fastpath, &iter, a);
 	}
+
+	enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_discard_bucket);
+
+	return ret;
 }
 
 static void calculate_discard_sectors_to_release(struct btree_trans *trans)
@@ -431,6 +444,7 @@ static void calculate_discard_sectors_to_release(struct btree_trans *trans)
 
 static void bch2_do_discards(struct bch_fs *c)
 {
+	struct bch_fs_discards *d = &c->discards;
 	int ret = 0;
 	bool again;
 	unsigned flushed_wb = 0;
@@ -464,9 +478,29 @@ static void bch2_do_discards(struct bch_fs *c)
 			int ret2 = bch2_discard_one_bucket(trans,
 						bucket, bucket_size,
 						s, false);
-			if (ret2 == -BCH_ERR_max_discards_in_flight)
+			/*
+			 * Reap completed discards as we go: in_flight entries
+			 * are only freed in bch2_discards_complete(), so if we
+			 * never reach DEV_IN_FLIGHT_MAX - the device completes
+			 * discards inline, or doesn't support REQ_OP_DISCARD -
+			 * the in_flight darray would otherwise grow without
+			 * bound and turn the linear scans in
+			 * discard_in_flight_add()/discard_endio() into O(n^2).
+			 * in_flight.nr > ref means there are completed entries
+			 * waiting to be reaped.
+			 *
+			 * On success the bucket's been handled, so advance the
+			 * iterator before the nested restart so we don't
+			 * reprocess it; on -max_discards_in_flight leave it put
+			 * so we retry the bucket after draining.
+			 */
+			if (ret2 == -BCH_ERR_max_discards_in_flight ||
+			    (!ret2 && READ_ONCE(d->in_flight.nr) > READ_ONCE(d->ref))) {
+				if (!ret2)
+					bch2_btree_iter_advance(&iter);
 				ret2 = bch2_discards_complete(trans, s, false, false) ?:
 				btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
+			}
 			ret2;
 		}));
 

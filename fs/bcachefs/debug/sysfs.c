@@ -706,6 +706,8 @@ static ssize_t bch2_btree_trans_stats_json_read(struct file *file,
 			if (IS_ENABLED(CONFIG_BCACHEFS_LOCK_TIME_STATS)) {
 				prt_str(out, ",\"lock_hold_times\":");
 				bch2_time_stats_json_to_text(out, &s->lock_hold_times, NULL, 0);
+				prt_str(out, ",\"lock_wait_times\":");
+				bch2_time_stats_json_to_text(out, &s->lock_wait_times, NULL, 0);
 			}
 
 			prt_char(out, '}');
@@ -740,6 +742,7 @@ static ssize_t bch2_btree_trans_stats_json_write(struct file *file,
 		guard(mutex)(&s->lock);
 		bch2_time_stats_reset(&s->duration);
 		bch2_time_stats_reset(&s->lock_hold_times);
+		bch2_time_stats_reset(&s->lock_wait_times);
 		s->nr_max_paths = 0;
 		s->max_mem = 0;
 		kfree(s->max_paths_text);
@@ -801,10 +804,11 @@ static ssize_t sysfs_opt_store(struct bch_fs *c,
 
 	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
 	guard(opt_change_lock)(c);
+	CLASS(opt_change_scope, opt_scope)(c);
 
 	u64 v;
 	ret =   bch2_opt_parse(c, opt, strim(tmp), &v, NULL) ?:
-		bch2_opt_hook_pre_set(c, ca, 0, id, v, true);
+		bch2_opt_hook_pre_set(c, ca, 0, id, v, true, &opt_scope);
 
 	if (!ret) {
 		bool is_sb = opt->get_sb || opt->get_member || opt->get_ext;

@@ -381,6 +381,13 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 	for_each_member_device(c, ca) {
 		bch2_dev_io_ref_stop(ca, WRITE);
 		bch2_dev_allocator_remove(c, ca);
+
+		/*
+		 * Queued from bch2_journal_space_available(); not cancelled
+		 * anywhere else on the going-RO path, so cancel it here, after
+		 * the journal is stopped, or it can run against a freed device.
+		 */
+		cancel_work_sync(&ca->journal.discard);
 	}
 }
 
@@ -1186,6 +1193,11 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	c->journal.noflush_write_time	= &c->times[BCH_TIME_journal_noflush_write];
 	c->journal.flush_seq_time	= &c->times[BCH_TIME_journal_flush_seq];
 
+	/* must be initialized before we throw any errors */
+	c->counters.now = __alloc_percpu(sizeof(u64) * BCH_COUNTER_NR, sizeof(u64));
+	if (!c->counters.now)
+		return -BCH_ERR_ENOMEM_fs_counters_init;
+
 	try(bch2_fs_capacity_init(c));
 
 	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
@@ -1301,6 +1313,7 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	try(bch2_fs_errors_init(c));
 	try(bch2_fs_encryption_init(c));
 	try(bch2_fs_io_read_init(c));
+	try(bch2_fs_snapshots_init(c));
 	try(bch2_fs_vfs_init(c));
 	try(bch2_io_clock_init(&c->io_clock[READ]));
 	try(bch2_io_clock_init(&c->io_clock[WRITE]));
