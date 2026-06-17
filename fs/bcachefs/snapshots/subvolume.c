@@ -219,7 +219,7 @@ int bch2_check_subvol_children(struct bch_fs *c)
 /* Subvolumes: */
 
 int bch2_subvolume_validate(struct bch_fs *c, struct bkey_s_c k,
-			    struct bkey_validate_context from)
+			    const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_subvolume subvol = bkey_s_c_to_subvolume(k);
 	int ret = 0;
@@ -240,7 +240,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_subvolume_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_subvolume_to_text(struct printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_s_c_subvolume s = bkey_s_c_to_subvolume(k);
@@ -313,10 +313,12 @@ int bch2_subvolume_get(struct btree_trans *trans, unsigned subvol,
 	return bch2_subvolume_get_inlined(trans, subvol, inconsistent_if_not_found, s);
 }
 
-int bch2_subvol_is_ro_trans(struct btree_trans *trans, u32 subvol)
+int bch2_subvol_is_ro_trans(struct btree_trans *trans, u32 subvol, u32 *snapid)
 {
 	struct bch_subvolume s;
 	try(bch2_subvolume_get_inlined(trans, subvol, true, &s));
+
+	*snapid = le32_to_cpu(s.snapshot);
 
 	if (BCH_SUBVOLUME_RO(&s) ||
 	    BCH_SUBVOLUME_UNLINKED(&s))
@@ -327,7 +329,8 @@ int bch2_subvol_is_ro_trans(struct btree_trans *trans, u32 subvol)
 int bch2_subvol_is_ro(struct bch_fs *c, u32 subvol)
 {
 	CLASS(btree_trans, trans)(c);
-	return lockrestart_do(trans, bch2_subvol_is_ro_trans(trans, subvol));
+	u32 snapshot;
+	return lockrestart_do(trans, bch2_subvol_is_ro_trans(trans, subvol, &snapshot));
 }
 
 int bch2_snapshot_get_subvol(struct btree_trans *trans, u32 snapshot,
@@ -543,6 +546,7 @@ int bch2_subvolume_create(struct btree_trans *trans, u64 inode,
 			  u32 src_subvolid,
 			  u32 *new_subvolid,
 			  u32 *new_snapshotid,
+			  struct bch_subvolume *new_subvol_out,
 			  bool ro)
 {
 	struct bch_fs *c = trans->c;
@@ -597,6 +601,7 @@ int bch2_subvolume_create(struct btree_trans *trans, u64 inode,
 
 	*new_subvolid	= new_subvol->k.p.offset;
 	*new_snapshotid	= new_nodes[0];
+	*new_subvol_out	= new_subvol->v;
 	return 0;
 }
 
@@ -645,8 +650,7 @@ static int __bch2_fs_upgrade_for_subvolumes(struct btree_trans *trans)
 	}
 
 	struct bch_inode_unpacked inode;
-	ret = bch2_inode_unpack(k, &inode);
-	BUG_ON(ret);
+	bch2_inode_unpack(trans->c, k, &inode);
 
 	inode.bi_subvol = BCACHEFS_ROOT_SUBVOL;
 

@@ -76,7 +76,7 @@ const struct bch_hash_desc bch2_xattr_hash_desc = {
 };
 
 int bch2_xattr_validate(struct bch_fs *c, struct bkey_s_c k,
-			struct bkey_validate_context from)
+			const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_xattr xattr = bkey_s_c_to_xattr(k);
 	unsigned val_u64s = xattr_val_u64s(xattr.v->x_name_len,
@@ -108,7 +108,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_xattr_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_xattr_to_text(struct printbuf *out, struct bch_fs *c,
 			struct bkey_s_c k)
 {
 	const struct xattr_handler *handler;
@@ -170,7 +170,8 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 {
 	struct bch_fs *c = trans->c;
 
-	try(bch2_subvol_is_ro_trans(trans, inum.subvol));
+	u32 snapshot;
+	try(bch2_subvol_is_ro_trans(trans, inum.subvol, &snapshot));
 
 	CLASS(btree_iter_uninit, inode_iter)(trans);
 	try(bch2_inode_peek(trans, &inode_iter, inode_u, inum, BTREE_ITER_intent));
@@ -567,6 +568,9 @@ static int __bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
 
 		try(bch2_write_inode(c, inode, inode_opt_set_fn, &s, 0));
 	}
+
+	if (inode_opt_id == Inode_opt_casefold)
+		bch2_dir_casefold_changed(dentry);
 
 	bch2_opt_hook_post_set(c, NULL, inode->ei_inode.bi_inum, opt_id, v);
 	return 0;

@@ -50,7 +50,7 @@ static inline unsigned bkey_type_to_indirect(const struct bkey *k)
 /* reflink pointers */
 
 int bch2_reflink_p_validate(struct bch_fs *c, struct bkey_s_c k,
-			    struct bkey_validate_context from)
+			    const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_reflink_p p = bkey_s_c_to_reflink_p(k);
 	int ret = 0;
@@ -63,7 +63,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_reflink_p_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_reflink_p_to_text(struct printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_s_c_reflink_p p = bkey_s_c_to_reflink_p(k);
@@ -104,7 +104,7 @@ bool bch2_reflink_p_merge(struct bch_fs *c, struct bkey_s _l, struct bkey_s_c _r
 /* indirect extents */
 
 int bch2_reflink_v_validate(struct bch_fs *c, struct bkey_s_c k,
-			    struct bkey_validate_context from)
+			    const struct bkey_validate_context *from)
 {
 	int ret = 0;
 
@@ -118,7 +118,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_reflink_v_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_reflink_v_to_text(struct printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_s_c_reflink_v r = bkey_s_c_to_reflink_v(k);
@@ -143,12 +143,12 @@ bool bch2_reflink_v_merge(struct bch_fs *c, struct bkey_s _l, struct bkey_s_c _r
 /* indirect inline data */
 
 int bch2_indirect_inline_data_validate(struct bch_fs *c, struct bkey_s_c k,
-				       struct bkey_validate_context from)
+				       const struct bkey_validate_context *from)
 {
 	return 0;
 }
 
-void bch2_indirect_inline_data_to_text(struct printbuf *out,
+__cold void bch2_indirect_inline_data_to_text(struct printbuf *out,
 				       struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_indirect_inline_data d = bkey_s_c_to_indirect_inline_data(k);
@@ -707,7 +707,7 @@ s64 bch2_remap_range(struct bch_fs *c,
 		ret = bch2_extent_update(trans, dst_inum, &dst_iter,
 					 new_dst.k, new_dst.k->k.u64s, &res.r,
 					 new_i_size, i_sectors_delta,
-					 true, 0);
+					 true, 0, NULL);
 	}
 
 	BUG_ON(!ret && !bkey_eq(dst_iter.pos, dst_end));

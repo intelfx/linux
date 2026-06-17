@@ -287,10 +287,12 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 		if (req->cl) {
 			closure_wait(&c->allocator.open_buckets_wait, req->cl);
 			return ERR_PTR(alloc_trace_add(req, U8_MAX,
-					bch_err_throw(c, open_bucket_alloc_blocked), 0));
+					bch_err_throw(c, open_bucket_alloc_blocked),
+					0, 0, false));
 		} else {
 			return ERR_PTR(alloc_trace_add(req, U8_MAX,
-					bch_err_throw(c, open_buckets_empty), 0));
+					bch_err_throw(c, open_buckets_empty),
+					0, 0, false));
 		}
 	}
 
@@ -503,7 +505,7 @@ fail:
 	return ob;
 }
 
-static noinline void bucket_alloc_to_text(struct printbuf *out,
+static noinline __cold void bucket_alloc_to_text(struct printbuf *out,
 					  struct bch_fs *c,
 					  struct alloc_request *req,
 					  struct open_bucket *ob)
@@ -620,6 +622,7 @@ struct open_bucket *bch2_bucket_alloc_trans(struct btree_trans *trans,
 	struct open_bucket *ob = NULL;
 	bool freespace = READ_ONCE(ca->mi.freespace_initialized);
 	bool waiting = false;
+	bool copygc_can_make_progress = false;
 
 	req->btree_bitmap = req->data_type == BCH_DATA_btree;
 	memset(&req->counters, 0, sizeof(req->counters));
@@ -644,6 +647,7 @@ again:
 			goto alloc;
 
 		if (bch2_copygc_can_make_progress(ca)) {
+			copygc_can_make_progress = true;
 			req->copygc_can_make_progress = true;
 			bch2_copygc_wakeup(c);
 		}
@@ -709,7 +713,8 @@ err:
 		event_inc_trace(c, bucket_alloc_fail, buf,
 			bucket_alloc_to_text(&buf, c, req, ob));
 
-	alloc_trace_add(req, ca->dev_idx, ret, wake_counter_snapshot);
+	alloc_trace_add(req, ca->dev_idx, ret, wake_counter_snapshot,
+			avail, copygc_can_make_progress);
 
 	return ob;
 }
@@ -901,7 +906,7 @@ int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
 	}
 
 	return ret ?: alloc_trace_add(req, BCH_SB_MEMBER_INVALID,
-			bch_err_throw(c, insufficient_devices), 0);
+			bch_err_throw(c, insufficient_devices), 0, 0, false);
 }
 
 /* Allocate from stripes: */
@@ -1546,7 +1551,7 @@ void bch2_fs_allocator_foreground_init(struct bch_fs *c)
 	}
 }
 
-void bch2_open_bucket_to_text(struct printbuf *out, struct bch_fs *c, struct open_bucket *ob)
+__cold void bch2_open_bucket_to_text(struct printbuf *out, struct bch_fs *c, struct open_bucket *ob)
 {
 	struct bch_fs_allocator *a = &c->allocator;
 	struct bch_dev *ca = ob_dev(c, ob);
@@ -1567,7 +1572,7 @@ void bch2_open_bucket_to_text(struct printbuf *out, struct bch_fs *c, struct ope
 	prt_newline(out);
 }
 
-void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c,
 			       struct bch_dev *ca)
 {
 	struct bch_fs_allocator *a = &c->allocator;
@@ -1582,7 +1587,7 @@ void bch2_open_buckets_to_text(struct printbuf *out, struct bch_fs *c,
 	}
 }
 
-void bch2_open_buckets_partial_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_open_buckets_partial_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	guard(printbuf_atomic)(out);
 	guard(spinlock)(&c->allocator.freelist_lock);
@@ -1599,7 +1604,7 @@ static const char * const bch2_write_point_states[] = {
 	NULL
 };
 
-static void bch2_write_point_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void bch2_write_point_to_text(struct printbuf *out, struct bch_fs *c,
 				     struct write_point *wp)
 {
 	struct open_bucket *ob;
@@ -1625,7 +1630,7 @@ static void bch2_write_point_to_text(struct printbuf *out, struct bch_fs *c,
 			bch2_open_bucket_to_text(out, c, ob);
 }
 
-void bch2_write_points_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_write_points_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct bch_fs_allocator *a = &c->allocator;
 	struct write_point *wp;
@@ -1646,7 +1651,7 @@ void bch2_write_points_to_text(struct printbuf *out, struct bch_fs *c)
 	bch2_write_point_to_text(out, c, &a->btree_write_point);
 }
 
-void bch2_fs_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_fs_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 24);
@@ -1675,7 +1680,7 @@ void bch2_fs_open_buckets_to_text(struct printbuf *out, struct bch_fs *c)
 	prt_printf(out, "open_buckets_wait\t%s\n",		a->open_buckets_wait.list.first ? "waiting" : "empty");
 }
 
-void bch2_fs_alloc_debug_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_fs_alloc_debug_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 24);
@@ -1684,11 +1689,11 @@ void bch2_fs_alloc_debug_to_text(struct printbuf *out, struct bch_fs *c)
 	prt_printf(out, "capacity\t%llu\n",		c->capacity.capacity);
 	prt_printf(out, "used\t%llu\n",			bch2_fs_usage_read_short(c).used);
 	prt_printf(out, "reserved\t%llu\n",		c->capacity.reserved);
-	prt_printf(out, "hidden\t%llu\n",		percpu_u64_get(&c->capacity.usage->hidden));
-	prt_printf(out, "btree\t%llu\n",		percpu_u64_get(&c->capacity.usage->btree));
-	prt_printf(out, "data\t%llu\n",			percpu_u64_get(&c->capacity.usage->data));
-	prt_printf(out, "cached\t%llu\n",		percpu_u64_get(&c->capacity.usage->cached));
-	prt_printf(out, "reserved\t%llu\n",		percpu_u64_get(&c->capacity.usage->reserved));
+	prt_printf(out, "hidden\t%llu\n",		percpu_u64_get(&c->capacity.pcpu->usage.hidden));
+	prt_printf(out, "btree\t%llu\n",		percpu_u64_get(&c->capacity.pcpu->usage.btree));
+	prt_printf(out, "data\t%llu\n",			percpu_u64_get(&c->capacity.pcpu->usage.data));
+	prt_printf(out, "cached\t%llu\n",		percpu_u64_get(&c->capacity.pcpu->usage.cached));
+	prt_printf(out, "reserved\t%llu\n",		percpu_u64_get(&c->capacity.pcpu->usage.reserved));
 	prt_printf(out, "online_reserved\t%llu\n",	percpu_u64_get(&c->capacity.pcpu->online_reserved));
 
 	prt_newline(out);
@@ -1697,7 +1702,7 @@ void bch2_fs_alloc_debug_to_text(struct printbuf *out, struct bch_fs *c)
 	prt_newline(out);
 }
 
-void bch2_dev_alloc_debug_to_text(struct printbuf *out, struct bch_dev *ca)
+__cold void bch2_dev_alloc_debug_to_text(struct printbuf *out, struct bch_dev *ca)
 {
 	struct bch_fs *c = ca->fs;
 	struct bch_fs_allocator *a = &c->allocator;
@@ -1764,7 +1769,7 @@ static inline bool dev_may_alloc(struct bch_fs *c, struct bch_dev *ca, struct al
 		(ca->mi.data_allowed & BIT(req->data_type));
 }
 
-static void alloc_trace_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void alloc_trace_to_text(struct printbuf *out, struct bch_fs *c,
 			        struct alloc_request *req)
 {
 	if (!req->trace.nr)
@@ -1787,12 +1792,15 @@ static void alloc_trace_to_text(struct printbuf *out, struct bch_fs *c,
 				prt_str(out, " retry_set");
 			if (e->have_cl)
 				prt_str(out, " cl");
+			prt_printf(out, " free %llu copygc_progress %u",
+				   e->free_buckets,
+				   e->copygc_can_make_progress);
 			prt_printf(out, " -> %s\n",
 				   e->err ? bch2_err_str(e->err) : "ok");
 		}
 }
 
-void bch2_alloc_request_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_alloc_request_to_text(struct printbuf *out, struct bch_fs *c,
 				struct alloc_request *req)
 {
 	prt_printf(out, "nr_replicas:\t%u\n", req->nr_replicas);

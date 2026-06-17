@@ -204,14 +204,24 @@ struct stripe_update_bucket_stats {
 	u32			sectors_done;
 };
 
-static void bch2_bkey_drop_stripe_ptr(const struct bch_fs *c, struct bkey_s k, u64 idx)
+static void bch2_bkey_drop_stripe_ptr(const struct bch_fs *c, struct bkey_s k,
+				      struct bch_extent_stripe_ptr ec)
 {
 	struct bkey_ptrs ptrs = bch2_bkey_ptrs(k);
 	union bch_extent_entry *entry;
 
+	/*
+	 * Match on (idx, block), not idx alone: an extent can have two of its
+	 * blocks in the same stripe, and we must drop the stripe_ptr belonging
+	 * to the pointer being migrated - not whichever one happens to share
+	 * the stripe idx. Dropping by idx alone could drop a sibling block's
+	 * stripe_ptr and leave the migrated pointer carrying two, which fails
+	 * validation as a redundant stripe entry.
+	 */
 	bkey_extent_entry_for_each(ptrs, entry)
 		if (extent_entry_type(entry) == BCH_EXTENT_ENTRY_stripe_ptr &&
-		    entry->stripe_ptr.idx == idx) {
+		    entry->stripe_ptr.idx == ec.idx &&
+		    entry->stripe_ptr.block == ec.block) {
 			extent_entry_drop(c, k, entry);
 			return;
 		}
@@ -320,7 +330,7 @@ static int stripe_update_extent(struct btree_trans *trans,
 	bkey_reassemble(n, k);
 
 	if (p.has_ec)
-		bch2_bkey_drop_stripe_ptr(c, bkey_i_to_s(n), p.ec.idx);
+		bch2_bkey_drop_stripe_ptr(c, bkey_i_to_s(n), p.ec);
 
 	if (old_block.dev != new_block.dev)
 		bch2_bkey_drop_device_noerror(c, bkey_i_to_s(n), new_block.dev);
@@ -462,7 +472,7 @@ static int stripe_update_extents(struct bch_fs *c, struct ec_stripe_new *s)
 				       s->old_blocks_nr);
 }
 
-void bch2_logged_op_stripe_update_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+__cold void bch2_logged_op_stripe_update_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_logged_op_stripe_update op = bkey_s_c_to_logged_op_stripe_update(k);
 
@@ -539,6 +549,17 @@ void bch2_ec_stripe_new_free(struct bch_fs *c, struct ec_stripe_new *s)
 	kfree(s);
 }
 
+static bool stripe_has_removing_dev(struct bch_fs *c, struct bch_stripe *v)
+{
+	guard(rcu)();
+	for (unsigned i = 0; i < v->nr_blocks; i++) {
+		struct bch_dev *ca = bch2_dev_rcu(c, v->ptrs[i].dev);
+		if (ca && READ_ONCE(ca->removing))
+			return true;
+	}
+	return false;
+}
+
 static int __ec_stripe_create(struct ec_stripe_new *s)
 {
 	struct bch_fs *c = s->c;
@@ -550,6 +571,26 @@ static int __ec_stripe_create(struct ec_stripe_new *s)
 			bch_err(c, "error creating stripe: error writing data buckets");
 		return s->err;
 	}
+
+	/*
+	 * Device removal is about to delete alloc info and invalidate stripe
+	 * pointers; if we reused an existing stripe, our copies of its
+	 * pointers may be stale, and we must not commit new references to the
+	 * device. bch2_dev_remove() sets ->removing before the data drop,
+	 * then flushes outstanding creates: checking here, before we commit,
+	 * is sufficient.
+	 *
+	 * Only the new key's pointers are checked: a create that's moving
+	 * data off the device (old stripe references it, blocks_moving) gets
+	 * fresh buckets for those blocks and commits a clean key - and
+	 * reading from the device during the data drop is fine, that's how
+	 * the data gets moved. The dangerous population is creates that
+	 * copied pointers while the device was healthy (blocks_gotten,
+	 * pointer retained in the new key) and seal after the removal walk
+	 * has passed: those would resurrect pointers to a removed device.
+	 */
+	if (stripe_has_removing_dev(c, v))
+		return bch_err_throw(c, stripe_create_device_removing);
 
 	for (unsigned i = s->old_blocks_nr; i < nr_data; i++) {
 		struct open_bucket *ob = c->allocator.open_buckets + s->blocks[i];
@@ -758,42 +799,27 @@ void *bch2_writepoint_ec_buf(struct bch_fs *c, struct write_point *wp)
 	return ob->ec->new_stripe.data[ob->ec_idx] + (offset << 9);
 }
 
-static int unsigned_cmp(const void *_l, const void *_r)
-{
-	unsigned l = *((const unsigned *) _l);
-	unsigned r = *((const unsigned *) _r);
-
-	return cmp_int(l, r);
-}
-
 /* pick most common bucket size: */
 static unsigned pick_blocksize(struct bch_fs *c,
 			       struct bch_devs_mask *devs)
 {
-	unsigned nr = 0, sizes[BCH_SB_MEMBERS_MAX];
 	struct {
 		unsigned nr, size;
-	} cur = { 0, 0 }, best = { 0, 0 };
+	} best = { 0, 0 };
 
-	for_each_member_device_rcu(c, ca, devs)
-		sizes[nr++] = ca->mi.bucket_size;
+	for_each_member_device_rcu(c, ca, devs) {
+		unsigned size = ca->mi.bucket_size, nr = 0;
 
-	sort(sizes, nr, sizeof(unsigned), unsigned_cmp, NULL);
+		for_each_member_device_rcu(c, ca2, devs)
+			nr += ca2->mi.bucket_size == size;
 
-	for (unsigned i = 0; i < nr; i++) {
-		if (sizes[i] != cur.size) {
-			if (cur.nr > best.nr)
-				best = cur;
-
-			cur.nr = 0;
-			cur.size = sizes[i];
+		/* on a tie, prefer the smaller size: */
+		if (nr > best.nr ||
+		    (nr == best.nr && size < best.size)) {
+			best.nr   = nr;
+			best.size = size;
 		}
-
-		cur.nr++;
 	}
-
-	if (cur.nr > best.nr)
-		best = cur;
 
 	return best.size;
 }
@@ -1467,7 +1493,7 @@ static int stripe_alloc_or_reuse(struct btree_trans *trans,
 	return 0;
 }
 
-static void bch2_new_stripe_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void bch2_new_stripe_to_text(struct printbuf *out, struct bch_fs *c,
 				    struct ec_stripe_new *s)
 {
 	prt_printf(out, "\tidx %llu blocks %u+%u allocated %u ref %u %u %s obs",
@@ -1492,7 +1518,7 @@ static void bch2_new_stripe_to_text(struct printbuf *out, struct bch_fs *c,
 		prt_printf(out, "old_stripe.cl:\t%u\n", closure_nr_remaining(&s->old_stripe.io));
 }
 
-void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct ec_stripe_head *h;
 	struct ec_stripe_new *s;

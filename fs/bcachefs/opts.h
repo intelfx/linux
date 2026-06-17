@@ -251,11 +251,6 @@ enum fsck_err_opts {
 	  OPT_UINT(0, 16),						\
 	  BCH_SB_SHARD_INUMS_NBITS,	0,				\
 	  NULL,		"Shard new inode numbers by CPU id")		\
-	x(btree_node_mem_ptr_optimization, u8,				\
-	  OPT_FS|OPT_MOUNT|OPT_RUNTIME|OPT_NODOC,			\
-	  OPT_BOOL(),							\
-	  BCH2_NO_SB_OPT,		true,				\
-	  NULL,		"Stash pointer to in memory btree node in btree ptr")\
 	x(gc_reserve_percent,		u8,				\
 	  OPT_FS|OPT_FORMAT|OPT_MOUNT|OPT_RUNTIME,			\
 	  OPT_UINT(5, 21),						\
@@ -508,7 +503,7 @@ enum fsck_err_opts {
 	  OPT_BOOL(),							\
 	  BCH_SB_NOCOW,			false,				\
 	  NULL,		"Nocow mode: Writes will be done in place when possible.\n"\
-			"Snapshots and reflink will still caused writes to be COW\n"\
+			"Snapshots and reflink will still cause writes to be COW\n"\
 			"Implicitly disables data checksumming, compression and encryption")\
 	x(nocow_enabled,		u8,				\
 	  OPT_FS|OPT_MOUNT|OPT_NODOC,					\

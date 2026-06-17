@@ -58,6 +58,14 @@ static int evacuate_bucket_pred(struct btree_trans *, void *,
 				struct bch_inode_opts *,
 				struct data_update_opts *);
 
+static void data_update_free_rcu(struct rcu_head *rcu)
+{
+	struct data_update *u = container_of(rcu, struct data_update, rcu);
+
+	bch2_bkey_buf_exit(&u->k);
+	kfree(u);
+}
+
 static void move_write_done(struct bch_write_op *op)
 {
 	struct data_update *u = container_of(op, struct data_update, op);
@@ -75,7 +83,7 @@ static void move_write_done(struct bch_write_op *op)
 		bch2_data_update_ec_alloc_failed(u);
 
 	bch2_data_update_exit(u, op->error);
-	kfree_rcu(u, rcu);
+	call_rcu(&u->rcu, data_update_free_rcu);
 	closure_put(&ctxt->cl);
 }
 
@@ -1137,7 +1145,7 @@ int bch2_data_job(struct bch_fs *c,
 	return ret;
 }
 
-void bch2_move_stats_to_text(struct printbuf *out, struct bch_move_stats *stats)
+__cold void bch2_move_stats_to_text(struct printbuf *out, struct bch_move_stats *stats)
 {
 	prt_printf(out, "%s: data type==", stats->name);
 	bch2_prt_data_type(out, stats->data_type);
@@ -1161,7 +1169,7 @@ void bch2_move_stats_to_text(struct printbuf *out, struct bch_move_stats *stats)
 	prt_newline(out);
 }
 
-static void bch2_moving_ctxt_to_text(struct printbuf *out, struct bch_fs *c, struct moving_context *ctxt)
+static __cold void bch2_moving_ctxt_to_text(struct printbuf *out, struct bch_fs *c, struct moving_context *ctxt)
 {
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 32);
@@ -1190,7 +1198,7 @@ static void bch2_moving_ctxt_to_text(struct printbuf *out, struct bch_fs *c, str
 	}
 }
 
-void bch2_fs_moving_ctxts_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_fs_moving_ctxts_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct moving_context *ctxt;
 

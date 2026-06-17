@@ -364,7 +364,7 @@ static inline void pr_name_and_units(struct printbuf *out, const char *name, u64
 
 #define TABSTOP_SIZE 12
 
-void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats)
+__cold void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats)
 {
 	struct quantiles *quantiles = time_stats_to_quantiles(stats);
 	s64 f_mean = 0, d_mean = 0;
@@ -417,13 +417,13 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 		prt_printf(out, "mean:\t");
 		bch2_pr_time_units_aligned(out, d_mean);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_mean(stats->duration_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_median(stats->duration_stats_weighted));
 		prt_newline(out);
 
 		prt_printf(out, "stddev:\t");
 		bch2_pr_time_units_aligned(out, d_stddev);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_stddev(stats->duration_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_stddev(stats->duration_stats_weighted));
 		prt_newline(out);
 	}
 
@@ -435,13 +435,13 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 		prt_printf(out, "mean:\t");
 		bch2_pr_time_units_aligned(out, f_mean);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_mean(stats->freq_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_median(stats->freq_stats_weighted));
 		prt_newline(out);
 
 		prt_printf(out, "stddev:\t");
 		bch2_pr_time_units_aligned(out, f_stddev);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_stddev(stats->freq_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_stddev(stats->freq_stats_weighted));
 		prt_newline(out);
 	}
 
@@ -466,7 +466,7 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 	}
 }
 
-void bch2_time_stats_json_to_text(struct printbuf *out, struct bch2_time_stats *stats,
+__cold void bch2_time_stats_json_to_text(struct printbuf *out, struct bch2_time_stats *stats,
 				  const char *epoch_name, unsigned int flags)
 {
 	char buf[1024];
@@ -576,7 +576,7 @@ void bch2_pd_controller_init(struct bch_pd_controller *pd)
 	pd->backpressure	= 1;
 }
 
-void bch2_pd_controller_debug_to_text(struct printbuf *out, struct bch_pd_controller *pd)
+__cold void bch2_pd_controller_debug_to_text(struct printbuf *out, struct bch_pd_controller *pd)
 {
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 20);
@@ -874,7 +874,7 @@ static const char * const bch2_bio_flag_strs[] = {
 	NULL
 };
 
-void bch2_bio_to_text(struct printbuf *out, struct bio *bio)
+__cold void bch2_bio_to_text(struct printbuf *out, struct bio *bio)
 {
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 24);

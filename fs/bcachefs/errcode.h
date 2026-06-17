@@ -304,6 +304,7 @@
 	x(EINVAL,			remove_with_metadata_missing_unimplemented)\
 	x(EINVAL,			remove_would_lose_data)			\
 	x(EINVAL,			remove_by_backpointer_did_not_terminate)\
+	x(EINVAL,			remove_stripes_did_not_terminate)\
 	x(EINVAL,			no_resize_with_buckets_nouse)		\
 	x(EINVAL,			inode_unpack_error)			\
 	x(EINVAL,			inode_not_unlinked)			\
@@ -499,6 +500,7 @@
 	x(EIO,				sb_not_downgraded)			\
 	x(EIO,				btree_node_write_all_failed)		\
 	x(EIO,				btree_node_read_error)			\
+	x(EIO,				btree_root_error_unset)			\
 	x(EIO,				btree_need_topology_repair)		\
 	x(EIO,				bucket_ref_update)			\
 	x(EIO,				trigger_alloc)				\
@@ -522,6 +524,7 @@
 	x(EIO,				insufficient_journal_devices)		\
 	x(EIO,				device_offline)				\
 	x(EIO,				stripe_create_device_offline)		\
+	x(EROFS,			stripe_create_device_removing)		\
 	x(EIO,				EIO_fault_injected)			\
 	x(EIO,				ec_block_read)				\
 	x(EIO,				ec_block_write)				\

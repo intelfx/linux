@@ -43,6 +43,7 @@
 #include "debug/sysfs.h"
 
 #include "fs/check.h"
+#include "fs/dirent.h"
 #include "fs/inode.h"
 #include "fs/quota.h"
 
@@ -90,8 +91,6 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kent Overstreet <kent.overstreet@gmail.com>");
 MODULE_DESCRIPTION("bcachefs filesystem");
-
-typedef DARRAY(struct bch_sb_handle) bch_sb_handles;
 
 #define x(n)		#n,
 const char * const bch2_fs_flag_strs[] = {
@@ -589,6 +588,9 @@ static int __bch2_fs_read_write(struct bch_fs *c, bool early)
 	scoped_guard(spinlock, &c->journal.lock) {
 		set_bit(JOURNAL_need_flush_write, &c->journal.flags);
 		set_bit(JOURNAL_running, &c->journal.flags);
+#ifdef CONFIG_BCACHEFS_DEBUG
+		c->journal.stop_thread = NULL;
+#endif
 		bch2_journal_space_available(&c->journal);
 	}
 
@@ -757,8 +759,6 @@ int bch2_fs_stop(struct bch_fs *c)
 		/* btree prefetch might have kicked off reads in the background: */
 		bch2_btree_flush_all_reads(c);
 
-		for_each_member_device(c, ca)
-			cancel_work_sync(&ca->io_error_work);
 
 		cancel_work_sync(&c->read_only_work);
 
@@ -857,7 +857,7 @@ int bch2_fs_init_rw(struct bch_fs *c)
 
 	try(bch2_fs_btree_init_rw(c));
 	try(bch2_fs_io_write_init(c));
-	try(bch2_fs_journal_init(&c->journal));
+	try(bch2_fs_journal_init_rw(&c->journal));
 	try(bch2_fs_vfs_init_rw(c));
 	try(bch2_journal_reclaim_start(&c->journal));
 	try(bch2_btree_write_buffer_start(c));
@@ -1282,6 +1282,8 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 
 	c->block_bits		= ilog2(block_sectors(c));
 
+	bch2_fs_inode_shard_cpu_init(c);
+
 	if (bch2_fs_init_fault("fs_alloc")) {
 		prt_printf(out, "fs_alloc fault injected\n");
 		return -EFAULT;
@@ -1313,6 +1315,7 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	try(bch2_fs_errors_init(c));
 	try(bch2_fs_encryption_init(c));
 	try(bch2_fs_io_read_init(c));
+	try(bch2_fs_journal_init(&c->journal));
 	try(bch2_fs_snapshots_init(c));
 	try(bch2_fs_vfs_init(c));
 	try(bch2_io_clock_init(&c->io_clock[READ]));
@@ -1391,7 +1394,7 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts *opts,
 	return c;
 }
 
-void bch2_missing_devs_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_missing_devs_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	prt_printf(out, "Missing devices\n");
 	for_each_member_device(c, ca)
@@ -1589,13 +1592,54 @@ static inline int sb_cmp(struct bch_sb *l, struct bch_sb *r)
 		cmp_int(le64_to_cpu(l->write_time), le64_to_cpu(r->write_time));
 }
 
+int bch2_sbs_filter_dead(bch_sb_handles *sbs, struct bch_opts *opts, struct printbuf *out)
+{
+	struct bch_sb_handle *best = NULL;
+	int ret;
+
+	for (size_t i = 0; i < sbs->nr; i++)
+		if (!best || sb_cmp(sbs->data[i].sb, best->sb) > 0)
+			best = &sbs->data[i];
+
+	if (!best)
+		return 0;
+
+	for (size_t i = sbs->nr; i; --i) {
+		struct bch_sb_handle *sb = &sbs->data[i - 1];
+
+		ret = bch2_dev_in_fs(best, sb, opts);
+
+		if (ret == -BCH_ERR_device_has_been_removed ||
+		    ret == -BCH_ERR_device_splitbrain) {
+			if (out)
+				prt_printf(out, "Not using device %s: %s\n",
+					   sb->sb_name, bch2_err_str(ret));
+			bch2_free_super(sb);
+			array_remove_item(sbs->data, sbs->nr, i - 1);
+			best -= best > sb;
+			continue;
+		}
+
+		if (ret) {
+			if (out)
+				prt_printf(out, "Cannot mount with device %s: %s\n",
+					   sb->sb_name, bch2_err_str(ret));
+			return ret;
+		}
+	}
+
+	if (best != sbs->data)
+		swap(*best, sbs->data[0]);
+
+	return 0;
+}
+
 static struct bch_fs *__bch2_fs_open(darray_const_str *devices,
 				     struct bch_opts *opts,
 				     struct printbuf *out)
 {
 	bch_sb_handles sbs = {};
 	struct bch_fs *c = NULL;
-	struct bch_sb_handle *best = NULL;
 	int ret = 0;
 
 	if (!try_module_get(THIS_MODULE))
@@ -1620,32 +1664,11 @@ static struct bch_fs *__bch2_fs_open(darray_const_str *devices,
 		BUG_ON(darray_push(&sbs, sb));
 	}
 
-	darray_for_each(sbs, sb)
-		if (!best || sb_cmp(sb->sb, best->sb) > 0)
-			best = sb;
+	ret = bch2_sbs_filter_dead(&sbs, opts, out);
+	if (ret)
+		goto err;
 
-	darray_for_each_reverse(sbs, sb) {
-		ret = bch2_dev_in_fs(best, sb, opts);
-
-		if (ret == -BCH_ERR_device_has_been_removed ||
-		    ret == -BCH_ERR_device_splitbrain) {
-			prt_printf(out, "Not using device %s: %s\n",
-				   sb->sb_name, bch2_err_str(ret));
-			bch2_free_super(sb);
-			darray_remove_item(&sbs, sb);
-			best -= best > sb;
-			ret = 0;
-			continue;
-		}
-
-		if (ret) {
-			prt_printf(out, "Cannot mount with device %s: %s\n",
-				   sb->sb_name, bch2_err_str(ret));
-			goto err;
-		}
-	}
-
-	c = bch2_fs_alloc(best->sb, opts, &sbs, out);
+	c = bch2_fs_alloc(sbs.data->sb, opts, &sbs, out);
 	ret = PTR_ERR_OR_ZERO(c);
 	if (ret)
 		goto err;
@@ -1712,6 +1735,8 @@ static void bcachefs_exit(void)
 static int __init bcachefs_init(void)
 {
 	bch2_bkey_pack_test();
+
+	bch2_dirent_init();
 
 	kobject_init(&bcachefs_kobj, &bcachefs_ktype);
 

@@ -34,7 +34,7 @@ static inline struct bbpos bp_to_bbpos(struct bch_backpointer bp)
 }
 
 int bch2_backpointer_validate(struct bch_fs *c, struct bkey_s_c k,
-			      struct bkey_validate_context from)
+			      const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_backpointer bp = bkey_s_c_to_backpointer(k);
 	int ret = 0;
@@ -51,7 +51,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_backpointer_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+__cold void bch2_backpointer_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_backpointer bp = bkey_s_c_to_backpointer(k);
 
@@ -844,14 +844,6 @@ static int check_btree_root_to_backpointers(struct btree_trans *trans,
 	return check_extent_to_backpointers(trans, s, btree_id, b->c.level + 1, k);
 }
 
-static u64 system_totalram_bytes(void)
-{
-	struct sysinfo i;
-	si_meminfo(&i);
-
-	return i.totalram * i.mem_unit;
-}
-
 static u64 mem_may_pin_bytes(struct bch_fs *c)
 {
 	return div_u64(system_totalram_bytes() * c->opts.fsck_memory_usage_percent, 100);
@@ -919,7 +911,7 @@ static int bch2_check_extents_to_backpointers_pass(struct btree_trans *trans,
 	for (enum btree_id btree_id = 0;
 	     btree_id < btree_id_nr_alive(c);
 	     btree_id++) {
-		int level, depth = btree_type_has_data_ptrs(btree_id) ? 0 : 1;
+		int level = 0, depth = btree_type_has_data_ptrs(btree_id) ? 0 : 1;
 
 		try(commit_do(trans, &res.r, NULL,
 			      BCH_TRANS_COMMIT_no_enospc,

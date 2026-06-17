@@ -20,6 +20,7 @@
 
 #include "data/copygc.h"
 #include "data/ec/trigger.h"
+#include "data/extents.h"
 #include "data/reconcile/trigger.h"
 #include "data/reflink.h"
 
@@ -36,8 +37,21 @@
 
 void bch2_dev_usage_read_fast(struct bch_dev *ca, struct bch_dev_usage *usage)
 {
-	for (unsigned i = 0; i < BCH_DATA_NR; i++)
-		usage->buckets[i] = percpu_u64_get(&ca->usage->d[i].buckets);
+	memset(usage, 0, sizeof(*usage));
+
+	/*
+	 * One sweep over the cpus instead of BCH_DATA_NR of them: each cpu's
+	 * usage is read once while its cache lines are hot. (We don't use the
+	 * full-struct reader here to avoid a bch_dev_usage_full sized temporary
+	 * on the allocation hot path.)
+	 */
+	int cpu;
+	for_each_possible_cpu(cpu) {
+		struct bch_dev_usage_full *u = per_cpu_ptr(ca->usage, cpu);
+
+		for (unsigned i = 0; i < BCH_DATA_NR; i++)
+			usage->buckets[i] += u->d[i].buckets;
+	}
 }
 
 void bch2_dev_usage_full_read_fast(struct bch_dev *ca, struct bch_dev_usage_full *usage)
@@ -55,16 +69,19 @@ static u64 reserve_factor(u64 r)
 static struct bch_fs_usage_short
 __bch2_fs_usage_read_short(struct bch_fs *c)
 {
+	/*
+	 * Sum the whole per-cpu struct in a single sweep (one cache line per
+	 * cpu); sectors_available is summed into the throwaway and ignored.
+	 */
+	struct bch_fs_capacity_pcpu b = {};
+	acc_u64s_percpu((u64 *) &b, (u64 __percpu *) c->capacity.pcpu,
+			sizeof(b) / sizeof(u64));
+
 	struct bch_fs_usage_short ret;
-	u64 data, reserved;
+	ret.capacity	= c->capacity.capacity - b.usage.hidden;
 
-	ret.capacity = c->capacity.capacity -
-		percpu_u64_get(&c->capacity.usage->hidden);
-
-	data		= percpu_u64_get(&c->capacity.usage->data) +
-		percpu_u64_get(&c->capacity.usage->btree);
-	reserved	= percpu_u64_get(&c->capacity.usage->reserved) +
-		percpu_u64_get(&c->capacity.pcpu->online_reserved);
+	u64 data	= b.usage.data + b.usage.btree;
+	u64 reserved	= b.usage.reserved + b.online_reserved;
 
 	ret.used	= min(ret.capacity, data + reserve_factor(reserved));
 	ret.free	= ret.capacity - ret.used;
@@ -79,7 +96,7 @@ bch2_fs_usage_read_short(struct bch_fs *c)
 	return __bch2_fs_usage_read_short(c);
 }
 
-void bch2_dev_usage_to_text(struct printbuf *out,
+__cold void bch2_dev_usage_to_text(struct printbuf *out,
 			    struct bch_dev *ca,
 			    struct bch_dev_usage_full *usage)
 {
@@ -393,6 +410,9 @@ int bch2_check_fix_ptrs(struct btree_trans *trans, struct btree_iter *iter,
 		try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(new),
 						  BKEY_EXTENT_U64s_MAX,
 						  SET_NEEDS_RECONCILE_opt_change, 0));
+		if (bkey_is_btree_ptr(&new->k))
+			trans->extra_disk_res = (u64) bch2_bkey_nr_ptrs_allocated(c, bkey_i_to_s_c(new)) *
+				btree_sectors(c);
 
 		if (!level) {
 			try(bch2_trans_update(trans, iter, new,
@@ -540,11 +560,13 @@ int bch2_bucket_ref_update(struct btree_trans *trans, struct bch_dev *ca,
 void bch2_trans_account_disk_usage_change(struct btree_trans *trans)
 {
 	struct bch_fs *c = trans->c;
+
+	lockdep_assert_held(&c->capacity.mark_lock);
+
 	u64 disk_res_sectors = trans->disk_res ? trans->disk_res->sectors : 0;
 	static int warned_disk_usage = 0;
 	bool warn = false;
 
-	guard(percpu_read)(&c->capacity.mark_lock);
 	struct bch_fs_usage_base *src = &trans->fs_usage_delta;
 
 	s64 added = src->btree + src->data + src->reserved;
@@ -573,7 +595,7 @@ void bch2_trans_account_disk_usage_change(struct btree_trans *trans)
 	}
 
 	scoped_guard(preempt) {
-		struct bch_fs_usage_base *dst = this_cpu_ptr(c->capacity.usage);
+		struct bch_fs_usage_base *dst = &this_cpu_ptr(c->capacity.pcpu)->usage;
 		acc_u64s((u64 *) dst, (u64 *) src, sizeof(*src) / sizeof(u64));
 	}
 

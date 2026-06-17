@@ -2,6 +2,7 @@
 
 #include "bcachefs.h"
 
+#include "alloc/accounting.h"
 #include "alloc/background.h"
 #include "alloc/backpointers.h"
 #include "alloc/buckets.h"
@@ -107,11 +108,11 @@ static struct reconcile_scan reconcile_scan_decode(struct bch_fs *c, u64 v)
 	if (v == RECONCILE_SCAN_COOKIE_fs)
 		return (struct reconcile_scan) { .type = RECONCILE_SCAN_fs};
 
-	bch_err(c, "unknown realance scan cookie %llu", v);
+	bch_err(c, "unknown reconcile scan cookie %llu", v);
 	return (struct reconcile_scan) { .type = RECONCILE_SCAN_fs};
 }
 
-static void reconcile_scan_to_text(struct printbuf *out,
+static __cold void reconcile_scan_to_text(struct printbuf *out,
 				   struct bch_fs *c, struct reconcile_scan s)
 {
 	prt_str(out, bch2_rebalance_scan_strs[s.type]);
@@ -1289,12 +1290,28 @@ static int do_reconcile_scan(struct moving_context *ctxt,
 	return 0;
 }
 
+static bool reconcile_hipri_work_pending(struct bch_fs *c)
+{
+	struct disk_accounting_pos pos;
+	disk_accounting_key_init(pos, reconcile_work,
+				 BCH_RECONCILE_ACCOUNTING_high_priority);
+
+	u64 v[2];
+	bch2_accounting_mem_read(c, disk_accounting_pos_to_bpos(&pos), v, ARRAY_SIZE(v));
+	return v[0] || v[1];
+}
+
 static void reconcile_wait(struct bch_fs *c)
 {
 	struct bch_fs_reconcile *r = &c->reconcile;
 	struct io_clock *clock = &c->io_clock[WRITE];
 	u64 now = atomic64_read(&clock->now);
 	u64 min_member_capacity = bch2_min_rw_member_capacity(c);
+
+	if (reconcile_hipri_work_pending(c)) {
+		cond_resched();
+		return;
+	}
 
 	if (min_member_capacity == U64_MAX)
 		min_member_capacity = 128 * 2048;
@@ -1797,7 +1814,7 @@ static int bch2_reconcile_thread(void *arg)
 	return 0;
 }
 
-void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	printbuf_tabstop_push(out, 24);
 	printbuf_tabstop_push(out, 12);
@@ -1882,7 +1899,7 @@ void bch2_reconcile_status_to_text(struct printbuf *out, struct bch_fs *c)
 	}
 }
 
-void bch2_reconcile_scan_pending_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_reconcile_scan_pending_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	/*
 	 * No multithreaded btree access until BCH_FS_may_go_rw and we're no

@@ -652,7 +652,7 @@ static unsigned bch_alloc_v1_val_u64s(const struct bch_alloc *a)
 }
 
 int bch2_alloc_v1_validate(struct bch_fs *c, struct bkey_s_c k,
-			   struct bkey_validate_context from)
+			   const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_alloc a = bkey_s_c_to_alloc(k);
 	int ret = 0;
@@ -667,7 +667,7 @@ fsck_err:
 }
 
 int bch2_alloc_v2_validate(struct bch_fs *c, struct bkey_s_c k,
-			   struct bkey_validate_context from)
+			   const struct bkey_validate_context *from)
 {
 	struct bkey_alloc_unpacked u;
 	int ret = 0;
@@ -680,7 +680,7 @@ fsck_err:
 }
 
 int bch2_alloc_v3_validate(struct bch_fs *c, struct bkey_s_c k,
-			   struct bkey_validate_context from)
+			   const struct bkey_validate_context *from)
 {
 	struct bkey_alloc_unpacked u;
 	int ret = 0;
@@ -693,7 +693,7 @@ fsck_err:
 }
 
 int bch2_alloc_v4_validate(struct bch_fs *c, struct bkey_s_c k,
-			   struct bkey_validate_context from)
+			   const struct bkey_validate_context *from)
 {
 	struct bch_alloc_v4 a;
 	int ret = 0;
@@ -784,7 +784,7 @@ void bch2_alloc_v4_swab(const struct bch_fs *c, struct bkey_s k)
 	a->stripe_sectors	= swab32(a->stripe_sectors);
 }
 
-static inline void __bch2_alloc_v4_to_text(struct printbuf *out, struct bch_fs *c,
+static inline __cold void __bch2_alloc_v4_to_text(struct printbuf *out, struct bch_fs *c,
 					   struct bkey_s_c k,
 					   const struct bch_alloc_v4 *a)
 {
@@ -816,7 +816,7 @@ static inline void __bch2_alloc_v4_to_text(struct printbuf *out, struct bch_fs *
 	bch2_dev_put(ca);
 }
 
-void bch2_alloc_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+__cold void bch2_alloc_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bch_alloc_v4 _a;
 	const struct bch_alloc_v4 *a = bch2_alloc_to_v4(k, &_a);
@@ -824,7 +824,7 @@ void bch2_alloc_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c 
 	__bch2_alloc_v4_to_text(out, c, k, a);
 }
 
-void bch2_alloc_v4_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+__cold void bch2_alloc_v4_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	__bch2_alloc_v4_to_text(out, c, k, bkey_s_c_to_alloc_v4(k).v);
 }
@@ -952,7 +952,7 @@ struct bkey_i_alloc_v4 *bch2_trans_start_alloc_update(struct btree_trans *trans,
 }
 
 int bch2_bucket_gens_validate(struct bch_fs *c, struct bkey_s_c k,
-			      struct bkey_validate_context from)
+			      const struct bkey_validate_context *from)
 {
 	int ret = 0;
 
@@ -964,7 +964,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_bucket_gens_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+__cold void bch2_bucket_gens_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_bucket_gens g = bkey_s_c_to_bucket_gens(k);
 	unsigned i;
@@ -1705,7 +1705,7 @@ void bch2_dev_allocator_remove(struct bch_fs *c, struct bch_dev *ca)
 	 * journal_res_get() can block waiting for free space in the journal -
 	 * it needs to notice there may not be devices to allocate from anymore:
 	 */
-	wake_up(&c->journal.wait);
+	closure_wake_up(&c->journal.async_wait);
 
 	/* Now wait for any in flight writes: */
 
@@ -1736,18 +1736,15 @@ void bch2_fs_capacity_exit(struct bch_fs *c)
 	}
 
 	free_percpu(c->capacity.pcpu);
-	free_percpu(c->capacity.usage);
 }
 
 int bch2_fs_capacity_init(struct bch_fs *c)
 {
 	spin_lock_init(&c->capacity.sectors_available_lock);
-	seqcount_init(&c->capacity.usage_lock);
 
 	try(percpu_init_rwsem(&c->capacity.mark_lock));
 
-	if (!(c->capacity.pcpu = alloc_percpu(struct bch_fs_capacity_pcpu)) ||
-	    !(c->capacity.usage = alloc_percpu(struct bch_fs_usage_base)))
+	if (!(c->capacity.pcpu = alloc_percpu(struct bch_fs_capacity_pcpu)))
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	return 0;

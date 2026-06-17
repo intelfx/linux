@@ -12,6 +12,7 @@
 #include "journal/sb.h"
 #include "journal/seq_blacklist.h"
 
+#include "fs/inode.h"
 #include "fs/quota.h"
 
 #include "init/dev.h"
@@ -182,7 +183,7 @@ static const struct bch2_metadata_version bch2_metadata_versions[] = {
 #undef x
 };
 
-void bch2_version_to_text(struct printbuf *out, enum bcachefs_metadata_version v)
+__cold void bch2_version_to_text(struct printbuf *out, enum bcachefs_metadata_version v)
 {
 	const char *str = "(unknown version)";
 
@@ -610,8 +611,17 @@ int bch2_sb_validate(struct bch_sb *sb, struct bch_opts *opts, u64 read_offset,
 		SET_BCH_SB_MULTI_DEVICE(sb, true);
 
 #ifdef __KERNEL__
-	if (!BCH_SB_SHARD_INUMS_NBITS(sb))
-		SET_BCH_SB_SHARD_INUMS_NBITS(sb, ilog2(roundup_pow_of_two(num_online_cpus())));
+	if (!BCH_SB_SHARD_INUMS_NBITS(sb)) {
+		u64 fs_size = 0;
+		for (unsigned i = 0; i < bch2_sb_nr_devices(sb); i++) {
+			struct bch_member m = bch2_sb_member_get(sb, i);
+			fs_size += le64_to_cpu(m.nbuckets) * le16_to_cpu(m.bucket_size);
+		}
+
+		SET_BCH_SB_SHARD_INUMS_NBITS(sb,
+			bch2_shard_inode_numbers_bits_default(num_online_cpus(),
+				fs_size << 9, (u64) BCH_SB_BTREE_NODE_SIZE(sb) << 9));
+	}
 #endif
 
 	/* validate layout */
@@ -1504,7 +1514,7 @@ static int bch2_sb_ext_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_ext_to_text(struct printbuf *out,
+static __cold void bch2_sb_ext_to_text(struct printbuf *out,
 				struct bch_fs *c,
 				struct bch_sb *sb,
 				struct bch_sb_field *f)
@@ -1573,7 +1583,7 @@ static int bch2_sb_field_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return ret;
 }
 
-void __bch2_sb_field_to_text(struct printbuf *out,
+__cold void __bch2_sb_field_to_text(struct printbuf *out,
 			     struct bch_fs *c,
 			     struct bch_sb *sb,
 			     struct bch_sb_field *f)
@@ -1588,7 +1598,7 @@ void __bch2_sb_field_to_text(struct printbuf *out,
 		ops->to_text(out, c, sb, f);
 }
 
-void bch2_sb_field_to_text(struct printbuf *out,
+__cold void bch2_sb_field_to_text(struct printbuf *out,
 			   struct bch_fs *c,
 			   struct bch_sb *sb,
 			   struct bch_sb_field *f)
@@ -1606,7 +1616,7 @@ void bch2_sb_field_to_text(struct printbuf *out,
 	__bch2_sb_field_to_text(out, c, sb, f);
 }
 
-void bch2_sb_layout_to_text(struct printbuf *out, struct bch_sb_layout *l)
+__cold void bch2_sb_layout_to_text(struct printbuf *out, struct bch_sb_layout *l)
 {
 	prt_printf(out, "Type:                    %u", l->layout_type);
 	prt_newline(out);
@@ -1627,7 +1637,7 @@ void bch2_sb_layout_to_text(struct printbuf *out, struct bch_sb_layout *l)
 	prt_newline(out);
 }
 
-void bch2_sb_to_text(struct printbuf *out,
+__cold void bch2_sb_to_text(struct printbuf *out,
 		     struct bch_fs *c, struct bch_sb *sb,
 		     bool print_layout, unsigned fields)
 {

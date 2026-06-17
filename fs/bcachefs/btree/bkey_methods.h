@@ -22,7 +22,7 @@ extern const struct bkey_ops bch2_bkey_null_ops;
  */
 struct bkey_ops {
 	int		(*key_validate)(struct bch_fs *c, struct bkey_s_c k,
-					struct bkey_validate_context from);
+					const struct bkey_validate_context *from);
 	void		(*val_to_text)(struct printbuf *, struct bch_fs *,
 				       struct bkey_s_c);
 	void		(*swab)(const struct bch_fs *, struct bkey_s);
@@ -48,14 +48,11 @@ static inline const struct bkey_ops *bch2_bkey_type_ops(enum bch_bkey_type type)
 }
 
 int bch2_bkey_val_validate(struct bch_fs *, struct bkey_s_c,
-			   struct bkey_validate_context);
+			   const struct bkey_validate_context *);
 int __bch2_bkey_validate(struct bch_fs *, struct bkey_s_c,
-			 struct bkey_validate_context);
+			 const struct bkey_validate_context *);
 int bch2_bkey_validate(struct bch_fs *, struct bkey_s_c,
-		       struct bkey_validate_context);
-int bch2_bkey_in_btree_node(struct bch_fs *, struct btree *, struct bkey_s_c,
-			    struct bkey_validate_context from);
-
+		       const struct bkey_validate_context *);
 void bch2_bpos_to_text(struct printbuf *, struct bpos);
 void bch2_bkey_to_text(struct printbuf *, const struct bkey *);
 void bch2_val_to_text(struct printbuf *, struct bch_fs *,
@@ -144,7 +141,7 @@ static inline void bch2_bkey_compat(const struct bch_fs *c, unsigned level, enum
 			       struct bkey_format *f,
 			       struct bkey_packed *k)
 {
-	if (version < bcachefs_metadata_version_current ||
+	if (unlikely(version < bcachefs_metadata_version_current) ||
 	    big_endian != CPU_BIG_ENDIAN ||
 	    IS_ENABLED(CONFIG_BCACHEFS_DEBUG))
 		__bch2_bkey_compat(c, level, btree_id, version,

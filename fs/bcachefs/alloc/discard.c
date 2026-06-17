@@ -32,7 +32,7 @@ static bool dev_bucket_nouse(struct bch_fs *c, struct bpos bucket)
 
 #define DEV_IN_FLIGHT_MAX		4
 
-static void __discard_state_to_text(struct printbuf *out, struct discard_state *s)
+static __cold void __discard_state_to_text(struct printbuf *out, struct discard_state *s)
 {
 	printbuf_tabstop_push(out, 32);
 	prt_printf(out, "seen:\t%llu\n",		s->seen);
@@ -47,7 +47,7 @@ static void __discard_state_to_text(struct printbuf *out, struct discard_state *
 	prt_printf(out, "committed:\t%llu\n",		s->committed);
 }
 
-void bch2_discards_to_text(struct printbuf *out, struct bch_fs *c, struct discard_state *s)
+__cold void bch2_discards_to_text(struct printbuf *out, struct bch_fs *c, struct discard_state *s)
 {
 	__discard_state_to_text(out, s);
 
@@ -313,6 +313,16 @@ static int bch2_discard_one_bucket(struct btree_trans *trans,
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 
 	struct bkey_i_alloc_v4 *a = errptr_try(bch2_alloc_to_v4_mut(trans, k));
+
+	if (fastpath && a->v.journal_seq_empty) {
+		/*
+		 * Queued to the discard fastpath (skip journal commit), but
+		 * multiple nonempty <-> need_discard transitions mean it wasn't
+		 * actually a fastpath discard
+		 */
+		s->need_journal_commit += bucket_size;
+		return 0;
+	}
 
 	if (a->v.journal_seq_empty > c->journal.flushed_seq_ondisk) {
 		s->need_journal_commit += bucket_size;
@@ -652,7 +662,7 @@ put_ref:
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_discard_fast);
 }
 
-void bch2_fast_discards_to_text(struct printbuf *out, struct bch_dev *ca)
+__cold void bch2_fast_discards_to_text(struct printbuf *out, struct bch_dev *ca)
 {
 	prt_printf(out, "%zu\n", ca->discard_fast.nr);
 }
@@ -778,7 +788,8 @@ static struct bkey_s_c next_lru_key(struct btree_trans *trans, struct btree_iter
 				    struct bch_dev *ca, bool *wrapped)
 {
 	while (true) {
-		struct bkey_s_c k = bch2_btree_iter_peek_max(iter, lru_pos(ca->dev_idx, U64_MAX, LRU_TIME_MAX));
+		struct bpos end = lru_pos(ca->dev_idx, U64_MAX, LRU_TIME_MAX);
+		struct bkey_s_c k = bch2_btree_iter_peek_max(iter, &end);
 		if (k.k || *wrapped)
 			return k;
 

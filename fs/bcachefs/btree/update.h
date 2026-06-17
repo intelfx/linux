@@ -177,20 +177,9 @@ void *__bch2_trans_subbuf_alloc(struct btree_trans *,
 				struct btree_trans_subbuf *,
 				unsigned, ulong);
 
-static inline int
-bch2_trans_subbuf_reserve(struct btree_trans *trans,
-			  struct btree_trans_subbuf *buf,
-			  unsigned u64s)
-{
-	if (buf->u64s + u64s > buf->size) {
-		unsigned old_u64s = buf->u64s;
-		void *p = __bch2_trans_subbuf_alloc(trans, buf, u64s, _THIS_IP_);
-		if (IS_ERR(p))
-			return PTR_ERR(p);
-		buf->u64s = old_u64s;
-	}
-	return 0;
-}
+int bch2_trans_subbuf_reserve(struct btree_trans *,
+			      struct btree_trans_subbuf *,
+			      unsigned);
 
 static inline void *
 bch2_trans_subbuf_alloc_ip(struct btree_trans *trans,
@@ -334,6 +323,20 @@ static inline int bch2_trans_commit(struct btree_trans *trans,
 {
 	trans->disk_res		= disk_res;
 	trans->journal_seq	= journal_seq;
+	trans->flush		= NULL;
+
+	return __bch2_trans_commit(trans, flags);
+}
+
+static inline int bch2_trans_commit_flush(struct btree_trans *trans,
+					  struct disk_reservation *disk_res,
+					  u64 *journal_seq,
+					  struct closure *flush,
+					  enum bch_trans_commit_flags flags)
+{
+	trans->disk_res		= disk_res;
+	trans->journal_seq	= journal_seq;
+	trans->flush		= flush;
 
 	return __bch2_trans_commit(trans, flags);
 }

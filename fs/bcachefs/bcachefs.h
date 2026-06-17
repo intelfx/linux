@@ -330,6 +330,10 @@ BCH_DEBUG_PARAMS_ALL()
 	  "scan btree key cache for eviction")				\
 	x(btree_write_buffer_flush,					\
 	  "Flush btree write buffer to btree")				\
+	x(btree_write_buffer_flush_shard_sched_delay,			\
+	  "Per-shard: queued to start of execution (workqueue scheduling delay)") \
+	x(btree_write_buffer_flush_shard_work,				\
+	  "Per-shard: actual flush work duration (wb_flush_sorted_range)") \
 	x(btree_gc,							\
 	  "GC pass recalculating oldest generation numbers")		\
 	x(data_write,							\
@@ -368,8 +372,20 @@ BCH_DEBUG_PARAMS_ALL()
 	x(blocked_journal_max_open,					\
 	  "Blocked: too many journal entries open, "			\
 	  "not yet closed for writing")					\
-	x(blocked_journal_write_buffer_flush,				\
+	x(blocked_journal_blocked,					\
 	  "Blocked: waiting for write buffer flush")			\
+	x(blocked_journal_full,						\
+	  "Blocked: writer hit journal_full (no room in current "	\
+	  "entry, reclaim not keeping up)")				\
+	x(blocked_journal_pin_full,					\
+	  "Blocked: writer hit journal_pin_full (pin fifo full, "	\
+	  "btree node / key cache flushers not keeping up)")		\
+	x(blocked_journal_buf_enomem,					\
+	  "Blocked: writer hit journal_buf_enomem (preallocated "	\
+	  "data buffer not topped up)")					\
+	x(blocked_journal_stuck,					\
+	  "Blocked: writer hit journal_stuck (10s timeout fired "	\
+	  "in slowpath wait)")						\
 	x(blocked_key_cache_flush,					\
 	  "Blocked: waiting for key cache flush")			\
 	x(blocked_allocate,						\
@@ -414,6 +430,7 @@ struct io_count {
 	x(journal_read)					\
 	x(fs_journal_alloc)				\
 	x(fs_resize_on_mount)				\
+	x(fs_mi_field_upgrades)				\
 	x(sb_journal_sort)				\
 	x(btree_node_read)				\
 	x(btree_node_read_all_replicas)			\
@@ -468,11 +485,32 @@ struct bch_dev {
 	struct percpu_ref	ref;
 #endif
 	struct completion	ref_completion;
+	/*
+	 * ref_outer keeps the bch_dev allocation alive - nothing more.
+	 * Unlike ca->ref, holding it does NOT mean the device is still a
+	 * member of the filesystem.
+	 *
+	 * ca->ref drains inside the device removal protocol, under
+	 * state_lock - so a ca->ref holder must never block on state_lock.
+	 * Contexts that do block on state_lock with a device in hand (work
+	 * items, ioctl lookups) hold ref_outer instead, and recheck
+	 * ca->removing under the lock before touching member state.
+	 */
+	refcount_t		ref_outer;
+	struct completion	ref_outer_completion;
 	struct enumerated_ref	io_ref[2];
 
 	struct bch_fs		*fs;
 
 	u8			dev_idx;
+	/*
+	 * Device is being removed and its alloc info and stripe pointers are
+	 * about to be deleted: new references must not be created. Checked by
+	 * __ec_stripe_create(), which may hold pre-invalidation copies of
+	 * stripe pointers; set by bch2_dev_remove() before the data drop,
+	 * cleared if removal fails.
+	 */
+	bool			removing;
 	/*
 	 * Cached version of this device's member info from superblock
 	 * Committed by bch2_write_super() -> bch_fs_mi_update()
@@ -624,6 +662,7 @@ struct journal_seq_blacklist_table {
 	x(invalidate)							\
 	x(delete_dead_snapshots)					\
 	x(gc_gens)							\
+	x(presplit_shard_boundaries)					\
 	x(snapshot_delete_pagecache)					\
 	x(sysfs)							\
 	x(btree_write_buffer)						\
@@ -700,6 +739,13 @@ struct bch_fs {
 	struct unicode_map	*cf_encoding;
 
 	unsigned short		block_bits;	/* ilog2(block_size) */
+
+	/*
+	 * shard → preferred CPU mapping for wake_cpu hinting from
+	 * bch2_trans_begin(): each shard's worth of btree-node working set
+	 * gravitates to a fixed CPU's L1/L2.
+	 */
+	u16			inode_shard_cpu[256];
 
 	struct delayed_work	maybe_schedule_btree_bitmap_gc;
 
@@ -804,13 +850,7 @@ struct bch_fs {
 
 /* Error tracking: */
 
-static inline int __bch2_err_throw(struct bch_fs *c, int err)
-{
-	BUG_ON(err >= 0);
-	this_cpu_inc(c->counters.now[BCH_COUNTER_error_throw]);
-	trace_error_throw(c, bch2_err_str(err));
-	return err;
-}
+int __bch2_err_throw(struct bch_fs *, int);
 
 #define bch_err_throw(_c, _err) __bch2_err_throw(_c, -BCH_ERR_##_err)
 

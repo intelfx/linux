@@ -21,7 +21,7 @@
 
 int bch2_extent_reconcile_validate(struct bch_fs *c,
 				   struct bkey_s_c k,
-				   struct bkey_validate_context from,
+				   const struct bkey_validate_context *from,
 				   const struct bch_extent_reconcile *r)
 {
 	int ret = 0;
@@ -71,7 +71,7 @@ enum reconcile_work_id bch2_bkey_reconcile_work_id(const struct bch_fs *c, struc
 	}
 }
 
-void bch2_extent_rebalance_v1_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_extent_rebalance_v1_to_text(struct printbuf *out, struct bch_fs *c,
 				      const struct bch_extent_rebalance_v1 *r)
 {
 	prt_printf(out, "replicas=%u", r->data_replicas);
@@ -120,7 +120,7 @@ void bch2_extent_rebalance_v1_to_text(struct printbuf *out, struct bch_fs *c,
 	}
 }
 
-void bch2_extent_reconcile_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_extent_reconcile_to_text(struct printbuf *out, struct bch_fs *c,
 				      const struct bch_extent_reconcile *r)
 {
 	prt_str(out, "need_rb=");
@@ -1025,9 +1025,9 @@ int bch2_bkey_get_io_opts(struct btree_trans *trans,
 							   SPOS(0, k.k->p.inode, U32_MAX),
 							   BTREE_ITER_all_snapshots, inode_k, ({
 					struct bch_inode_unpacked inode;
-					if (!bkey_is_inode(inode_k.k) ||
-					    bch2_inode_unpack(inode_k, &inode))
+					if (!bkey_is_inode(inode_k.k))
 						continue;
+					bch2_inode_unpack(c, inode_k, &inode);
 
 					struct snapshot_io_opts_entry e = { .snapshot = inode_k.k->p.snapshot };
 					bch2_inode_opts_get_inode(c, &inode, &e.io_opts);

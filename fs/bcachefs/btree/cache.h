@@ -35,8 +35,7 @@ struct btree *bch2_btree_node_mem_alloc(struct btree_trans *, bool);
 struct btree *bch2_btree_node_get(struct btree_trans *, struct btree_path *,
 				  const struct bkey_i *, unsigned,
 				  enum six_lock_type,
-				  enum btree_iter_update_trigger_flags,
-				  unsigned long);
+				  enum btree_iter_update_trigger_flags);
 
 struct btree *bch2_btree_node_get_noiter(struct btree_trans *, const struct bkey_i *,
 					 enum btree_id, unsigned, bool);
@@ -168,6 +167,23 @@ static inline unsigned btree_blocks(const struct bch_fs *c)
 }
 
 #define BTREE_WRITE_IO_LIMIT(c)			64
+
+static inline bool bch2_btree_cache_should_throttle(struct bch_fs *c)
+{
+	return READ_ONCE(c->btree.cache.should_throttle);
+}
+
+static inline void bch2_btree_cache_update_throttle(struct bch_fs *c)
+{
+	struct bch_fs_btree_cache *bc = &c->btree.cache;
+	size_t live	= btree_cache_nr_live(bc);
+	size_t dirty	= btree_cache_nr_dirty(bc);
+	bool throttle	= atomic_long_read(&bc->nr_in_flight_inner) > BTREE_WRITE_IO_LIMIT(c) ||
+			  (live && dirty > live * 3 / 4);
+
+	if (throttle != READ_ONCE(bc->should_throttle))
+		WRITE_ONCE(bc->should_throttle, throttle);
+}
 
 #define BTREE_SPLIT_THRESHOLD(c)		(btree_max_u64s(c) * 3 / 4)
 

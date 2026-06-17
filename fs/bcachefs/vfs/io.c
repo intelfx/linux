@@ -353,7 +353,7 @@ static int __bch2_truncate_folio(struct bch_inode_info *inode,
 			goto unlock;
 	}
 
-	ret = bch2_folio_set(c, inode_inum(inode), &folio, 1);
+	ret = bch2_folio_set(c, inode, &folio, 1);
 	if (ret)
 		goto unlock;
 
@@ -532,6 +532,9 @@ int bchfs_truncate(struct mnt_idmap *idmap,
 
 	ret = bch2_truncate(c, inode_inum(inode), iattr->ia_size, &i_sectors_delta);
 	bch2_i_sectors_acct(c, inode, NULL, i_sectors_delta);
+
+	scoped_guard(spinlock, &inode->ei_reserved_lock)
+		inode->ei_reserved_start = inode->ei_reserved_end = 0;
 
 	if (unlikely(ret)) {
 		/*
@@ -851,6 +854,9 @@ long bch2_fallocate_dispatch(struct file *file, int mode,
 		ret = bchfs_fcollapse_finsert(inode, offset, len, false);
 	else
 		ret = bch_err_throw(c, unsupported_fallocate_mode);
+
+	scoped_guard(spinlock, &inode->ei_reserved_lock)
+		inode->ei_reserved_start = inode->ei_reserved_end = 0;
 err:
 	inode_unlock(&inode->v);
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_fallocate);
@@ -958,6 +964,12 @@ static loff_t bch2_remap_file_range_errcode(struct file *file_src, loff_t pos_sr
 	ret = min((u64) ret << 9, (u64) len);
 
 	bch2_i_sectors_acct(c, dst, &quota_res, i_sectors_delta);
+
+	scoped_guard(spinlock, &dst->ei_reserved_lock)
+		dst->ei_reserved_start = dst->ei_reserved_end = 0;
+
+	scoped_guard(spinlock, &src->ei_reserved_lock)
+		src->ei_reserved_start = src->ei_reserved_end = 0;
 
 	scoped_guard(spinlock, &dst->v.i_lock)
 		if (pos_dst + ret > dst->v.i_size)

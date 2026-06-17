@@ -23,7 +23,7 @@ struct find_btree_nodes_worker {
 	struct bch_dev		*ca;
 };
 
-void bch2_found_btree_node_to_text(struct printbuf *out, struct bch_fs *c, const struct found_btree_node *n)
+__cold void bch2_found_btree_node_to_text(struct printbuf *out, struct bch_fs *c, const struct found_btree_node *n)
 {
 	bch2_btree_id_level_to_text(out, n->btree_id, n->level);
 	prt_printf(out, " seq=%u journal_seq=%llu cookie=%llx ",
@@ -46,7 +46,7 @@ void bch2_found_btree_node_to_text(struct printbuf *out, struct bch_fs *c, const
 	}
 }
 
-static void found_btree_nodes_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void found_btree_nodes_to_text(struct printbuf *out, struct bch_fs *c,
 				      darray_found_btree_node nodes)
 {
 	guard(printbuf_indent)(out);
@@ -566,12 +566,12 @@ int bch2_get_scanned_nodes(struct bch_fs *c, enum btree_id btree,
 
 		found_btree_node_to_key(&tmp.k, &n);
 
-		BUG_ON(bch2_bkey_validate(c, bkey_i_to_s_c(&tmp.k),
-					  (struct bkey_validate_context) {
-						.from	= BKEY_VALIDATE_btree_node,
-						.level	= level + 1,
-						.btree	= btree,
-					  }));
+		struct bkey_validate_context from = {
+			.from	= BKEY_VALIDATE_btree_node,
+			.level	= level + 1,
+			.btree	= btree,
+		};
+		BUG_ON(bch2_bkey_validate(c, bkey_i_to_s_c(&tmp.k), &from));
 
 		if (!*nodes_found) {
 			prt_printf(out, "recovering from btree node scan at ");

@@ -105,15 +105,30 @@ struct btree {
 
 	/*
 	 * Per-field unpack constants, derived from @format at node init.
-	 * Lets __bch2_bkey_unpack_key skip the per-field state machine in
-	 * the common case where the field can be extracted by a single
-	 * aligned load + shift + mask.
+	 * Extract each field with:
+	 *
+	 *   field = (load_8_unaligned(bytes + byte_offset) >> (64 - bits))
+	 *           + field_offset
+	 *
+	 * Load position chosen so the field ends at the top of the loaded
+	 * value (load_offset + 8 == byte after field's MSB byte); junk from
+	 * earlier-in-memory fields lands in the low bits and shifts off.
+	 *
+	 * byte_offset is signed: for a field near the start of @in, the
+	 * load can need to start before @in. The byte(s) before @in are
+	 * always valid memory in the callers we care about (bset payload
+	 * after the bset header, or other bkeys in the same bset).
+	 *
+	 * Only handles formats where every field's MSB sits at a byte
+	 * boundary (field_msb_bit % 8 == 7). bch2_bkey_format_done()
+	 * rounds fields up to byte width when there are spare bits, so
+	 * this is the common case. Formats too tight to byte-align take
+	 * the slow path via byte_aligned_fields = false.
 	 */
+	bool				byte_aligned_fields;
 	struct bkey_unpack_field {
-		u8	byte_offset;	/* byte within packed key */
-		u8	load_size;	/* 1, 2, 4, 8; 0 = no bits in packed; 0xff = fallback */
-		u8	shift;		/* shift right after load */
-		u8	_pad;
+		s8	byte_offset;
+		u8	shift_right;	/* 64 - bits, or 64 if field has no bits in packed */
 	} unpack[BKEY_NR_FIELDS];
 
 	struct btree_node	*data;
@@ -272,6 +287,7 @@ struct bch_fs_btree_cache {
 	atomic_long_t		nr_in_flight;
 	atomic_long_t		nr_in_flight_inner;
 	struct closure_waitlist	nr_in_flight_wait;
+	bool			should_throttle ____cacheline_aligned_in_smp;
 
 	/* shrinker stats */
 	size_t			nr_freed;
@@ -412,12 +428,6 @@ struct btree_trigger_op {
 
 /* Btree paths and iterators: */
 
-enum btree_path_uptodate {
-	BTREE_ITER_UPTODATE		= 0,
-	BTREE_ITER_NEED_RELOCK		= 1,
-	BTREE_ITER_NEED_TRAVERSE	= 2,
-};
-
 #if defined(CONFIG_BCACHEFS_LOCK_TIME_STATS) || defined(CONFIG_BCACHEFS_DEBUG)
 #define TRACK_PATH_ALLOCATED
 #endif
@@ -432,10 +442,9 @@ struct btree_path {
 	/* btree_iter_copy starts here: */
 	struct bpos		pos;
 
-	enum btree_id		btree_id:5;
+	enum btree_id		btree_id:7;
 	bool			cached:1;
 	bool			preserve:1;
-	enum btree_path_uptodate uptodate:2;
 	/*
 	 * When true, failing to relock this path will cause the transaction to
 	 * restart:
@@ -649,10 +658,12 @@ struct btree_trans {
 	btree_path_idx_t	nr_paths;
 	btree_path_idx_t	nr_paths_max;
 	btree_path_idx_t	nr_updates;
+	s16			shard_cpu;
 	u8			fn_idx;
 	u8			lock_must_abort;
 	bool			lock_may_not_fail:1;
 	bool			locked:1;
+	bool			migrate_disabled:1;
 	bool			write_locked:1;
 	bool			srcu_held:1;
 	bool			btree_cache_cannibalize_locked:1;
@@ -712,6 +723,7 @@ struct btree_trans {
 	struct journal_res	journal_res;
 	u64			*journal_seq;
 	struct disk_reservation *disk_res;
+	struct closure		*flush;
 
 	struct bch_fs_usage_base fs_usage_delta;
 

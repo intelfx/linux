@@ -161,6 +161,30 @@ struct btree *__bch2_btree_node_alloc_replacement(struct btree_update *,
 int bch2_btree_split_leaf(struct btree_trans *, btree_path_idx_t,
 			  unsigned, enum bch_trans_commit_flags);
 
+struct bpos bch2_btree_node_shard_pivot(struct bch_fs *, const struct btree *);
+
+static inline int btree_node_shard(struct bch_fs *c, struct btree *b)
+{
+	if (!c->opts.shard_inode_numbers_bits)
+		return -1;
+
+	u64 field;
+	switch (b->c.btree_id) {
+	case BTREE_ID_inodes:
+		field = b->key.k.p.offset;
+		break;
+	case BTREE_ID_extents:
+	case BTREE_ID_dirents:
+	case BTREE_ID_xattrs:
+		field = b->key.k.p.inode;
+		break;
+	default:
+		return -1;
+	}
+
+	return (field << 1) >> (64 - c->opts.shard_inode_numbers_bits);
+}
+
 int bch2_btree_increase_depth(struct btree_trans *, btree_path_idx_t, unsigned);
 
 int __bch2_foreground_maybe_merge(struct btree_trans *, btree_path_idx_t,
@@ -337,25 +361,7 @@ static inline struct btree_node_entry *want_new_bset(struct bch_fs *c, struct bt
 	return NULL;
 }
 
-static inline void push_whiteout(struct btree *b, struct bpos pos)
-{
-	struct bkey_packed k;
-
-	BUG_ON(bch2_btree_keys_u64s_remaining(b) < BKEY_U64s);
-	EBUG_ON(btree_node_just_written(b));
-
-	if (!bkey_pack_pos(&k, pos, b)) {
-		struct bkey *u = (void *) &k;
-
-		bkey_init(u);
-		u->p = pos;
-	}
-
-	k.needs_whiteout = true;
-
-	b->whiteout_u64s += k.u64s;
-	bkey_p_copy(unwritten_whiteouts_start(b), &k);
-}
+void bch2_push_whiteout(struct btree *b, struct bpos pos);
 
 /*
  * write lock must be held on @b (else the dirty bset that we were going to
@@ -397,7 +403,7 @@ static inline bool bch2_btree_node_compact_fits(struct bch_fs *c,
 
 static inline bool btree_bkey_and_val_eq(struct bkey_s_c l, struct bkey_s_c r)
 {
-	if (!bkey_fields_eq(*l.k, *r.k))
+	if (!bkey_fields_eq(l.k, r.k))
 		return false;
 
 	/* Skip mem_ptr field */

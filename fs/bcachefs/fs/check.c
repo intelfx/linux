@@ -115,7 +115,6 @@ static struct qstr lostfound_str = QSTR("lost+found");
 static int create_lostfound(struct btree_trans *trans, u32 snapshot_tree,
 			    subvol_inum root_inum,
 			    struct bch_inode_unpacked *root_inode,
-			    struct bch_hash_info *root_hash_info,
 			    struct bch_inode_unpacked *lostfound)
 {
 	struct bch_fs *c = trans->c;
@@ -134,7 +133,6 @@ static int create_lostfound(struct btree_trans *trans, u32 snapshot_tree,
 	prt_printf(&msg.m, "/lost+found in subvol %llu snapshot %u", root_inum.subvol, snapshot);
 
 	u64 now = bch2_current_time(c);
-	u64 cpu = raw_smp_processor_id();
 
 	bch2_inode_init_early(c, lostfound);
 	bch2_inode_init_late(c, lostfound, now, 0, 0, S_IFDIR|0700, 0, root_inode);
@@ -144,14 +142,14 @@ static int create_lostfound(struct btree_trans *trans, u32 snapshot_tree,
 	root_inode->bi_nlink++;
 
 	CLASS(btree_iter_uninit, lostfound_iter)(trans);
-	try(bch2_inode_create(trans, &lostfound_iter, lostfound, snapshot, cpu,
+	try(bch2_inode_create(trans, &lostfound_iter, lostfound, snapshot,
 			      inode_opt_get(c, root_inode, inodes_32bit)));
 
 	bch2_btree_iter_set_snapshot(&lostfound_iter, snapshot);
 	try(bch2_btree_iter_traverse(&lostfound_iter));
 
 	try(bch2_dirent_create_snapshot(trans,
-				0, root_inode->bi_inum, snapshot, root_hash_info,
+				0, snapshot, root_inode,
 				mode_to_type(lostfound->bi_mode),
 				&lostfound_str,
 				lostfound->bi_inum,
@@ -174,7 +172,7 @@ static int lookup_lostfound(struct btree_trans *trans, u32 snapshot,
 	u32 snapshot_tree = bch2_snapshot_tree(c, snapshot);
 	int ret;
 
-	u32 subvolid;
+	u32 subvolid = 0;
 	ret = find_snapshot_tree_subvol(trans, snapshot_tree, &subvolid);
 	bch_err_msg(c, ret, "finding subvol associated with snapshot tree %u",
 		    bch2_snapshot_tree(c, snapshot));
@@ -219,8 +217,7 @@ static int lookup_lostfound(struct btree_trans *trans, u32 snapshot,
 		 * We always create lost_found in its own transaction; this will
 		 * return a transaction restart:
 		 */
-		ret = create_lostfound(trans, snapshot_tree, root_inum,
-				       &root_inode, &root_hash_info, lostfound);
+		ret = create_lostfound(trans, snapshot_tree, root_inum, &root_inode, lostfound);
 		bch_err_msg(c, ret, "creating lost+found");
 		return ret;
 	}
@@ -345,16 +342,14 @@ int bch2_reattach_inode(struct btree_trans *trans, struct bch_inode_unpacked *in
 
 	try(__bch2_fsck_write_inode(trans, &lostfound));
 
-	struct bch_hash_info dir_hash;
-	try(bch2_hash_info_init(c, &lostfound, &dir_hash));
 	struct qstr name = QSTR(name_buf);
 
 	inode->bi_dir = lostfound.bi_inum;
 
 	ret = bch2_dirent_create_snapshot(trans,
-				inode->bi_parent_subvol, lostfound.bi_inum,
+				inode->bi_parent_subvol,
 				dirent_snapshot,
-				&dir_hash,
+				&lostfound,
 				inode_d_type(inode),
 				&name,
 				inode->bi_subvol ?: inode->bi_inum,
@@ -399,7 +394,7 @@ int bch2_reattach_inode(struct btree_trans *trans, struct bch_inode_unpacked *in
 				continue;
 
 			struct bch_inode_unpacked child_inode;
-			try(bch2_inode_unpack(k, &child_inode));
+			bch2_inode_unpack(c, k, &child_inode);
 
 			if (!inode_should_reattach(&child_inode)) {
 				try(maybe_delete_dirent(trans,
@@ -438,14 +433,13 @@ static int reconstruct_subvol(struct btree_trans *trans, u32 snapshotid, u32 sub
 	if (!inum) {
 		CLASS(btree_iter_uninit, inode_iter)(trans);
 		struct bch_inode_unpacked new_inode;
-		u64 cpu = raw_smp_processor_id();
 
 		bch2_inode_init_early(c, &new_inode);
 		bch2_inode_init_late(c, &new_inode, bch2_current_time(c), 0, 0, S_IFDIR|0755, 0, NULL);
 
 		new_inode.bi_subvol = subvolid;
 
-		try(bch2_inode_create(trans, &inode_iter, &new_inode, snapshotid, cpu, false));
+		try(bch2_inode_create(trans, &inode_iter, &new_inode, snapshotid, false));
 		try(bch2_btree_iter_traverse(&inode_iter));
 		try(bch2_inode_write(trans, &inode_iter, &new_inode));
 
@@ -623,12 +617,12 @@ static int add_inode(struct bch_fs *c, struct inode_walker *w,
 
 	struct inode_walker_entry *n = &darray_last(w->inodes);
 	if (!n->whiteout) {
-		return bch2_inode_unpack(inode, &n->inode);
+		bch2_inode_unpack(c, inode, &n->inode);
 	} else {
 		n->inode.bi_inum	= inode.k->p.offset;
 		n->inode.bi_snapshot	= inode.k->p.snapshot;
-		return 0;
 	}
+	return 0;
 }
 
 static int get_inodes_all_snapshots(struct btree_trans *trans,
@@ -906,7 +900,7 @@ static int check_inode(struct btree_trans *trans,
 	if (!bkey_is_inode(k.k))
 		return 0;
 
-	try(bch2_inode_unpack(k, &u));
+	bch2_inode_unpack(c, k, &u);
 	BUG_ON(u.bi_snapshot != k.k->p.snapshot);
 
 	if (snapshot_root->bi_inum != u.bi_inum ||
@@ -1130,7 +1124,7 @@ static int find_oldest_inode_needs_reattach(struct btree_trans *trans,
 			break;
 
 		struct bch_inode_unpacked parent_inode;
-		try(bch2_inode_unpack(k, &parent_inode));
+		bch2_inode_unpack(trans->c, k, &parent_inode);
 
 		if (!inode_should_reattach(&parent_inode))
 			break;
@@ -1152,7 +1146,7 @@ static int check_unreachable_inode(struct btree_trans *trans,
 		return 0;
 
 	struct bch_inode_unpacked inode;
-	try(bch2_inode_unpack(k, &inode));
+	bch2_inode_unpack(trans->c, k, &inode);
 
 	if (!inode_should_reattach(&inode))
 		return 0;

@@ -5,6 +5,7 @@
 #include "alloc/buckets.h"
 
 #include "btree/bkey_buf.h"
+#include "btree/bkey_cmp.h"
 #include "btree/bkey_methods.h"
 #include "btree/cache.h"
 #include "btree/iter.h"
@@ -45,7 +46,7 @@ module_param_named(btree_read_corrupt_device, bch2_btree_read_corrupt_device, in
 MODULE_PARM_DESC(btree_read_corrupt_ratio, "");
 #endif
 
-static void bch2_btree_node_header_to_text(struct printbuf *out, struct btree_node *bn)
+static __cold void bch2_btree_node_header_to_text(struct printbuf *out, struct btree_node *bn)
 {
 	bch2_btree_id_level_to_text(out, BTREE_NODE_ID(bn), BTREE_NODE_LEVEL(bn));
 	prt_printf(out, " seq %llx %llu\n", bn->keys.seq, BTREE_NODE_SEQ(bn));
@@ -395,28 +396,23 @@ static int btree_node_bkey_val_validate(struct bch_fs *c, struct btree *b,
 					struct bkey_s_c k,
 					enum bch_validate_flags flags)
 {
-	return bch2_bkey_val_validate(c, k, (struct bkey_validate_context) {
-		.from	= BKEY_VALIDATE_btree_node,
-		.level	= b->c.level,
-		.btree	= b->c.btree_id,
-		.flags	= flags
-	});
-}
-
-static int bset_key_validate(struct bch_fs *c, struct btree *b,
-			     struct bkey_s_c k,
-			     bool updated_range,
-			     enum bch_validate_flags flags)
-{
-	struct bkey_validate_context from = (struct bkey_validate_context) {
+	struct bkey_validate_context from = {
 		.from	= BKEY_VALIDATE_btree_node,
 		.level	= b->c.level,
 		.btree	= b->c.btree_id,
 		.flags	= flags,
 	};
+	return bch2_bkey_val_validate(c, k, &from);
+}
+
+static int bset_key_validate(struct bch_fs *c, struct btree *b,
+			     struct bkey_s_c k,
+			     bool updated_range,
+			     const struct bkey_validate_context *from)
+{
 	return __bch2_bkey_validate(c, k, from) ?:
 		(!updated_range ? bch2_bkey_in_btree_node(c, b, k, from) : 0) ?:
-		(flags & BCH_VALIDATE_write ? btree_node_bkey_val_validate(c, b, k, flags) : 0);
+		(from->flags & BCH_VALIDATE_write ? btree_node_bkey_val_validate(c, b, k, from->flags) : 0);
 }
 
 static bool bkey_packed_valid(struct bch_fs *c, struct btree *b,
@@ -433,20 +429,20 @@ static bool bkey_packed_valid(struct bch_fs *c, struct btree *b,
 
 	struct bkey tmp;
 	struct bkey_s u = __bkey_disassemble(b, k, &tmp);
-	return !__bch2_bkey_validate(c, u.s_c,
-				     (struct bkey_validate_context) {
-					.from	= BKEY_VALIDATE_btree_node,
-					.level	= b->c.level,
-					.btree	= b->c.btree_id,
-					.flags	= BCH_VALIDATE_silent
-				     });
+	struct bkey_validate_context from = {
+		.from	= BKEY_VALIDATE_btree_node,
+		.level	= b->c.level,
+		.btree	= b->c.btree_id,
+		.flags	= BCH_VALIDATE_silent,
+	};
+	return !__bch2_bkey_validate(c, u.s_c, &from);
 }
 
 static inline int btree_node_read_bkey_cmp(const struct btree *b,
 				const struct bkey_packed *l,
 				const struct bkey_packed *r)
 {
-	return bch2_bkey_cmp_packed(b, l, r)
+	return bch2_bkey_cmp_packed_inlined(b, l, r)
 		?: (int) bkey_deleted(r) - (int) bkey_deleted(l);
 }
 
@@ -462,6 +458,12 @@ int bch2_validate_bset_keys(struct bch_fs *c,
 	CLASS(printbuf, buf)();
 	bool updated_range = b->key.k.type == KEY_TYPE_btree_ptr_v2 &&
 		BTREE_PTR_RANGE_UPDATED(&bkey_i_to_btree_ptr_v2(&b->key)->v);
+	struct bkey_validate_context from = (struct bkey_validate_context) {
+		.from	= BKEY_VALIDATE_btree_node,
+		.level	= b->c.level,
+		.btree	= b->c.btree_id,
+		.flags	= write,
+	};
 	int ret = 0;
 
 	for (k = i->start;
@@ -502,7 +504,7 @@ int bch2_validate_bset_keys(struct bch_fs *c,
 
 		u = __bkey_disassemble(b, k, &tmp);
 
-		ret = bset_key_validate(c, b, u.s_c, updated_range, write);
+		ret = bset_key_validate(c, b, u.s_c, updated_range, &from);
 		if (unlikely(ret == -BCH_ERR_fsck_delete_bkey))
 			goto drop_this_key;
 		if (unlikely(ret))
@@ -1013,7 +1015,7 @@ static void btree_node_read_endio(struct bio *bio)
 	queue_work(c->btree.read_complete_wq, &rb->work);
 }
 
-void bch2_btree_read_bio_to_text(struct printbuf *out, struct btree_read_bio *rbio)
+__cold void bch2_btree_read_bio_to_text(struct printbuf *out, struct btree_read_bio *rbio)
 {
 	bch2_bio_to_text(out, &rbio->bio);
 }

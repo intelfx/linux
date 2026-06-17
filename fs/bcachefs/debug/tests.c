@@ -5,6 +5,7 @@
 
 #include "alloc/buckets.h"
 
+#include "btree/interior.h"
 #include "btree/update.h"
 
 #include "journal/reclaim.h"
@@ -340,10 +341,10 @@ static int test_peek_end(struct bch_fs *c, u64 nr)
 	CLASS(btree_iter, iter)(trans, BTREE_ID_xattrs, SPOS(0, 0, U32_MAX), 0);
 
 	struct bkey_s_c k;
-	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, POS(0, U64_MAX))));
+	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, &POS(0, U64_MAX))));
 	BUG_ON(k.k);
 
-	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, POS(0, U64_MAX))));
+	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, &POS(0, U64_MAX))));
 	BUG_ON(k.k);
 
 	return 0;
@@ -357,10 +358,10 @@ static int test_peek_end_extents(struct bch_fs *c, u64 nr)
 	CLASS(btree_iter, iter)(trans, BTREE_ID_extents, SPOS(0, 0, U32_MAX), 0);
 
 	struct bkey_s_c k;
-	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, POS(0, U64_MAX))));
+	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, &POS(0, U64_MAX))));
 	BUG_ON(k.k);
 
-	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, POS(0, U64_MAX))));
+	lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, &POS(0, U64_MAX))));
 	BUG_ON(k.k);
 
 	return 0;
@@ -465,7 +466,7 @@ static int test_extent_create_dup(struct bch_fs *c, u64 inum)
 	CLASS(disk_reservation, res)(c);
 
 	int ret = commit_do(trans, &res.r, NULL, 0, ({
-		struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(&iter, POS(inum, U64_MAX)));
+		struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(&iter, &POS(inum, U64_MAX)));
 
 		int _ret = !k.k || k.k->type != KEY_TYPE_extent ? -ENOENT : 0;
 		if (!_ret) {
@@ -492,6 +493,59 @@ static int test_extent_create_dup(struct bch_fs *c, u64 inum)
 	return ret;
 }
 
+static int test_btree_ptr_stale_dirty_key(struct btree_trans *trans, struct bkey_s_c k)
+{
+	struct bch_fs *c = trans->c;
+	CLASS(btree_iter, iter)(trans, BTREE_ID_extents, k.k->p, BTREE_ITER_intent);
+
+	try(bch2_btree_iter_traverse(&iter));
+
+	struct btree_path *path = btree_iter_path(trans, &iter);
+	struct btree *b = path_l(path)->b;
+	if (!b || b->c.level)
+		return -ENOENT;
+
+	struct bkey_i *update = errptr_try(bch2_bkey_make_mut_noupdate(trans, bkey_i_to_s_c(&b->key)));
+	struct bkey_ptrs ptrs = bch2_bkey_ptrs(bkey_i_to_s(update));
+
+	bkey_for_each_ptr(ptrs, ptr) {
+		if (ptr->cached || ptr->dev == BCH_SB_MEMBER_INVALID)
+			continue;
+
+		bch_info(c, "%s: injecting stale dirty btree ptr at %llu:%llu:%u dev %u bucket %llu gen %u -> %u",
+			 __func__, k.k->p.inode, k.k->p.offset, k.k->p.snapshot,
+			 ptr->dev, (u64) ptr->offset, ptr->gen, ptr->gen - 1);
+
+		ptr->gen--;
+		return bch2_btree_node_update_key(trans, &iter, b, update,
+						  BCH_TRANS_COMMIT_no_enospc, true) ?: 1;
+	}
+
+	return 0;
+}
+
+static int test_btree_ptr_stale_dirty_level(struct btree_trans *trans,
+					    unsigned level)
+{
+	CLASS(btree_node_iter, iter)(trans, BTREE_ID_extents, POS_MIN, 0, level, BTREE_ITER_intent);
+
+	struct bkey_s_c k = bch2_btree_iter_peek_max_type(&iter, SPOS_MAX, 0);
+	int ret = bkey_err(k);
+	if (ret)
+		return ret;
+	if (!k.k || !bkey_is_btree_ptr(k.k))
+		return -ENOENT;
+
+	ret = test_btree_ptr_stale_dirty_key(trans, k);
+	return ret <= 0 ? ret ?: -ENOENT : 0;
+}
+
+static int test_btree_ptr_stale_dirty(struct bch_fs *c, u64 nr)
+{
+	CLASS(btree_trans, trans)(c);
+	return lockrestart_do(trans, test_btree_ptr_stale_dirty_level(trans, 1));
+}
+
 /* snapshot unit tests */
 
 /* Test skipping over keys in unrelated snapshots: */
@@ -507,7 +561,7 @@ static int test_snapshot_filter(struct bch_fs *c, u32 snapid_lo, u32 snapid_hi)
 	CLASS(btree_iter, iter)(trans, BTREE_ID_xattrs, SPOS(0, 0, snapid_lo), 0);
 
 	struct bkey_s_c k;
-	int ret = lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, POS(0, U64_MAX))));
+	int ret = lockrestart_do(trans, bkey_err(k = bch2_btree_iter_peek_max(&iter, &POS(0, U64_MAX))));
 
 	BUG_ON(k.k->p.snapshot != U32_MAX);
 
@@ -652,7 +706,7 @@ static int __do_delete(struct btree_trans *trans, struct bpos pos)
 {
 	CLASS(btree_iter, iter)(trans, BTREE_ID_xattrs, pos,
 				BTREE_ITER_intent);
-	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(&iter, POS(0, U64_MAX)));
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(&iter, &POS(0, U64_MAX)));
 
 	if (!k.k)
 		return 0;
@@ -816,6 +870,7 @@ int bch2_btree_perf_test(struct bch_fs *c, const char *testname,
 	perf_test(test_extent_overwrite_all);
 	perf_test(test_extent_create_overlapping);
 	perf_test(test_extent_create_dup);
+	perf_test(test_btree_ptr_stale_dirty);
 
 	perf_test(test_snapshots);
 

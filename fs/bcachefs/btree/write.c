@@ -6,6 +6,8 @@
 #include "btree/sort.h"
 #include "btree/write.h"
 
+#include "fs/inode.h"
+
 #include "data/reconcile/trigger.h"
 #include "data/write.h"
 
@@ -127,6 +129,9 @@ static void btree_node_write_work(struct work_struct *work)
 	struct btree *b		= wbio->wbio.bio.bi_private;
 
 	CLASS(btree_trans, trans)(c);
+	int shard = btree_node_shard(c, b);
+	if (shard >= 0)
+		trans->shard_cpu = c->inode_shard_cpu[shard];
 
 	/*
 	 * btree_node_write_update_key commits through the journal; on a dead
@@ -222,25 +227,33 @@ static void btree_node_write_endio(struct bio *bio)
 		wb->data);
 
 	atomic_long_dec(&c->btree.cache.nr_in_flight_inner);
+	bch2_btree_cache_update_throttle(c);
 	closure_wake_up(&c->btree.cache.nr_in_flight_wait);
 
 	clear_btree_node_write_in_flight_inner(b);
 	smp_mb__after_atomic();
 	wake_up_bit(&b->flags, BTREE_NODE_write_in_flight_inner);
 	INIT_WORK(&wb->work, btree_node_write_work);
-	queue_work(c->btree.write_complete_wq, &wb->work);
+#ifdef __KERNEL__
+	int shard = btree_node_shard(c, b);
+	if (shard >= 0)
+		queue_work_on(c->inode_shard_cpu[shard],
+			      c->btree.write_complete_wq, &wb->work);
+	else
+#endif
+		queue_work(c->btree.write_complete_wq, &wb->work);
 }
 
 static int validate_bset_for_write(struct bch_fs *c, struct btree *b,
 				   struct bset *i)
 {
-	int ret = bch2_bkey_validate(c, bkey_i_to_s_c(&b->key),
-				     (struct bkey_validate_context) {
-					.from	= BKEY_VALIDATE_btree_node,
-					.level	= b->c.level + 1,
-					.btree	= b->c.btree_id,
-					.flags	= BCH_VALIDATE_write,
-				     });
+	struct bkey_validate_context from = {
+		.from	= BKEY_VALIDATE_btree_node,
+		.level	= b->c.level + 1,
+		.btree	= b->c.btree_id,
+		.flags	= BCH_VALIDATE_write,
+	};
+	int ret = bch2_bkey_validate(c, bkey_i_to_s_c(&b->key), &from);
 	if (ret) {
 		bch2_fs_inconsistent(c, "invalid btree node key before write");
 		return ret;
@@ -544,6 +557,7 @@ do_write:
 	async_object_list_add(c, btree_write_bio, wbio, &wbio->list_idx);
 
 	atomic_long_inc(&c->btree.cache.nr_in_flight_inner);
+	bch2_btree_cache_update_throttle(c);
 
 	/*
 	 * Queue the bio on the trans — no block layer work while we hold
@@ -834,7 +848,7 @@ static const char * const bch2_btree_write_types[] = {
 	NULL
 };
 
-void bch2_btree_write_stats_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_btree_write_stats_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	printbuf_tabstop_push(out, 20);
 	printbuf_tabstop_push(out, 10);
