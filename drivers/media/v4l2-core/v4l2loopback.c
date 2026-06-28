@@ -2802,6 +2802,10 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 
 	int nr = -1;
 
+	/* Fix: Ensure buffer count does not exceed the statically allocated array size */
+	if (_max_buffers > MAX_BUFFERS)
+		_max_buffers = MAX_BUFFERS;
+
 	if (conf) {
 		const int output_nr = conf->output_nr;
 #ifdef SPLIT_DEVICES
