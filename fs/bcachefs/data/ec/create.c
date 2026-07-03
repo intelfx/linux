@@ -339,7 +339,7 @@ static int stripe_update_extent(struct btree_trans *trans,
 	ec_ptr->dev	= new_block.dev;
 	ec_ptr->offset	-= old_block.offset;
 	ec_ptr->offset	+= new_block.offset;
-	ec_ptr->gen	= new_block.gen;
+	ec_ptr->generation	= new_block.generation;
 
 	ec_ptr = bch2_bkey_has_device(c, bkey_i_to_s(n), new_block.dev);
 	__extent_entry_insert(c, n,
@@ -495,7 +495,7 @@ int bch2_resume_logged_op_stripe_update(struct btree_trans *trans, struct bkey_i
 	bch2_bkey_buf_init(&old_sk);
 
 	/* Read new stripe */
-	CLASS(btree_iter, new_iter)(trans, BTREE_ID_stripes, POS(0, new_idx), 0);
+	CLASS(btree_iter, new_iter)(trans, BTREE_ID_stripes, POS(0, new_idx), BTREE_ITER_cached);
 	struct bkey_s_c new_k = bkey_try(bch2_btree_iter_peek_slot(&new_iter));
 
 	if (new_k.k->type != KEY_TYPE_stripe) {
@@ -507,7 +507,7 @@ int bch2_resume_logged_op_stripe_update(struct btree_trans *trans, struct bkey_i
 
 	/* Read old stripe (may be same as new, or may be gone) */
 	if (old_idx && old_idx != new_idx) {
-		CLASS(btree_iter, old_iter)(trans, BTREE_ID_stripes, POS(0, old_idx), 0);
+		CLASS(btree_iter, old_iter)(trans, BTREE_ID_stripes, POS(0, old_idx), BTREE_ITER_cached);
 		struct bkey_s_c old_k = bkey_try(bch2_btree_iter_peek_slot(&old_iter));
 
 		if (old_k.k->type == KEY_TYPE_stripe)
@@ -1523,8 +1523,13 @@ __cold void bch2_new_stripes_to_text(struct printbuf *out, struct bch_fs *c)
 	struct ec_stripe_head *h;
 	struct ec_stripe_new *s;
 
+	unsigned long limit = (totalram_pages() << PAGE_SHIFT) / 100 *
+		c->opts.ec_stripe_buf_limit;
+
 	prt_printf(out, "stripe buf memory: ");
 	prt_human_readable_u64(out, c->ec.stripe_buf_bytes);
+	prt_char(out, '/');
+	prt_human_readable_u64(out, limit);
 	prt_newline(out);
 
 	scoped_guard(mutex, &c->ec.stripe_head_lock)

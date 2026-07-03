@@ -1476,9 +1476,13 @@ int bch2_btree_path_traverse_one(struct btree_trans *trans,
 		struct btree_path *linked;
 		unsigned iter;
 
-		trans_for_each_path_with_node(trans, path_l(path)->b, linked, iter)
+		trans_for_each_path_with_node(trans, path_l(path)->b, linked, iter) {
+			if (!btree_path_pos_in_node(linked, path_l(path)->b))
+				continue;
+
 			for (unsigned j = path->level + 1; j < max_level; j++)
 				linked->l[j] = path->l[j];
+		}
 	}
 
 out_uptodate:
@@ -3200,24 +3204,32 @@ struct bkey_s_c bch2_btree_iter_peek_slot(struct btree_iter *iter)
 
 	if ((iter->flags & BTREE_ITER_cached) ||
 	    !(iter->flags & (BTREE_ITER_is_extents|BTREE_ITER_filter_snapshots))) {
-		k = bkey_s_c_null;
-
-		if (unlikely(trans->nr_updates)) {
-			bch2_btree_trans_peek_slot_updates(trans, iter, &k);
-			if (k.k)
-				goto out;
-		}
-
-		if (unlikely(iter->flags & BTREE_ITER_with_journal) &&
-		    (k = btree_trans_peek_slot_journal(trans, iter)).k)
-			goto out;
-
+		/*
+		 * Consult sources in the same order as bch2_btree_iter_peek_max():
+		 * btree, then key cache, then journal, then the transaction's own
+		 * updates - each overlaying the last, so an in-transaction update
+		 * wins. Crucially the key cache is peeked before trans updates, so
+		 * the key_cache_path is established even when we already have an
+		 * update for this key; otherwise a second update to the same cached
+		 * key in one transaction would skip the cache and livelock against
+		 * a dirty cached entry in bch2_trans_update_get_key_cache().
+		 */
 		k = bch2_btree_path_peek_slot(btree_iter_path(trans, iter), &iter->k);
-		if (unlikely(!k.k))
-			goto out;
 
 		if (unlikely(iter->flags & BTREE_ITER_with_key_cache) &&
 		    btree_trans_peek_key_cache(iter, &k))
+			goto out;
+
+		if (unlikely(iter->flags & BTREE_ITER_with_journal)) {
+			struct bkey_s_c j = btree_trans_peek_slot_journal(trans, iter);
+			if (j.k)
+				k = j;
+		}
+
+		if (unlikely(trans->nr_updates))
+			bch2_btree_trans_peek_slot_updates(trans, iter, &k);
+
+		if (unlikely(!k.k))
 			goto out;
 
 		if (unlikely(bkey_extent_whiteout(k.k) &&
@@ -3764,6 +3776,10 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 	if (unlikely(trans->srcu_held &&
 		     time_after(jiffies, trans->srcu_lock_time + msecs_to_jiffies(10))))
 		bch2_trans_unlock_long(trans);
+
+	/* Fresh attempt — re-arm the srcu-held-too-long warning (cleared after
+	 * the unlock_long above has had its chance to fire). */
+	trans->srcu_io_submitted = false;
 
 	if (!trans->restarted)
 		trans->locking_wait.trans_start_time = now;

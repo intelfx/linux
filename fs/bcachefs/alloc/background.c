@@ -422,6 +422,9 @@
  * \texttt{foreground\_target=/dev/sda1}). Internally, both device references
  * and label references resolve to entries in the disk groups superblock field,
  * which maps label strings to device sets.
+ * Disk group entries may be retained after the last device in a label is
+ * removed, because filesystem and per-file target options may still refer to
+ * the label; preserving the entry avoids creating dangling target references.
  *
  * Four target options control where data is placed:
  *
@@ -498,7 +501,7 @@ static const unsigned BCH_ALLOC_V1_FIELD_BYTES[] = {
 
 struct bkey_alloc_unpacked {
 	u64		journal_seq;
-	u8		gen;
+	u8		generation;
 	u8		oldest_gen;
 	u8		data_type;
 	bool		need_discard:1;
@@ -545,7 +548,7 @@ static void bch2_alloc_unpack_v1(struct bkey_alloc_unpacked *out,
 	const void *d = in->data;
 	unsigned idx = 0;
 
-	out->gen = in->gen;
+	out->generation = in->generation;
 
 #define x(_name, _bits) out->_name = alloc_field_v1_get(in, &d, idx++);
 	BCH_ALLOC_FIELDS_V1()
@@ -562,7 +565,7 @@ static int bch2_alloc_unpack_v2(struct bkey_alloc_unpacked *out,
 	int ret;
 	u64 v;
 
-	out->gen	= a.v->gen;
+	out->generation	= a.v->generation;
 	out->oldest_gen	= a.v->oldest_gen;
 	out->data_type	= a.v->data_type;
 
@@ -595,7 +598,7 @@ static int bch2_alloc_unpack_v3(struct bkey_alloc_unpacked *out,
 	int ret;
 	u64 v;
 
-	out->gen	= a.v->gen;
+	out->generation	= a.v->generation;
 	out->oldest_gen	= a.v->oldest_gen;
 	out->data_type	= a.v->data_type;
 	out->need_discard = BCH_ALLOC_V3_NEED_DISCARD(a.v);
@@ -623,7 +626,7 @@ static int bch2_alloc_unpack_v3(struct bkey_alloc_unpacked *out,
 
 static struct bkey_alloc_unpacked bch2_alloc_unpack(struct bkey_s_c k)
 {
-	struct bkey_alloc_unpacked ret = { .gen	= 0 };
+	struct bkey_alloc_unpacked ret = { .generation	= 0 };
 
 	switch (k.k->type) {
 	case KEY_TYPE_alloc:
@@ -748,7 +751,8 @@ int bch2_alloc_v4_validate(struct bch_fs *c, struct bkey_s_c k,
 	case BCH_DATA_user:
 	case BCH_DATA_parity:
 		bkey_fsck_err_on(!a.dirty_sectors &&
-				 !stripe_sectors,
+				 !stripe_sectors &&
+				 !a.stripe_refcount,
 				 c, alloc_key_dirty_sectors_0,
 				 "data_type %s but dirty_sectors==0",
 				 bch2_data_type_str(a.data_type));
@@ -792,7 +796,7 @@ static inline __cold void __bch2_alloc_v4_to_text(struct printbuf *out, struct b
 
 	prt_newline(out);
 
-	prt_printf(out, "gen %u oldest_gen %u data_type ", a->gen, a->oldest_gen);
+	prt_printf(out, "gen %u oldest_gen %u data_type ", a->generation, a->oldest_gen);
 	bch2_prt_data_type(out, a->data_type);
 	prt_newline(out);
 	prt_printf(out, "journal_seq_nonempty %llu\n",	a->journal_seq_nonempty);
@@ -850,7 +854,7 @@ void __bch2_alloc_to_v4(struct bkey_s_c k, struct bch_alloc_v4 *out)
 		*out = (struct bch_alloc_v4) {
 			.journal_seq_nonempty	= u.journal_seq,
 			.flags			= u.need_discard,
-			.gen			= u.gen,
+			.generation			= u.generation,
 			.oldest_gen		= u.oldest_gen,
 			.data_type		= u.data_type,
 			.dirty_sectors		= u.dirty_sectors,
@@ -1004,7 +1008,7 @@ static int bucket_gens_init_iter(struct btree_trans *trans, struct bkey_s_c k,
 	}
 
 	struct bch_alloc_v4 a;
-	g->v.gens[offset] = bch2_alloc_to_v4(k, &a)->gen;
+	g->v.gens[offset] = bch2_alloc_to_v4(k, &a)->generation;
 	return 0;
 }
 
@@ -1086,7 +1090,7 @@ int bch2_alloc_read(struct bch_fs *c)
 			}
 
 			struct bch_alloc_v4 a;
-			*bucket_gen(ca, k.k->p.offset) = bch2_alloc_to_v4(k, &a)->gen;
+			*bucket_gen(ca, k.k->p.offset) = bch2_alloc_to_v4(k, &a)->generation;
 			0;
 		}));
 	}
@@ -1281,6 +1285,15 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 			SET_BCH_ALLOC_V4_NEED_DISCARD(new_a, true);
 		}
 
+		/*
+		 * These are normal-operation invariants; fsck's alloc-info
+		 * repair legitimately re-establishes bucket state from the
+		 * stripes/backpointers and drives these transitions itself
+		 * (e.g. need_discard -> parity when re-marking a stripe's parity
+		 * bucket), so don't WARN during fsck.
+		 */
+		bool in_fsck = test_bit(BCH_FS_in_fsck, &c->flags);
+
 		if (statechange_to(a->data_type == BCH_DATA_free)) {
 			/*
 			 * Legitimate paths to free:
@@ -1290,15 +1303,18 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 			 *     oldest_gen (bucket was empty the whole time;
 			 *     no discard needed)
 			 */
-			WARN_ON(old_a->data_type != BCH_DATA_need_discard &&
+			WARN_ON(!in_fsck &&
+				old_a->data_type != BCH_DATA_need_discard &&
 				old_a->data_type != BCH_DATA_need_gc_gens);
 		}
 
 		if (statechange_from(a->data_type == BCH_DATA_need_discard)) {
 			if (data_type_is_empty(new_a->data_type))
-				WARN_ON(!(op.flags & BTREE_TRIGGER_is_discard));
+				WARN_ON(!in_fsck &&
+					!(op.flags & BTREE_TRIGGER_is_discard));
 			else
-				WARN_ON(!bch2_bucket_is_open_safe(c, op.new.k->p.inode, op.new.k->p.offset));
+				WARN_ON(!in_fsck &&
+					!bch2_bucket_is_open_safe(c, op.new.k->p.inode, op.new.k->p.offset));
 		}
 
 		/*
@@ -1344,10 +1360,10 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 		if (data_type_is_empty(new_a->data_type) &&
 		    BCH_ALLOC_V4_NEED_INC_GEN(new_a) &&
 		    !bch2_bucket_is_open_safe(c, op.new.k->p.inode, op.new.k->p.offset)) {
-			if (new_a->oldest_gen == new_a->gen &&
+			if (new_a->oldest_gen == new_a->generation &&
 			    !bch2_bucket_sectors_total(*new_a))
 				new_a->oldest_gen++;
-			new_a->gen++;
+			new_a->generation++;
 			SET_BCH_ALLOC_V4_NEED_INC_GEN(new_a, false);
 			alloc_data_type_set(new_a, new_a->data_type);
 		}
@@ -1383,8 +1399,8 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 				    alloc_lru_idx_fragmentation(*old_a, ca),
 				    alloc_lru_idx_fragmentation(*new_a, ca)));
 
-		if (old_a->gen != new_a->gen)
-			try(bch2_bucket_gen_update(trans, op.new.k->p, new_a->gen));
+		if (old_a->generation != new_a->generation)
+			try(bch2_bucket_gen_update(trans, op.new.k->p, new_a->generation));
 
 		try(bch2_alloc_key_to_dev_counters(trans, ca, old_a, new_a, op.flags));
 	}
@@ -1402,12 +1418,12 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 			new_a->journal_seq_nonempty = transaction_seq;
 		}
 
-		if (new_a->gen != old_a->gen) {
+		if (new_a->generation != old_a->generation) {
 			guard(rcu)();
 			u8 *gen = bucket_gen(ca, op.new.k->p.offset);
 			if (unlikely(!gen))
 				return inval_bucket_key(trans, op.new.s_c);
-			*gen = new_a->gen;
+			*gen = new_a->generation;
 		}
 
 		if (statechange_to(a->data_type == BCH_DATA_free))
@@ -1466,7 +1482,7 @@ int bch2_trigger_alloc(struct btree_trans *trans, struct btree_trigger_op op)
 		if (unlikely(!g))
 			return inval_bucket_key(trans, op.new.s_c);
 		g->gen_valid	= 1;
-		g->gen		= new_a->gen;
+		g->generation		= new_a->generation;
 	}
 fsck_err:
 	return ret;

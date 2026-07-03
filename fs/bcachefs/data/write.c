@@ -827,13 +827,14 @@ void bch2_bio_free_pages_pool(struct bch_fs *c, struct bio *bio)
 }
 
 static void __bch2_bio_alloc_pages_pool(struct bch_fs *c, struct bio *bio,
-					unsigned bs, size_t size)
+					unsigned bs, size_t size,
+					gfp_t gfp_flags)
 {
 	mutex_lock(&c->bio_bounce_pages_lock);
 
 	while (bio->bi_iter.bi_size < size)
 		bio_add_virt_nofail(bio,
-				    mempool_alloc(&c->bio_bounce_bufs, GFP_NOFS),
+				    mempool_alloc(&c->bio_bounce_bufs, gfp_flags),
 				    BIO_BOUNCE_BUF_POOL_LEN);
 
 	bio->bi_iter.bi_size = min(bio->bi_iter.bi_size, size);
@@ -842,12 +843,13 @@ static void __bch2_bio_alloc_pages_pool(struct bch_fs *c, struct bio *bio,
 }
 
 void bch2_bio_alloc_pages_pool(struct bch_fs *c, struct bio *bio,
-			       unsigned bs, size_t size)
+			       unsigned bs, size_t size,
+			       gfp_t gfp_flags)
 {
-	bch2_bio_alloc_pages(bio, c->opts.block_size, size, GFP_NOFS);
+	bch2_bio_alloc_pages(bio, c->opts.block_size, size, gfp_flags);
 
 	if (bio->bi_iter.bi_size < size)
-		__bch2_bio_alloc_pages_pool(c, bio, bs, size);
+		__bch2_bio_alloc_pages_pool(c, bio, bs, size, gfp_flags);
 }
 
 /* Extent update path: */
@@ -906,8 +908,9 @@ static void bi_sectors_underflow(struct btree_trans *trans,
 	s64 bi_sectors = le64_to_cpu(inode->v.bi_sectors);
 
 	CLASS(bch_log_msg, msg)(trans->c);
-	prt_printf(&msg.m, "inode %llu i_sectors underflow: %lli + %lli < 0",
-		   inode->k.p.offset, bi_sectors, *i_sectors_delta);
+	prt_printf(&msg.m, "inode %llu snapshot %u i_sectors underflow: %lli + %lli < 0",
+		   inode->k.p.offset, inode->k.p.snapshot,
+		   bi_sectors, *i_sectors_delta);
 
 	msg.m.suppress = !bch2_count_fsck_err(trans->c, inode_i_sectors_underflow, &msg.m);
 
@@ -1578,16 +1581,23 @@ static struct bio *bch2_write_bio_alloc(struct bch_fs *c,
 	/*
 	 * We can't use mempool for more than c->sb.encoded_extent_max
 	 * worth of pages, but we'd like to allocate more if we can:
+	 *
+	 * CONFIG_INIT_ON_ALLOC_DEFAULT_ON is frequently on and it forces all
+	 * memory allocations to be zeroed, as a security hardening measure: not
+	 * unreasonable for data structures, but very expensive and pointless
+	 * for data buffers we're just passing through and are about to be
+	 * overwritten with real data:
 	 */
 	bch2_bio_alloc_pages(bio,
 			     c->opts.block_size,
 			     output_available,
-			     GFP_NOFS);
+			     GFP_NOFS|__GFP_SKIP_ZERO);
 
 	unsigned required = min(output_available, c->opts.encoded_extent_max);
 
 	if (unlikely(bio->bi_iter.bi_size < required))
-		__bch2_bio_alloc_pages_pool(c, bio, c->opts.block_size, required);
+		__bch2_bio_alloc_pages_pool(c, bio, c->opts.block_size, required,
+					    GFP_NOFS|__GFP_SKIP_ZERO);
 
 	return bio;
 }
@@ -2180,7 +2190,7 @@ retry:
 
 		bch2_trans_unlock(trans);
 
-		bch2_bkey_nocow_lock(c, ptrs, cas, BUCKET_NOCOW_LOCK_UPDATE);
+		bch2_bkey_nocow_lock(c, trans, ptrs, cas, BUCKET_NOCOW_LOCK_UPDATE);
 
 		/*
 		 * This could be handled better: If we're able to trylock the
@@ -2193,7 +2203,7 @@ retry:
 				struct bch_dev *ca = cas[i++];
 
 				int gen = bucket_gen_get(ca, PTR_BUCKET_NR(ca, ptr));
-				stale = gen < 0 ? gen : gen_after(gen, ptr->gen);
+				stale = gen < 0 ? gen : gen_after(gen, ptr->generation);
 				if (unlikely(stale)) {
 					stale_at = ptr;
 					goto err_bucket_stale;
@@ -2398,10 +2408,16 @@ err:
 		bio->bi_private	= &op->cl;
 		bio->bi_opf |= REQ_OP_WRITE;
 
-		/* If it's an internal move, do FUA writes so the journal
-		 * doesn't have to flush them:
-		 */
 		if (op->flags & BCH_WRITE_move)
+			bio->bi_opf |= REQ_SYNC|REQ_IDLE;
+
+		/*
+		 * Internal moves can be issued FUA, making the journal's cache
+		 * flush a no-op for them. Off by default: the per-write FUA
+		 * regresses background-move throughput, and the journal flushes
+		 * every device on commit regardless, so durability is unchanged.
+		 */
+		if ((op->flags & BCH_WRITE_move) && c->opts.move_writes_fua)
 			bio->bi_opf |= REQ_FUA;
 
 		closure_get(bio->bi_private);

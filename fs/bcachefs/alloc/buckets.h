@@ -142,7 +142,7 @@ static inline struct bucket *PTR_GC_BUCKET(struct bch_dev *ca,
 
 static inline void alloc_to_bucket(struct bucket *dst, struct bch_alloc_v4 src)
 {
-	dst->gen		= src.gen;
+	dst->generation		= src.generation;
 	dst->data_type		= src.data_type;
 	dst->stripe_sectors	= src.stripe_sectors;
 	dst->dirty_sectors	= src.dirty_sectors;
@@ -151,7 +151,7 @@ static inline void alloc_to_bucket(struct bucket *dst, struct bch_alloc_v4 src)
 
 static inline void __bucket_m_to_alloc(struct bch_alloc_v4 *dst, struct bucket src)
 {
-	dst->gen		= src.gen;
+	dst->generation		= src.generation;
 	dst->data_type		= src.data_type;
 	dst->stripe_sectors	= src.stripe_sectors;
 	dst->dirty_sectors	= src.dirty_sectors;
@@ -191,7 +191,7 @@ static inline s64 ptr_disk_sectors(s64 sectors, struct extent_ptr_decoded p)
 static inline int dev_ptr_stale_rcu(struct bch_dev *ca, const struct bch_extent_ptr *ptr)
 {
 	int gen = bucket_gen_get_rcu(ca, PTR_BUCKET_NR(ca, ptr));
-	return gen < 0 ? gen : gen_after(gen, ptr->gen);
+	return gen < 0 ? gen : gen_after(gen, ptr->generation);
 }
 
 /**
@@ -294,12 +294,28 @@ static inline u64 dev_buckets_available(struct bch_dev *ca,
 struct bch_fs_usage_short
 bch2_fs_usage_read_short(struct bch_fs *);
 
-int bch2_bucket_ref_update(struct btree_trans *, struct bch_dev *,
-			   struct bkey_s_c, const struct bch_extent_ptr *,
-			   s64, enum bch_data_type, u8, u8, u32 *);
+int __bch2_bucket_ref_update(struct btree_trans *, struct bch_dev *,
+			     struct bkey_s_c, const struct bch_extent_ptr *,
+			     s64, enum bch_data_type, u8, u8 *, u32 *);
 
-int bch2_check_fix_ptrs(struct btree_trans *, struct btree_iter *,
-			enum btree_id, unsigned, struct bkey_s_c);
+static inline int bch2_bucket_ref_update(struct btree_trans *trans, struct bch_dev *ca,
+					 struct bkey_s_c k,
+					 const struct bch_extent_ptr *ptr,
+					 s64 sectors, enum bch_data_type ptr_data_type,
+					 u8 b_gen, u8 *bucket_data_type,
+					 u32 *bucket_sectors)
+{
+	BUG_ON(!sectors);
+
+	if (unlikely(b_gen != ptr->generation ||
+		     bucket_data_type_mismatch(*bucket_data_type, ptr_data_type) ||
+		     (u64) *bucket_sectors + sectors > U32_MAX))
+		return __bch2_bucket_ref_update(trans, ca, k, ptr, sectors, ptr_data_type,
+						b_gen, bucket_data_type, bucket_sectors);
+
+	*bucket_sectors += sectors;
+	return 0;
+}
 
 int bch2_trigger_extent(struct btree_trans *, struct btree_trigger_op);
 int bch2_trigger_reservation(struct btree_trans *, struct btree_trigger_op);
@@ -383,7 +399,7 @@ bch2_disk_reservation_init(struct bch_fs *c, unsigned nr_replicas)
 		.sectors	= 0,
 #if 0
 		/* not used yet: */
-		.gen		= c->capacity_gen,
+		.generation		= c->capacity_gen,
 #endif
 		.nr_replicas	= nr_replicas,
 	};

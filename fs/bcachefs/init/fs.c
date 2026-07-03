@@ -850,9 +850,9 @@ int bch2_fs_init_rw(struct bch_fs *c)
 	if (!(c->btree_update_wq = alloc_workqueue("bcachefs",
 				WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM|WQ_UNBOUND, 512)) ||
 	    !(c->write_ref_wq = alloc_workqueue("bcachefs_write_ref",
-				WQ_FREEZABLE, 0)) ||
+				WQ_FREEZABLE|WQ_PERCPU, 0)) ||
 	    !(c->promote_wq = alloc_workqueue("bcachefs_promotes",
-				WQ_FREEZABLE, 2)))
+				WQ_FREEZABLE|WQ_PERCPU, 2)))
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	try(bch2_fs_btree_init_rw(c));
@@ -1117,11 +1117,15 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 		}
 	}
 
-#if defined(__KERNEL__) && !defined(CONFIG_RUST)
-	bch_warn(c, "kernel does not have CONFIG_RUST enabled; "
-		 "this will be required for bcachefs in the near future - "
-		 "please alert your distribution or kernel developers "
-		 "if your kernel does not support CONFIG_RUST");
+#ifdef __KERNEL__
+#ifdef CONFIG_BCACHEFS_RUST
+	prt_str(out, "Rust support enabled\n");
+#else
+	prt_str(out,
+		"built without Rust support; this will be required in the near "
+		"future - ensure a compatible Rust toolchain (rustc + bindgen + "
+		"rust-src) is available at module build time\n");
+#endif
 #endif
 
 	bch2_fs_mi_field_upgrades(c);

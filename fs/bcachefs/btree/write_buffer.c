@@ -1017,14 +1017,14 @@ static int btree_write_buffer_flush_seq(struct btree_trans *trans, u64 max_seq,
 	struct bch_fs *c = trans->c;
 	int ret = 0, fetch_from_journal_err;
 
-	bch2_trans_unlock_long(trans);
+	bch2_trans_unlock(trans);
 
 	do {
 		fetch_from_journal_err = fetch_wb_keys_from_journal(c, max_seq);
 
-		closure_wait_event(&c->btree.write_buffer_flush_wait,
-				   !any_wb_pin_le(c, max_seq, did_work, caller) ||
-				   (ret = bch2_journal_error(&c->journal)));
+		trans_wait_event(trans, &c->btree.write_buffer_flush_wait,
+				 !any_wb_pin_le(c, max_seq, did_work, caller) ||
+				 (ret = bch2_journal_error(&c->journal)));
 	} while (!ret && fetch_from_journal_err);
 
 	return ret;
@@ -1139,7 +1139,15 @@ int bch2_btree_write_buffer_maybe_flush(struct btree_trans *trans,
 	    f->nr_flushes * 8 > f->nr_done)
 		return 0;
 
-	if (!bkey_and_val_eq(referring_k, bkey_i_to_s_c(f->last_flushed.k))) {
+	/*
+	 * last_flushed caches "we flushed the write buffer while looking at this
+	 * key, so a re-read is current" - but a repair issued after that flush
+	 * (bch2_btree_bit_mod_buffered etc.) commits a new write buffer entry and
+	 * silently invalidates the cache. Detect that via the commit seq: if
+	 * anything committed since we flushed, the cache is stale, re-flush.
+	 */
+	if (!bkey_and_val_eq(referring_k, bkey_i_to_s_c(f->last_flushed.k)) ||
+	    f->flushed_seq != journal_cur_seq(&c->journal)) {
 		event_inc_trace(c, write_buffer_maybe_flush, buf, ({
 			prt_printf(&buf, "%s\n", trans->fn);
 			bch2_bkey_val_to_text(&buf, c, referring_k);
@@ -1155,11 +1163,13 @@ int bch2_btree_write_buffer_maybe_flush(struct btree_trans *trans,
 			bch2_btree_interior_updates_flush(c);
 		}
 
+		u64 flush_seq = journal_cur_seq(&c->journal);
 		bool did_work = false;
-		try(btree_write_buffer_flush_seq(trans, journal_cur_seq(&c->journal), &did_work,
+		try(btree_write_buffer_flush_seq(trans, flush_seq, &did_work,
 						 WB_FLUSH_maybe));
 
 		bch2_bkey_buf_copy(&f->last_flushed, tmp.k);
+		f->flushed_seq = flush_seq;
 		f->nr_flushes++;
 
 		/* can we avoid the unconditional restart? */

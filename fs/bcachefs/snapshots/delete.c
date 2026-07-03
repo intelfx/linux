@@ -143,6 +143,56 @@ int bch2_snapshot_node_set_deleted(struct btree_trans *trans, u32 id)
 	return 0;
 }
 
+/*
+ * Sanity check before a destructive snapshot-node transition (emptying or
+ * deleting a node): the per-snapshot disk accounting counter must be zero.
+ *
+ * That counter tracks on-disk data sectors (the same values as the replicas
+ * counter, aggregated by snapshot id). A nonzero count means the deletion is
+ * about to drop data still accounted to this node, and one of two things is
+ * wrong:
+ *
+ *  - the accounting is stale/incorrect, or
+ *  - the inodes btree is missing an entry: the deletion scan relies on "an
+ *    extent/dirent/xattr in snapshot X implies an inode in snapshot X" to find
+ *    the keys to remove, so a missing inode strands that snapshot's keys.
+ *
+ * Refuse the transition and schedule check_allocations (recompute accounting)
+ * and check_inodes (revalidate the inode<->snapshot mapping) to resolve which,
+ * rather than dropping the data.
+ *
+ * Note this is a data (sectors) check, not a keys check: metadata-only keys
+ * carry no sectors and don't show up here - those are caught by the relevant
+ * check_dirents/check_xattrs/check_inodes passes. This guards the catastrophic
+ * (data) case at the cheapest possible cost (one in-memory read).
+ */
+static int bch2_snapshot_node_check_no_data(struct btree_trans *trans, u32 id)
+{
+	struct bch_fs *c = trans->c;
+
+	struct disk_accounting_pos acc;
+	memset(&acc, 0, sizeof(acc));
+	acc.type = BCH_DISK_ACCOUNTING_snapshot;
+	acc.snapshot.id = id;
+
+	u64 sectors = 0;
+	bch2_accounting_mem_read(c, disk_accounting_pos_to_bpos(&acc), &sectors, 1);
+
+	if (likely(!sectors))
+		return 0;
+
+	CLASS(printbuf, buf)();
+	prt_printf(&buf, "snapshot node %u still has %llu sectors of data accounted to it - refusing to delete/empty, to prevent data loss; scheduling repair:\n",
+		   id, sectors);
+
+	int ret = bch2_require_recovery_pass(c, &buf, BCH_RECOVERY_PASS_check_allocations);
+	ret = bch2_require_recovery_pass(c, &buf, BCH_RECOVERY_PASS_check_inodes) ?: ret;
+
+	bch_err(c, "%s", buf.buf);
+
+	return ret ?: bch_err_throw(c, EINVAL_snapshot_delete_with_data);
+}
+
 static int bch2_snapshot_node_set_no_keys(struct btree_trans *trans, u32 id)
 {
 	struct bkey_i_snapshot *s =
@@ -151,6 +201,8 @@ static int bch2_snapshot_node_set_no_keys(struct btree_trans *trans, u32 id)
 	bch2_fs_inconsistent_on(bch2_err_matches(ret, ENOENT), trans->c, "missing snapshot %u", id);
 	if (unlikely(ret))
 		return ret;
+
+	try(bch2_snapshot_node_check_no_data(trans, id));
 
 	SET_BCH_SNAPSHOT_NO_KEYS(&s->v,		true);
 	SET_BCH_SNAPSHOT_WILL_DELETE(&s->v,	false);
@@ -176,6 +228,8 @@ static int bch2_snapshot_node_delete(struct btree_trans *trans, u32 id, bool del
 
 	if (ret)
 		return ret;
+
+	try(bch2_snapshot_node_check_no_data(trans, id));
 
 	BUG_ON(BCH_SNAPSHOT_DELETED(&s->v));
 
@@ -259,7 +313,14 @@ static int bch2_snapshot_node_delete(struct btree_trans *trans, u32 id, bool del
 	if (!bch2_request_incompat_feature(c, bcachefs_metadata_version_snapshot_deletion_v2)) {
 		SET_BCH_SNAPSHOT_DELETED(&s->v, true);
 		s->v.parent		= 0;
-		s->v.children[0]	= 0;
+		/*
+		 * Retain the pointer to our live descendant: the node is spliced
+		 * out of the live tree, but a stray key later found in this
+		 * deleted snapshot must still be migrated to where it's visible,
+		 * and bch2_snapshot_live_descendent() walks children[0] to find
+		 * it. (child_id is 0 for a leaf - nothing to retain.)
+		 */
+		s->v.children[0]	= cpu_to_le32(child_id);
 		s->v.children[1]	= 0;
 		s->v.subvol		= 0;
 		s->v.tree		= 0;
@@ -342,6 +403,43 @@ static const struct snapshot_interior_delete *snapshot_id_dying(struct snapshot_
 	return ret;
 }
 
+/*
+ * Remove a key from a dying/deleted snapshot node, migrating it to that node's
+ * live descendant first when there is one (live_child != 0): the key is still
+ * visible to the descendant via inheritance, so dropping it outright would lose
+ * data. Only copy it down if the descendant doesn't already have its own key at
+ * that position. With no live descendant (a leaf) the key is just deleted.
+ *
+ * Shared by the deletion pass (delete_dead_snapshots_process_key) and the fsck
+ * repair (bch2_check_key_has_snapshot).
+ */
+int bch2_delete_dead_snapshot_key(struct btree_trans *trans, struct btree_iter *iter,
+				  struct bkey_s_c k, u32 live_child)
+{
+	struct bch_fs *c = trans->c;
+
+	if (live_child) {
+		BUG_ON(!bch2_snapshot_exists(c, live_child));
+
+		struct bpos dst = k.k->p;
+		dst.snapshot = live_child;
+
+		CLASS(btree_iter, dst_iter)(trans, iter->btree_id, dst,
+					    BTREE_ITER_all_snapshots|BTREE_ITER_intent);
+		struct bkey_s_c dst_k = bkey_try(bch2_btree_iter_peek_slot(&dst_iter));
+
+		if (bkey_deleted(dst_k.k)) {
+			struct bkey_i *new = errptr_try(bch2_bkey_make_mut_noupdate(trans, k));
+
+			new->k.p = dst;
+			try(bch2_trans_update(trans, &dst_iter, new,
+					      BTREE_UPDATE_internal_snapshot_node));
+		}
+	}
+
+	return bch2_btree_delete_at(trans, iter, BTREE_UPDATE_internal_snapshot_node);
+}
+
 static int delete_dead_snapshots_process_key(struct btree_trans *trans,
 					     struct btree_iter *iter,
 					     struct bkey_s_c k)
@@ -359,28 +457,7 @@ static int delete_dead_snapshots_process_key(struct btree_trans *trans,
 	if (!dying)
 		return 0;
 
-	if (dying->live_child) {
-		BUG_ON(!bch2_snapshot_exists(c, dying->live_child));
-
-		struct bpos dst = k.k->p;
-		dst.snapshot = dying->live_child;
-
-		CLASS(btree_iter, dst_iter)(trans, iter->btree_id, dst,
-					    BTREE_ITER_all_snapshots|BTREE_ITER_intent);
-		struct bkey_s_c dst_k = bkey_try(bch2_btree_iter_peek_slot(&dst_iter));
-
-		if (bkey_deleted(dst_k.k)) {
-			struct bkey_i *new = errptr_try(bch2_bkey_make_mut_noupdate(trans, k));
-
-			new->k.p = dst;
-			try(bch2_trans_update(trans, &dst_iter, new,
-					      BTREE_UPDATE_internal_snapshot_node));
-		}
-	}
-
-	try(bch2_btree_delete_at(trans, iter,
-				 BTREE_UPDATE_internal_snapshot_node));
-	return 0;
+	return bch2_delete_dead_snapshot_key(trans, iter, k, dying->live_child);
 }
 
 static bool skip_unrelated_snapshot_tree(struct btree_trans *trans, struct btree_iter *iter, u64 *prev_inum)

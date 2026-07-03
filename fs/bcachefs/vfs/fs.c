@@ -42,6 +42,7 @@
 #include <linux/pagemap.h>
 #include <linux/posix_acl.h>
 #include <linux/random.h>
+#include <linux/security.h>
 #include <linux/seq_file.h>
 #include <linux/siphash.h>
 #include <linux/statfs.h>
@@ -573,6 +574,61 @@ struct inode *bch2_vfs_inode_get(struct bch_fs *c, subvol_inum inum,
 	return ret ? ERR_PTR(ret) : &inode->v;
 }
 
+struct bch2_initxattrs_ctx {
+	struct btree_trans	*trans;
+	subvol_inum		inum;
+	struct bch_hash_info	hash;
+};
+
+static int bch2_initxattrs(struct inode *vinode,
+			   const struct xattr *xattr_array,
+			   void *fs_data)
+{
+	struct bch2_initxattrs_ctx *ctx = fs_data;
+	const struct xattr *xattr;
+
+	for (xattr = xattr_array; xattr->name; xattr++) {
+		int ret = __bch2_xattr_set(ctx->trans, ctx->inum, &ctx->hash,
+					   xattr->name, xattr->value,
+					   xattr->value_len,
+					   KEY_TYPE_XATTR_INDEX_SECURITY,
+					   XATTR_CREATE);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int bch2_inode_init_security(struct btree_trans *trans,
+				    struct bch_inode_info *dir,
+				    struct bch_inode_info *inode,
+				    const struct qstr *name,
+				    subvol_inum inum,
+				    struct bch_inode_unpacked *inode_u)
+{
+	struct bch2_initxattrs_ctx ctx = {
+		.trans	= trans,
+		.inum	= inum,
+	};
+
+	/*
+	 * The LSM computes the new label from the task, the dir, and the new
+	 * inode's mode; the vfs inode isn't initialized until after commit
+	 * (bch2_vfs_inode_init), so give it just enough identity here:
+	 */
+	inode->v.i_mode = inode_u->bi_mode;
+	i_uid_write(&inode->v, inode_u->bi_uid);
+	i_gid_write(&inode->v, inode_u->bi_gid);
+
+	try(bch2_hash_info_init(trans->c, inode_u, &ctx.hash));
+
+	return security_inode_init_security(&inode->v, &dir->v, name,
+					    bch2_initxattrs, &ctx);
+}
+
+DEFINE_FREE(posix_acl, struct posix_acl *, posix_acl_release(_T))
+
 struct bch_inode_info *
 __bch2_create(struct mnt_idmap *idmap,
 	      struct bch_inode_info *dir, struct dentry *dentry,
@@ -583,7 +639,8 @@ __bch2_create(struct mnt_idmap *idmap,
 	struct bch_inode_unpacked dir_u;
 	struct bch_inode_info *inode;
 	struct bch_inode_unpacked inode_u;
-	struct posix_acl *default_acl = NULL, *acl = NULL;
+	struct posix_acl *default_acl __free(posix_acl) = NULL;
+	struct posix_acl *acl __free(posix_acl) = NULL;
 	subvol_inum inum;
 	struct bch_subvolume subvol;
 	kuid_t kuid = mapped_fsuid(idmap, i_user_ns(&dir->v));
@@ -602,11 +659,8 @@ __bch2_create(struct mnt_idmap *idmap,
 	}
 
 	inode = __bch2_new_inode(c, GFP_NOFS);
-	if (unlikely(!inode)) {
-		posix_acl_release(default_acl);
-		posix_acl_release(acl);
+	if (unlikely(!inode))
 		return ERR_PTR(-ENOMEM);
-	}
 
 	bch2_inode_init_early(c, &inode_u);
 
@@ -636,14 +690,24 @@ retry:
 	inum.subvol = inode_u.bi_subvol ?: dir->ei_inum.subvol;
 	inum.inum = inode_u.bi_inum;
 
-	ret = bch2_trans_commit(trans, NULL, NULL, 0);
+	ret =   bch2_inode_init_security(trans, dir, inode,
+					 !(flags & BCH_CREATE_TMPFILE)
+					 ? &dentry->d_name : NULL,
+					 inum, &inode_u) ?:
+		bch2_trans_commit(trans, NULL, NULL, 0);
 	if (unlikely(ret)) {
 		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, -1,
 				KEY_TYPE_QUOTA_WARN);
 err_before_quota:
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			goto retry;
-		goto err_trans;
+
+		if (!(flags & BCH_CREATE_TMPFILE))
+			mutex_unlock(&dir->ei_update_lock);
+
+		make_bad_inode(&inode->v);
+		iput(&inode->v);
+		return ERR_PTR(ret);
 	}
 
 	if (!(flags & BCH_CREATE_TMPFILE)) {
@@ -672,19 +736,7 @@ err_before_quota:
 	 * that we just created, and we _really_ can't take a transaction
 	 * restart here.
 	 */
-	inode = bch2_inode_hash_insert(c, NULL, inode);
-err:
-	posix_acl_release(default_acl);
-	posix_acl_release(acl);
-	return inode;
-err_trans:
-	if (!(flags & BCH_CREATE_TMPFILE))
-		mutex_unlock(&dir->ei_update_lock);
-
-	make_bad_inode(&inode->v);
-	iput(&inode->v);
-	inode = ERR_PTR(ret);
-	goto err;
+	return bch2_inode_hash_insert(c, NULL, inode);
 }
 
 /* methods */
@@ -1015,7 +1067,6 @@ err:
 
 static int bch2_unlink(struct inode *vdir, struct dentry *dentry)
 {
-	struct bch_inode_info *dir = to_bch_ei(vdir);
 	int ret = __bch2_unlink(vdir, dentry, false);
 	return bch2_err_class(ret);
 }
@@ -1716,7 +1767,7 @@ static const struct address_space_operations bch_address_space_operations = {
 struct bcachefs_fid {
 	u64		inum;
 	u32		subvol;
-	u32		gen;
+	u32		generation;
 } __packed;
 
 struct bcachefs_fid_with_parent {
@@ -1741,7 +1792,7 @@ static struct bcachefs_fid bch2_inode_to_fid(struct bch_inode_info *inode)
 	return (struct bcachefs_fid) {
 		.inum	= inode->ei_inum.inum,
 		.subvol	= inode->ei_inum.subvol,
-		.gen	= inode->ei_inode.bi_generation,
+		.generation	= inode->ei_inode.bi_generation,
 	};
 }
 
@@ -1789,7 +1840,7 @@ static struct inode *bch2_nfs_get_inode(struct super_block *sb,
 				    .subvol = fid.subvol,
 				    .inum = fid.inum,
 	}, NULL);
-	if (!IS_ERR(vinode) && vinode->i_generation != fid.gen) {
+	if (!IS_ERR(vinode) && vinode->i_generation != fid.generation) {
 		iput(vinode);
 		vinode = ERR_PTR(-ESTALE);
 	}
@@ -1799,8 +1850,11 @@ static struct inode *bch2_nfs_get_inode(struct super_block *sb,
 static struct dentry *bch2_fh_alias(struct super_block *sb, struct inode *vinode)
 {
 	struct dentry *dentry = d_obtain_alias(vinode);
-	if (!IS_ERR(dentry))
+	if (!IS_ERR(dentry)) {
+#if IS_ENABLED(CONFIG_UNICODE)
 		bch2_dentry_set_casefold_ops_locked(dentry, vinode);
+#endif
+	}
 	return dentry;
 }
 
@@ -2259,6 +2313,15 @@ static int bch2_show_devname(struct seq_file *seq, struct dentry *root)
 	struct bch_fs *c = root->d_sb->s_fs_info;
 	bool first = true;
 
+	if (c->sb.multi_device) {
+		CLASS(printbuf, buf)();
+		prt_str(&buf, "/dev/disk/by-uuid/");
+		pr_uuid(&buf, c->sb.user_uuid.b);
+		printbuf_nul_terminate(&buf);
+		seq_printf(seq, "%s", buf.buf);
+		return buf.allocation_failure ? -ENOMEM : 0;
+	}
+
 	guard(rcu)();
 	for_each_online_member_rcu(c, ca) {
 		if (!first)
@@ -2333,23 +2396,23 @@ static const struct super_operations bch_super_operations = {
 	.unfreeze_fs	= bch2_unfreeze,
 };
 
-static int bch2_set_super(struct super_block *s, void *data)
+static int bch2_set_super(struct super_block *s, struct fs_context *fc)
 {
-	s->s_fs_info = data;
+	s->s_fs_info = fc->s_fs_info;
 	return 0;
 }
 
-static int bch2_noset_super(struct super_block *s, void *data)
+static int bch2_noset_super(struct super_block *s, struct fs_context *fc)
 {
 	return -EBUSY;
 }
 
 typedef DARRAY(struct bch_fs *) darray_fs;
 
-static int bch2_test_super(struct super_block *s, void *data)
+static int bch2_test_super(struct super_block *s, struct fs_context *fc)
 {
 	struct bch_fs *c = s->s_fs_info;
-	darray_fs *d = data;
+	darray_fs *d = fc->s_fs_info;
 
 	if (!c)
 		return false;
@@ -2392,7 +2455,11 @@ static int bch2_fs_get_tree(struct fs_context *fc)
 			goto err;
 	}
 
-	sb = sget(fc->fs_type, bch2_test_super, bch2_noset_super, fc->sb_flags|SB_NOSEC, &devs_to_fs);
+	/* sget_fc() passes the payload to the callbacks via fc->s_fs_info, and
+	 * takes the sb flags from fc->sb_flags (no flags argument). */
+	fc->s_fs_info = &devs_to_fs;
+	fc->sb_flags |= SB_NOSEC;
+	sb = sget_fc(fc, bch2_test_super, bch2_noset_super);
 	if (!IS_ERR(sb))
 		goto got_sb;
 
@@ -2426,7 +2493,8 @@ static int bch2_fs_get_tree(struct fs_context *fc)
 	if (c->opts.read_only)
 		fc->sb_flags |= SB_RDONLY;
 
-	sb = sget(fc->fs_type, NULL, bch2_set_super, fc->sb_flags|SB_NOSEC, c);
+	fc->s_fs_info = c;
+	sb = sget_fc(fc, NULL, bch2_set_super);
 	ret = PTR_ERR_OR_ZERO(sb);
 	if (ret)
 		goto err_stop_fs;
@@ -2709,7 +2777,7 @@ int bch2_fs_vfs_init_rw(struct bch_fs *c)
 		return bch_err_throw(c, ENOMEM_nocow_flush_bioset_init);
 
 	c->vfs.writeback_wq = alloc_workqueue("bcachefs_vfs_writeback",
-					      WQ_MEM_RECLAIM|WQ_FREEZABLE, 1);
+					      WQ_MEM_RECLAIM|WQ_FREEZABLE|WQ_UNBOUND, 1);
 	if (!c->vfs.writeback_wq)
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 

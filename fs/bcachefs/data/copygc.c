@@ -121,7 +121,7 @@ static int bch2_bucket_is_movable(struct btree_trans *trans,
 
 	struct bch_alloc_v4 _a;
 	const struct bch_alloc_v4 *a = bch2_alloc_to_v4(k, &_a);
-	b->k.gen	= a->gen;
+	b->k.generation	= a->generation;
 	b->sectors	= bch2_bucket_sectors_dirty(*a);
 	u64 lru_idx	= alloc_lru_idx_fragmentation(*a, ca);
 
@@ -362,7 +362,7 @@ static int bch2_copygc(struct moving_context *ctxt,
 
 		move_bucket_in_flight_add(buckets_in_flight, b);
 
-		ret = bch2_evacuate_bucket(ctxt, b, b->k.bucket, b->k.gen, data_opts);
+		ret = bch2_evacuate_bucket(ctxt, b, b->k.bucket, b->k.generation, data_opts);
 		if (ret)
 			goto err;
 
@@ -619,7 +619,7 @@ int bch2_copygc_start(struct bch_fs *c)
 
 	if (!c->copygc.wq &&
 	    !(c->copygc.wq = alloc_workqueue("bcachefs_copygc",
-				WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM|WQ_CPU_INTENSIVE, 1)))
+				WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM|WQ_UNBOUND, 1)))
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	if (!c->copygc.thread) {

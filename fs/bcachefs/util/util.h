@@ -240,6 +240,7 @@ static inline int bch2_strtoul_h(const char *cp, long *res)
 
 bool bch2_is_zero(const void *, size_t);
 
+u64 bch2_read_flag_list_mask(const char *, const char * const[], u64);
 u64 bch2_read_flag_list(const char *, const char * const[]);
 
 void bch2_prt_u64_base2_nbits(struct printbuf *, u64, unsigned);
@@ -445,6 +446,23 @@ do {									\
 u64 bch2_get_random_u64_below(u64);
 
 /*
+ * Rust-facing wrappers: local_clock() is a static inline and cond_resched() is a
+ * macro, so neither binds through bindgen. Wrapping them as bch2_* static
+ * inlines (allowlisted, so the codegen's wrap_static_fns emits callable
+ * wrappers) lets fs/ Rust call them uniformly across the kernel and userspace
+ * builds, with the macro expanded at C-compile time.
+ */
+static inline u64 bch2_local_clock(void)
+{
+	return local_clock();
+}
+
+static inline void bch2_cond_resched(void)
+{
+	cond_resched();
+}
+
+/*
  * All-ones mask of width @bits, defined for the full range 0..64 — unlike
  * (1ULL << bits) - 1 (UB at 64) or ~0ULL >> (64 - bits) (UB at 0).
  * Compiles branchless (cmov).
@@ -456,6 +474,11 @@ static inline u64 u64_bitmask(unsigned bits)
 
 void memcpy_to_bio(struct bio *, struct bvec_iter, const void *);
 void memcpy_from_bio(void *, struct bio *, struct bvec_iter);
+void bch2_bio_copy_data_iter(struct bio *, struct bvec_iter *,
+			     struct bio *, struct bvec_iter *);
+void bch2_zero_fill_bio_iter(struct bio *, struct bvec_iter);
+void bch2_bio_set_pages_dirty(struct bio *);
+void bch2_bio_check_pages_dirty(struct bio *);
 
 #ifdef CONFIG_BCACHEFS_DEBUG
 void bch2_corrupt_bio(struct bio *);

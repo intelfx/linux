@@ -408,6 +408,14 @@ static struct bch_read_bio *promote_alloc(struct btree_trans *trans,
 				k, pos, pick, flags, sectors, orig, failed);
 	int ret = PTR_ERR_OR_ZERO(promote);
 	if (unlikely(ret)) {
+		/*
+		 * A transaction restart can't be swallowed as a best-effort
+		 * nopromote - it would leave the transaction poisoned and panic
+		 * at bch2_trans_put. Return it so the read retries; this is the
+		 * only error promote_alloc passes back as an ERR_PTR.
+		 */
+		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+			return ERR_PTR(ret);
 		event_inc_trace(c, data_read_nopromote, buf, ({
 			prt_printf(&buf, "%s\n", bch2_err_str(ret));
 			bch2_bkey_val_to_text(&buf, c, k);
@@ -952,7 +960,7 @@ static int __bch2_read_endio_work(struct bch_read_bio *rbio)
 			if (rbio->bounce) {
 				struct bvec_iter src_iter = src->bi_iter;
 
-				bio_copy_data_iter(dst, &dst_iter, src, &src_iter);
+				bch2_bio_copy_data_iter(dst, &dst_iter, src, &src_iter);
 			}
 		}
 	} else {
@@ -983,7 +991,7 @@ static int __bch2_read_endio_work(struct bch_read_bio *rbio)
 		if (rbio->bounce) {
 			struct bvec_iter src_iter = src->bi_iter;
 
-			bio_copy_data_iter(dst, &dst_iter, src, &src_iter);
+			bch2_bio_copy_data_iter(dst, &dst_iter, src, &src_iter);
 		}
 	}
 
@@ -1178,6 +1186,12 @@ static inline struct bch_read_bio *read_extent_rbio_alloc(struct btree_trans *tr
 		? promote_alloc(trans, iter, k, &pick, flags, orig,
 				&bounce, &read_full, failed)
 		: NULL;
+	/*
+	 * promote_alloc() returns an ERR_PTR only on transaction restart;
+	 * propagate it before we consume @ca or unlock so the read retries:
+	 */
+	if (IS_ERR(rbio))
+		return rbio;
 
 	/*
 	 * If it's being moved internally, we don't want to flag it as a cache
@@ -1192,10 +1206,7 @@ static inline struct bch_read_bio *read_extent_rbio_alloc(struct btree_trans *tr
 	 * Unlock the iterator while the btree node's lock is still in cache,
 	 * before allocating the clone/fragment (if any) and doing the IO:
 	 */
-	if (!(flags & BCH_READ_in_retry))
-		bch2_trans_unlock(trans);
-	else
-		bch2_trans_unlock_long(trans);
+	bch2_trans_unlock(trans);
 
 	if (!read_full) {
 		EBUG_ON(crc_is_compressed(pick.crc));
@@ -1236,7 +1247,21 @@ static inline struct bch_read_bio *read_extent_rbio_alloc(struct btree_trans *tr
 						  &c->bio_read_split),
 				 orig, failed);
 
-		bch2_bio_alloc_pages_pool(c, &rbio->bio, 512, sectors << 9);
+		gfp_t gfp = GFP_NOFS;
+
+		/*
+		 * Only skip zeroing if we can detect if the device lied and
+		 * didn't DMA.
+		 *
+		 * If @failed is set, we might be in the extended read call that
+		 * allows returning data to userspace that didn't pass the
+		 * checksum check, so userspace can get back mangled data to
+		 * attempt its own recovery:
+		 */
+		if (pick.crc.csum_type && !failed)
+			gfp |= __GFP_SKIP_ZERO;
+
+		bch2_bio_alloc_pages_pool(c, &rbio->bio, 512, sectors << 9, gfp);
 		rbio->bounce	= true;
 	} else if (flags & BCH_READ_must_clone) {
 		/*
@@ -1330,7 +1355,7 @@ static noinline int read_extent_inline(struct bch_fs *c,
 
 	unsigned bytes = min(iter.bi_size, offset_into_extent << 9);
 	swap(iter.bi_size, bytes);
-	zero_fill_bio_iter(&rbio->bio, iter);
+	bch2_zero_fill_bio_iter(&rbio->bio, iter);
 	swap(iter.bi_size, bytes);
 
 	bio_advance_iter(&rbio->bio, &iter, bytes);
@@ -1343,7 +1368,7 @@ static noinline int read_extent_inline(struct bch_fs *c,
 
 	bio_advance_iter(&rbio->bio, &iter, bytes);
 
-	zero_fill_bio_iter(&rbio->bio, iter);
+	bch2_zero_fill_bio_iter(&rbio->bio, iter);
 
 	return read_extent_done(rbio, flags, 0);
 }
@@ -1368,7 +1393,7 @@ static noinline int read_extent_hole(struct bch_fs *c,
 	if (rbio->data_update)
 		rbio->ret = bch_err_throw(c, data_read_key_overwritten);
 
-	zero_fill_bio_iter(&rbio->bio, iter);
+	bch2_zero_fill_bio_iter(&rbio->bio, iter);
 
 	return read_extent_done(rbio, flags, 0);
 }
@@ -1529,6 +1554,15 @@ int __bch2_read_extent(struct btree_trans *trans,
 		read_extent_rbio_alloc(trans, orig, iter, read_pos, data_btree, k,
 				       pick, ca, offset_into_extent, failed, flags,
 				       bounce, read_full, narrow_crcs);
+	if (IS_ERR(rbio)) {
+		/*
+		 * Transaction restart during promote setup; @ca was not
+		 * consumed by read_extent_rbio_alloc() on this path:
+		 */
+		if (ca)
+			enumerated_ref_put(&ca->io_ref[READ], BCH_DEV_READ_REF_io_read);
+		return PTR_ERR(rbio);
+	}
 
 	if (likely(!rbio->pick.do_ec_reconstruct)) {
 		if (unlikely(!rbio->ca)) {
@@ -1545,6 +1579,14 @@ int __bch2_read_extent(struct btree_trans *trans,
 			if (likely(!(flags & BCH_READ_in_retry)))
 				bio_endio(&rbio->bio);
 		} else {
+			/*
+			 * submit_bio() can block for an unbounded time on a
+			 * congested device; flag it so the long srcu hold that
+			 * results doesn't trip the warning in
+			 * bch2_trans_unlock_long() — it's legitimate IO, not a
+			 * stuck codepath.
+			 */
+			trans->srcu_io_submitted = true;
 			if (likely(!(flags & BCH_READ_in_retry)))
 				submit_bio(&rbio->bio);
 			else

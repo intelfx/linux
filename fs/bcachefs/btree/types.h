@@ -361,7 +361,8 @@ struct btree_node_iter {
 #define BTREE_UPDATE_FLAGS()			\
 	x(internal_snapshot_node)		\
 	x(nojournal)				\
-	x(key_cache_reclaim)
+	x(key_cache_reclaim)			\
+	x(overwrite_triggered)
 
 
 /*
@@ -666,6 +667,13 @@ struct btree_trans {
 	bool			migrate_disabled:1;
 	bool			write_locked:1;
 	bool			srcu_held:1;
+	/*
+	 * IO was submitted under the srcu read lock (submit_bio() can block for
+	 * an unbounded time): suppress the next bch2_trans_unlock_long() "held
+	 * too long" warning. Scoped to one locked attempt — cleared on relock /
+	 * bch2_trans_begin().
+	 */
+	bool			srcu_io_submitted:1;
 	bool			btree_cache_cannibalize_locked:1;
 	bool			pf_memalloc_nofs:1;
 	bool			used_mempool:1;
