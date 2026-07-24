@@ -7,11 +7,6 @@ config BINARY_PRINTF
 	def_bool n
 
 menu "Library routines"
-#
-# Generic algorithms support
-#
-config XOR_BLOCKS
-	tristate "Accelerated block XOR algorithm"
 
 config MIN_HEAP
 	bool "Generic minheap algorithm"
