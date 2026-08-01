@@ -5,6 +5,58 @@
 #include "util/darray.h"
 #include "snapshots/types.h"
 
+static inline enum bch_subvolume_state bch2_subvolume_state(const struct bch_subvolume *s)
+{
+	return le32_to_cpu(s->state);
+}
+
+static inline enum bch_subvolume_state bch2_subvolume_state_from_flags(const struct bch_subvolume *s)
+{
+	return BCH_SUBVOLUME_UNLINKED_OBSOLETE(s)
+		? SUBVOLUME_STATE_unlinked
+		: SUBVOLUME_STATE_live;
+}
+
+static inline enum bch_subvolume_state bch2_subvolume_state_compat(const struct bch_subvolume *s)
+{
+	return s->state
+		? bch2_subvolume_state(s)
+		: bch2_subvolume_state_from_flags(s);
+}
+
+static inline bool bch2_subvolume_state_valid(enum bch_subvolume_state state)
+{
+	switch (state) {
+#define x(n, v) case SUBVOLUME_STATE_##n:
+	BCH_SUBVOLUME_STATES()
+#undef x
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Nearest-codeword decode for a corrupted state field (see snapshot.h): */
+static inline enum bch_subvolume_state
+bch2_subvolume_state_nearest(u32 v, unsigned *dist)
+{
+	enum bch_subvolume_state best = SUBVOLUME_STATE_live;
+	unsigned best_dist = 33;
+
+#define x(n, val)						\
+	if (hweight32(v ^ (val)) < best_dist) {			\
+		best_dist = hweight32(v ^ (val));		\
+		best = SUBVOLUME_STATE_##n;			\
+	}
+	BCH_SUBVOLUME_STATES()
+#undef x
+	*dist = best_dist;
+	return best;
+}
+
+const char *bch2_subvolume_state_str(enum bch_subvolume_state);
+void bch2_subvolume_state_set(struct bch_subvolume *, enum bch_subvolume_state);
+
 int bch2_check_subvols(struct bch_fs *);
 int bch2_check_subvol_children(struct bch_fs *);
 
@@ -23,6 +75,9 @@ int bch2_subvolume_trigger(struct btree_trans *, struct btree_trigger_op);
 int bch2_subvol_has_children(struct btree_trans *, u32);
 int bch2_subvolume_get(struct btree_trans *, unsigned,
 		       bool, struct bch_subvolume *);
+int bch2_subvolume_get_key(struct btree_trans *, unsigned,
+			   bool, struct bkey_i_subvolume *);
+int bch2_subvolume_is_unlinked(struct btree_trans *, u32);
 int __bch2_subvolume_get_snapshot(struct btree_trans *, u32,
 				  u32 *, bool);
 int bch2_subvolume_get_snapshot(struct btree_trans *, u32, u32 *);

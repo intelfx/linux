@@ -224,8 +224,6 @@ read_attribute(filldir64_specialization);
 BCH_PERSISTENT_COUNTERS()
 #undef x
 
-rw_attribute(label);
-
 read_attribute(copy_gc_wait);
 
 read_attribute(reconcile_status);
@@ -500,8 +498,11 @@ STORE(bch2_fs)
 	if (attr == &sysfs_trigger_gc)
 		bch2_gc_gens(c);
 
-	if (attr == &sysfs_trigger_delete_dead_snapshots)
-		__bch2_delete_dead_snapshots(c);
+	if (attr == &sysfs_trigger_delete_dead_snapshots) {
+		/* debug force: bypass auto_snapshot_deletion; serialize via run_lock */
+		scoped_guard(mutex, &c->recovery.run_lock)
+			__bch2_delete_dead_snapshots(c);
+	}
 
 	if (attr == &sysfs_trigger_emergency_read_only) {
 		CLASS(bch_log_msg, msg)(c);
@@ -776,6 +777,14 @@ static ssize_t sysfs_opt_show(struct bch_fs *c,
 	u64 v;
 
 	if (ca) {
+		if (opt->type == BCH_OPT_STR_MEMBER) {
+			/* The value lives in the member, not a u64 - render it here: */
+			guard(mutex_noio)(&c->sb_lock);
+			struct bch_member m = bch2_sb_member_get(c->disk_sb.sb, ca->dev_idx);
+			prt_printf(out, "%.*s\n", (int) opt->member_size,
+				   (char *) &m + opt->member_offset);
+			return 0;
+		}
 		if (!((opt->flags & OPT_DEVICE) && opt->get_member))
 			return bch_err_throw(c, EINVAL_sysfs_opt_not_found);
 		v = bch2_opt_from_sb(c->disk_sb.sb, id, ca->dev_idx);
@@ -809,20 +818,22 @@ static ssize_t sysfs_opt_store(struct bch_fs *c,
 	if (unlikely(!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_sysfs)))
 		return -EROFS;
 
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
+	guard(memalloc_flags)(PF_MEMALLOC_NOIO);
 	guard(opt_change_lock)(c);
 	CLASS(opt_change_scope, opt_scope)(c);
 
+	char *val = strim(tmp);
 	u64 v;
-	ret =   bch2_opt_parse(c, opt, strim(tmp), &v, NULL) ?:
+	ret =   bch2_opt_parse(c, opt, val, &v, NULL) ?:
 		bch2_opt_hook_pre_set(c, ca, 0, id, v, true, &opt_scope);
 
 	if (!ret) {
-		bool is_sb = opt->get_sb || opt->get_member || opt->get_ext;
+		bool is_sb = opt->get_sb || opt->get_member || opt->get_ext ||
+			     opt->type == BCH_OPT_STR_MEMBER;
 		bool changed = false;
 
 		if (is_sb) {
-			changed = bch2_opt_set_sb(c, ca, opt, v);
+			changed = bch2_opt_set_sb(c, ca, opt, v, val);
 		} else if (!ca) {
 			changed = bch2_opt_get_by_id(&c->opts, id) != v;
 		} else {
@@ -1001,12 +1012,6 @@ SHOW(bch2_dev)
 	sysfs_print(first_bucket,	ca->mi.first_bucket);
 	sysfs_print(nbuckets,		ca->mi.nbuckets);
 
-	if (attr == &sysfs_label) {
-		if (ca->mi.group)
-			bch2_disk_path_to_text(out, c, ca->mi.group - 1);
-		prt_char(out, '\n');
-	}
-
 	if (attr == &sysfs_has_data) {
 		prt_bitflags(out, __bch2_data_types, bch2_dev_has_data(c, ca));
 		prt_char(out, '\n');
@@ -1065,14 +1070,6 @@ STORE(bch2_dev)
 	struct bch_dev *ca = container_of(kobj, struct bch_dev, kobj);
 	struct bch_fs *c = ca->fs;
 
-	if (attr == &sysfs_label) {
-		char *tmp __free(kfree) = kstrdup(buf, GFP_KERNEL);
-		if (!tmp)
-			return -ENOMEM;
-
-		try(bch2_dev_group_set(c, ca, strim(tmp)));
-	}
-
 	if (attr == &sysfs_io_errors_reset)
 		bch2_dev_errors_reset(ca);
 
@@ -1088,9 +1085,6 @@ struct attribute *bch2_dev_files[] = {
 	&sysfs_uuid,
 	&sysfs_first_bucket,
 	&sysfs_nbuckets,
-
-	/* settings: */
-	&sysfs_label,
 
 	&sysfs_has_data,
 	&sysfs_io_done,

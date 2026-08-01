@@ -3,6 +3,7 @@
 #include "bcachefs.h"
 
 #include "alloc/buckets.h"
+#include "alloc/foreground.h"
 #include "alloc/replicas.h"
 
 #include "btree/key_cache.h"
@@ -77,18 +78,31 @@ void bch2_journal_set_watermark(struct journal *j)
 		j->space[journal_space_total].total;
 	bool low_on_pin = fifo_free(&j->pin) < j->pin.size / 4;
 	bool low_on_wb = bch2_btree_write_buffer_must_wait(c);
+	/*
+	 * Open buckets are a fixed pool that btree nodes hold until their update's
+	 * journal commit lands; the reclaim path (write-buffer flush -> journal ->
+	 * writeback) both frees them and, to make progress, allocates them. If new
+	 * journal-reserving work (fsck repair) drains the pool, that reclaim path
+	 * can't get the buckets it needs to advance the journal and everything
+	 * wedges. Throttle new work early, keeping headroom above the reclaim
+	 * reserve - the reclaim path itself is exempt (no_journal_res).
+	 */
+	bool low_on_open_buckets =
+		c->allocator.open_buckets_nr_free < bch2_open_buckets_journal_reserved();
 
-	unsigned watermark = low_on_space || low_on_pin || low_on_wb
+	unsigned watermark = low_on_space || low_on_pin || low_on_wb || low_on_open_buckets
 		? BCH_WATERMARK_reclaim
 		: BCH_WATERMARK_stripe;
 
 	if (track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_space], low_on_space) |
 	    track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_pin], low_on_pin) |
+	    track_event_change(&c->times[BCH_TIME_blocked_journal_low_on_open_buckets], low_on_open_buckets) |
 	    track_event_change(&c->times[BCH_TIME_blocked_write_buffer_full], low_on_wb))
 		event_inc_trace(c, journal_full, buf, ({
 			guard(printbuf_atomic)(&buf);
 			prt_printf(&buf, "low_on_space %u\n",	low_on_space);
 			prt_printf(&buf, "low_on_pin %u\n",	low_on_pin);
+			prt_printf(&buf, "low_on_open_buckets %u\n", low_on_open_buckets);
 			prt_printf(&buf, "low_on_wb %u\n",	low_on_wb);
 			if (low_on_wb)
 				bch2_btree_write_buffer_to_text(&buf, c);
@@ -99,6 +113,7 @@ void bch2_journal_set_watermark(struct journal *j)
 	mod_bit(JOURNAL_low_on_space,	&j->flags, low_on_space);
 	mod_bit(JOURNAL_low_on_pin,	&j->flags, low_on_pin);
 	mod_bit(JOURNAL_low_on_wb,	&j->flags, low_on_wb);
+	mod_bit(JOURNAL_low_on_open_buckets, &j->flags, low_on_open_buckets);
 
 	swap(watermark, j->watermark);
 	if (watermark > j->watermark)
@@ -383,7 +398,7 @@ static void bch2_journal_dev_do_discards(struct journal_device *ja)
 			blkdev_issue_discard(ca->disk_sb.bdev,
 					     bucket_to_sector(ca,
 							      ja->buckets[ja->discard_idx]),
-					     ca->mi.bucket_size, GFP_NOFS);
+					     ca->mi.bucket_size, GFP_NOIO);
 
 		scoped_guard(spinlock, &j->lock) {
 			ja->discard_idx = (ja->discard_idx + 1) % ja->nr;
@@ -639,8 +654,16 @@ void bch2_journal_pin_copy(struct journal *j,
 			spin_lock_nested(&dst_l->lock, 1);
 		}
 
+		/*
+		 * Keep-oldest, like bch2_journal_pin_add(): a dst already
+		 * pinning an older seq must not be moved forward, or we
+		 * release an obligation - the callers (interior update pin
+		 * transfers: reparent, will_free_node) copy several pins into
+		 * one and need the min. A pin at an older seq covers src_seq.
+		 */
+		bool keep = dst_seq && dst_seq <= src_seq;
 		bool reclaim = false, race = src_seq != src->seq || dst_seq != dst->seq;
-		if (!race)
+		if (!race && !keep)
 			reclaim = bch2_journal_pin_set_locked(j, dst_l, src_l, dst, src_seq, flush_fn);
 
 		if (dst_l && dst_l != src_l)
@@ -652,7 +675,7 @@ void bch2_journal_pin_copy(struct journal *j,
 			 * If the journal is currently full,  we might want to call flush_fn
 			 * immediately:
 			 */
-			if (src_seq == j->last_seq)
+			if (!keep && src_seq == j->last_seq)
 				journal_wake(j);
 			if (reclaim)
 				bch2_journal_maybe_update_last_seq(j);
@@ -666,6 +689,17 @@ void bch2_journal_pin_set(struct journal *j, u64 new_seq,
 			  journal_pin_flush_fn flush_fn)
 {
 	guard(percpu_read)(&j->pin_resize_lock);
+
+	/*
+	 * fifo_entry() below masks without a range check, so a pin outside the
+	 * live window lands on an out-of-[front,back) slot: that pin is never
+	 * reclaimed (reclaim only walks the window) and is left dangling in the
+	 * old buffer when the fifo is resized+freed. Catch the offending caller
+	 * here rather than debugging the eventual use-after-free.
+	 */
+	WARN_ONCE(new_seq < j->pin.front || new_seq >= j->pin.back,
+		  "journal pin set for seq %llu outside live range [%llu, %llu)",
+		  new_seq, j->pin.front, j->pin.back);
 
 	while (true) {
 		u64 old_seq = READ_ONCE(pin->seq);
@@ -924,7 +958,7 @@ static int __bch2_journal_reclaim(struct journal *j, bool direct, bool kicked)
 	 * we're holding the reclaim lock:
 	 */
 	lockdep_assert_held(&j->reclaim_lock);
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
+	guard(memalloc_flags)(PF_MEMALLOC_NOIO);
 
 	do {
 		if (kthread && kthread_should_stop())
@@ -1208,10 +1242,86 @@ int bch2_journal_flush_device_pins(struct journal *j, int dev_idx)
 
 	try(bch2_journal_error(j));
 
+	/*
+	 * flush_pins() only advances the in-memory last_seq past @seq. The
+	 * device's journal replicas entries aren't dropped until last_seq_ondisk
+	 * advances past them (in journal_write_done()), and that requires a
+	 * journal write recording the new last_seq. Force one here so we don't
+	 * depend on a caller flushing afterwards: otherwise dev_idx lingers in
+	 * the on-disk journal replicas set, and once it's taken offline the next
+	 * superblock write can't satisfy that entry and goes emergency read-only.
+	 */
+	try(bch2_journal_meta(j));
+
 	return 0;
 }
 
-__cold bool bch2_journal_seq_pins_to_text(struct printbuf *out, struct journal *j, u64 *seq)
+/*
+ * Before a device leaves the journal write set (going RO/evacuating), push
+ * journal reclaim until the *other* journal devices have free space to write
+ * to. Otherwise, if @dev_idx held the journal's only free space, dropping it
+ * from rw_devs[journal] strands the journal: reclaim can no longer advance
+ * last_seq_ondisk (which needs a journal write, hence a writable device) to
+ * free anyone else's buckets, and we deadlock in journal_full - with the task
+ * taking the device offline wedged in journal_res_get while holding state_lock.
+ *
+ * Must run before @dev_idx is pulled from rw_devs[journal], so reclaim can
+ * still use it to write the last_seq advance that frees the remaining devices.
+ * Can't fail: the only way out of the loop besides success is the whole
+ * filesystem going read-only, which stops reclaim.
+ */
+void bch2_journal_flush_dev_ro(struct journal *j, unsigned dev_idx)
+{
+	struct bch_fs *c = container_of(j, struct bch_fs, journal);
+	unsigned want = READ_ONCE(c->opts.metadata_replicas);
+
+	while (true) {
+		unsigned nr_devs = 0, nr_with_space = 0;
+		bool flush_needed;
+
+		scoped_guard(spinlock, &j->lock) {
+			scoped_guard(rcu)
+				for_each_member_device_rcu(c, ca,
+						&c->allocator.rw_devs[BCH_DATA_journal]) {
+					if (ca->dev_idx == dev_idx || !ca->journal.nr)
+						continue;
+					nr_devs++;
+					if (bch2_journal_dev_buckets_available(j, &ca->journal,
+								journal_space_discarded))
+						nr_with_space++;
+				}
+
+			/*
+			 * Reclaim advances last_seq (in memory) as it flushes
+			 * pins, but the buckets it frees can't be discarded until
+			 * last_seq_ondisk catches up, which only happens when a
+			 * journal write completes (journal_write_done()). Only
+			 * force a write when there's such an advance to persist.
+			 */
+			flush_needed = j->last_seq_ondisk < j->last_seq;
+		}
+
+		/*
+		 * Enough other devices have free journal space that the journal
+		 * can keep writing once @dev_idx leaves the write set:
+		 */
+		if (nr_with_space >= min(want, nr_devs))
+			break;
+
+		int ret;
+		if (flush_needed) {
+			ret = bch2_journal_meta(j);
+		} else {
+			scoped_guard(mutex, &j->reclaim_lock)
+				ret = bch2_journal_reclaim(j);
+		}
+		if (ret)	/* filesystem read-only */
+			break;
+	}
+}
+
+__cold bool bch2_journal_seq_pins_to_text(struct printbuf *out, struct journal *j, u64 *seq,
+					  unsigned *nr)
 {
 	struct journal_entry_pin *pin;
 
@@ -1241,12 +1351,18 @@ __cold bool bch2_journal_seq_pins_to_text(struct printbuf *out, struct journal *
 
 	prt_printf(out, "unflushed:\n");
 	for (unsigned i = 0; i < ARRAY_SIZE(pin_list->unflushed); i++)
-		list_for_each_entry(pin, &pin_list->unflushed[i], list)
+		list_for_each_entry(pin, &pin_list->unflushed[i], list) {
 			prt_printf(out, "\t%px %ps\n", pin, pin->flush);
+			if (nr)
+				++*nr;
+		}
 
 	prt_printf(out, "flushed:\n");
-	list_for_each_entry(pin, &pin_list->flushed, list)
+	list_for_each_entry(pin, &pin_list->flushed, list) {
 		prt_printf(out, "\t%px %ps\n", pin, pin->flush);
+		if (nr)
+			++*nr;
+	}
 
 	return false;
 }
@@ -1257,10 +1373,9 @@ __cold void bch2_journal_pins_to_text(struct printbuf *out, struct journal *j,
 	u64 seq = 0;
 	unsigned nr = 0;
 
-	while (nr < limit && !bch2_journal_seq_pins_to_text(out, j, &seq)) {
+	/* limit the number of pins printed, not the number of seqs scanned */
+	while (nr < limit && !bch2_journal_seq_pins_to_text(out, j, &seq, &nr))
 		seq++;
-		nr++;
-	}
 }
 
 static __cold void bch2_time_stats_summary_to_text(struct printbuf *out,
@@ -1310,6 +1425,7 @@ __cold void bch2_journal_reclaim_to_text(struct printbuf *out, struct journal *j
 	prt_printf(out, "Blocked time stats:\tcount\tavg\tmax\n");
 	bch2_time_stats_summary_to_text(out, "  low_on_space",		&c->times[BCH_TIME_blocked_journal_low_on_space]);
 	bch2_time_stats_summary_to_text(out, "  low_on_pin",		&c->times[BCH_TIME_blocked_journal_low_on_pin]);
+	bch2_time_stats_summary_to_text(out, "  low_on_open_buckets",	&c->times[BCH_TIME_blocked_journal_low_on_open_buckets]);
 	bch2_time_stats_summary_to_text(out, "  max_in_flight",		&c->times[BCH_TIME_blocked_journal_max_in_flight]);
 	bch2_time_stats_summary_to_text(out, "  max_open",		&c->times[BCH_TIME_blocked_journal_max_open]);
 	bch2_time_stats_summary_to_text(out, "  write_buffer_full",	&c->times[BCH_TIME_blocked_write_buffer_full]);

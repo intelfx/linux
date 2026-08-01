@@ -16,6 +16,10 @@ ifneq ($(bcachefs-version),)
 ifeq ($(shell $(CONFIG_SHELL) $(src)/scripts/fetch-module.sh '$(KERNELRELEASE)' '$(bcachefs-version)' '$(obj)/bcachefs.ko' && echo hit),hit)
 CONFIG_BCACHEFS_FS :=
 endif
+else
+# No version means no lookup key — say so rather than silently compiling:
+# the missing file is the tell that this tree wasn't staged the supported way.
+$(warning bcachefs: no version in $(src)/version.h - not looking for a prebuilt module (version.h is staged by bcachefs-tools 'make install_dkms'; a hand-copied kernel fs/bcachefs/ tree lacks it))
 endif
 endif
 
@@ -156,6 +160,7 @@ bcachefs-y		:=			\
 	fs/xattr.o				\
 	init/chardev.o				\
 	init/dev.o				\
+	init/damage.o				\
 	init/error.o				\
 	init/fs.o				\
 	init/progress.o				\
@@ -185,6 +190,7 @@ bcachefs-y		:=			\
 	util/enumerated_ref.o			\
 	util/eytzinger.o			\
 	util/fast_list.o			\
+	util/locking.o				\
 	util/mean_and_variance.o		\
 	util/printbuf.o				\
 	util/rcu_pending.o			\
@@ -215,7 +221,14 @@ ifndef BCACHEFS_DKMS
 endif
 
 ifdef BCACHEFS_DKMS
+ifneq ($(wildcard $(src)/module-version.c),)
 	bcachefs-y += module-version.o
+else
+# Staged by bcachefs-tools 'make install_dkms'; a hand-copied kernel
+# fs/bcachefs/ tree lacks it. Degrade rather than fail with a bare
+# "no rule to make target" (field report: CRCinAU, 2026-07-23).
+$(warning bcachefs: $(src)/module-version.c missing - module will carry no MODULE_VERSION)
+endif
 endif
 
 # Rust support — optional, gated on CONFIG_RUST. The C side owns the module
@@ -254,9 +267,10 @@ bcachefs-vendor-rust :=
 else
 # CONFIG_RUST=n: no kernel Rust to link against — build bcachefs's own vendored
 # stack instead (Makefile.rust.vendor), if we can. BCACHEFS_RUST=1 forces; auto
-# needs rustc + its rust-src + bindgen, and the kernel tree's Rust target spec
-# (scripts/target.json + include/generated/rustc_cfg, present even on a Rust-off
-# kernel).
+# needs rustc + its rust-src + bindgen, plus the kernel's rustc_cfg (generated
+# unconditionally by syncconfig) and its target-spec generator source.
+# scripts/target.json itself is always-$(CONFIG_RUST), so a Rust-off tree
+# doesn't have one — we generate our own below rather than requiring it.
 BCACHEFS_RUST ?= auto
 ifeq ($(BCACHEFS_RUST),1)
 bcachefs-rust-y := y
@@ -265,7 +279,7 @@ bcachefs-rust-y := n
 else
 bcachefs-rust-y := $(shell command -v $(RUSTC) >/dev/null 2>&1 &&		\
 	command -v $(BINDGEN) >/dev/null 2>&1 &&				\
-	[ -r '$(objtree)/scripts/target.json' ] &&			\
+	[ -r '$(objtree)/scripts/generate_rust_target.rs' ] &&		\
 	[ -r '$(objtree)/include/generated/rustc_cfg' ] && echo y || echo n)
 endif
 bcachefs-vendor-rust := $(bcachefs-rust-y)
@@ -279,6 +293,29 @@ endif
 # predates the current rustc's lang items (meta_sized).
 ifeq ($(bcachefs-vendor-rust),y)
 bch-rust-L := -L$(obj)/vrust
+
+# A Rust-off kernel never generates scripts/target.json (it's
+# always-$(CONFIG_RUST)), but its KBUILD_RUSTFLAGS still point --target at
+# it. Generate our own copy under $(obj)/vrust with the kernel's own
+# generator — same invocation as scripts/Makefile's filechk_rust_target —
+# and rewrite --target to match. The kernel tree stays read-only. Done
+# eagerly at parse time so every Rust rule in this file and the vendored
+# includes sees a present, current file; the -nt check skips the rebuild
+# when the generator binary is already newer than its source.
+bch-target-json := $(abspath $(obj))/vrust/target.json
+$(shell	mkdir -p '$(abspath $(obj))/vrust' &&				\
+	{ [ '$(abspath $(obj))/vrust/generate_rust_target' -nt		\
+	    '$(objtree)/scripts/generate_rust_target.rs' ] ||		\
+	  $(HOSTRUSTC) --edition=2021 -Copt-level=0			\
+	    '$(objtree)/scripts/generate_rust_target.rs'		\
+	    -o '$(abspath $(obj))/vrust/generate_rust_target'; } &&	\
+	'$(abspath $(obj))/vrust/generate_rust_target'			\
+	    < '$(objtree)/include/config/auto.conf' > '$(bch-target-json)')
+ifneq ($(wildcard $(bch-target-json)),)
+KBUILD_RUSTFLAGS := $(patsubst --target=$(objtree)/scripts/target.json,--target=$(bch-target-json),$(KBUILD_RUSTFLAGS))
+else
+$(warning bcachefs: failed to generate $(bch-target-json); leaving --target unchanged)
+endif
 else
 bch-rust-L := -L$(objtree)/rust
 endif
@@ -326,6 +363,12 @@ bcachefs-codegen-skip-cflags := \
 	-fdiagnostics-show-context -fdiagnostics-show-context=% \
 	--param=% --param asan-% -fno-isolate-erroneous-paths-dereference
 
+# Also drop $(CC_FLAGS_LTO): bindgen skips functions with hidden visibility,
+# so its -fvisibility=hidden strips every plain extern declaration from the
+# bindings. Visibility doesn't affect layout, and the kernel's own bindgen
+# pass filters the same group via bindgen_c_flags_lto.
+bcachefs-codegen-skip-cflags += $(CC_FLAGS_LTO)
+
 # Also drop -funsigned-char: the kernel builds char unsigned, which makes bindgen
 # bind `char *` as `*const u8`, but the fs/ Rust (shared with userspace, where
 # char is signed) expects `c_char`. Char signedness doesn't affect layout, so
@@ -346,8 +389,12 @@ bcachefs-codegen-blocklist := \
 
 # The codegen tool: zero-dep, plain host rustc. codegen_main.rs include!s
 # codegen.rs, so list the latter as a prereq to rebuild on either change.
+#
+# Also, link with $(HOSTCC) like the kernel's own host Rust rules do
+# (see scripts/Makefile.host).
 quiet_cmd_bch_codegen_host = HOSTRUSTC $@
-      cmd_bch_codegen_host = $(HOSTRUSTC) --edition 2021 -O $< -o $@
+      cmd_bch_codegen_host = $(HOSTRUSTC) --edition 2021 -O \
+	-Clinker-flavor=gcc -Clinker=$(HOSTCC) $< -o $@
 
 $(obj)/codegen: $(src)/codegen_main.rs $(src)/codegen.rs FORCE
 	$(call if_changed,bch_codegen_host)
@@ -402,26 +449,51 @@ $(obj)/rust/bcachefs.rs: $(obj)/codegen $(obj)/rust/generic-radix-tree.h $(bcach
 $(obj)/rust/extern.c: $(obj)/rust/bcachefs.rs ;
 CFLAGS_rust/extern.o += -Wno-missing-prototypes -Wno-missing-declarations
 
+# Kernel trees < 6.18 pass -Zno-jump-tables in KBUILD_RUSTFLAGS, written for
+# their era's pinned rustc; newer rustc has it stabilized as -Cjump-tables=n.
+# Rewrite the underlying variable - rust_flags expands it lazily, so this covers
+# every Rust rule below and in the vendored includes.
+#
+# Only rewrite when $(RUSTC) actually accepts the stable spelling. rustc from
+# before the stabilization rejects it outright:
+#
+#   $ rustc -Cjump-tables=n --print=sysroot
+#   error: unknown codegen option: `jump-tables`
+#
+# so rewriting unconditionally turns a working build into a hard failure on
+# those toolchains, which is worse than leaving the flag the kernel chose.
+rustc-has-cjump-tables := $(shell $(RUSTC) -Cjump-tables=n --print=sysroot \
+	>/dev/null 2>&1 && echo y || echo n)
+ifeq ($(rustc-has-cjump-tables),y)
+KBUILD_RUSTFLAGS := $(patsubst -Zno-jump-tables,-Cjump-tables=n,$(KBUILD_RUSTFLAGS))
+endif
+
 # mod.rs keys on cfg(kernel) to source the kernel-compat types from the kernel
 # crate (vs bcachefs-shim in userspace); the kernel build doesn't set it on its
 # own, so do it here for every Rust object in this dir.
 rustflags-y += --cfg kernel
 
-# Vendored Rust crates the kernel doesn't provide: paste (a proc-macro) and
-# bitfield (a plain rlib), both dependency-free, under fs/vendor/. We build them
-# here, replicating the kernel's own rustc_procmacro / rustc_library commands
-# (those live in rust/Makefile and aren't callable out-of-tree), then feed them
-# to mod.o via --extern. The flag vars they use ($(rust_common_flags),
-# $(rust_flags), $(KBUILD_PROCMACROLDFLAGS)) are all global, so reachable here.
+# Rust crates the kernel doesn't provide: the vendored paste (a proc-macro),
+# bitfield/bitflags/uuid (plain rlibs) under fs/vendor/, and our own
+# typeinfo-macros (a proc-macro, deliberately dependency-free so this recipe
+# can build it). We build them here, replicating the kernel's own
+# rustc_procmacro / rustc_library commands (those live in rust/Makefile and
+# aren't callable out-of-tree), then feed them to mod.o via --extern. The flag
+# vars they use ($(rust_common_flags), $(rust_flags),
+# $(KBUILD_PROCMACROLDFLAGS)) are all global, so reachable here.
+# Proc-macro crate name is derived from the target: lib<name>.so.
 quiet_cmd_bch_procmacro = RUSTC P  $@
       cmd_bch_procmacro = $(RUSTC) $(rust_common_flags) \
 	-Clinker-flavor=gcc -Clinker=$(HOSTCC) \
 	-Clink-args='$(call escsq,$(KBUILD_PROCMACROLDFLAGS))' \
 	--emit=dep-info=$(depfile) --emit=link=$@ --extern proc_macro \
-	--crate-type proc-macro --crate-name paste \
+	--crate-type proc-macro --crate-name $(patsubst lib%.so,%,$(notdir $@)) \
 	@$(objtree)/include/generated/rustc_cfg $<
 
 $(obj)/libpaste.so: $(src)/vendor/paste/src/lib.rs FORCE
+	$(call if_changed_dep,bch_procmacro)
+
+$(obj)/libtypeinfo_macros.so: $(src)/typeinfo-macros/src/lib.rs FORCE
 	$(call if_changed_dep,bch_procmacro)
 
 # Generic leaf-rlib build (crate name derived from the object stem), shared by
@@ -439,19 +511,32 @@ $(obj)/bitfield.o: $(src)/vendor/bitfield/src/lib.rs FORCE
 $(obj)/bitflags.o: $(src)/vendor/bitflags/src/lib.rs FORCE
 	$(call if_changed_dep,bch_library)
 
+# The kernel builds Rust with -Wrust_2018_idioms, which CONFIG_WERROR turns
+# into -Dwarnings; the vendored uuid predates both of the lifetime lints that
+# implies and trips 11 of them. Those lints are a statement about how we want
+# our own code written - they say nothing about whether someone else's crate is
+# correct - so allow them here rather than patching a vendored tree we would
+# have to re-patch on every refresh.
+#
+# Both are needed: elided_lifetimes_in_paths accounts for 6 and
+# mismatched_lifetime_syntaxes for the other 5, so allowing only the one named
+# in the bug report leaves the build broken. bitfield and bitflags are clean
+# under the same flags, which is why this is scoped to uuid.o.
+RUSTFLAGS_uuid.o += -Aelided_lifetimes_in_paths -Amismatched_lifetime_syntaxes
+
 $(obj)/uuid.o: $(src)/vendor/uuid/src/lib.rs FORCE
 	$(call if_changed_dep,bch_library)
 
 # mod.o (only — not the crates' own builds) gets them as externs.
-RUSTFLAGS_mod.o += --extern paste=$(obj)/libpaste.so --extern bitfield=$(obj)/libbitfield.rmeta --extern bitflags=$(obj)/libbitflags.rmeta --extern uuid=$(obj)/libuuid.rmeta
-$(obj)/mod.o: $(obj)/libpaste.so $(obj)/bitfield.o $(obj)/bitflags.o $(obj)/uuid.o
+RUSTFLAGS_mod.o += --extern paste=$(obj)/libpaste.so --extern typeinfo_macros=$(obj)/libtypeinfo_macros.so --extern bitfield=$(obj)/libbitfield.rmeta --extern bitflags=$(obj)/libbitflags.rmeta --extern uuid=$(obj)/libuuid.rmeta
+$(obj)/mod.o: $(obj)/libpaste.so $(obj)/libtypeinfo_macros.so $(obj)/bitfield.o $(obj)/bitflags.o $(obj)/uuid.o
 
 # mod.rs finds the generated files via env!("OUT_DIR"); point it at the gen dir
 # (absolute, since include! concatenates it) and make mod.o wait for them.
 $(obj)/mod.o: export OUT_DIR := $(abspath $(obj)/rust)
 $(obj)/mod.o: $(obj)/rust/bcachefs.rs
 
-targets += codegen rust/bcachefs.rs libpaste.so bitfield.o bitflags.o uuid.o
+targets += codegen rust/bcachefs.rs libpaste.so libtypeinfo_macros.so bitfield.o bitflags.o uuid.o
 
 # mod.o: Rust glue. rust/extern.o: the static-inline wrappers, a normal kernel C
 # object. bitfield.o/bitflags.o/uuid.o: the vendored rlibs' objects, linked in.
@@ -470,6 +555,18 @@ endif # bcachefs-rust-y
 
 # Silence "note: xyz changed in GCC X.X" messages
 subdir-ccflags-y += $(call cc-disable-warning, psabi)
+
+# Don't let a large stack frame fail the build (e.g. Proxmox ships
+# CONFIG_FRAME_WARN=1024, stricter than the usual 2048, + CONFIG_WERROR). The
+# functions that trip it — mainly the data-update path — run from kthread /
+# workqueue context with a full stack, and we're careful not to blow it, so
+# drop the error but keep the warning informational rather than playing
+# frame-size whack-a-mole.
+#
+# The trailing '=' is required, not a typo: -Wframe-larger-than takes a value
+# (-Wframe-larger-than=N), so -Wno-error= must name it as 'frame-larger-than=';
+# GCC 15 rejects the form without it.
+subdir-ccflags-y += -Wno-error=frame-larger-than=
 
 # kbuild weirdness - sometimes this gets passed automatically, other times we
 # need to specify it. no idea why:

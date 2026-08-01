@@ -38,6 +38,26 @@ static inline u64 sector_to_bucket_and_offset(const struct bch_dev *ca, sector_t
 	return div_u64_rem(s, ca->mi.bucket_size, offset);
 }
 
+/*
+ * Device position fractions: a device-relative sector offset as a 32.32
+ * fixed point fraction of the device's size, for comparing and averaging
+ * positions across devices of different sizes (same fraction ~= same zone
+ * on rotational media):
+ */
+#define BCH_DEV_POS_FRAC_BITS	32
+
+static inline u64 dev_offset_to_frac(const struct bch_dev *ca, u64 offset)
+{
+	return mul_u64_u64_div_u64(offset, 1ULL << BCH_DEV_POS_FRAC_BITS,
+				   bucket_to_sector(ca, ca->mi.nbuckets));
+}
+
+static inline u64 dev_frac_to_offset(const struct bch_dev *ca, u64 frac)
+{
+	return mul_u64_u64_div_u64(frac, bucket_to_sector(ca, ca->mi.nbuckets),
+				   1ULL << BCH_DEV_POS_FRAC_BITS);
+}
+
 #define for_each_bucket(_b, _buckets)				\
 	for (_b = (_buckets)->b + (_buckets)->first_bucket;	\
 	     _b < (_buckets)->b + (_buckets)->nbuckets; _b++)
@@ -319,6 +339,7 @@ static inline int bch2_bucket_ref_update(struct btree_trans *trans, struct bch_d
 
 int bch2_trigger_extent(struct btree_trans *, struct btree_trigger_op);
 int bch2_trigger_reservation(struct btree_trans *, struct btree_trigger_op);
+int bch2_trigger_snapshot_nr_keys(struct btree_trans *, struct btree_trigger_op);
 
 #define trigger_run_overwrite_then_insert(_fn, _trans, _btree_id, _level, _old, _new, _flags)\
 ({												\

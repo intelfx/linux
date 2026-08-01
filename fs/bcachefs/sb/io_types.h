@@ -16,6 +16,7 @@ struct bch_sb_cpu {
 	u8		nr_devices;
 	u8		clean;
 	bool		multi_device; /* true if we've ever had more than one device */
+	bool		dirents_sanitized;
 
 	u8		encryption_type;
 
@@ -32,6 +33,7 @@ struct bch_sb_cpu {
 	u64		recovery_passes_required;
 	unsigned long	errors_silent[BITS_TO_LONGS(BCH_FSCK_ERR_MAX)];
 	u64		btrees_lost_data;
+	u64		btrees_clean;
 };
 
 #endif /* _BCACHEFS_SB_IO_TYPES_H */

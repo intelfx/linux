@@ -51,7 +51,7 @@ int bch2_create_trans(struct btree_trans *trans,
 
 	try(bch2_subvolume_get(trans, dir.subvol, true, new_subvol));
 	if (BCH_SUBVOLUME_RO(new_subvol) ||
-	    BCH_SUBVOLUME_UNLINKED(new_subvol))
+	    bch2_subvolume_state_compat(new_subvol) == SUBVOLUME_STATE_unlinked)
 		return -EROFS;
 
 	u32 dir_snapshot = le32_to_cpu(new_subvol->snapshot);
@@ -66,6 +66,11 @@ int bch2_create_trans(struct btree_trans *trans,
 
 		if (flags & BCH_CREATE_TMPFILE)
 			new_inode->bi_flags |= BCH_INODE_unlinked;
+
+		if (acl)
+			new_inode->bi_flags |= BCH_INODE_has_access_acl;
+		if (default_acl)
+			new_inode->bi_flags |= BCH_INODE_has_default_acl;
 
 		try(bch2_inode_create(trans, &inode_iter, new_inode, dir_snapshot,
 				      inode_opt_get(c, dir_u, inodes_32bit)));
@@ -271,6 +276,13 @@ int bch2_unlink_trans(struct btree_trans *trans,
 	if (deleting_subvol || inode_u->bi_subvol) {
 		try(bch2_subvolume_unlink(trans, inode_u->bi_subvol));
 
+		/*
+		 * No dirent will ever point at this inode again - deletion
+		 * belongs to the subvolume path, though: the inode reaper keys
+		 * off bch2_inode_is_subvolume_root() to leave it alone.
+		 */
+		inode_u->bi_flags |= BCH_INODE_unlinked;
+
 		struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&dirent_iter));
 
 		/*
@@ -460,8 +472,22 @@ int bch2_rename_trans(struct btree_trans *trans,
 		src_dir_u->bi_nlink += mode == BCH_RENAME_EXCHANGE;
 	}
 
-	if (mode == BCH_RENAME_OVERWRITE)
-		bch2_inode_nlink_dec(trans, dst_inode_u);
+	if (mode == BCH_RENAME_OVERWRITE) {
+		/*
+		 * Overwriting a subvolume root deletes the subvolume, same as
+		 * unlink (the victim was empty or a bare file, per the checks
+		 * above): hand it to the subvolume deletion path, don't treat
+		 * it as an ordinary inode losing its last link - see
+		 * bch2_unlink_trans():
+		 */
+		if (dst_inode_u->bi_subvol) {
+			try(bch2_subvol_has_children(trans, dst_inode_u->bi_subvol));
+			try(bch2_subvolume_unlink(trans, dst_inode_u->bi_subvol));
+			dst_inode_u->bi_flags |= BCH_INODE_unlinked;
+		} else {
+			bch2_inode_nlink_dec(trans, dst_inode_u);
+		}
+	}
 
 	src_dir_u->bi_mtime		= now;
 	src_dir_u->bi_ctime		= now;
@@ -491,6 +517,28 @@ int bch2_rename_trans(struct btree_trans *trans,
 	}
 
 	return 0;
+}
+
+struct bkey_s_c_dirent bch2_inode_get_dirent(struct btree_trans *trans,
+					     struct btree_iter *iter,
+					     struct bch_inode_unpacked *inode,
+					     u32 *snapshot)
+{
+	if (inode->bi_parent_subvol) {
+		int ret = bch2_subvolume_get_snapshot(trans, inode->bi_parent_subvol, snapshot);;
+		if (ret)
+			return ((struct bkey_s_c_dirent) { .k = ERR_PTR(ret) });
+	}
+
+	/*
+	 * If we're running after an interrupted snapshot deletion, the dirent
+	 * may have been moved to a child snapshot (when cleaning up redundant
+	 * interior node snapshots) but not the inode - do the lookup in the
+	 * child snapshot we'll be moving to:
+	 */
+	*snapshot = bch2_snapshot_redundant_interior(trans->c, *snapshot) ?: *snapshot;
+
+	return dirent_get_by_pos(trans, iter, SPOS(inode->bi_dir, inode->bi_dir_offset, *snapshot));
 }
 
 /* inum_to_path */
@@ -601,16 +649,8 @@ static int bch2_inum_to_path_reversed(struct btree_trans *trans,
 			break;
 		}
 
-		if (inode.bi_parent_subvol) {
-			subvol = inode.bi_parent_subvol;
-			ret = bch2_subvolume_get_snapshot(trans, inode.bi_parent_subvol, &snapshot);
-			if (ret)
-				break;
-		}
-
-		CLASS(btree_iter, d_iter)(trans, BTREE_ID_dirents,
-					  SPOS(inode.bi_dir, inode.bi_dir_offset, snapshot), 0);
-		struct bkey_s_c_dirent d = bch2_bkey_get_typed(&d_iter, dirent);
+		CLASS(btree_iter_uninit, d_iter)(trans);
+		struct bkey_s_c_dirent d = bch2_inode_get_dirent(trans, &d_iter, &inode, &snapshot);
 		ret = bkey_err(d.s_c);
 		if (ret)
 			break;
@@ -619,6 +659,15 @@ static int bch2_inum_to_path_reversed(struct btree_trans *trans,
 
 		prt_bytes_reversed(path, dirent_name.name, dirent_name.len);
 		prt_char(path, '/');
+
+		/*
+		 * Track the subvol as we cross boundaries: the loop-detection key
+		 * above is (subvol ?: snapshot, inum), and inode numbers repeat
+		 * across subvolumes (a snapshot shares its source's root inum), so
+		 * without this the key collides and a valid path reads as a loop.
+		 */
+		if (inode.bi_parent_subvol)
+			subvol = inode.bi_parent_subvol;
 
 		inum = inode.bi_dir;
 	}
@@ -675,6 +724,51 @@ int bch2_inum_snapshot_to_path(struct btree_trans *trans, u64 inum, u32 snapshot
 	return __bch2_inum_to_path(trans, 0, inum, snapshot, 0, 0, path);
 }
 
+/*
+ * Is @inum a descendant of @ancestor? The bi_dir walk from path
+ * resolution, minus the names: look up the inode, ascend bi_dir -
+ * crossing subvolume boundaries - until we hit @ancestor or the root.
+ * > 0 yes, 0 no (including disconnected or looped ancestry), < 0 error.
+ */
+int bch2_inum_is_descendant(struct btree_trans *trans, subvol_inum inum,
+			    subvol_inum ancestor)
+{
+	u32 subvol = inum.subvol, snapshot;
+	u64 cur = inum.inum;
+	CLASS(darray_subvol_inum, inums)();
+
+	try(bch2_subvolume_get_snapshot(trans, subvol, &snapshot));
+
+	while (true) {
+		if (subvol == ancestor.subvol && cur == ancestor.inum)
+			return 1;
+
+		subvol_inum n = (subvol_inum) { subvol, cur };
+		if (darray_find_p(inums, i,
+				  i->subvol == n.subvol && i->inum == n.inum))
+			return 0;
+		try(darray_push(&inums, n));
+
+		struct bch_inode_unpacked inode;
+		int ret = bch2_inode_find_by_inum_snapshot(trans, cur, snapshot,
+							   &inode, 0);
+		if (ret)
+			return bch2_err_matches(ret, ENOENT) ? 0 : ret;
+
+		if ((inode.bi_subvol == BCACHEFS_ROOT_SUBVOL &&
+		     inode.bi_inum == BCACHEFS_ROOT_INO) ||
+		    (!inode.bi_dir && !inode.bi_dir_offset))
+			return 0;
+
+		if (inode.bi_parent_subvol) {
+			subvol = inode.bi_parent_subvol;
+			try(bch2_subvolume_get_snapshot(trans, subvol,
+							&snapshot));
+		}
+		cur = inode.bi_dir;
+	}
+}
+
 /* fsck */
 
 static int bch2_check_dirent_inode_dirent(struct btree_trans *trans,
@@ -727,14 +821,18 @@ static int bch2_check_dirent_inode_dirent(struct btree_trans *trans,
 
 	if (!backpointer_exists) {
 		if (fsck_err(trans, inode_wrong_backpointer,
-			     "inode %llu:%u has wrong backpointer:\n"
+			     "inode has wrong backpointer:\n"
 			     "got       %llu:%llu\n"
-			     "should be %llu:%llu",
-			     target->bi_inum, target->bi_snapshot,
+			     "should be %llu:%llu\n%s",
 			     target->bi_dir,
 			     target->bi_dir_offset,
 			     d.k->p.inode,
-			     d.k->p.offset)) {
+			     d.k->p.offset,
+			     (printbuf_reset(&buf),
+			      bch2_inode_unpacked_to_text(&buf, target),
+			      prt_newline(&buf),
+			      bch2_bkey_val_to_text(&buf, c, d.s_c),
+			      buf.buf))) {
 			target->bi_dir		= d.k->p.inode;
 			target->bi_dir_offset	= d.k->p.offset;
 			try(__bch2_fsck_write_inode(trans, target));

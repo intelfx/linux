@@ -436,6 +436,15 @@ static int reconcile_set_data_opts(struct btree_trans *trans,
 	data_opts->target		= r->background_target;
 
 	/*
+	 * Never wait on the allocator mid-write: a blocked data update holds a
+	 * read-time snapshot of the extent while other movers rewrite it, and
+	 * the stale write is then discarded at index update time
+	 * (data_update_useless_write_fail). Better to fail with freelist_empty
+	 * and retry from a fresh read.
+	 */
+	data_opts->write_flags |= BCH_WRITE_alloc_nowait;
+
+	/*
 	 * we can't add/drop replicas from btree nodes incrementally, we always
 	 * need to be able to spill over to the whole fs
 	 */
@@ -702,7 +711,9 @@ static int check_reconcile_pending_err(struct btree_trans *trans,
 	     !bch2_err_matches(err, ENOSPC))
 		 return err;
 
-	event_add_trace(c, reconcile_set_pending, k.k->size, buf, ({
+	s64 sectors = bkey_is_btree_ptr(k.k) ? btree_sectors(c) : k.k->size;
+
+	event_add_trace(c, reconcile_set_pending, sectors, buf, ({
 		prt_printf(&buf, "%s\n", bch2_err_str(err));
 		bch2_bkey_val_to_text(&buf, c, k);
 		prt_newline(&buf);
@@ -872,8 +883,11 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 		return ret;
 	if (ret) {
 		WARN_ONCE(!bch2_err_matches(ret, EROFS) &&
-			  ret != -BCH_ERR_data_update_fail_no_snapshot &&
-			  ret != -BCH_ERR_data_update_fail_in_flight,
+			  !bch2_err_matches(ret, BCH_ERR_snapshot) &&
+			  !bch2_err_matches(ret, BCH_ERR_data_update_fail_no_snapshot) &&
+			  !bch2_err_matches(ret, BCH_ERR_data_update_fail_in_flight) &&
+			  !bch2_err_matches(ret, BCH_ERR_freelist_empty) &&
+			  !bch2_err_matches(ret, BCH_ERR_open_buckets_empty),
 			  "unhandled error from move_extent: %s", bch2_err_str(ret));
 		/* skip it and continue */
 	}
@@ -1028,7 +1042,7 @@ static int update_reconcile_opts_scan(struct btree_trans *trans,
 {
 	switch (s.type) {
 #define x(n) case RECONCILE_SCAN_##n:						\
-		event_add_trace(trans->c, reconcile_scan_##n, k.k->size,	\
+		event_add_trace(trans->c, reconcile_scan_##n, !level ? k.k->size : btree_sectors(trans->c),	\
 				buf, bch2_bkey_val_to_text(&buf, trans->c, k));	\
 		break;
 		RECONCILE_SCAN_TYPES()
@@ -1325,7 +1339,7 @@ static bool reconcile_hipri_work_pending(struct bch_fs *c)
 	return v[0] || v[1];
 }
 
-static void reconcile_wait(struct bch_fs *c)
+static void reconcile_wait(struct bch_fs *c, u32 kick)
 {
 	struct bch_fs_reconcile *r = &c->reconcile;
 	struct io_clock *clock = &c->io_clock[WRITE];
@@ -1348,7 +1362,15 @@ static void reconcile_wait(struct bch_fs *c)
 		r->running		= false;
 	}
 
-	bch2_kthread_io_clock_wait_once(clock, r->wait_iotime_end, MAX_SCHEDULE_TIMEOUT);
+	/*
+	 * Recheck the kick after setting TASK_INTERRUPTIBLE: a kick +
+	 * wake_up_process() is either seen here or wakes the sleep - no lost
+	 * wakeups:
+	 */
+	set_current_state(TASK_INTERRUPTIBLE);
+	if (kick == READ_ONCE(r->kick))
+		bch2_kthread_io_clock_wait_once(clock, r->wait_iotime_end, MAX_SCHEDULE_TIMEOUT);
+	__set_current_state(TASK_RUNNING);
 }
 
 struct reconcile_phase {
@@ -1803,7 +1825,7 @@ out:
 	    kick == r->kick) {
 		bch2_moving_ctxt_flush_all(ctxt);
 		bch2_trans_unlock_long(trans);
-		reconcile_wait(c);
+		reconcile_wait(c, kick);
 	}
 
 	if (!bch2_err_matches(ret, EROFS))

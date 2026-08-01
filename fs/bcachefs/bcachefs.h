@@ -54,6 +54,14 @@
 #include <linux/zstd.h>
 #include <linux/unicode.h>
 
+/* WQ_PERCPU is 6.17+; before that, per-cpu was the unflagged default: */
+#ifdef __KERNEL__
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,17,0)
+#define WQ_PERCPU	0
+#endif
+#endif
+
 #include "bcachefs_format.h"
 #include "errcode.h"
 #include "opts.h"
@@ -64,6 +72,7 @@
 #include "util/enumerated_ref_types.h"
 #include "util/fast_list.h"
 #include "util/fifo.h"
+#include "util/locking.h"
 #include "util/seqmutex.h"
 #include "util/time_stats.h"
 #include "util/thread_with_file_types.h"
@@ -367,6 +376,9 @@ BCH_DEBUG_PARAMS_ALL()
 	x(blocked_journal_low_on_pin,					\
 	  "Blocked: journal pins (dirty btree nodes, "			\
 	  "key cache entries) not flushed fast enough")			\
+	x(blocked_journal_low_on_open_buckets,				\
+	  "Blocked: open buckets running low, throttling new "		\
+	  "journal work so reclaim can free them")			\
 	x(blocked_journal_max_in_flight,				\
 	  "Blocked: too many journal writes in flight")			\
 	x(blocked_journal_max_open,					\
@@ -527,7 +539,6 @@ struct bch_dev {
 	struct bch_sb		*sb_read_scratch;
 	int			sb_write_error;
 	dev_t			dev;
-	atomic_t		flush_seq;
 
 	struct bch_devs_mask	self;
 
@@ -551,11 +562,13 @@ struct bch_dev {
 	u64			alloc_cursor[3];
 
 	/*
-	 * Incremented by bch2_alloc_wake_dev() / _all() at every site that
-	 * wakes freelist_wait. Waiters on c->allocator.freelist_wait
-	 * snapshot the counters for the devices they need at park time and
-	 * compare on wake: if none have advanced, the wake didn't concern
-	 * this waiter and it re-parks without the full alloc retry.
+	 * Incremented by bch2_alloc_wake_dev() at every site that wakes
+	 * freelist_wait for a specific device. Waiters on
+	 * c->allocator.freelist_wait snapshot the counters for the devices
+	 * they need at park time and compare on wake: if none have advanced,
+	 * the wake didn't concern this waiter and it re-parks without the
+	 * full alloc retry. Fs-wide wakes bump allocator.wake_all_counter
+	 * instead (see bch2_alloc_wake_all()).
 	 */
 	atomic_t		alloc_wake_counter;
 
@@ -611,9 +624,9 @@ struct bch_dev {
 	x(write_disable_complete)	\
 	x(clean_shutdown)		\
 	x(in_recovery)			\
+	x(running_recovery_passes)	\
 	x(in_fsck)			\
 	x(initial_gc_unfixed)		\
-	x(need_delete_dead_snapshots)	\
 	x(error)			\
 	x(topology_error)		\
 	x(errors_fixed)			\
@@ -660,7 +673,6 @@ struct journal_seq_blacklist_table {
 	x(discard_fast)							\
 	x(check_discard_freespace_key)					\
 	x(invalidate)							\
-	x(delete_dead_snapshots)					\
 	x(gc_gens)							\
 	x(presplit_shard_boundaries)					\
 	x(snapshot_delete_pagecache)					\
@@ -734,7 +746,7 @@ struct bch_fs {
 	struct bch_sb_cpu	sb;
 	struct bch_sb_handle	disk_sb;
 	struct closure		sb_write;
-	struct mutex		sb_lock;
+	struct mutex_noio	sb_lock;
 	unsigned long		incompat_versions_requested[BITS_TO_LONGS(BCH_VERSION_MINOR(bcachefs_metadata_version_current))];
 	struct unicode_map	*cf_encoding;
 
@@ -1006,8 +1018,11 @@ struct bch_log_msg {
 
 static inline void bch2_log_msg_exit(struct bch_log_msg *msg)
 {
-	if (!msg->m.suppress)
+	if (!msg->m.suppress) {
+		/* elastic tabstops: align any raw \t/\r columns */
+		bch2_printbuf_tabstop_align(&msg->m);
 		bch2_print_str_loglevel(msg->c, msg->loglevel, msg->m.buf);
+	}
 	printbuf_exit(&msg->m);
 }
 
@@ -1060,6 +1075,12 @@ typedef class_bch_log_msg_t class_bch_log_msg_ratelimited_t;
 
 static inline void class_bch_log_msg_ratelimited_destructor(class_bch_log_msg_t *p)
 { bch2_log_msg_exit(p); }
+
+/* btrees_clean: see bch_sb_field_ext.btrees_clean and bch2_set/clear_btree_clean() */
+static inline bool bch2_btree_is_clean(struct bch_fs *c, enum btree_id btree)
+{
+	return c->sb.btrees_clean & BIT_ULL(btree);
+}
 #define class_bch_log_msg_ratelimited_constructor(_c)		\
 	bch2_log_msg_init(_c, 3, bch2_ratelimit(_c), false)
 

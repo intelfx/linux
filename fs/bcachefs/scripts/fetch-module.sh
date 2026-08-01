@@ -19,7 +19,7 @@
 # module must match AND that a running system can reconstruct from its own
 # package database:
 #
-#   <base>/<distro>/<arch>/<pkgver>/bcachefs-<ref>.ko
+#   <base>/<distro>/<arch>/<pkgver>/bcachefs-v<ref>.ko
 #
 #   distro  os-release ID (debian, ubuntu, fedora, arch, ...)
 #   arch    the distro's own arch name (amd64 vs x86_64) — asked of the package
@@ -73,6 +73,7 @@ fall_back()
 [ -n "$dest" ]      || fall_back "no destination path"
 command -v modinfo >/dev/null 2>&1 || fall_back "no modinfo to verify the module"
 command -v openssl >/dev/null 2>&1 || fall_back "no openssl to verify the module signature"
+command -v xz >/dev/null 2>&1 || fall_back "no xz to decompress the module"
 
 # The signing CA (public root) is bundled next to this script; an env override
 # helps testing. Resolve it up front so we fail fast before downloading.
@@ -199,15 +200,28 @@ esac
 
 [ -n "$pkgver" ] || fall_back "could not determine the kernel package version"
 
-url=$base_url/$distro/$arch/$pkgver/bcachefs-$ref.ko
+# The farm publishes modules named after the git tag (bcachefs-v1.38.8.ko),
+# while $ref is the package version DKMS passes (1.38.8, no leading v) - so
+# normalize to the published "v"-prefixed form. (github #784)
+url=$base_url/$distro/$arch/$pkgver/bcachefs-v${ref#v}.ko
 
 work=$(mktemp -d) || fall_back "could not create a working directory"
 trap 'rm -rf "$work"' EXIT
 ko=$work/bcachefs.ko
 
-echo "bcachefs: trying prebuilt module $url" >&2
-download "$url" "$ko" ||
+# The farm publishes xz-compressed (~6x: 6.6M of module is 1.1M on the wire),
+# and only that - no uncompressed fallback. Nothing published before this is
+# reachable anyway: the abbrev fix renames every snapshot, so the store gets
+# republished wholesale.
+#
+# Compression is applied after signing, so it must be undone before anything
+# reads the trailer - both verify_signature and the vermagic check below parse
+# it. Decompress here and everything downstream sees a plain signed .ko.
+echo "bcachefs: trying prebuilt module $url.xz" >&2
+download "$url.xz" "$ko.xz" ||
 	fall_back "not available for $distro/$arch/$pkgver bcachefs $ref"
+xz -d -c -- "$ko.xz" >"$ko" ||
+	fall_back "could not decompress $url.xz"
 
 # Authenticity gate: refuse anything not signed by the bcachefs key, so a bad
 # mirror or MITM can't get a module installed. (ABI gate — vermagic — follows.)

@@ -41,6 +41,7 @@
 #include "init/error.h"
 
 #include "journal/journal.h"
+#include "journal/reclaim.h"
 
 #include "sb/counters.h"
 
@@ -82,11 +83,15 @@ void bch2_alloc_wake_dev(struct bch_dev *ca)
 	closure_wake_up(&ca->fs->allocator.freelist_wait);
 }
 
+/*
+ * Fs-wide wake: bump wake_all_counter so every parked waiter forces a full
+ * allocator retry (see alloc_wait_advanced()), rather than filtering on the
+ * per-device counters in its failed-alloc trace. Eligibility may have changed
+ * for a device outside any trace — e.g. a newly added one.
+ */
 void bch2_alloc_wake_all(struct bch_fs *c)
 {
-	guard(rcu)();
-	for_each_member_device_rcu(c, ca, NULL)
-		atomic_inc(&ca->alloc_wake_counter);
+	atomic_inc(&c->allocator.wake_all_counter);
 	closure_wake_up(&c->allocator.freelist_wait);
 }
 
@@ -321,19 +326,28 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 	return ob;
 }
 
-static struct open_bucket *try_alloc_bucket(struct btree_trans *trans,
-					    struct alloc_request *req,
-					    struct btree_iter *freespace_iter)
+static struct open_bucket *try_alloc_bucket_pos(struct btree_trans *trans,
+						struct alloc_request *req,
+						u64 pos)
 {
 	struct bch_fs *c = trans->c;
-	u64 b = freespace_iter->pos.offset & ~(~0ULL << 56);
+	u64 b = pos & ~(~0ULL << 56);
 
 	if (!may_alloc_bucket(c, req, POS(req->ca->dev_idx, b)))
 		return NULL;
 
+	/*
+	 * nopreserve: we're called for a fresh candidate position each time,
+	 * so a preserved path is never reused - and a scan over a long run of
+	 * unallocatable buckets would accumulate a dead path per candidate
+	 * until the transaction overflows:
+	 */
+	CLASS(btree_iter, iter)(trans, BTREE_ID_freespace,
+				POS(req->ca->dev_idx, pos), BTREE_ITER_nopreserve);
+
 	u8 gen;
 	u64 journal_seq_empty;
-	int ret = bch2_check_freespace_key_async(trans, freespace_iter, &gen, &journal_seq_empty);
+	int ret = bch2_check_freespace_key_async(trans, &iter, &gen, &journal_seq_empty);
 	if (ret < 0)
 		return ERR_PTR(ret);
 	if (ret)
@@ -372,8 +386,9 @@ bch2_bucket_alloc_early(struct btree_trans *trans,
 	 * bucket.
 	 */
 again:
+	/* BTREE_ITER_committed: see bucket_alloc_scan() */
 	for_each_btree_key_norestart(trans, iter, BTREE_ID_alloc, POS(ca->dev_idx, alloc_cursor),
-			   BTREE_ITER_slots, k, ret) {
+			   BTREE_ITER_slots|BTREE_ITER_committed, k, ret) {
 		u64 bucket = alloc_cursor = k.k->p.offset;
 
 		if (bkey_ge(k.k->p, POS(ca->dev_idx, ca->mi.nbuckets)))
@@ -401,7 +416,8 @@ again:
 			continue;
 
 		/* now check the cached key to serialize concurrent allocs of the bucket */
-		CLASS(btree_iter, citer)(trans, BTREE_ID_alloc, k.k->p, BTREE_ITER_cached|BTREE_ITER_nopreserve);
+		CLASS(btree_iter, citer)(trans, BTREE_ID_alloc, k.k->p,
+					 BTREE_ITER_cached|BTREE_ITER_nopreserve|BTREE_ITER_committed);
 		struct bkey_s_c ck = bch2_btree_iter_peek_slot(&citer);
 		ret = bkey_err(ck);
 		if (ret)
@@ -433,76 +449,200 @@ again:
 	return ob;
 }
 
+/*
+ * Scan for the nearest bucket we can allocate, forwards or backwards from
+ * @start, within one genbits class of the freespace btree: candidates come
+ * from peeking the freespace btree (extents - every bucket in a returned
+ * extent is free), and candidates we can't allocate - held open, btree
+ * bitmap mismatches - advance the scan.
+ */
+static struct open_bucket *
+bucket_alloc_scan(struct btree_trans *trans, struct alloc_request *req,
+		  u64 genbits, u64 start, bool forwards)
+{
+	struct bch_dev *ca = req->ca;
+	const u64 bucket_mask = ~(~0ULL << 56);
+	struct bpos end	= POS(ca->dev_idx, genbits | bucket_mask);
+	struct bpos min	= POS(ca->dev_idx, genbits | ca->mi.first_bucket);
+	u64 pos = start;
+
+	if (!forwards) {
+		/* @start itself belongs to the forwards scan: */
+		if (pos == min.offset)
+			return NULL;
+		pos--;
+	}
+
+	/*
+	 * BTREE_ITER_committed: bucket allocation is an irrevocable side
+	 * effect - the open bucket, and btree nodes created from it, outlive
+	 * a transaction restart - so it must only consume commit-durable
+	 * state, never this transaction's own pending updates.
+	 *
+	 * Notably, a transaction that frees a bucket (the discard path's
+	 * mark_free) can trigger node allocation from within its own commit
+	 * via a split: allocating the bucket being freed consumes state that
+	 * may never commit, and, by making the bucket open, prevents the
+	 * retried commit from ever freeing it. Every alloc-state read on the
+	 * allocation path must carry this flag.
+	 */
+	CLASS(btree_iter, iter)(trans, BTREE_ID_freespace,
+				POS(ca->dev_idx, pos), BTREE_ITER_committed);
+
+	while (1) {
+		if (!forwards && pos < min.offset)
+			return NULL;
+
+		bch2_btree_iter_set_pos(&iter, POS(ca->dev_idx, pos));
+
+		struct bkey_s_c k = forwards
+			? bch2_btree_iter_peek_max(&iter, &end)
+			: bch2_btree_iter_peek_prev_min(&iter, min);
+		int ret = bkey_err(k);
+		if (ret)
+			return ERR_PTR(ret);
+		if (!k.k)
+			return NULL;
+
+		u64 cand = forwards
+			? max(pos, bkey_start_offset(k.k))
+			: min(pos, k.k->p.offset - 1);
+		u64 bucket = cand & bucket_mask;
+
+		req->counters.buckets_seen++;
+
+		if (req->btree_bitmap != BTREE_BITMAP_ANY &&
+		    req->btree_bitmap != bch2_dev_btree_bitmap_marked_sectors(ca,
+				bucket_to_sector(ca, bucket), ca->mi.bucket_size)) {
+			u64 shift = ca->mi.btree_bitmap_shift;
+
+			req->counters.skipped_mi_btree_bitmap++;
+
+			/* skip to the next bitmap granule: */
+			if (forwards) {
+				if (req->btree_bitmap == BTREE_BITMAP_YES &&
+				    bucket_to_sector(ca, bucket) > 64ULL << shift)
+					return NULL;
+				pos = genbits | sector_to_bucket(ca,
+						round_up(bucket_to_sector(ca, bucket + 1),
+							 1ULL << shift));
+			} else {
+				u64 granule = round_down(bucket_to_sector(ca, bucket),
+							 1ULL << shift);
+				if (!granule)
+					return NULL;
+				pos = genbits | (sector_to_bucket(ca, granule) - 1);
+			}
+			continue;
+		}
+
+		struct open_bucket *ob = try_alloc_bucket_pos(trans, req, cand);
+		if (ob)
+			return ob;
+
+		if (forwards)
+			pos = cand + 1;
+		else if (cand == min.offset)
+			return NULL;
+		else
+			pos = cand - 1;
+	}
+}
+
+/*
+ * Allocate from the device cursor: forward scans from the cursor position
+ * through the genbits classes above it, wrapping around to the start of the
+ * device if nothing was found:
+ */
 static struct open_bucket *bch2_bucket_alloc_freelist(struct btree_trans *trans,
 						      struct alloc_request *req)
 {
 	struct bch_dev *ca = req->ca;
-	struct bkey_s_c k;
-	struct open_bucket *ob = NULL;
 	u64 *dev_alloc_cursor = &ca->alloc_cursor[req->btree_bitmap];
-	u64 alloc_start = max_t(u64, ca->mi.first_bucket, READ_ONCE(*dev_alloc_cursor));
-	u64 alloc_cursor = alloc_start;
-	int ret;
-again:
-	for_each_btree_key_max_norestart(trans, iter, BTREE_ID_freespace,
-					 POS(ca->dev_idx, alloc_cursor),
-					 POS(ca->dev_idx, U64_MAX),
-					 0, k, ret) {
-		/*
-		 * peek normally dosen't trim extents - they can span iter.pos,
-		 * which is not what we want here:
-		 */
-		iter.k.size = iter.k.p.offset - iter.pos.offset;
+	u64 start = max_t(u64, ca->mi.first_bucket, READ_ONCE(*dev_alloc_cursor));
 
-		while (iter.k.size) {
-			req->counters.buckets_seen++;
-
-			u64 bucket = iter.pos.offset & ~(~0ULL << 56);
-			if (req->btree_bitmap != BTREE_BITMAP_ANY &&
-			    req->btree_bitmap != bch2_dev_btree_bitmap_marked_sectors(ca,
-					bucket_to_sector(ca, bucket), ca->mi.bucket_size)) {
-				if (req->btree_bitmap == BTREE_BITMAP_YES &&
-				    bucket_to_sector(ca, bucket) > 64ULL << ca->mi.btree_bitmap_shift)
-					goto fail;
-
-				bucket = sector_to_bucket(ca,
-						round_up(bucket_to_sector(ca, bucket + 1),
-							 1ULL << ca->mi.btree_bitmap_shift));
-				alloc_cursor = bucket|(iter.pos.offset & (~0ULL << 56));
-
-				bch2_btree_iter_set_pos(&iter, POS(ca->dev_idx, alloc_cursor));
-				req->counters.skipped_mi_btree_bitmap++;
-				goto next;
-			}
-
-			ob = try_alloc_bucket(trans, req, &iter);
+	for (unsigned pass = 0; pass < 2; pass++) {
+		for (u64 g = start >> 56; g < BCH_FREESPACE_GENBITS_NR; g++) {
+			u64 genbits = g << 56;
+			struct open_bucket *ob = bucket_alloc_scan(trans, req, genbits,
+					max(start, genbits | ca->mi.first_bucket), true);
 			if (ob) {
 				if (!IS_ERR(ob))
-					*dev_alloc_cursor = iter.pos.offset;
-				bch2_set_btree_iter_dontneed(&iter);
-				break;
+					*dev_alloc_cursor = genbits | ob->bucket;
+				return ob;
+			}
+		}
+
+		if (start == ca->mi.first_bucket)
+			break;
+		start = ca->mi.first_bucket;
+	}
+
+	return NULL;
+}
+
+/*
+ * Targeted allocation, for erasure coding: allocate the free bucket nearest
+ * req->target_frac (a fixed point fraction of the device, see
+ * dev_frac_to_offset()), so that a stripe's blocks land at equivalent
+ * positions on each device.
+ *
+ * The freespace btree sorts by (genbits, bucket), so each genbits class (gen
+ * wraparound avoidance) is scanned separately: forwards and backwards from
+ * the target, each direction allocating the nearest bucket it can, keeping
+ * whichever candidate is closest overall. An exact hit returns immediately;
+ * otherwise every class is searched - proximity beats the cursor path's
+ * strict genbits ordering here, and the open bucket get/put on candidates we
+ * don't keep is cheap.
+ *
+ * Unlike bch2_bucket_alloc_freelist() this neither reads nor updates
+ * ca->alloc_cursor: targeted allocations don't drag the shared cursors
+ * around, and concurrent stripe creates don't interfere with each other.
+ */
+
+static struct open_bucket *bch2_bucket_alloc_target(struct btree_trans *trans,
+						    struct alloc_request *req)
+{
+	struct bch_fs *c = trans->c;
+	struct bch_dev *ca = req->ca;
+	u64 target_bucket = clamp(sector_to_bucket(ca,
+					dev_frac_to_offset(ca, req->target_frac)),
+				  (u64) ca->mi.first_bucket,
+				  ca->mi.nbuckets - 1);
+	struct open_bucket *best = NULL;
+
+	for (u64 g = 0; g < BCH_FREESPACE_GENBITS_NR; g++) {
+		u64 genbits = g << 56;
+		u64 target = genbits | target_bucket;
+
+		for (unsigned forwards = 0; forwards < 2; forwards++) {
+			struct open_bucket *ob =
+				bucket_alloc_scan(trans, req, genbits,
+							      target, forwards);
+			if (IS_ERR(ob)) {
+				if (best)
+					bch2_open_bucket_put(c, best);
+				return ob;
+			}
+			if (!ob)
+				continue;
+
+			if (!best) {
+				best = ob;
+			} else if (abs_diff(ob->bucket, target_bucket) <
+				   abs_diff(best->bucket, target_bucket)) {
+				bch2_open_bucket_put(c, best);
+				best = ob;
+			} else {
+				bch2_open_bucket_put(c, ob);
 			}
 
-			iter.k.size--;
-			iter.pos.offset++;
+			if (best->bucket == target_bucket)
+				return best;
 		}
-next:
-		if (ob || ret)
-			break;
-	}
-fail:
-
-	BUG_ON(ob && ret);
-
-	if (ret)
-		ob = ERR_PTR(ret);
-
-	if (!ob && alloc_start > ca->mi.first_bucket) {
-		alloc_cursor = alloc_start = ca->mi.first_bucket;
-		goto again;
 	}
 
-	return ob;
+	return best;
 }
 
 static noinline __cold void bucket_alloc_to_text(struct printbuf *out,
@@ -515,6 +655,8 @@ static noinline __cold void bucket_alloc_to_text(struct printbuf *out,
 	if (req->ca) {
 		prt_printf(out, "dev\t%s (%u)\n",	req->ca->name, req->ca->dev_idx);
 		prt_printf(out, "avail\t%llu\n",	__dev_buckets_free(req->ca, req->usage, req->watermark));
+		scoped_guard(percpu_read_noio, &c->capacity.mark_lock)
+			prt_printf(out, "copygc dev wait\t%lli\n", bch2_copygc_dev_wait_amount(req->ca));
 	}
 
 	prt_printf(out, "watermark\t%s\n",	bch2_watermarks[req->watermark]);
@@ -525,8 +667,7 @@ static noinline __cold void bucket_alloc_to_text(struct printbuf *out,
 	prt_printf(out, "blocking\t%u\n", !(req->flags & BCH_WRITE_alloc_nowait));
 	prt_printf(out, "free\t%llu\n",		req->usage.buckets[BCH_DATA_free]);
 	prt_printf(out, "need_discard\t%llu\n",	req->usage.buckets[BCH_DATA_need_discard]);
-	prt_printf(out, "copygc_wait\t%llu/%lli\n",
-		   bch2_copygc_wait_amount(c),
+	prt_printf(out, "copygc_wait\t%lli\n",
 		   c->copygc.wait - atomic64_read(&c->io_clock[WRITE].now));
 	prt_printf(out, "seen\t%llu\n",	req->counters.buckets_seen);
 	prt_printf(out, "open\t%llu\n",	req->counters.skipped_open);
@@ -646,8 +787,9 @@ again:
 		    c->recovery.pass_done < BCH_RECOVERY_PASS_check_allocations)
 			goto alloc;
 
-		if (bch2_copygc_can_make_progress(ca)) {
-			copygc_can_make_progress = true;
+		scoped_guard(percpu_read_noio, &c->capacity.mark_lock)
+			copygc_can_make_progress = bch2_copygc_can_make_progress(ca);
+		if (copygc_can_make_progress) {
 			req->copygc_can_make_progress = true;
 			bch2_copygc_wakeup(c);
 		}
@@ -679,7 +821,9 @@ again:
 		bch2_alloc_wake_dev(ca);
 alloc:
 	ob = likely(freespace)
-		? bch2_bucket_alloc_freelist(trans, req)
+		? (req->target_frac
+		   ? bch2_bucket_alloc_target(trans, req)
+		   : bch2_bucket_alloc_freelist(trans, req))
 		: bch2_bucket_alloc_early(trans, req);
 
 	if (!ob && req->btree_bitmap != BTREE_BITMAP_ANY) {
@@ -699,6 +843,19 @@ err:
 
 	if (!ret) {
 		ob->data_type = req->data_type;
+
+		/*
+		 * We just consumed an open bucket. If the pool is getting low, poke
+		 * the journal watermark: it factors in open-bucket usage and will
+		 * throttle new journal-reserving work before the reclaim path starves
+		 * (see bch2_journal_set_watermark()). freelist_lock has been dropped
+		 * by now, so taking j->lock here doesn't nest the two.
+		 */
+		if (unlikely(READ_ONCE(c->allocator.open_buckets_nr_free) <
+			     bch2_open_buckets_journal_reserved())) {
+			guard(spinlock)(&c->journal.lock);
+			bch2_journal_set_watermark(&c->journal);
+		}
 
 		event_inc_trace(c, bucket_alloc, buf,
 			bucket_alloc_to_text(&buf, c, req, ob));
@@ -748,18 +905,35 @@ static void dev_stripe_state_sync(struct dev_stripe_state *stripe,
 			if (!test_bit(i, added.d))
 				min_va = min(min_va, stripe->next_alloc[i]);
 
+		/*
+		 * Raise to min, never lower: a device rejoining the mask (e.g.
+		 * excluded for one sort because it holds the previous replica)
+		 * keeps its allocation history - assigning would erase it,
+		 * letting the same device win every equal-hand tie forever
+		 * while its siblings starve:
+		 */
 		if (min_va != U64_MAX)
 			for_each_set_bit(i, added.d, BCH_SB_MEMBERS_MAX)
-				stripe->next_alloc[i] = min_va;
+				stripe->next_alloc[i] = max(stripe->next_alloc[i], min_va);
 	}
 
 	stripe->cached_devs = *devs;
 }
 
-void bch2_dev_alloc_list(struct bch_fs *c,
-			 struct dev_stripe_state *stripe,
-			 struct bch_devs_mask *devs,
-			 struct dev_alloc_list *ret)
+/*
+ * Devices are ordered by failure domain occupancy first - so replicas
+ * spread across failure domains - with the free space round robin breaking
+ * ties:
+ */
+#define dev_alloc_cmp(l, r)						\
+	((domain_keys ? cmp_int(domain_keys[l], domain_keys[r]) : 0) ?:\
+	 __dev_stripe_cmp(stripe, l, r))
+
+static void __dev_alloc_list(struct bch_fs *c,
+			     struct dev_stripe_state *stripe,
+			     struct bch_devs_mask *devs,
+			     const u64 *domain_keys,
+			     struct dev_alloc_list *ret)
 {
 	dev_stripe_state_sync(stripe, devs);
 
@@ -769,7 +943,60 @@ void bch2_dev_alloc_list(struct bch_fs *c,
 	for_each_set_bit(i, devs->d, BCH_SB_MEMBERS_MAX)
 		ret->data[ret->nr++] = i;
 
-	bubble_sort(ret->data, ret->nr, dev_stripe_cmp);
+	bubble_sort(ret->data, ret->nr, dev_alloc_cmp);
+}
+
+/*
+ * Refresh req->domain_keys for every device we may allocate from - one rcu
+ * section per batch. Recomputed whenever devs_chosen changes (each pick
+ * changes the occupancy the next pick should avoid):
+ */
+static void bch2_dev_domain_keys_update(struct bch_fs *c, struct alloc_request *req)
+{
+	unsigned i;
+	scoped_guard(rcu)
+		for_each_set_bit(i, req->devs_may_alloc.d, BCH_SB_MEMBERS_MAX)
+			req->domain_keys[i] = bch2_dev_domain_key(c, &req->devs_chosen, i);
+
+	/*
+	 * For erasure coding failure domains are a hard requirement, not a
+	 * preference: exclude every device sharing a domain with an
+	 * already-chosen block (domain_key > 0) so the allocation fails, or
+	 * narrows, rather than doubling up.
+	 */
+	if (req->failure_domains_required)
+		for_each_set_bit(i, req->devs_may_alloc.d, BCH_SB_MEMBERS_MAX)
+			if (req->domain_keys[i])
+				__clear_bit(i, req->devs_may_alloc.d);
+}
+
+/*
+ * The journal's device selection: domain keys live in the caller's scratch
+ * buffer rather than an alloc_request:
+ */
+void bch2_dev_alloc_list_devs(struct bch_fs *c,
+			      struct dev_stripe_state *stripe,
+			      struct bch_devs_mask *devs,
+			      const struct bch_devs_mask *devs_chosen,
+			      u64 *domain_keys,
+			      struct dev_alloc_list *ret)
+{
+	unsigned i;
+	scoped_guard(rcu)
+		for_each_set_bit(i, devs->d, BCH_SB_MEMBERS_MAX)
+			domain_keys[i] = bch2_dev_domain_key(c, devs_chosen, i);
+
+	__dev_alloc_list(c, stripe, devs, domain_keys, ret);
+}
+
+void bch2_dev_alloc_list(struct bch_fs *c,
+			 struct dev_stripe_state *stripe,
+			 struct alloc_request *req)
+{
+	bch2_dev_domain_keys_update(c, req);
+
+	__dev_alloc_list(c, stripe, &req->devs_may_alloc,
+			 req->domain_keys, &req->devs_sorted);
 }
 
 static const u64 stripe_clock_hand_rescale	= 1ULL << 62; /* trigger rescale at */
@@ -845,11 +1072,11 @@ static int add_new_bucket(struct bch_fs *c,
 {
 	unsigned durability = ob_dev(c, ob)->mi.durability;
 
-	BUG_ON(req->nr_effective >= req->nr_replicas);
+	BUG_ON(req->nr_effective >= req->nr_replicas && durability);
 
 	__clear_bit(ob->dev, req->devs_may_alloc.d);
+	__set_bit(ob->dev, req->devs_chosen.d);
 	req->nr_effective	+= durability;
-	req->have_cache	|= !durability;
 
 	ob_push(c, &req->ptrs, ob);
 
@@ -857,6 +1084,9 @@ static int add_new_bucket(struct bch_fs *c,
 		return 1;
 	if (ob->ec)
 		return 1;
+	if (!durability) /* only allocate one cached copy */
+		return 1;
+
 	return 0;
 }
 
@@ -866,44 +1096,59 @@ int bch2_bucket_alloc_set_trans(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	int ret = 0;
+	bool progress;
 
 	BUG_ON(req->nr_effective >= req->nr_replicas);
 
-	bch2_dev_alloc_list(c, stripe, &req->devs_may_alloc, &req->devs_sorted);
+	bch2_dev_alloc_list(c, stripe, req);
 
+	/*
+	 * Evaluated once, on the full candidate list: this classifies the
+	 * whole allocation for tracing/bailing, and must not flip as the
+	 * list shrinks below.
+	 */
 	if (req->devs_sorted.nr <= 1)
 		req->will_retry_target_devices = false;
 
-	darray_for_each(req->devs_sorted, i) {
-		req->ca = bch2_dev_tryget_noerror(c, *i);
-		if (!req->ca)
-			continue;
+	do {
+		progress = false;
 
-		if (!req->ca->mi.durability && req->have_cache) {
+		darray_for_each(req->devs_sorted, i) {
+			req->ca = bch2_dev_tryget_noerror(c, *i);
+			if (!req->ca)
+				continue;
+
+			req->will_retry_set_devices =
+				i + 1 < req->devs_sorted.data + req->devs_sorted.nr;
+
+			struct open_bucket *ob = bch2_bucket_alloc_trans(trans, req);
+			if (!IS_ERR(ob))
+				bch2_dev_stripe_increment_inlined(req->ca, stripe, &req->usage);
+
 			bch2_dev_put(req->ca);
 			req->ca = NULL;
-			continue;
+
+			if (IS_ERR(ob)) { /* don't squash error */
+				ret = PTR_ERR(ob);
+				if (bch2_err_matches(ret, BCH_ERR_transaction_restart) ||
+				    bch2_err_matches(ret, BCH_ERR_operation_blocked) ||
+				    bch2_err_matches(ret, BCH_ERR_open_buckets_empty))
+					return ret;
+			} else if (add_new_bucket(c, req, ob)) {
+				return 0;
+			} else {
+				progress = true;
+				break;
+			}
 		}
 
-		req->will_retry_set_devices =
-			i + 1 < req->devs_sorted.data + req->devs_sorted.nr;
-
-		struct open_bucket *ob = bch2_bucket_alloc_trans(trans, req);
-		if (!IS_ERR(ob))
-			bch2_dev_stripe_increment_inlined(req->ca, stripe, &req->usage);
-
-		bch2_dev_put(req->ca);
-		req->ca = NULL;
-
-		if (IS_ERR(ob)) { /* don't squash error */
-			ret = PTR_ERR(ob);
-			if (bch2_err_matches(ret, BCH_ERR_transaction_restart) ||
-			    bch2_err_matches(ret, BCH_ERR_operation_blocked) ||
-			    bch2_err_matches(ret, BCH_ERR_open_buckets_empty))
-				return ret;
-		} else if (add_new_bucket(c, req, ob))
-			return 0;
-	}
+		/*
+		 * Each allocation changes which failure domains the next
+		 * replica should avoid - re-sort and go again:
+		 */
+		if (progress)
+			bch2_dev_alloc_list(c, stripe, req);
+	} while (progress);
 
 	return ret ?: alloc_trace_add(req, BCH_SB_MEMBER_INVALID,
 			bch_err_throw(c, insufficient_devices), 0, 0, false);
@@ -927,7 +1172,7 @@ static int bucket_alloc_from_stripe(struct btree_trans *trans,
 	if (!h)
 		return 0;
 
-	bch2_dev_alloc_list(c, &req->wp->stripe, &req->devs_may_alloc, &req->devs_sorted);
+	bch2_dev_alloc_list(c, &req->wp->stripe, req);
 
 	darray_for_each(req->devs_sorted, i)
 		for (unsigned ec_idx = 0; ec_idx < ec_stripe_new_nr_data(h->s); ec_idx++) {
@@ -960,16 +1205,10 @@ static bool want_bucket(struct bch_fs *c,
 			struct alloc_request *req,
 			struct open_bucket *ob)
 {
-	struct bch_dev *ca = ob_dev(c, ob);
-
 	if (!test_bit(ob->dev, req->devs_may_alloc.d))
 		return false;
 
 	if (ob->data_type != req->wp->data_type)
-		return false;
-
-	if (!ca->mi.durability &&
-	    (req->wp->data_type == BCH_DATA_btree || req->ec || req->have_cache))
 		return false;
 
 	if (req->ec != (ob->ec != NULL))
@@ -998,6 +1237,24 @@ static int bucket_alloc_set_writepoint(struct bch_fs *c,
 	return ret;
 }
 
+static int partial_bucket_alloc(struct bch_fs *c,
+				struct alloc_request *req,
+				unsigned idx)
+{
+	struct bch_fs_allocator *a = &c->allocator;
+	struct open_bucket *ob = a->open_buckets + a->open_buckets_partial[idx];
+
+	array_remove_item(a->open_buckets_partial,
+			  a->open_buckets_partial_nr,
+			  idx);
+	ob->on_partial_list = false;
+
+	scoped_guard(rcu)
+		bch2_dev_rcu(c, ob->dev)->nr_partial_buckets--;
+
+	return add_new_bucket(c, req, ob);
+}
+
 static int bucket_alloc_set_partial(struct bch_fs *c,
 				    struct alloc_request *req)
 {
@@ -1008,34 +1265,95 @@ static int bucket_alloc_set_partial(struct bch_fs *c,
 
 	guard(spinlock)(&a->freelist_lock);
 
-	if (!a->open_buckets_partial_nr)
-		return 0;
+	/*
+	 * Pick the domain-best usable candidate each round, not the first
+	 * match: on a steady-state filesystem most allocations are satisfied
+	 * here, and first-fit would undo the failure domain spreading
+	 * bch2_bucket_alloc_set_trans() does for fresh buckets. Each pick
+	 * updates devs_chosen (via add_new_bucket), so the keys are
+	 * recomputed per round - same shape as the fresh-bucket re-sort loop.
+	 */
+	while (a->open_buckets_partial_nr) {
+		int best = -1;
+		u64 best_key = U64_MAX;
 
-	for (int i = a->open_buckets_partial_nr - 1; i >= 0; --i) {
-		struct open_bucket *ob = a->open_buckets + a->open_buckets_partial[i];
+		bch2_dev_domain_keys_update(c, req);
 
-		if (want_bucket(c, req, ob)) {
-			struct bch_dev *ca = ob_dev(c, ob);
-			u64 avail;
+		for (int i = a->open_buckets_partial_nr - 1; i >= 0; --i) {
+			struct open_bucket *ob = a->open_buckets + a->open_buckets_partial[i];
 
-			bch2_dev_usage_read_fast(ca, &req->usage);
-			avail = __dev_buckets_free(ca, req->usage, req->watermark) + ca->nr_partial_buckets;
-			if (!avail)
+			if (!want_bucket(c, req, ob))
 				continue;
 
-			array_remove_item(a->open_buckets_partial,
-					  a->open_buckets_partial_nr,
-					  i);
-			ob->on_partial_list = false;
+			struct bch_dev *ca = ob_dev(c, ob);
 
-			scoped_guard(rcu)
-				bch2_dev_rcu(c, ob->dev)->nr_partial_buckets--;
+			bch2_dev_usage_read_fast(ca, &req->usage);
+			if (!(__dev_buckets_free(ca, req->usage, req->watermark) +
+			      ca->nr_partial_buckets))
+				continue;
 
-			try(add_new_bucket(c, req, ob));
+			if (req->domain_keys[ob->dev] < best_key) {
+				best		= i;
+				best_key	= req->domain_keys[ob->dev];
+			}
 		}
+
+		if (best < 0)
+			return 0;
+
+		try(partial_bucket_alloc(c, req, best));
 	}
 
 	return 0;
+}
+
+noinline
+static int bucket_alloc_cached(struct btree_trans *trans, struct alloc_request *req)
+{
+	struct bch_fs *c = trans->c;
+	struct bch_fs_allocator *a = &c->allocator;
+	struct open_bucket *ob;
+	unsigned i;
+
+	open_bucket_for_each(c, &req->wp->ptrs, ob, i)
+		if (test_bit(ob->dev, req->devs_may_alloc.d)) {
+			add_new_bucket(c, req, ob);
+			array_remove_item(req->wp->ptrs.v,
+					  req->wp->ptrs.nr,
+					  i);
+			return 0;
+		}
+
+	if (a->open_buckets_partial_nr) {
+		guard(spinlock)(&a->freelist_lock);
+
+		for (unsigned i = 0; i < a->open_buckets_partial_nr; i++) {
+			struct open_bucket *ob = a->open_buckets + a->open_buckets_partial[i];
+
+			if (ob->data_type == req->wp->data_type &&
+			    test_bit(ob->dev, req->devs_may_alloc.d)) {
+				partial_bucket_alloc(c, req, i);
+				return 0;
+			}
+		}
+	}
+
+	/*
+	 * The request is already complete in durability terms - ask for one
+	 * more bucket, and never block: a write doesn't wait for its cache
+	 * copy, and not getting one isn't an error:
+	 */
+	req->scratch_nr_replicas	= req->nr_replicas;
+	struct closure *cl		= req->cl;
+	req->nr_replicas		= req->nr_effective + 1;
+	req->cl				= NULL;
+
+	int ret = bch2_bucket_alloc_set_trans(trans, req, &req->wp->stripe);
+
+	req->nr_replicas		= req->scratch_nr_replicas;
+	req->cl				= cl;
+
+	return bch2_err_matches(ret, BCH_ERR_transaction_restart) ? ret : 0;
 }
 
 /**
@@ -1310,18 +1628,19 @@ int bch2_alloc_sectors_req(struct btree_trans *trans,
 	struct bch_fs_allocator *a = &c->allocator;
 	struct open_bucket *ob;
 	unsigned write_points_nr;
+	unsigned orig_target = req->target;
 	int i;
 
 	BUG_ON(!req->nr_replicas);
 retry:
 	req->ca				= NULL;
+	req->wake_all_counter_snapshot	= atomic_read(&c->allocator.wake_all_counter);
 	req->will_retry_all_devices	= req->target && !(req->flags & BCH_WRITE_only_specified_devs);
 	req->will_retry_target_devices	= !(req->flags & BCH_WRITE_alloc_nowait);
 	req->copygc_can_make_progress	= false;
 	req->trace_alloc_failed		= false;
 	req->ptrs.nr			= 0;
 	req->nr_effective		= 0;
-	req->have_cache			= (req->flags & BCH_WRITE_move) && !(req->flags & BCH_WRITE_cached);
 	req->trace.nr			= 0;
 	write_points_nr			= a->write_points_nr;
 
@@ -1329,23 +1648,40 @@ retry:
 
 	req->data_type		= req->wp->data_type;
 
-	/* metadata may not allocate on cache devices: */
-	if (req->data_type != BCH_DATA_user)
-		req->have_cache = true;
-
 	int ret = bch2_trans_relock(trans);
 	if (ret)
 		goto err;
 
 	while (1) {
-		req->devs_may_alloc = target_rw_devs(c, req->wp->data_type, req->target);
+		req->devs_may_alloc = target_rw_devs(c, req->data_type, req->target);
 
-		/* Don't allocate from devices we already have pointers to: */
-		darray_for_each(*req->devs_have, i)
+		/*
+		 * Writes of cached data (promotes) allocate their one copy
+		 * from durability 0 devices and durable devices alike:
+		 */
+		if (req->flags & BCH_WRITE_cached) {
+			struct bch_devs_mask cached_devs =
+				target_rw_devs(c, BCH_DATA_cached, req->target);
+
+			bitmap_or(req->devs_may_alloc.d, req->devs_may_alloc.d,
+				  cached_devs.d, BCH_SB_MEMBERS_MAX);
+		}
+
+		/*
+		 * Don't allocate from devices we already have pointers to -
+		 * and spread away from their failure domains:
+		 */
+		memset(&req->devs_chosen, 0, sizeof(req->devs_chosen));
+
+		darray_for_each(*req->devs_have, i) {
 			__clear_bit(*i, req->devs_may_alloc.d);
+			__set_bit(*i, req->devs_chosen.d);
+		}
 
-		open_bucket_for_each(c, &req->ptrs, ob, i)
+		open_bucket_for_each(c, &req->ptrs, ob, i) {
 			__clear_bit(ob->dev, req->devs_may_alloc.d);
+			__set_bit(ob->dev, req->devs_chosen.d);
+		}
 
 		ret =   bucket_alloc_set_writepoint(c, req) ?:
 			bucket_alloc_set_partial(c, req) ?:
@@ -1361,13 +1697,7 @@ retry:
 			goto err;
 
 		if (ret && req->will_retry_all_devices) {
-			/*
-			 * Only try to allocate cache (durability = 0 devices) from the
-			 * specified target:
-			 *
-			 * Only allocate stripes on the specified target
-			 */
-			req->have_cache			= true;
+			/* Only allocate stripes on the specified target */
 			req->ec				= false;
 			req->target			= 0;
 			req->will_retry_all_devices	= false;
@@ -1425,6 +1755,33 @@ retry:
 	    !ec_open_bucket(c, &req->ptrs)) {
 		ret = bch_err_throw(c, ec_alloc_failed);
 		goto err;
+	}
+
+	/*
+	 * If the specified target has durability=0 devices, also write one
+	 * cached copy to one of those. Not for moves - they only move the
+	 * data that exists - and not for writes of cached data, which
+	 * allocate from the cache devices directly:
+	 */
+	if (!(req->flags & (BCH_WRITE_move|BCH_WRITE_cached)) &&
+	    req->data_type == BCH_DATA_user) {
+		/*
+		 * Rebuilt from scratch: devs_may_alloc has been through
+		 * per-device clears and possibly a widened target - the cache
+		 * copy comes from the target the caller specified:
+		 */
+		req->devs_may_alloc = target_rw_devs(c, BCH_DATA_cached, orig_target);
+
+		darray_for_each(*req->devs_have, d)
+			__clear_bit(*d, req->devs_may_alloc.d);
+		open_bucket_for_each(c, &req->ptrs, ob, i)
+			__clear_bit(ob->dev, req->devs_may_alloc.d);
+
+		if (dev_mask_nr(&req->devs_may_alloc)) {
+			ret = bucket_alloc_cached(trans, req);
+			if (ret)
+				goto err;
+		}
 	}
 
 	if (req->nr_effective > req->nr_replicas)
@@ -1925,9 +2282,19 @@ static noinline void bch2_print_allocator_stuck(struct bch_fs *c, struct alloc_r
  */
 static bool alloc_wait_advanced(struct bch_fs *c, struct alloc_request *req)
 {
+	/*
+	 * A global wake means allocation eligibility may have changed outside
+	 * the devices recorded in this request's trace (for example, a newly
+	 * added device).  Force a full allocator retry in that case.
+	 */
+	if (atomic_read(&c->allocator.wake_all_counter) !=
+	    req->wake_all_counter_snapshot)
+		return true;
+
 	if (unlikely(req->trace_alloc_failed))
 		return true;
 
+	guard(percpu_read_noio)(&c->capacity.mark_lock);
 	guard(rcu)();
 	bool found = false;
 
@@ -1966,6 +2333,17 @@ void __bch2_wait_on_allocator(struct btree_trans *trans,
 	bch2_trans_unlock(trans);
 
 	while (1) {
+		/*
+		 * A wake may race with closure_wait() before our closure is on
+		 * the waitlist.  Check the snapshots before sleeping; unpark is
+		 * required to remove our closure from the llist on this path.
+		 */
+		if (bch2_err_matches(err, BCH_ERR_bucket_alloc_blocked) &&
+		    alloc_wait_advanced(c, req)) {
+			bch2_alloc_waiters_unpark(c);
+			return;
+		}
+
 		long t = until - jiffies;
 
 		if (t > 0 && trans_closure_sync_timeout(trans, cl, t)) {

@@ -5,6 +5,8 @@
 #include <linux/list.h>
 #include <linux/rhashtable.h>
 
+#include "util/locking.h"
+
 #include "alloc/buckets_types.h"
 #include "alloc/replicas_types.h"
 
@@ -272,7 +274,7 @@ struct bch_fs_btree_cache {
 	 * common to delete and allocate btree nodes in quick succession. It
 	 * should never grow past ~2-3 nodes in practice.
 	 */
-	struct mutex		lock;
+	struct mutex_noio	lock;
 	struct list_head	freeable;
 	struct list_head	freed_pcpu;
 	struct list_head	freed_nonpcpu;
@@ -338,6 +340,7 @@ struct btree_node_iter {
 
 #define BTREE_ITER_FLAGS()			\
 	x(slots)				\
+	x(prev)					\
 	x(intent)				\
 	x(prefetch)				\
 	x(is_extents)				\
@@ -353,6 +356,7 @@ struct btree_node_iter {
 	x(nofill)				\
 	x(cached_nofill)			\
 	x(key_cache_fill)			\
+	x(committed)				\
 
 #define STR_HASH_FLAGS()			\
 	x(must_create)				\
@@ -400,8 +404,8 @@ enum {
 #undef x
 };
 
-/* iter flags must fit in a u16: */
-//BUILD_BUG_ON(BTREE_ITER_FLAG_BIT_key_cache_fill > 15);
+/* iter flags must fit in struct btree_iter.flags: */
+static_assert(BTREE_ITER_FLAG_BIT_committed < 32);
 
 enum btree_iter_update_trigger_flags {
 #define x(n) BTREE_ITER_##n	= 1U << BTREE_ITER_FLAG_BIT_##n,
@@ -498,7 +502,7 @@ struct btree_iter {
 	u8			min_depth;
 
 	/* btree_iter_copy starts here: */
-	u16			flags;
+	u32			flags;
 
 	/* When we're filtering by snapshot, the snapshot ID we're looking for: */
 	unsigned		snapshot;
@@ -675,7 +679,7 @@ struct btree_trans {
 	 */
 	bool			srcu_io_submitted:1;
 	bool			btree_cache_cannibalize_locked:1;
-	bool			pf_memalloc_nofs:1;
+	bool			pf_memalloc_noio:1;
 	bool			used_mempool:1;
 	bool			in_traverse_all:1;
 	bool			paths_sorted:1;
@@ -683,12 +687,27 @@ struct btree_trans {
 	bool			journal_transaction_names:1;
 	bool			journal_replay_not_finished:1;
 	bool			notrace_relock_fail:1;
+	/*
+	 * Exempt bch2_trans_begin() from the dropped-updates warning. Set
+	 * around a nested transaction - one that grabs trans->restart_count,
+	 * does work whose inner commits discard the outer's queued updates, and
+	 * returns trans_was_restarted() (e.g. fsck counting i_sectors, which
+	 * spans too many extents to be a single transaction). The begin can't
+	 * see the restart that's about to be returned, so the caller vouches
+	 * for it here.
+	 */
+	bool			begin_may_drop_updates:1;
 	bool			has_interior_updates:1;
 	enum bch_errcode	restarted:16;
 	u32			restart_count;
 #ifdef CONFIG_BCACHEFS_INJECT_TRANSACTION_RESTARTS
 	u32			restart_count_this_trans;
 #endif
+	/*
+	 * Incremented on every successful (non-empty) commit; for detecting
+	 * that cached state derived from btree reads may be stale:
+	 */
+	u32			commit_count;
 
 	u64			last_begin_time;
 	unsigned long		last_begin_ip;
@@ -1099,6 +1118,19 @@ static inline enum btree_node_type btree_node_type(struct btree *b)
 
 const char *bch2_btree_node_type_str(enum btree_node_type);
 
+/*
+ * Mask of btree ids that have snapshots; defined here, ahead of the other
+ * btree-id masks below, because the trigger masks build on it: every snapshot
+ * btree needs trans triggers so that bch2_trigger_snapshot_nr_keys() runs for
+ * its keys. (<< 1 maps btree_id space to btree_node_type space, where a leaf's
+ * node type is id + 1.)
+ */
+static const u64 btree_has_snapshots_mask = 0
+#define x(name, nr, flags, ...)	|((!!((flags) & BTREE_IS_snapshots)) << nr)
+BCH_BTREE_IDS()
+#undef x
+;
+
 #define BTREE_NODE_TYPE_HAS_TRANS_TRIGGERS		\
 	(BIT_ULL(BKEY_TYPE_extents)|			\
 	 BIT_ULL(BKEY_TYPE_alloc)|			\
@@ -1106,7 +1138,9 @@ const char *bch2_btree_node_type_str(enum btree_node_type);
 	 BIT_ULL(BKEY_TYPE_stripes)|			\
 	 BIT_ULL(BKEY_TYPE_reflink)|			\
 	 BIT_ULL(BKEY_TYPE_subvolumes)|			\
-	 BIT_ULL(BKEY_TYPE_btree))
+	 BIT_ULL(BKEY_TYPE_snapshots)|			\
+	 BIT_ULL(BKEY_TYPE_btree)|			\
+	 (btree_has_snapshots_mask << 1))
 
 #define BTREE_NODE_TYPE_HAS_ATOMIC_TRIGGERS		\
 	(BIT_ULL(BKEY_TYPE_alloc)|			\
@@ -1152,12 +1186,6 @@ static inline bool btree_node_type_is_extents(enum btree_node_type type)
 {
 	return type != BKEY_TYPE_btree && btree_id_is_extents(type - 1);
 }
-
-static const u64 btree_has_snapshots_mask = 0
-#define x(name, nr, flags, ...)	|((!!((flags) & BTREE_IS_snapshots)) << nr)
-BCH_BTREE_IDS()
-#undef x
-;
 
 static inline bool btree_type_has_snapshots(enum btree_id btree)
 {

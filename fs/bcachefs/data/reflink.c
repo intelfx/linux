@@ -154,9 +154,9 @@ __cold void bch2_indirect_inline_data_to_text(struct printbuf *out,
 	struct bkey_s_c_indirect_inline_data d = bkey_s_c_to_indirect_inline_data(k);
 	unsigned datalen = bkey_inline_data_bytes(k.k);
 
-	prt_printf(out, "refcount %llu datalen %u: %*phN",
-	       le64_to_cpu(d.v->refcount), datalen,
-	       min(datalen, 32U), d.v->data);
+	prt_printf(out, "refcount %llu datalen %u: ",
+	       le64_to_cpu(d.v->refcount), datalen);
+	prt_hex_bytes(out, d.v->data, min(datalen, 32U));
 }
 
 /* lookup */
@@ -207,7 +207,8 @@ static int bch2_indirect_extent_missing_error(struct btree_trans *trans,
 	prt_printf(&buf, "\nmissing reflink btree range %llu-%llu",
 		   missing_start, missing_end);
 
-	if (ret_fsck_err(trans, reflink_p_to_missing_reflink_v, "%s", buf.buf)) {
+	if (ret_inode_fsck_err(trans, p.k->p,
+			       reflink_p_to_missing_reflink_v, "%s", buf.buf)) {
 		struct bkey_i_reflink_p *new =
 			errptr_try(bch2_bkey_make_mut_noupdate_typed(trans, p.s_c, reflink_p));
 

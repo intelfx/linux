@@ -850,15 +850,26 @@ unsigned bch2_disk_label_ec_devs(struct bch_fs *c, unsigned disk_label,
 /*
  * Can a stripe with @redundancy parity blocks be formed in @target right now?
  *
- * Minimum stripe size is redundancy + 1 (one data block + parity), and all
- * blocks in a stripe must share a single bucket_size. So we need at least
- * redundancy + 1 RW devices in the target that agree on bucket_size.
+ * This must model what ec_stripe_head_devs_update() computes as
+ * insufficient_devs, because that is what actually refuses to allocate. Both
+ * of its conditions apply:
+ *
+ *  - at least redundancy + 2 devices agreeing on bucket_size. Not + 1: a
+ *    stripe of one data block plus parity is strictly worse than replication,
+ *    so that case is rejected rather than formed.
+ *  - at least redundancy + 2 distinct failure domains. One block per domain is
+ *    a hard requirement for erasure coding, not a preference - the allocator
+ *    excludes devices sharing an already-placed block's domain. With no
+ *    failure domains configured every device is its own domain and this is
+ *    the device count again, so it only bites where devices share one.
  *
  * bch2_disk_label_ec_devs already returns the filtered device mask (RW members
  * with durability > 0, narrowed to the picked best bucket_size).
  *
  * Used by reconcile to avoid queueing EC work that can't make progress —
- * otherwise reconcile spins re-queueing data_update_fail forever.
+ * otherwise reconcile spins re-queueing data_update_fail forever. Modelling
+ * only the device count let configurations through that the allocator then
+ * refused, costing one wasted rewrite of every affected extent.
  */
 bool bch2_can_form_ec_stripe(struct bch_fs *c, unsigned target, unsigned redundancy)
 {
@@ -866,14 +877,26 @@ bool bch2_can_form_ec_stripe(struct bch_fs *c, unsigned target, unsigned redunda
 		return false;
 
 	struct target t = target_decode(target);
-	unsigned disk_label = t.type == TARGET_GROUP && t.group <= U8_MAX
+
+	/*
+	 * A group above U8_MAX cannot be a disk label, and __ec_stripe_head_get()
+	 * refuses it outright ("cannot create a stripe when disk_label > U8_MAX").
+	 * Folding it to disk_label 0 here would ask about every device in the
+	 * filesystem and answer yes to a target the allocator will not serve --
+	 * the same shape of mismatch this function is being fixed for.
+	 */
+	if (t.type == TARGET_GROUP && t.group > U8_MAX)
+		return false;
+
+	unsigned disk_label = t.type == TARGET_GROUP
 		? t.group + 1
 		: 0;
 
 	struct bch_devs_mask devs;
 	bch2_disk_label_ec_devs(c, disk_label, &devs, 0);
 
-	return dev_mask_nr(&devs) >= redundancy + 1;
+	return dev_mask_nr(&devs) >= redundancy + 2 &&
+	       bch2_target_nr_domains(c, &devs) >= redundancy + 2;
 }
 
 /*
@@ -1009,6 +1032,35 @@ static struct ec_stripe_new *ec_new_stripe_alloc(struct bch_fs *c,
 	return s;
 }
 
+/*
+ * The centroid of the blocks the stripe has so far, as a mean device
+ * position fraction (see dev_offset_to_frac(); device sizes may differ, so
+ * raw offsets aren't comparable): each new block is allocated as close to it
+ * as possible, so that a stripe's blocks sit at equivalent positions on each
+ * device:
+ */
+static u64 stripe_blocks_centroid(struct bch_fs *c, struct bch_stripe *v,
+				  unsigned long *blocks_gotten)
+{
+	u64 sum = 0;
+	unsigned nr = 0, i;
+
+	guard(rcu)();
+	for_each_set_bit(i, blocks_gotten, v->nr_blocks) {
+		if (v->ptrs[i].dev == BCH_SB_MEMBER_INVALID)
+			continue;
+
+		struct bch_dev *ca = bch2_dev_rcu_noerror(c, v->ptrs[i].dev);
+		if (!ca)
+			continue;
+
+		sum += dev_offset_to_frac(ca, v->ptrs[i].offset);
+		nr++;
+	}
+
+	return nr ? div_u64(sum, nr) : 0;
+}
+
 static int __new_stripe_alloc_buckets(struct btree_trans *trans,
 				    struct alloc_request *req,
 				    struct ec_dev_stripe_state *dev_stripe,
@@ -1022,6 +1074,20 @@ static int __new_stripe_alloc_buckets(struct btree_trans *trans,
 	unsigned i, j, nr_have_parity = 0, nr_have_data = 0;
 
 	req->new_stripe_alloc = true;
+	/*
+	 * For erasure coding, distinct failure domains are a hard requirement,
+	 * not a preference: the allocator excludes devices sharing an
+	 * already-placed block's domain (see bch2_dev_domain_keys_update()).
+	 */
+	req->failure_domains_required = true;
+
+	/*
+	 * Rebuilt below from the current stripe blocks. We may be called twice
+	 * on the same req (full-stripe attempt, then stripe reuse), and the
+	 * released first-attempt buckets must not linger here - a stale bit
+	 * would wrongly exclude that device's whole domain, above.
+	 */
+	memset(&req->devs_chosen, 0, sizeof(req->devs_chosen));
 
 	/* * We bypass the sector allocator which normally does this: */
 	bitmap_and(req->devs_may_alloc.d, req->devs_may_alloc.d,
@@ -1034,8 +1100,11 @@ static int __new_stripe_alloc_buckets(struct btree_trans *trans,
 		 * walk backpointers and update all extents that point to that
 		 * block when updating the stripe
 		 */
-		if (v->ptrs[i].dev != BCH_SB_MEMBER_INVALID)
+		if (v->ptrs[i].dev != BCH_SB_MEMBER_INVALID) {
 			__clear_bit(v->ptrs[i].dev, req->devs_may_alloc.d);
+			/* spread new blocks away from existing blocks' domains: */
+			__set_bit(v->ptrs[i].dev, req->devs_chosen.d);
+		}
 
 		if (i < nr_data)
 			nr_have_data++;
@@ -1046,11 +1115,18 @@ static int __new_stripe_alloc_buckets(struct btree_trans *trans,
 	BUG_ON(nr_have_data	> nr_data);
 	BUG_ON(nr_have_parity	> nr_parity);
 
-	req->ptrs.nr = 0;
-	if (nr_have_parity < nr_parity) {
-		req->nr_replicas	= nr_parity;
+	/*
+	 * Allocate one block per bch2_bucket_alloc_set_trans() call,
+	 * recomputing the centroid as blocks accumulate, so every block -
+	 * including the parity blocks allocated first - is targeted at the
+	 * stripe's emerging region:
+	 */
+	while (nr_have_parity < nr_parity) {
+		req->ptrs.nr		= 0;
+		req->nr_replicas	= nr_have_parity + 1;
 		req->nr_effective	= nr_have_parity;
 		req->data_type		= BCH_DATA_parity;
+		req->target_frac		= stripe_blocks_centroid(c, v, s->blocks_gotten);
 
 		int ret = bch2_bucket_alloc_set_trans(trans, req, &dev_stripe->parity_stripe);
 
@@ -1063,17 +1139,20 @@ static int __new_stripe_alloc_buckets(struct btree_trans *trans,
 			s->blocks[j] = req->ptrs.v[i];
 			v->ptrs[j] = bch2_ob_ptr(c, ob);
 			__set_bit(j, s->blocks_gotten);
+			__clear_bit(ob->dev, req->devs_may_alloc.d);
+			nr_have_parity++;
 		}
 
 		if (ret)
 			return ret;
 	}
 
-	req->ptrs.nr = 0;
-	if (nr_have_data < nr_data) {
-		req->nr_replicas	= nr_data;
+	while (nr_have_data < nr_data) {
+		req->ptrs.nr		= 0;
+		req->nr_replicas	= nr_have_data + 1;
 		req->nr_effective	= nr_have_data;
 		req->data_type		= BCH_DATA_user;
+		req->target_frac		= stripe_blocks_centroid(c, v, s->blocks_gotten);
 
 		int ret = bch2_bucket_alloc_set_trans(trans, req, &dev_stripe->block_stripe);
 
@@ -1085,6 +1164,8 @@ static int __new_stripe_alloc_buckets(struct btree_trans *trans,
 			s->blocks[j] = req->ptrs.v[i];
 			v->ptrs[j] = bch2_ob_ptr(c, ob);
 			__set_bit(j, s->blocks_gotten);
+			__clear_bit(ob->dev, req->devs_may_alloc.d);
+			nr_have_data++;
 		}
 
 		if (ret)
@@ -1094,12 +1175,132 @@ static int __new_stripe_alloc_buckets(struct btree_trans *trans,
 	return 0;
 }
 
+/*
+ * Once all blocks are allocated the centroid is settled: try to reallocate
+ * outliers closer to it. New blocks are open buckets nothing has been
+ * written to, so a swap is just open_bucket_put() + allocate closer - but
+ * only new blocks: pre-existing blocks (stripe reuse) are fixed anchors, and
+ * blocks a writer has already claimed (blocks_allocated) can't move.
+ *
+ * Best effort: an attempt that fails or doesn't halve the block's distance
+ * to the centroid keeps the original, so this never makes things worse and
+ * never turns a successful stripe allocation into a failure.
+ */
+static int stripe_reallocate_outliers(struct btree_trans *trans,
+				      struct alloc_request *req,
+				      struct ec_stripe_new *s,
+				      unsigned long *blocks_had)
+{
+	struct bch_fs *c = trans->c;
+	struct bch_stripe *v = &s->new_stripe.key.v;
+	u64 frac[BCH_BKEY_PTRS_MAX];
+	unsigned long frac_valid[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)] = {};
+	unsigned i, j, nr = 0;
+	u64 sum = 0;
+	int ret = 0;
+
+	/*
+	 * All positions as device fractions (device sizes may differ, so raw
+	 * offsets aren't comparable). Iteration bounds are BCH_BKEY_PTRS_MAX,
+	 * not v->nr_blocks: they're equivalent (nr_blocks is strictly
+	 * limited), but the compiler can't see that and warns about frac[]
+	 * indexing otherwise:
+	 */
+	BUILD_BUG_ON(sizeof(s->blocks_gotten) * 8 < BCH_BKEY_PTRS_MAX);
+	EBUG_ON(v->nr_blocks > BCH_BKEY_PTRS_MAX);
+
+	scoped_guard(rcu)
+		for_each_set_bit(i, s->blocks_gotten, BCH_BKEY_PTRS_MAX) {
+			if (v->ptrs[i].dev == BCH_SB_MEMBER_INVALID)
+				continue;
+
+			struct bch_dev *ca = bch2_dev_rcu_noerror(c, v->ptrs[i].dev);
+			if (!ca)
+				continue;
+
+			frac[i] = dev_offset_to_frac(ca, v->ptrs[i].offset);
+			__set_bit(i, frac_valid);
+			sum += frac[i];
+			nr++;
+		}
+	if (nr < 3)
+		return 0;
+
+	enum bch_write_flags saved_flags = req->flags;
+	req->flags |= BCH_WRITE_alloc_nowait;
+
+	for_each_set_bit(i, frac_valid, BCH_BKEY_PTRS_MAX) {
+		if (test_bit(i, blocks_had) ||
+		    test_bit(i, s->blocks_allocated))
+			continue;
+
+		/*
+		 * Each block's deviation is measured against the centroid and
+		 * mean absolute deviation of the *other* blocks: a single
+		 * large outlier inflates a global mad enough to mask itself:
+		 */
+		u64 centroid = div_u64(sum - frac[i], nr - 1);
+		u64 mad = 0;
+		for_each_set_bit(j, frac_valid, BCH_BKEY_PTRS_MAX)
+			if (j != i)
+				mad += abs_diff(frac[j], centroid);
+		mad = div_u64(mad, nr - 1);
+
+		u64 dist = abs_diff(frac[i], centroid);
+		if (dist <= mad * 2)
+			continue;
+
+		struct bch_dev *ca = bch2_dev_tryget_noerror(c, v->ptrs[i].dev);
+		if (!ca)
+			continue;
+
+		/* can't meaningfully improve within a bucket: */
+		if (dist <= dev_offset_to_frac(ca, ca->mi.bucket_size)) {
+			bch2_dev_put(ca);
+			continue;
+		}
+
+		req->target_frac = centroid;
+		req->ca = ca;
+		struct open_bucket *ob = bch2_bucket_alloc_trans(trans, req);
+		req->ca = NULL;
+
+		if (IS_ERR(ob)) {
+			bch2_dev_put(ca);
+			ret = PTR_ERR(ob);
+			if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+				break;
+			ret = 0;	/* best effort */
+			continue;
+		}
+
+		struct bch_extent_ptr new_ptr = bch2_ob_ptr(c, ob);
+		u64 new_frac = dev_offset_to_frac(ca, new_ptr.offset);
+		bch2_dev_put(ca);
+
+		if (abs_diff(new_frac, centroid) < dist / 2) {
+			bch2_open_bucket_put(c, c->allocator.open_buckets + s->blocks[i]);
+			s->blocks[i]	= ob - c->allocator.open_buckets;
+			sum		+= new_frac - frac[i];
+			frac[i]		= new_frac;
+			v->ptrs[i]	= new_ptr;
+		} else {
+			bch2_open_bucket_put(c, ob);
+		}
+	}
+
+	req->flags	= saved_flags;
+	req->target_frac = 0;
+	return ret;
+}
+
 static bool copygc_can_run_on_devs(struct bch_fs *c,
 				   struct bch_devs_mask *devs)
 {
+	guard(percpu_read_noio)(&c->capacity.mark_lock);
 	guard(rcu)();
 	for_each_member_device_rcu(c, ca, devs)
-		if (!bch2_copygc_dev_wait_amount(ca))
+		if (bch2_copygc_dev_wait_amount(ca) <= 0)
 			return true;
 	return false;
 }
@@ -1129,16 +1330,19 @@ static int new_stripe_alloc_buckets(struct btree_trans *trans,
 	if (bitmap_weight(s->blocks_gotten, v->nr_blocks) == v->nr_blocks)
 		return 0;
 
+	/* pre-existing blocks can't be reallocated by the outlier pass: */
+	unsigned long blocks_had[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
+	bitmap_copy(blocks_had, s->blocks_gotten, BCH_BKEY_PTRS_MAX);
+	bool shrunk = false;
+
 	req->scratch_flags		= req->flags;
 	req->scratch_data_type		= req->data_type;
 	req->scratch_ptrs		= req->ptrs;
 	req->scratch_nr_replicas	= req->nr_replicas;
 	req->scratch_nr_effective	= req->nr_effective;
-	req->scratch_have_cache		= req->have_cache;
 	req->scratch_devs_may_alloc	= req->devs_may_alloc;
 
 	req->devs_may_alloc	= s->devs;
-	req->have_cache		= true;
 
 	if (req->watermark == BCH_WATERMARK_copygc)
 		req->flags |= BCH_WRITE_alloc_nowait;
@@ -1204,6 +1408,7 @@ static int new_stripe_alloc_buckets(struct btree_trans *trans,
 			v->nr_blocks = new_nr_blocks;
 			v->nr_redundant = nr_parity_gotten;
 			ret = 0;
+			shrunk = true;
 
 			struct bch_devs_list d = {};
 			for_each_data_parity_block(i, new_nr_data, nr_parity_gotten) {
@@ -1220,13 +1425,23 @@ static int new_stripe_alloc_buckets(struct btree_trans *trans,
 		}
 	}
 
+	/*
+	 * Fully allocated: the centroid is settled, see if any blocks are
+	 * outliers we can reallocate closer to it. Not after shrinking: the
+	 * slot shift invalidates blocks_had, and a stripe we could barely
+	 * allocate at all has no spare buckets to improve placement with.
+	 */
+	if (!ret && !shrunk &&
+	    bitmap_weight(s->blocks_gotten, v->nr_blocks) == v->nr_blocks)
+		ret = stripe_reallocate_outliers(trans, req, s, blocks_had);
+
 	req->flags		= req->scratch_flags;
 	req->data_type		= req->scratch_data_type;
 	req->ptrs		= req->scratch_ptrs;
 	req->nr_replicas	= req->scratch_nr_replicas;
 	req->nr_effective	= req->scratch_nr_effective;
-	req->have_cache		= req->scratch_have_cache;
 	req->devs_may_alloc	= req->scratch_devs_may_alloc;
+	req->target_frac		= 0;
 	return ret;
 }
 
@@ -1594,6 +1809,16 @@ static void ec_stripe_head_devs_update(struct bch_fs *c, struct ec_stripe_head *
 	 */
 	h->insufficient_devs = h->nr_active_devs < h->redundancy + 2;
 
+	/*
+	 * One block per failure domain is a hard requirement (see
+	 * __new_stripe_alloc_buckets): too few domains for redundancy to mean
+	 * anything means no stripes at all. With no failure domains configured
+	 * each device is its own domain, so this only tightens the device-count
+	 * check above when devices share domains.
+	 */
+	unsigned nr_domains = bch2_target_nr_domains(c, &h->devs);
+	h->insufficient_devs |= nr_domains < h->redundancy + 2;
+
 	struct bch_devs_mask devs_leaving;
 	bitmap_andnot(devs_leaving.d, old_devs.d, h->devs.d, BCH_SB_MEMBERS_MAX);
 
@@ -1719,6 +1944,17 @@ struct ec_stripe_head *bch2_ec_stripe_head_get(struct btree_trans *trans,
 		unsigned active = min_t(unsigned, h->nr_active_devs, BCH_BKEY_PTRS_MAX);
 		unsigned nr_data = min_t(unsigned, active - h->redundancy,
 					 req->ec_max_data_blocks ?: ~0U);
+
+		/*
+		 * One block per failure domain: the stripe can't be wider than
+		 * the domains available. If a domain becomes unavailable, the
+		 * next stripe is allocated narrower rather than doubling up.
+		 * With no failure domains each device is its own domain, so this
+		 * is the usual device-count cap.
+		 */
+		unsigned nr_domains = bch2_target_nr_domains(c, &h->devs);
+		/* insufficient_devs was checked - at least redundancy + 2 domains: */
+		nr_data = min(nr_data, nr_domains - h->redundancy);
 
 		h->s = ec_new_stripe_alloc(c,
 					   h->devs,

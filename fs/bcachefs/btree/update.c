@@ -125,6 +125,18 @@ int __bch2_insert_snapshot_whiteouts(struct btree_trans *trans,
 				     snapshot_id_list *s)
 {
 	darray_for_each(*s, id) {
+		/*
+		 * In fsck, a repair can fan whiteouts across an unbounded
+		 * number of snapshots: commit and restart before the batch
+		 * hits the trans mem cap. The re-drive converges - committed
+		 * whiteouts fail the KEY_TYPE_deleted check below and are
+		 * skipped. Runtime callers (extent splits) are excluded so
+		 * their whiteouts stay atomic with the extent update:
+		 */
+		if (test_bit(BCH_FS_in_fsck, &trans->c->flags))
+			try(bch2_trans_commit_lazy_if_full(trans, NULL, NULL,
+						BCH_TRANS_COMMIT_no_enospc));
+
 		pos.snapshot = *id;
 
 		CLASS(btree_iter, iter)(trans, btree, pos, BTREE_ITER_not_extents|BTREE_ITER_intent);
@@ -177,7 +189,7 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 	 * reservation:
 	 */
 	if (nr_splits > 1 &&
-	    (compressed_sectors = bch2_bkey_sectors_compressed(c, old)))
+	    (compressed_sectors = bch2_bkey_durability_safe(c, old).sectors_compressed))
 		trans->extra_disk_res += compressed_sectors * (nr_splits - 1);
 
 	if (front_split) {
@@ -328,11 +340,6 @@ btree_trans_update_by_path(struct btree_trans *trans,
 	EBUG_ON(trans->nr_updates >= trans->nr_paths);
 	EBUG_ON(!bpos_eq(k->k.p, path->pos));
 	BUG_ON(k_buf_u64s < k->k.u64s);
-	EBUG_ON(!path->level &&
-		btree_type_has_snapshots(path->btree_id) &&
-		!bkey_deleted(&k->k) &&
-		test_bit(JOURNAL_replay_done, &c->journal.flags) &&
-		!bch2_snapshot_exists(c, k->k.p.snapshot));
 
 	trans->has_interior_updates |= path->level != 0;
 

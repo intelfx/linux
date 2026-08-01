@@ -10,6 +10,7 @@
 #include "alloc/buckets_types.h"
 #include "util/clock_types.h"
 #include "util/fifo.h"
+#include "util/locking.h"
 
 #define BCH_WATERMARKS()		\
 	x(stripe)			\
@@ -158,12 +159,15 @@ struct bch_fs_capacity {
 
 	struct bch_fs_capacity_pcpu __percpu	*pcpu;
 
-	struct percpu_rw_semaphore	mark_lock;
+	struct percpu_rwsem_noio	mark_lock;
 };
 
 struct bch_fs_allocator {
 	struct bch_devs_mask	rw_devs[BCH_DATA_NR];
 	unsigned long		rw_devs_change_count;
+
+	/* fs-wide allocator wake generation; see bch2_alloc_wake_all() */
+	atomic_t		wake_all_counter;
 
 	spinlock_t		freelist_lock;
 	struct closure_waitlist	freelist_wait;

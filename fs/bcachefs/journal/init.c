@@ -75,8 +75,7 @@ static int bch2_set_nr_journal_buckets_iter(struct bch_dev *ca, unsigned nr,
 	ret = 0;
 
 	scoped_guard(journal_block, &c->journal) {
-		guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-		guard(mutex)(&c->sb_lock);
+		guard(mutex_noio)(&c->sb_lock);
 
 		memcpy(new_buckets,	ja->buckets,	ja->nr * sizeof(u64));
 		memcpy(new_bucket_seq,	ja->bucket_seq,	ja->nr * sizeof(u64));
@@ -198,8 +197,7 @@ int bch2_dev_journal_bucket_delete(struct bch_dev *ca, u64 b)
 	struct journal *j = &c->journal;
 	struct journal_device *ja = &ca->journal;
 
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-	guard(mutex)(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	unsigned pos;
 	for (pos = 0; pos < ja->nr; pos++)
 		if (ja->buckets[pos] == b)
@@ -282,7 +280,7 @@ int bch2_dev_journal_alloc(struct bch_dev *ca, bool new_fs)
 	 */
 	nr = clamp_t(unsigned, nr,
 		     BCH_JOURNAL_BUCKETS_MIN,
-		     system_totalram_bytes() / 4 / bucket_bytes(ca));
+		     div64_u64(system_totalram_bytes() / 4, bucket_bytes(ca)));
 
 	ret = bch2_set_nr_journal_buckets_loop(c, ca, nr, new_fs);
 err:
@@ -515,10 +513,20 @@ int bch2_fs_journal_start(struct journal *j, struct journal_start_info info)
 		return bch_err_throw(c, ENOMEM_journal_pin_fifo);
 	}
 
+	/*
+	 * Initialize the whole buffer, not just the live [front, back) window
+	 * below: fifo_entry() masks without a range check (unlike
+	 * journal_seq_pin()), so a stray pin_set() for an out-of-window seq must
+	 * still land on a valid (empty) list_head rather than kvmalloc garbage.
+	 * The resize path (bch2_journal_pin_fifo_resize) inits the full buffer
+	 * for the same reason.
+	 */
 	for (struct journal_entry_pin_list *pin = j->pin.data;
 	     pin < j->pin.data + j->pin.size;
-	     pin++)
+	     pin++) {
 		spin_lock_init(&pin->lock);
+		journal_pin_list_init(pin, 0);
+	}
 
 	j->replay_journal_seq	= last_seq;
 	j->replay_journal_seq_end = cur_seq;
@@ -727,7 +735,7 @@ void bch2_fs_journal_init_early(struct journal *j)
 {
 	static struct lock_class_key res_key;
 
-	mutex_init(&j->buf_lock);
+	mutex_noio_init(&j->buf_lock);
 	spin_lock_init(&j->lock);
 	spin_lock_init(&j->err_lock);
 	INIT_DELAYED_WORK(&j->write_work, bch2_journal_write_work);

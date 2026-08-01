@@ -125,7 +125,7 @@ int bch2_need_discard_or_freespace_err(struct btree_trans *trans,
 
 	bch2_bkey_val_to_text(&buf, c, alloc_k);
 
-	int ret = __bch2_fsck_err(NULL, trans, flags, err_id,
+	int ret = __bch2_fsck_err(NULL, trans, POS_MIN, flags, err_id,
 				  "bucket incorrectly %sset in %s btree\n%s",
 				  set ? "" : "un",
 				  bch2_btree_id_str(btree),
@@ -434,8 +434,14 @@ int __bch2_check_freespace_key(struct btree_trans *trans, struct btree_iter *ite
 	bucket.offset &= ~(~0ULL << 56);
 	u64 genbits = iter->pos.offset & (~0ULL << 56);
 
+	/*
+	 * async_repair means we're the allocator: committed-only reads, see
+	 * bucket_alloc_scan(). fsck's synchronous use keeps normal semantics:
+	 */
 	CLASS(btree_iter, alloc_iter)(trans, BTREE_ID_alloc, bucket,
-						     async_repair ? BTREE_ITER_cached : 0);
+						     async_repair
+						     ? BTREE_ITER_cached|BTREE_ITER_committed
+						     : 0);
 	struct bkey_s_c alloc_k = bkey_try(bch2_btree_iter_peek_slot(&alloc_iter));
 
 	if (!bch2_dev_bucket_exists(c, bucket)) {
@@ -706,10 +712,26 @@ static int bch2_check_alloc_to_lru_ref(struct btree_trans *trans,
 	a = bch2_alloc_to_v4(alloc_k, &a_convert);
 
 	u64 lru_idx = alloc_lru_idx_fragmentation(*a, ca);
-	if (lru_idx)
-		try(bch2_lru_check_set(trans, BCH_LRU_BUCKET_FRAGMENTATION,
-				       bucket_to_u64(alloc_k.k->p),
-				       lru_idx, alloc_k, last_flushed));
+	if (lru_idx) {
+		/*
+		 * per_dev_fragmentation_lru upgrade: the per-device entry is
+		 * either missing or was just written by check_lrus' migration
+		 * and is sitting unflushed in the write buffer, which reads as
+		 * missing - either way the lookup can't win, and the write
+		 * buffer flush it triggers is far more expensive than just
+		 * recreating the entry unconditionally:
+		 */
+		if (c->sb.version_upgrade_complete < bcachefs_metadata_version_per_dev_fragmentation_lru)
+			try(bch2_lru_set(trans,
+					 bucket_fragmentation_lru(alloc_k.k->p.inode),
+					 bucket_to_u64(alloc_k.k->p),
+					 lru_idx));
+		else
+			try(bch2_lru_check_set(trans,
+					       bucket_fragmentation_lru(alloc_k.k->p.inode),
+					       bucket_to_u64(alloc_k.k->p),
+					       lru_idx, alloc_k, last_flushed));
+	}
 
 	if (a->data_type == BCH_DATA_cached) {
 		if (ret_fsck_err_on(!a->io_time[READ],
@@ -816,9 +838,7 @@ int bch2_dev_freespace_init(struct bch_fs *c, struct bch_dev *ca,
 		try(lockrestart_do(trans, dev_freespace_init_iter(trans, ca, &iter, end)));
 	}
 
-	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-		guard(mutex)(&c->sb_lock);
-		guard(memalloc_flags)(PF_MEMALLOC_NOFS);
+	scoped_guard(mutex_noio, &c->sb_lock) {
 		struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
 		SET_BCH_MEMBER_FREESPACE_INITIALIZED(m, true);
 	}
@@ -850,8 +870,7 @@ int bch2_fs_freespace_init(struct bch_fs *c)
 	}
 
 	if (doing_init) {
-		guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-		guard(mutex)(&c->sb_lock);
+		guard(mutex_noio)(&c->sb_lock);
 		bch2_write_super(c);
 		bch_verbose(c, "done initializing freespace");
 	}

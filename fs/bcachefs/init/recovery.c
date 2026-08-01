@@ -51,10 +51,12 @@ int bch2_btree_lost_data(struct bch_fs *c,
 {
 	int ret = 0;
 
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-	guard(mutex)(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	bool write_sb = false;
 	struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
+
+	/* Forensic record, never cleared: */
+	write_sb |= !__test_and_set_bit_le64(btree, &ext->btrees_lost_data_ever);
 
 	if (!(c->sb.btrees_lost_data & BIT_ULL(btree))) {
 		prt_printf(msg, "flagging btree ");
@@ -135,6 +137,44 @@ int bch2_btree_lost_data(struct bch_fs *c,
 	return ret;
 }
 
+/*
+ * btrees_clean: sibling to btrees_lost_data. A set bit means the btree was
+ * validated consistent by its check pass and has not been mutated since.
+ *
+ * The bit is mutated straight through to the superblock (a synchronous write),
+ * so the on-disk value is always current and doesn't depend on a clean
+ * shutdown; the double-checked lock keeps the common case (already in the
+ * wanted state) off c->sb_lock. Set on clean pass completion; cleared from the
+ * btree's transactional trigger on mutation. See bch2_btree_is_clean().
+ */
+void bch2_set_btree_clean(struct bch_fs *c, enum btree_id btree)
+{
+	if (c->sb.btrees_clean & BIT_ULL(btree))
+		return;
+
+	guard(mutex_noio)(&c->sb_lock);
+	if (!(c->sb.btrees_clean & BIT_ULL(btree))) {
+		struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
+		__test_and_set_bit_le64(btree, &ext->btrees_clean);
+		c->sb.btrees_clean |= BIT_ULL(btree);
+		bch2_write_super(c);
+	}
+}
+
+void bch2_clear_btree_clean(struct bch_fs *c, enum btree_id btree)
+{
+	if (!(c->sb.btrees_clean & BIT_ULL(btree)))
+		return;
+
+	guard(mutex_noio)(&c->sb_lock);
+	if (c->sb.btrees_clean & BIT_ULL(btree)) {
+		struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
+		__clear_bit_le64(btree, &ext->btrees_clean);
+		c->sb.btrees_clean &= ~BIT_ULL(btree);
+		bch2_write_super(c);
+	}
+}
+
 static void kill_btree(struct bch_fs *c, enum btree_id btree)
 {
 	bch2_btree_id_root(c, btree)->alive = false;
@@ -144,8 +184,7 @@ static void kill_btree(struct bch_fs *c, enum btree_id btree)
 /* for -o reconstruct_alloc: */
 static void bch2_reconstruct_alloc(struct bch_fs *c)
 {
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-	guard(mutex)(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
 
 	__set_bit_le64(BCH_RECOVERY_PASS_STABLE_check_allocations, ext->recovery_passes_required);
@@ -203,8 +242,7 @@ void bch2_ignore_journal_rewind_errors(struct bch_fs *c)
 	 * will be stale for buckets whose state changed between the rewind
 	 * point and the original journal head.
 	 */
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-	guard(mutex)(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	struct bch_sb_field_ext *ext =
 		bch2_sb_field_get(c->disk_sb.sb, ext);
 
@@ -837,14 +875,19 @@ use_clean:
 	}
 
 	/*
-	 * After an unclean shutdown, skip then next few journal sequence
-	 * numbers as they may have been referenced by btree writes that
-	 * happened before their corresponding journal writes - those btree
-	 * writes need to be ignored, by skipping and blacklisting the next few
-	 * journal sequence numbers:
+	 * After an unclean shutdown, skip the next several journal sequence
+	 * numbers: btree nodes may have been written referencing journal
+	 * sequences whose journal writes never became durable (btree writes
+	 * lead the journal). Those sequences are blacklisted below, so btree
+	 * writes referencing them are ignored on replay.
+	 *
+	 * The skip must exceed how far a btree write can lead the durable
+	 * journal, which is bounded by the journal pipeline depth
+	 * (j->in_flight.size, currently 256). Use a large margin so this
+	 * can't silently break if pipelining is increased.
 	 */
 	if (!c->sb.clean)
-		journal_start.cur_seq += 64;
+		journal_start.cur_seq += 4096;
 
 	if (journal_start.replay_end &&
 	    journal_start.replay_end + 1 != journal_start.cur_seq) {
@@ -940,6 +983,13 @@ use_clean:
 		bch2_journal_meta(&c->journal);
 	}
 
+	if (c->errors.msgs.nr) {
+		CLASS(bch_log_msg, msg)(c);
+		prt_printf(&msg.m, "errors this recovery:\n");
+		bch2_fsck_err_counts_to_text(&msg.m, c);
+		bch2_fsck_damaged_paths_to_text(&msg.m, c);
+	}
+
 	/* If we fixed errors, verify that fs is actually clean now: */
 	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG) &&
 	    errors_fixed &&
@@ -971,7 +1021,7 @@ use_clean:
 		bch_verbose(c, "quotas done");
 	}
 
-	scoped_guard(mutex, &c->sb_lock) {
+	scoped_guard(mutex_noio, &c->sb_lock) {
 		struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
 		bool write_sb = false;
 
@@ -1030,12 +1080,6 @@ use_clean:
 			bch2_write_super(c);
 	}
 
-	if (test_bit(BCH_FS_need_delete_dead_snapshots, &c->flags) &&
-	    !c->opts.nochanges) {
-		bch2_fs_read_write_early(c);
-		bch2_delete_dead_snapshots_async(c);
-	}
-
 	/*
 	 * (Hopefully unnecessary) cleanup, once per mount - we should be
 	 * killing replicas entries when accounting entries go to 0, but - old
@@ -1070,8 +1114,7 @@ int bch2_fs_initialize(struct bch_fs *c)
 	bch_notice(c, "initializing new filesystem");
 	set_bit(BCH_FS_new_fs, &c->flags);
 
-	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-		guard(mutex)(&c->sb_lock);
+	scoped_guard(mutex_noio, &c->sb_lock) {
 		c->disk_sb.sb->compat[0] |= cpu_to_le64(BIT_ULL(BCH_COMPAT_extents_above_btree_updates_done));
 		c->disk_sb.sb->compat[0] |= cpu_to_le64(BIT_ULL(BCH_COMPAT_bformat_overflow_done));
 		c->disk_sb.sb->compat[0] |= cpu_to_le64(BIT_ULL(BCH_COMPAT_no_stale_ptrs));
@@ -1165,8 +1208,7 @@ int bch2_fs_initialize(struct bch_fs *c)
 	bch_info(c, "fs initialized, journal seq %llu rewind_seq %llu",
 		 init_seq - 1, init_seq);
 
-	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-		guard(mutex)(&c->sb_lock);
+	scoped_guard(mutex_noio, &c->sb_lock) {
 		SET_BCH_SB_INITIALIZED(c->disk_sb.sb, true);
 		SET_BCH_SB_CLEAN(c->disk_sb.sb, false);
 

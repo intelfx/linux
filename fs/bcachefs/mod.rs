@@ -39,7 +39,20 @@ pub mod debug {
 #[path = "journal/read.rs"]     pub mod journal;
 #[path = "fs/namei.rs"]        pub mod namei;
 pub mod sb;
+/// Name<->value tables for the snapshot/subvolume state codewords, generated
+/// from the BCH_*_STATES() x-macros in snapshots/format.h:
+pub mod snapshot_states {
+    include!(concat!(env!("OUT_DIR"), "/snapshot_states_gen.rs"));
+}
+/// Typed ioctl inventory, generated from the _IO*() defines in
+/// bcachefs_ioctl.h: a marker type per ioctl binding its opcode to its
+/// argument type. The tools' src/wrappers/ioctl.rs builds the calls on top.
+pub mod ioctl {
+    #![allow(non_camel_case_types)]
+    include!(concat!(env!("OUT_DIR"), "/ioctls_gen.rs"));
+}
 #[path = "fs/str_hash.rs"]     pub mod str_hash;
+pub mod typeinfo;
 pub mod util;
 #[path = "fs/xattr.rs"]        pub mod xattr;
 pub mod data {
@@ -77,6 +90,10 @@ pub mod c {
     // real return type (timespec64) uniformly across both builds.
     #[cfg(not(kernel))]
     pub type timespec64 = timespec;
+
+    // The generated bindings carry #[derive(TypeInfo)] on the bch_* family
+    // (injected by codegen.rs); bring the derive macro into scope for them.
+    use typeinfo_macros::TypeInfo;
 
     include!(concat!(env!("OUT_DIR"), "/bcachefs.rs"));
 
@@ -292,3 +309,61 @@ impl From<c::bch_reconcile_accounting_type> for u32 {
         t.0
     }
 }
+
+// ── ARM32 Kernel EABI Division Helpers ──────────────────────────
+//
+// On 32-bit ARM, raw 64-bit integer division lowers to compiler-rt calls.
+// Since the Linux kernel does not export these symbols to out-of-tree modules,
+// we declare them globally using assembly stubs that call the kernel's real
+// exported math functions. We restrict this to non-std (kernel) ARM32 builds.
+
+#[cfg(all(target_arch = "arm", not(feature = "std")))]
+core::arch::global_asm!(
+    ".global __aeabi_uldivmod",
+    ".type __aeabi_uldivmod, %function",
+    "__aeabi_uldivmod:",
+    "    .fnstart",
+    // Push r8 specifically to push exactly 6 registers (24 bytes) total,
+    // maintaining the AAPCS required 8-byte stack alignment for the C call.
+    "    push {{r4, r5, r6, r7, r8, lr}}",
+    "    .save {{r4, r5, r6, r7, r8, lr}}",
+    "    mov r4, r0",
+    "    mov r5, r1",
+    "    mov r6, r2",
+    "    mov r7, r3",
+    "    bl div64_u64",
+    "    umull r2, r3, r0, r6",
+    "    mla r3, r0, r7, r3",
+    "    mla r3, r1, r6, r3",
+    "    subs r2, r4, r2",
+    "    sbc r3, r5, r3",
+    "    pop {{r4, r5, r6, r7, r8, pc}}",
+    "    .fnend",
+    ".size __aeabi_uldivmod, . - __aeabi_uldivmod"
+);
+
+
+#[cfg(all(target_arch = "arm", not(feature = "std")))]
+core::arch::global_asm!(
+    ".global __aeabi_ldivmod",
+    ".type __aeabi_ldivmod, %function",
+    "__aeabi_ldivmod:",
+    "    .fnstart",
+    // Push r8 specifically to push exactly 6 registers (24 bytes) total,
+    // maintaining the AAPCS required 8-byte stack alignment for the C call.
+    "    push {{r4, r5, r6, r7, r8, lr}}",
+    "    .save {{r4, r5, r6, r7, r8, lr}}",
+    "    mov r4, r0",
+    "    mov r5, r1",
+    "    mov r6, r2",
+    "    mov r7, r3",
+    "    bl div64_s64",
+    "    umull r2, r3, r0, r6",
+    "    mla r3, r0, r7, r3",
+    "    mla r3, r1, r6, r3",
+    "    subs r2, r4, r2",
+    "    sbc r3, r5, r3",
+    "    pop {{r4, r5, r6, r7, r8, pc}}",
+    "    .fnend",
+    ".size __aeabi_ldivmod, . - __aeabi_ldivmod"
+);

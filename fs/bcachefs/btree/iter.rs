@@ -82,7 +82,7 @@ impl<'f> BtreeTrans<'f> {
     /// disk_res/journal_seq then calls __bch2_trans_commit().
     pub fn commit(
         &self,
-        disk_res: Option<&DiskReservation>,
+        disk_res: Option<&DiskReservation<'_>>,
         flags: CommitOpts,
     ) -> Result<(), BchError> {
         unsafe {
@@ -186,7 +186,7 @@ impl<'a, 't> TransAttempt<'a, 't> {
 
     pub fn commit(
         self,
-        disk_res: Option<&DiskReservation>,
+        disk_res: Option<&DiskReservation<'_>>,
         flags:    CommitOpts,
     ) -> Result<Self, TransError> {
         unsafe {
@@ -277,6 +277,46 @@ impl<'a, 't> TransAttempt<'a, 't> {
         }
 
         Ok(dst)
+    }
+
+    /// bkey_reassemble() into a buffer with `val_u64s` of value space:
+    /// the copied value is zero-extended (or truncated) to the new size.
+    pub fn bkey_reassemble_resized(&self, k: BkeySC<'_>, val_u64s: usize)
+        -> Result<TransBkey<'a, 't>, BchError>
+    {
+        const BKEY_U64S: usize = size_of::<c::bkey>() / size_of::<u64>();
+
+        let mut dst = self.bkey_alloc((BKEY_U64S + val_u64s) as u32)?;
+        dst.as_mut_u64s().fill(0);
+
+        let copy_val = (k.k.u64s as usize - BKEY_U64S).min(val_u64s);
+        unsafe {
+            core::ptr::copy_nonoverlapping(k.k, &mut dst.k_i_mut().k, 1);
+            core::ptr::copy_nonoverlapping(
+                k.v as *const c::bch_val as *const u64,
+                &mut dst.as_mut_u64s()[BKEY_U64S] as *mut u64,
+                copy_val,
+            );
+        }
+        dst.k_mut().u64s = (BKEY_U64S + val_u64s) as u8;
+
+        Ok(dst)
+    }
+
+    /// A fresh key: bkey_init()ed header with `type_` at `pos`, and
+    /// `val_u64s` of zeroed value space.
+    pub fn bkey_alloc_init(&self, val_u64s: usize, type_: u8, pos: c::bpos)
+        -> Result<TransBkey<'a, 't>, BchError>
+    {
+        const BKEY_U64S: usize = size_of::<c::bkey>() / size_of::<u64>();
+
+        let mut k = self.bkey_alloc((BKEY_U64S + val_u64s) as u32)?;
+        k.as_mut_u64s().fill(0);
+        unsafe { c::bkey_init(k.k_mut()) };
+        k.k_mut().u64s = (BKEY_U64S + val_u64s) as u8;
+        k.k_mut().type_ = type_;
+        k.k_mut().p = pos;
+        Ok(k)
     }
 
     pub fn bkey_make_mut_noupdate(&self, k: BkeySC<'_>) -> Result<TransBkey<'a, 't>, BchError> {
@@ -507,6 +547,7 @@ bitflags! {
         const SNAPSHOT_FIELD = c::btree_iter_update_trigger_flags::BTREE_ITER_snapshot_field.0;
         const ALL_SNAPSHOTS = c::btree_iter_update_trigger_flags::BTREE_ITER_all_snapshots.0;
         const FILTER_SNAPSHOTS = c::btree_iter_update_trigger_flags::BTREE_ITER_filter_snapshots.0;
+        const NOFILTER_WHITEOUTS = c::btree_iter_update_trigger_flags::BTREE_ITER_nofilter_whiteouts.0;
         const NOPRESERVE = c::btree_iter_update_trigger_flags::BTREE_ITER_nopreserve.0;
         const CACHED_NOFILL = c::btree_iter_update_trigger_flags::BTREE_ITER_cached_nofill.0;
         const KEY_CACHE_FILL = c::btree_iter_update_trigger_flags::BTREE_ITER_key_cache_fill.0;
@@ -619,7 +660,7 @@ where
 /// succeeds, commits the transaction. Retries on transaction restart.
 pub fn commit_do<'t, F>(
     trans: &BtreeTrans<'t>,
-    disk_res: Option<&DiskReservation>,
+    disk_res: Option<&DiskReservation<'_>>,
     flags: CommitOpts,
     mut f: F,
 ) -> Result<(), BchError>
@@ -638,7 +679,7 @@ where
 /// Equivalent to the C `bch2_trans_commit_do` macro.
 pub fn trans_commit_do<'t, F>(
     fs: &'t Fs,
-    disk_res: Option<&DiskReservation>,
+    disk_res: Option<&DiskReservation<'_>>,
     flags: CommitOpts,
     f: F,
 ) -> Result<(), BchError>
@@ -671,7 +712,15 @@ fn bkey_s_c_to_result<'i>(k: c::bkey_s_c) -> Result<Option<BkeySC<'i>>, BchError
             unsafe {
                 Some(BkeySC {
                     k:    &*k.k,
-                    v:    &*k.v,
+                    // Hole slots (peek_slot) return a deleted key with a NULL
+                    // val; bch_val is zero-sized, so a dangling well-aligned
+                    // reference is legal - the val is never read through (a
+                    // deleted key's val length is zero).
+                    v:    if !k.v.is_null() {
+                        &*k.v
+                    } else {
+                        NonNull::dangling().as_ref()
+                    },
                     iter: PhantomData,
                 })
             }
@@ -833,7 +882,7 @@ impl<'t> BtreeIter<'t> {
         t.result(ret)
     }
 
-    pub fn for_each_max<F>(&mut self, trans: &BtreeTrans, end: bpos, mut f: F)
+    pub fn for_each_max<F>(&mut self, trans: &BtreeTrans<'_>, end: bpos, mut f: F)
         -> Result<(), BchError>
     where
         F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
@@ -868,11 +917,17 @@ impl<'t> BtreeIter<'t> {
                     }
                 }
             }
-            unsafe { c::bch2_btree_iter_advance(raw) };
+            // advance() returns false when the key just visited ended at
+            // SPOS_MAX and the position can't move forward — true for the
+            // rightmost key of any interior node level. Looping again would
+            // peek the same key forever.
+            if !unsafe { c::bch2_btree_iter_advance(raw) } {
+                return Ok(());
+            }
         }
     }
 
-    pub fn for_each<F>(&mut self, trans: &BtreeTrans, f: F) -> Result<(), BchError>
+    pub fn for_each<F>(&mut self, trans: &BtreeTrans<'_>, f: F) -> Result<(), BchError>
     where
         F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
     {
@@ -882,7 +937,7 @@ impl<'t> BtreeIter<'t> {
     pub fn for_each_commit<F>(
         &mut self,
         trans:       &BtreeTrans<'t>,
-        disk_res:    Option<&DiskReservation>,
+        disk_res:    Option<&DiskReservation<'_>>,
         flags:       CommitOpts,
         mut f:       F,
     ) -> Result<(), BchError>
@@ -916,7 +971,9 @@ impl<'t> BtreeIter<'t> {
                 }
             }
 
-            unsafe { c::bch2_btree_iter_advance(raw) };
+            if !unsafe { c::bch2_btree_iter_advance(raw) } {
+                return Ok(());
+            }
         }
     }
 
@@ -925,7 +982,7 @@ impl<'t> BtreeIter<'t> {
         trans:       &BtreeTrans<'t>,
         end:         bpos,
         iter_flags:  BtreeIterFlags,
-        disk_res:    Option<&DiskReservation>,
+        disk_res:    Option<&DiskReservation<'_>>,
         flags:       CommitOpts,
         mut f:       F,
     ) -> Result<(), BchError>
@@ -965,11 +1022,13 @@ impl<'t> BtreeIter<'t> {
                 }
             }
 
-            unsafe { c::bch2_btree_iter_advance(raw) };
+            if !unsafe { c::bch2_btree_iter_advance(raw) } {
+                return Ok(());
+            }
         }
     }
 
-    pub fn for_each_reverse<F>(&mut self, trans: &BtreeTrans, min: bpos, mut f: F)
+    pub fn for_each_reverse<F>(&mut self, trans: &BtreeTrans<'_>, min: bpos, mut f: F)
         -> Result<(), BchError>
     where
         F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
@@ -998,7 +1057,7 @@ impl<'t> BtreeIter<'t> {
 
     pub fn for_each_reverse_flags<F>(
         &mut self,
-        trans: &BtreeTrans,
+        trans: &BtreeTrans<'_>,
         flags: BtreeIterFlags,
         mut f: F,
     ) -> Result<(), BchError>
@@ -1099,7 +1158,7 @@ impl<'t> BtreeNodeIter<'t> {
         }
     }
 
-    pub fn for_each<F>(&mut self, trans: &BtreeTrans, mut f: F) -> Result<(), BchError>
+    pub fn for_each<F>(&mut self, trans: &BtreeTrans<'_>, mut f: F) -> Result<(), BchError>
     where
         F: for<'a> FnMut(&'a c::btree) -> ControlFlow<()>,
     {

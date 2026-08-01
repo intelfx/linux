@@ -22,6 +22,7 @@
 #include "init/chardev.h"
 #include "init/dev.h"
 #include "init/fs.h"
+#include "init/passes.h"
 
 #include "journal/journal.h"
 
@@ -35,6 +36,7 @@
 
 #include <linux/aio.h>
 #include <linux/backing-dev.h>
+#include <linux/compat.h>
 #include <linux/exportfs.h>
 #include <linux/fileattr.h>
 #include <linux/fs_context.h>
@@ -82,7 +84,7 @@ void bch2_inode_update_after_write(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 
-	BUG_ON(bi->bi_inum != inode->v.i_ino);
+	BUG_ON(bi->bi_inum != inode->ei_inum.inum);
 
 	bch2_assert_pos_locked(trans, BTREE_ID_inodes, POS(0, bi->bi_inum));
 
@@ -510,7 +512,7 @@ static struct bch_inode_info *bch2_new_inode(struct btree_trans *trans)
 	struct bch_inode_info *inode = __bch2_new_inode(trans->c, GFP_NOWAIT);
 
 	if (unlikely(!inode)) {
-		int ret = drop_locks_do(trans, (inode = __bch2_new_inode(trans->c, GFP_NOFS)) ? 0 : -ENOMEM);
+		int ret = drop_locks_do(trans, (inode = __bch2_new_inode(trans->c, GFP_NOIO)) ? 0 : -ENOMEM);
 		if (ret && inode) {
 			__destroy_inode(&inode->v);
 			fast_list_put_idx(&trans->c->vfs.inodes, inode->ei_inodes_idx);
@@ -658,7 +660,7 @@ __bch2_create(struct mnt_idmap *idmap,
 			return ERR_PTR(ret);
 	}
 
-	inode = __bch2_new_inode(c, GFP_NOFS);
+	inode = __bch2_new_inode(c, GFP_NOIO);
 	if (unlikely(!inode))
 		return ERR_PTR(-ENOMEM);
 
@@ -750,7 +752,6 @@ static int dirent_to_missing_inode(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	CLASS(bch_log_msg, msg)(c);
-	msg.m.suppress = true;
 
 	prt_printf(&msg.m, "dirent to missing inode: (%s)\n", bch2_err_str(ret));
 	bch2_bkey_val_to_text(&msg.m, c, d.s_c);
@@ -758,8 +759,17 @@ static int dirent_to_missing_inode(struct btree_trans *trans,
 	try(bch2_inum_to_path(trans, dir, &msg.m));
 	prt_printf(&msg.m, "\ndir subvol %llu inum subvol %llu snapshot %u\n",
 		   dir.subvol, inum.subvol, snapshot);
-	__bch2_inconsistent_error(c, &msg.m);
-	return 0;
+
+	/*
+	 * Not a reason to take the whole filesystem read only: log it,
+	 * schedule check_dirents, and the lookup returns ENOENT.
+	 *
+	 * Scheduling the pass takes sb_lock and may write the superblock;
+	 * we're on the error return path, nothing here needs btree locks:
+	 */
+	bch2_trans_unlock(trans);
+	return bch2_run_explicit_recovery_pass(c, &msg.m,
+					       BCH_RECOVERY_PASS_check_dirents, 0);
 }
 
 static struct bch_inode_info *bch2_lookup_trans(struct btree_trans *trans,
@@ -1213,9 +1223,9 @@ err_tx_restart:
 		goto err;
 	}
 
-	BUG_ON(src_inode->v.i_ino != src_inode_u.bi_inum);
+	BUG_ON(src_inode->ei_inum.inum != src_inode_u.bi_inum);
 	BUG_ON(dst_inode &&
-	       dst_inode->v.i_ino != dst_inode_u.bi_inum);
+	       dst_inode->ei_inum.inum != dst_inode_u.bi_inum);
 
 	bch2_inode_update_after_write(trans, src_dir, &src_dir_u,
 				      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
@@ -1373,7 +1383,7 @@ static int bch2_getattr(struct mnt_idmap *idmap,
 	vfsgid_t vfsgid = i_gid_into_vfsgid(idmap, &inode->v);
 
 	stat->dev	= inode->v.i_sb->s_dev;
-	stat->ino	= inode->v.i_ino;
+	stat->ino	= inode->ei_inum.inum;
 	stat->mode	= inode->v.i_mode;
 	stat->nlink	= inode->v.i_nlink;
 	stat->uid	= vfsuid_into_kuid(vfsuid);
@@ -1480,10 +1490,133 @@ static int bch2_mmap(struct file *file, struct vm_area_struct *vma)
 
 /* Directories: */
 
+struct bch_dir_cookie_state {
+	bool		valid;
+	loff_t		cookie;
+	u64		next_pos;
+};
+
+#define BCH2_READDIR_32_FIRST	2
+#define BCH2_READDIR_32_EOF	INT_MAX
+
+static inline bool bch2_dir_32bit_api(void)
+{
+#ifdef CONFIG_COMPAT
+	return in_compat_syscall();
+#else
+	return BITS_PER_LONG == 32;
+#endif
+}
+
+static inline bool bch2_dir_32bit_dirents(struct file *file)
+{
+	return (file->f_mode & FMODE_32BITHASH) ||
+		(!(file->f_mode & FMODE_64BITHASH) && bch2_dir_32bit_api());
+}
+
+static inline unsigned bch2_dir_cookie_shift(const struct bch_hash_info *hash)
+{
+	if (hash->is_31bit)
+		return 0;
+	if (hash->type == BCH_STR_HASH_crc32c)
+		return 1;
+	return 32;
+}
+
+/*
+ * 32-bit readdir ABIs have to round-trip d_off through signed long and d_ino
+ * through unsigned long. Keep bcachefs' internal cursor 64-bit, but hand the
+ * caller values that its dirent layout can represent.
+ *
+ * Position translation never produces BCH2_READDIR_32_EOF - it's a pure
+ * sentinel, set only when a readdir exhausts the directory, so stateless
+ * consumers (NFS) terminate instead of rescanning the final cookie granule
+ * forever:
+ */
+static inline loff_t bch2_dir_pos_to_32(const struct bch_hash_info *hash, u64 pos)
+{
+	unsigned shift = bch2_dir_cookie_shift(hash);
+
+	if (pos < BCH2_READDIR_32_FIRST || !shift)
+		return min_t(loff_t, pos, BCH2_READDIR_32_EOF - 1);
+
+	return min_t(loff_t, BCH2_READDIR_32_EOF - 1,
+		     max_t(loff_t, BCH2_READDIR_32_FIRST,
+			   pos >> shift));
+}
+
+static inline u64 bch2_dir_pos_from_32(const struct bch_hash_info *hash, loff_t pos)
+{
+	unsigned shift = bch2_dir_cookie_shift(hash);
+
+	if (pos < BCH2_READDIR_32_FIRST || !shift)
+		return pos;
+	if (pos == BCH2_READDIR_32_FIRST)
+		return BCH2_READDIR_32_FIRST;
+	if (pos >= BCH2_READDIR_32_EOF)
+		return U64_MAX;
+	return (u64) pos << shift;
+}
+
+static inline u32 bch2_dir_ino_to_32(u64 ino)
+{
+	u32 ret = ino;
+
+	return ret ?: 1;
+}
+
+struct bch_readdir_ctx32 {
+	struct dir_context		ctx;
+	struct dir_context		*dst;
+	struct bch_dir_cookie_state	*state;
+	struct bch_hash_info		*hash;
+	/* an entry was refused: the iteration stopped at a full buffer, not EOF */
+	bool				full;
+};
+
+static bool bch2_readdir_emit32(struct dir_context *ctx,
+				const char *name, int namelen,
+				loff_t offset, u64 ino, unsigned type)
+{
+	struct bch_readdir_ctx32 *src = container_of(ctx, struct bch_readdir_ctx32, ctx);
+	loff_t cookie = bch2_dir_pos_to_32(src->hash, offset);
+	u32 ino32 = bch2_dir_ino_to_32(ino);
+	bool ret = src->dst->actor(src->dst, name, namelen, cookie, ino32, type);
+
+	if (ret) {
+		if (src->state) {
+			src->state->valid = true;
+			src->state->cookie = cookie;
+			src->state->next_pos = offset + 1;
+		}
+	} else {
+		src->full = true;
+	}
+
+	return ret;
+}
+
+static int bch2_dir_open(struct inode *vinode, struct file *file)
+{
+	file->private_data = kzalloc(sizeof(struct bch_dir_cookie_state), GFP_KERNEL);
+	return file->private_data ? 0 : -ENOMEM;
+}
+
+static int bch2_dir_release(struct inode *vinode, struct file *file)
+{
+	kfree(file->private_data);
+	return 0;
+}
+
 static loff_t bch2_dir_llseek(struct file *file, loff_t offset, int whence)
 {
-	return generic_file_llseek_size(file, offset, whence,
-					S64_MAX, S64_MAX);
+	struct bch_dir_cookie_state *state = file->private_data;
+	loff_t max = bch2_dir_32bit_dirents(file) ? BCH2_READDIR_32_EOF : S64_MAX;
+
+	if (state)
+		state->valid = false;
+
+	return generic_file_llseek_size(file, offset, whence, max, max);
 }
 
 static int bch2_vfs_readdir(struct file *file, struct dir_context *ctx)
@@ -1494,10 +1627,40 @@ static int bch2_vfs_readdir(struct file *file, struct dir_context *ctx)
 	struct bch_hash_info hash;
 	try(bch2_hash_info_init(c, &inode->ei_inode, &hash));
 
-	if (!dir_emit_dots(file, ctx))
-		return 0;
+	int ret;
 
-	int ret = bch2_readdir(c, inode_inum(inode), &hash, ctx);
+	if (bch2_dir_32bit_dirents(file)) {
+		struct bch_dir_cookie_state *state = file->private_data;
+		u64 start = state && state->valid && state->cookie == ctx->pos
+			? state->next_pos
+			: bch2_dir_pos_from_32(&hash, ctx->pos);
+		struct bch_readdir_ctx32 ctx32 = {
+			.ctx	= { .actor = bch2_readdir_emit32, .pos = start, },
+			.dst	= ctx,
+			.state	= state,
+			.hash	= &hash,
+		};
+
+		if (!dir_emit_dots(file, &ctx32.ctx)) {
+			ctx->pos = bch2_dir_pos_to_32(&hash, ctx32.ctx.pos);
+			return 0;
+		}
+
+		ret = bch2_readdir(c, inode_inum(inode), &hash, &ctx32.ctx);
+
+		/*
+		 * bch2_readdir() returning 0 means it stopped at a full buffer
+		 * or ran out of dirents; only the actor knows which:
+		 */
+		ctx->pos = !ret && !ctx32.full
+			? BCH2_READDIR_32_EOF
+			: bch2_dir_pos_to_32(&hash, ctx32.ctx.pos);
+	} else {
+		if (!dir_emit_dots(file, ctx))
+			return 0;
+
+		ret = bch2_readdir(c, inode_inum(inode), &hash, ctx);
+	}
 
 	bch_err_fn(c, ret);
 	return bch2_err_class(ret);
@@ -1718,6 +1881,8 @@ static const struct inode_operations bch_dir_inode_operations = {
 };
 
 static const struct file_operations bch_dir_file_operations = {
+	.open		= bch2_dir_open,
+	.release	= bch2_dir_release,
 	.llseek		= bch2_dir_llseek,
 	.read		= generic_read_dir,
 	.iterate_shared	= bch2_vfs_readdir,
@@ -2092,7 +2257,15 @@ static void bch2_evict_inode(struct inode *vinode)
 {
 	struct bch_fs *c = vinode->i_sb->s_fs_info;
 	struct bch_inode_info *inode = to_bch_ei(vinode);
-	bool delete = !inode->v.i_nlink && !is_bad_inode(&inode->v);
+	/*
+	 * An unlinked subvolume's root inode reads i_nlink == 0, but its
+	 * deletion belongs to the subvolume deletion path, not us (see
+	 * bch2_inode_is_subvolume_root()): this eviction completing is what
+	 * bch2_subvolume_wait_for_pagecache_and_delete() is waiting on to
+	 * tombstone the subvolume and hand the keys to the snapshot sweep.
+	 */
+	bool delete = !inode->v.i_nlink && !is_bad_inode(&inode->v) &&
+		!bch2_inode_is_subvolume_root(&inode->ei_inode);
 
 	/*
 	 * evict() has waited for outstanding writeback, we'll do no more IO
@@ -2312,15 +2485,6 @@ static int bch2_show_devname(struct seq_file *seq, struct dentry *root)
 {
 	struct bch_fs *c = root->d_sb->s_fs_info;
 	bool first = true;
-
-	if (c->sb.multi_device) {
-		CLASS(printbuf, buf)();
-		prt_str(&buf, "/dev/disk/by-uuid/");
-		pr_uuid(&buf, c->sb.user_uuid.b);
-		printbuf_nul_terminate(&buf);
-		seq_printf(seq, "%s", buf.buf);
-		return buf.allocation_failure ? -ENOMEM : 0;
-	}
 
 	guard(rcu)();
 	for_each_online_member_rcu(c, ca) {

@@ -730,6 +730,38 @@ DEFINE_CLASS(btree_iter_copy, struct btree_iter,
 	     bch2_trans_iter_copy_class_init(src),
 	     struct btree_iter *src)
 
+bool bch2_btree_iter_params_valid(enum btree_id, unsigned,
+				  struct bpos, struct bpos,
+				  enum btree_iter_update_trigger_flags);
+
+/*
+ * Low-level iterator init: takes level and flags exactly as given - no
+ * defaulting of not_extents/snapshot_field/all_snapshots (the node iterator
+ * conventions). For callers that need per-level iteration with caller-chosen
+ * snapshot semantics, e.g. the query_btree_keys ioctl; validate untrusted
+ * parameters with bch2_btree_iter_params_valid() first:
+ */
+void __bch2_trans_iter_init_ll(struct btree_trans *, struct btree_iter *,
+			       enum btree_id, struct bpos,
+			       unsigned, unsigned,
+			       enum btree_iter_update_trigger_flags,
+			       unsigned long);
+
+#define bch2_trans_iter_ll_class_init(_trans, _btree, _pos, _locks_want, _depth, _flags)\
+({										\
+	struct btree_iter iter;							\
+	__bch2_trans_iter_init_ll(_trans, &iter, (_btree), (_pos),		\
+				  (_locks_want), (_depth), (_flags), _THIS_IP_);\
+	iter;									\
+})
+
+DEFINE_CLASS(btree_iter_ll, struct btree_iter,
+	     bch2_trans_iter_exit(&_T),
+	     bch2_trans_iter_ll_class_init(trans, btree, pos, locks_want, depth, flags),
+	     struct btree_trans *trans, enum btree_id btree, struct bpos pos,
+	     unsigned locks_want, unsigned depth,
+	     enum btree_iter_update_trigger_flags flags)
+
 void __bch2_trans_node_iter_init(struct btree_trans *, struct btree_iter *,
 				 enum btree_id, struct bpos,
 				 unsigned, unsigned,
@@ -845,6 +877,19 @@ static inline struct bkey_s_c __bch2_bkey_get_typed(struct btree_iter *iter,
 #define bch2_bkey_get_typed(_iter, _type)						\
 	bkey_s_c_to_##_type(__bch2_bkey_get_typed(_iter, KEY_TYPE_##_type))
 
+/*
+ * Copy a value out of a key, zeroing whatever the key is too short to hold.
+ *
+ * Values grow: a key written by an older version stops short of the fields
+ * added since, and we have no defaults, so a field the key predates reads as
+ * 0. To ask whether the key was written with a field at all, test
+ * bkey_val_bytes() against offsetof() - that's the only thing that answers it,
+ * and it's what to_text() and validate() use.
+ *
+ * The typed mut helpers pass min_bytes = sizeof(struct bkey_i_<type>) and
+ * widen u64s to match, so a caller may assign a field the on-disk key was too
+ * short for and have it committed - see __bch2_bkey_make_mut_noupdate().
+ */
 static inline void __bkey_val_copy_pad(void *dst_v, unsigned dst_size, struct bkey_s_c src_k)
 {
 	unsigned b = min_t(unsigned, dst_size, bkey_val_bytes(src_k.k));
@@ -876,6 +921,38 @@ static inline int __bch2_bkey_get_val_typed(struct btree_trans *trans,
 #define bch2_bkey_get_val_typed(_trans, _btree_id, _pos, _flags, _type, _val)\
 	__bch2_bkey_get_val_typed(_trans, _btree_id, _pos, _flags,	\
 				  KEY_TYPE_##_type, sizeof(*_val), _val)
+
+/*
+ * As bch2_bkey_get_val_typed(), but fetches the whole key into a caller-stack
+ * bkey_i_<type>, so an error message can print the key instead of the fields
+ * whoever wrote the message happened to name.
+ *
+ * u64s keeps the on-disk length: the key is never written back, and
+ * to_text() reports u64s and gates fields on it, so widening would print
+ * fields the key doesn't have. Clamping to val_size is required in the other
+ * direction - an on-disk val longer than the caller's struct would leave u64s
+ * claiming val we didn't copy, and to_text() would read past the stack.
+ */
+static inline int __bch2_bkey_get_i_typed(struct btree_trans *trans,
+				enum btree_id btree, struct bpos pos,
+				enum btree_iter_update_trigger_flags flags,
+				enum bch_bkey_type type,
+				unsigned val_size, struct bkey_i *dst)
+{
+	CLASS(btree_iter, iter)(trans, btree, pos, flags);
+	struct bkey_s_c k = __bch2_bkey_get_typed(&iter, type);
+	int ret = bkey_err(k);
+	if (!ret) {
+		dst->k = *k.k;
+		set_bkey_val_bytes(&dst->k, min_t(unsigned, val_size, bkey_val_bytes(k.k)));
+		__bkey_val_copy_pad(&dst->v, val_size, k);
+	}
+	return ret;
+}
+
+#define bch2_bkey_get_i_typed(_trans, _btree_id, _pos, _flags, _type, _k)\
+	__bch2_bkey_get_i_typed(_trans, _btree_id, _pos, _flags,		\
+				KEY_TYPE_##_type, sizeof((_k)->v), &(_k)->k_i)
 
 u32 bch2_trans_begin(struct btree_trans *);
 
@@ -925,21 +1002,46 @@ static inline struct bkey_s_c bch2_btree_iter_peek_prev_type(struct btree_iter *
 static inline struct bkey_s_c bch2_btree_iter_peek_type(struct btree_iter *iter,
 							enum btree_iter_update_trigger_flags flags)
 {
-	return  flags & BTREE_ITER_slots      ? bch2_btree_iter_peek_slot(iter) :
+	return  flags & BTREE_ITER_prev	      ? bch2_btree_iter_peek_prev_type(iter, flags) :
+		flags & BTREE_ITER_slots      ? bch2_btree_iter_peek_slot(iter) :
 						bch2_btree_iter_peek(iter);
 }
 
+/*
+ * Range iteration in either direction: with BTREE_ITER_prev, iteration runs
+ * from the iterator's position down to @end (now the inclusive *lower*
+ * bound) - the mirror image of the forward case. BTREE_ITER_prev, like
+ * BTREE_ITER_slots, is consumed entirely here in the dispatch helpers; the
+ * core iterator never sees it.
+ */
 static inline struct bkey_s_c bch2_btree_iter_peek_max_type(struct btree_iter *iter,
 							    struct bpos end,
 							    enum btree_iter_update_trigger_flags flags)
 {
-	if (!(flags & BTREE_ITER_slots))
+	if (!(flags & (BTREE_ITER_slots|BTREE_ITER_prev)))
 		return bch2_btree_iter_peek_max(iter, &end);
 
-	if (bkey_gt(iter->pos, end))
-		return bkey_s_c_null;
+	if (flags & BTREE_ITER_prev) {
+		if (!(flags & BTREE_ITER_slots))
+			return bch2_btree_iter_peek_prev_min(iter, end);
+
+		if (bkey_lt(iter->pos, end))
+			return bkey_s_c_null;
+	} else {
+		if (bkey_gt(iter->pos, end))
+			return bkey_s_c_null;
+	}
 
 	return bch2_btree_iter_peek_slot(iter);
+}
+
+/* Advance in iteration order: forwards, or backwards with BTREE_ITER_prev: */
+static inline bool bch2_btree_iter_advance_type(struct btree_iter *iter,
+						enum btree_iter_update_trigger_flags flags)
+{
+	return flags & BTREE_ITER_prev
+		? bch2_btree_iter_rewind(iter)
+		: bch2_btree_iter_advance(iter);
 }
 
 int __bch2_btree_trans_too_many_iters(struct btree_trans *);
@@ -986,6 +1088,7 @@ static inline int btree_trans_too_many_iters(struct btree_trans *trans)
 	int _ret2;							\
 									\
 	_restart_count = _orig_restart_count = (_trans)->restart_count;	\
+	(_trans)->begin_may_drop_updates = true;			\
 									\
 	while (bch2_err_matches(_ret2 = (_do), BCH_ERR_transaction_restart))\
 		_restart_count = bch2_trans_begin(_trans);		\
@@ -1015,7 +1118,7 @@ static inline int btree_trans_too_many_iters(struct btree_trans *trans)
 		if (!_ret3)						\
 			bch2_trans_verify_not_restarted(_trans, _restart_count);\
 	} while (bch2_err_matches(_ret3, BCH_ERR_transaction_restart) ||\
-		 (!_ret3 && bch2_btree_iter_advance(&(_iter))));	\
+		 (!_ret3 && bch2_btree_iter_advance_type(&(_iter), (_flags))));\
 									\
 	_ret3;								\
 })
@@ -1037,28 +1140,8 @@ static inline int btree_trans_too_many_iters(struct btree_trans *trans)
 
 #define for_each_btree_key_reverse(_trans, _iter, _btree_id,			\
 				   _start, _flags, _k, _do)			\
-({										\
-	int _ret3 = 0;								\
-										\
-	CLASS(btree_iter, iter)((_trans), (_btree_id), (_start), (_flags));	\
-										\
-	do {									\
-		u32 _restart_count = bch2_trans_begin(_trans);			\
-		_ret3 = 0;							\
-										\
-		struct bkey_s_c _k =						\
-			bch2_btree_iter_peek_prev_type(&(_iter), (_flags));	\
-		if (!(_k).k)							\
-			break;							\
-										\
-		_ret3 = bkey_err(_k) ?: (_do);					\
-		if (!_ret3)							\
-			bch2_trans_verify_not_restarted(_trans, _restart_count);\
-	} while (bch2_err_matches(_ret3, BCH_ERR_transaction_restart) ||	\
-		 (!_ret3 && bch2_btree_iter_rewind(&(_iter))));			\
-										\
-	_ret3;									\
-})
+	for_each_btree_key_max(_trans, _iter, _btree_id, _start, POS_MIN,	\
+			       (_flags)|BTREE_ITER_prev, _k, _do)
 
 #define for_each_btree_key_commit(_trans, _iter, _btree_id,		\
 				  _start, _iter_flags, _k,		\
@@ -1103,7 +1186,7 @@ struct bkey_s_c bch2_btree_iter_peek_root(struct btree_trans *, struct btree_ite
 	for (CLASS(btree_iter, _iter)((_trans), (_btree_id), (_start), (_flags));	\
 	     (_k) = bch2_btree_iter_peek_max_type(&(_iter), _end, _flags),		\
 	     !((_ret) = bkey_err(_k)) && (_k).k;					\
-	     bch2_btree_iter_advance(&(_iter)))
+	     bch2_btree_iter_advance_type(&(_iter), (_flags)))
 
 #define for_each_btree_key_norestart(_trans, _iter, _btree_id,				\
 				     _start, _flags, _k, _ret)				\
@@ -1114,18 +1197,15 @@ struct bkey_s_c bch2_btree_iter_peek_root(struct btree_trans *, struct btree_ite
 	for (;										\
 	     (_k) = bch2_btree_iter_peek_max_type(&(_iter), _end, _flags),		\
 	     !((_ret) = bkey_err(_k)) && (_k).k;					\
-	     bch2_btree_iter_advance(&(_iter)))
+	     bch2_btree_iter_advance_type(&(_iter), (_flags)))
 
 #define for_each_btree_key_continue_norestart(_iter, _flags, _k, _ret)			\
 	for_each_btree_key_max_continue_norestart(_iter, SPOS_MAX, _flags, _k, _ret)
 
 #define for_each_btree_key_reverse_norestart(_trans, _iter, _btree_id,			\
 					     _start, _flags, _k, _ret)			\
-	for (CLASS(btree_iter, _iter)((_trans), (_btree_id),				\
-				      (_start), (_flags));				\
-	     (_k) = bch2_btree_iter_peek_prev_type(&(_iter), _flags),			\
-	     !((_ret) = bkey_err(_k)) && (_k).k;					\
-	     bch2_btree_iter_rewind(&(_iter)))
+	for_each_btree_key_max_norestart(_trans, _iter, _btree_id, _start,		\
+					 POS_MIN, (_flags)|BTREE_ITER_prev, _k, _ret)
 
 /*
  * This should not be used in a fastpath, without first trying _do in

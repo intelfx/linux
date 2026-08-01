@@ -252,6 +252,7 @@ impl FromStr for c::bpos {
 
 pub type bkey_type = c::bch_bkey_type;
 
+#[derive(Clone, Copy)]
 pub struct BkeySC<'a> {
     pub k:           &'a c::bkey,
     pub v:           &'a c::bch_val,
@@ -278,8 +279,24 @@ impl<'a> BkeySC<'a> {
         }
     }
 
+    /// Key only - type, pos, size - without rendering the value.
+    #[cfg(feature = "std")]
+    pub fn to_text_key(&self) -> BkeySCKeyToText<'a> {
+        BkeySCKeyToText {
+            k: BkeySC { k: self.k, v: self.v, iter: PhantomData },
+        }
+    }
+
     pub fn v(&self) -> BkeyValSC<'a> {
         unsafe { BkeyValSC::from_raw(self.k, self.v) }
+    }
+
+    /// The value as raw bytes: its full u64s extent past the key header.
+    pub fn val_bytes(&self) -> &'a [u8] {
+        let u64s = self.k.u64s as usize - core::mem::size_of::<c::bkey>() / 8;
+        unsafe {
+            core::slice::from_raw_parts(self.v as *const c::bch_val as *const u8, u64s * 8)
+        }
     }
 
     pub fn pos(&self) -> c::bpos {
@@ -334,6 +351,50 @@ impl<'a> From<&'a c::bkey_s_c> for BkeySC<'a> {
     }
 }
 
+/// Mutable counterpart of [`BkeySC`]: a borrowed, unpacked key + value with the
+/// lifetime tracked, so mutations land on the underlying buffer. It is a mutable
+/// handle, so it is deliberately not `Copy`; the extent iterators borrow it
+/// (`&mut BkeyS`), which lets a single handle be iterated more than once (e.g. a
+/// read scan then a rewrite pass) without ever aliasing `&mut`.
+pub struct BkeyS<'a> {
+    pub k: &'a mut c::bkey,
+    pub v: &'a mut c::bch_val,
+}
+
+impl<'a> BkeyS<'a> {
+    /// The raw `c::bkey_s` for passing to C helpers (e.g. `bch2_bkey_ptrs`).
+    pub(crate) fn to_raw(&mut self) -> c::bkey_s {
+        c::bkey_s {
+            __bindgen_anon_1: c::bkey_s__bindgen_ty_1 {
+                __bindgen_anon_1: c::bkey_s__bindgen_ty_1__bindgen_ty_1 {
+                    k: &mut *self.k,
+                    v: &mut *self.v,
+                },
+            },
+        }
+    }
+
+    pub fn key_type(&self) -> c::bch_bkey_type {
+        c::bch_bkey_type(self.k.type_ as u32)
+    }
+
+    /// The value bytes, mutably. Length is derived from the key's `u64s`; the
+    /// value is never packed, so this is the on-disk value region in place.
+    pub fn val_bytes_mut(&mut self) -> &mut [u8] {
+        let len = self.k.u64s as usize * 8 - core::mem::size_of::<c::bkey>();
+        unsafe { core::slice::from_raw_parts_mut(self.v as *mut c::bch_val as *mut u8, len) }
+    }
+}
+
+impl<'a> From<&'a mut c::bkey_i> for BkeyS<'a> {
+    fn from(k: &'a mut c::bkey_i) -> Self {
+        BkeyS {
+            k: &mut k.k,
+            v: &mut k.v,
+        }
+    }
+}
+
 #[cfg(feature = "std")]
 pub struct BkeySCToText<'a, 'f> {
     k:  BkeySC<'a>,
@@ -348,6 +409,18 @@ impl fmt::Display for BkeySCToText<'_, '_> {
                 c::bch2_bkey_val_to_text(buf, self.fs.raw, self.k.to_raw())
             })
         }
+    }
+}
+
+#[cfg(feature = "std")]
+pub struct BkeySCKeyToText<'a> {
+    k: BkeySC<'a>,
+}
+
+#[cfg(feature = "std")]
+impl fmt::Display for BkeySCKeyToText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        unsafe { printbuf_to_formatter(f, |buf| c::bch2_bkey_to_text(buf, self.k.k)) }
     }
 }
 
