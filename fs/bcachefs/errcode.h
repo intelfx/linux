@@ -595,7 +595,9 @@
 	x(0,				nocow_trylock_fail)			\
 	x(BCH_ERR_nocow_trylock_fail,	nocow_trylock_contended)		\
 	x(BCH_ERR_nocow_trylock_fail,	nocow_trylock_bucket_full)		\
-	x(EINTR,			recovery_cancelled)			\
+	x(EINTR,			cancelled)				\
+	x(BCH_ERR_cancelled,		recovery_cancelled)			\
+	x(BCH_ERR_cancelled,		kthread_cancelled)			\
 	x(0,				shutdown_with_errors)			\
 	x(BCH_ERR_shutdown_with_errors,	shutdown_with_errors_fixed)		\
 	x(BCH_ERR_shutdown_with_errors,	shutdown_with_errors_unfixed)		\
@@ -627,7 +629,7 @@ static inline bool _bch2_err_matches(int err, int class)
 
 int __bch2_err_class(int);
 
-static inline long bch2_err_class(long err)
+static inline s64 bch2_err_class(s64 err)
 {
 	return err < 0 ? __bch2_err_class(err) : err;
 }

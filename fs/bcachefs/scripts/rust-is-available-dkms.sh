@@ -23,14 +23,23 @@ canonical_version()
 }
 
 # Fall back to the C-only module, reporting exactly what's missing. The reason
-# goes to stderr; only the y/n verdict goes to stdout (the Makefile captures it
-# via $(shell ...), so stderr is free for diagnostics).
+# IS the verdict: stdout is "y", or else the reason we couldn't. The Makefile
+# bakes that into the module, so the mount-time "built without Rust support"
+# message can say why - months later, on a machine whose build log is long gone.
+# The stderr copy still lands in the DKMS build log for whoever is watching the
+# build itself.
+#
+# Stripped of the characters that would otherwise terminate the C string literal
+# it ends up inside: the reason travels through make and the shell into a -D. An
+# unusual path should mangle the message, never break the build. The apostrophe
+# comes out in the Makefile, which also covers the reasons it composes itself.
 skip()
 {
-	if [ -n "$1" ]; then
-		echo "bcachefs: building without Rust — $1" >&2
+	reason=$(printf '%s' "$1" | tr -d '"\\$`')
+	if [ -n "$reason" ]; then
+		echo "bcachefs: building without Rust — $reason" >&2
 	fi
-	echo n
+	printf '%s\n' "${reason:-reason not recorded}"
 	exit 0
 }
 
@@ -78,8 +87,34 @@ fi
 # + scripts but not the compiled rust/ artifacts — a locally built kernel, or a
 # kernel-devel/headers package without the Rust build output — otherwise dies
 # with E0463 "can't find crate for `core`" instead of falling back to C-only.
-if [ ! -r "$KERNEL_OBJ/rust/libcore.rmeta" ]; then
-	skip "missing the kernel's prebuilt Rust stdlib ($KERNEL_OBJ/rust/libcore.rmeta); the kernel was built/installed without its rust/ artifacts"
+libcore=$KERNEL_OBJ/rust/libcore.rmeta
+
+if [ ! -r "$libcore" ]; then
+	skip "missing the kernel's prebuilt Rust stdlib ($libcore); the kernel was built/installed without its rust/ artifacts"
+fi
+
+# ...and it has to have been built by *this* rustc, or rustc refuses to load it:
+# E0514, "found crate `core` compiled by an incompatible version of rustc".
+#
+# The CONFIG_RUSTC_VERSION check above does not cover this. That records the
+# rustc which ran at kernel *configure* time, which is not necessarily the one
+# that compiled the .rmeta files now sitting in rust/: reconfigure after a
+# toolchain change and auto.conf agrees with the installed rustc while every
+# artifact on disk disagrees. Reported by debaba, on a locally built 7.2-rc6
+# whose rust/ came from rustc 1.96 and which was then built against a 1.95
+# host — straight to E0514 rather than to the C-only module this script exists
+# to fall back to.
+#
+# So ask the artifact we actually link against. An rmeta opens with a
+# length-prefixed version string at offset 17, right after the "rust" magic and
+# the format version — the same string rustc reads to decide E0514. Extracted
+# with head/tr/grep rather than strings(1), which is binutils and not something
+# a DKMS build environment is guaranteed to have.
+libcore_version=$(head -c 4096 "$libcore" 2>/dev/null | tr -c '[:print:]' '\n' |
+	grep -oE 'rustc [0-9]+\.[0-9]+\.[0-9]+' | head -1 | sed 's/^rustc //')
+
+if [ -n "$libcore_version" ] && [ "$libcore_version" != "$rustc_version" ]; then
+	skip "rustc $rustc_version cannot use the kernel's Rust stdlib, which was built by rustc $libcore_version ($libcore)"
 fi
 
 echo y

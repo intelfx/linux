@@ -530,14 +530,26 @@ int bch2_reattach_inode(struct btree_trans *trans, struct bch_inode_unpacked *in
 		}
 	}
 
+	/*
+	 * is_subdir_for_nlink(), not S_ISDIR(): a subvolume root is named by a
+	 * DT_SUBVOL dirent, which doesn't count towards its parent's link
+	 * count. Bumping it here for one leaves check_nlinks() to disagree.
+	 */
 	if (!adopted)
-		lostfound.bi_nlink += S_ISDIR(inode->bi_mode);
+		lostfound.bi_nlink += is_subdir_for_nlink(inode);
 
-	/* ensure lost+found inode is also present in inode snapshot */
-	if (!inode->bi_subvol) {
-		BUG_ON(!bch2_snapshot_is_ancestor(trans, inode->bi_snapshot, lostfound.bi_snapshot));
-		lostfound.bi_snapshot = inode->bi_snapshot;
-	}
+	/*
+	 * Ensure lost+found has an inode version in the snapshot we're about to
+	 * create the dirent in, or we leave a key in a snapshot whose inode only
+	 * exists in an ancestor - snapshot_key_missing_inode_snapshot, which the
+	 * next check_dirents has to clean up after us.
+	 *
+	 * dirent_snapshot is the inode's own snapshot for an ordinary inode, and
+	 * the parent subvolume's for a subvolume root (above); lookup_lostfound()
+	 * resolved lost+found from it, so it is at worst an ancestor of it.
+	 */
+	BUG_ON(!bch2_snapshot_is_ancestor(trans, dirent_snapshot, lostfound.bi_snapshot));
+	lostfound.bi_snapshot = dirent_snapshot;
 
 	try(__bch2_fsck_write_inode(trans, &lostfound));
 
@@ -642,7 +654,7 @@ int bch2_reattach_inode(struct btree_trans *trans, struct bch_inode_unpacked *in
 	return ret;
 }
 
-static int reconstruct_subvol(struct btree_trans *trans, u32 snapshotid, u32 subvolid, u64 inum)
+int bch2_reconstruct_subvol(struct btree_trans *trans, u32 snapshotid, u32 subvolid, u64 inum)
 {
 	struct bch_fs *c = trans->c;
 
@@ -652,25 +664,42 @@ static int reconstruct_subvol(struct btree_trans *trans, u32 snapshotid, u32 sub
 	}
 
 	/*
-	 * If inum isn't set, that means we're being called from check_dirents,
-	 * not check_inodes - the root of this subvolume doesn't exist or we
-	 * would have found it there:
+	 * Without an inum from the caller, find the root inode rather than
+	 * minting one: the inode carrying bi_subvol == subvolid is the root,
+	 * and when it's the subvolume key that went missing that inode is
+	 * still there. Creating a second one would leave two claimants for the
+	 * same subvolume and the real contents orphaned behind the new empty
+	 * root.
+	 *
+	 * It can't be deferred to a later pass either - bch2_subvolume_validate()
+	 * rejects a subvolume key with inode == 0 (subvol_inode_bad), so the
+	 * key can't be written at all until we know it.
 	 */
 	if (!inum) {
-		CLASS(btree_iter_uninit, inode_iter)(trans);
-		struct bch_inode_unpacked new_inode;
+		struct bkey_s_c k;
+		int ret = 0;
 
-		bch2_inode_init_early(c, &new_inode);
-		bch2_inode_init_late(c, &new_inode, bch2_current_time(c), 0, 0, S_IFDIR|0755, 0, NULL);
+		for_each_btree_key_norestart(trans, iter, BTREE_ID_inodes, POS_MIN,
+					     BTREE_ITER_prefetch|BTREE_ITER_all_snapshots, k, ret) {
+			if (!bkey_is_inode(k.k))
+				continue;
 
-		new_inode.bi_subvol = subvolid;
+			struct bch_inode_unpacked candidate;
+			bch2_inode_unpack(c, k, &candidate);
 
-		try(bch2_inode_create(trans, &inode_iter, &new_inode, snapshotid, false));
-		bch2_btree_iter_set_snapshot(&inode_iter, snapshotid);
-		try(bch2_btree_iter_traverse(&inode_iter));
-		try(bch2_inode_write(trans, &inode_iter, &new_inode));
+			if (candidate.bi_subvol == subvolid) {
+				inum = candidate.bi_inum;
+				break;
+			}
+		}
+		if (ret)
+			return ret;
 
-		inum = new_inode.bi_inum;
+		if (!inum) {
+			bch_err(c, "no root inode found for subvol %u, can't reconstruct",
+				subvolid);
+			return bch_err_throw(c, fsck_repair_unimplemented);
+		}
 	}
 
 	bch_info(c, "reconstructing subvol %u with root inode %llu", subvolid, inum);
@@ -742,13 +771,28 @@ static int reconstruct_inode(struct btree_trans *trans, enum btree_id btree, u32
 	new_inode.bi_inum = inum;
 	new_inode.bi_snapshot = snapshot;
 
-	struct bch_inode_unpacked ancestor;
-	int ret = bch2_inode_find_oldest_snapshot(trans, inum, snapshot, &ancestor);
+	/*
+	 * Recover the hash info if any version of this inode survives anywhere.
+	 *
+	 * bi_hash_seed and the str_hash type are the same in every snapshot
+	 * version of an inode - bch2_repair_inode_hash_info() exists to enforce
+	 * that - so a descendant will do when no ancestor is left. Btree node
+	 * loss takes out one snapshot's inode key while leaving another's, and
+	 * an ancestor-only search calls that unrecoverable and falls back to the
+	 * random seed bch2_inode_init_early() left in new_inode. That puts every
+	 * dirent already under this directory at the wrong hash offset: lookups
+	 * miss, so creates insert duplicates instead of overwriting, and the
+	 * directory quietly becomes untraversable.
+	 */
+	struct bch_inode_unpacked hash_src;
+	int ret = bch2_inode_find_oldest_snapshot(trans, inum, snapshot, &hash_src);
+	if (bch2_err_matches(ret, ENOENT))
+		ret = bch2_inode_find_any_snapshot(trans, inum, &hash_src);
 	if (ret && !bch2_err_matches(ret, ENOENT))
 		return ret;
 	if (!ret) {
-		new_inode.bi_hash_seed = ancestor.bi_hash_seed;
-		SET_INODE_STR_HASH(&new_inode, INODE_STR_HASH(&ancestor));
+		new_inode.bi_hash_seed = hash_src.bi_hash_seed;
+		SET_INODE_STR_HASH(&new_inode, INODE_STR_HASH(&hash_src));
 	}
 
 	return __bch2_fsck_write_inode(trans, &new_inode);
@@ -1423,7 +1467,20 @@ static int check_inode(struct btree_trans *trans,
 		}
 	}
 
-	if (u.bi_subvol && bch2_snapshot_is_leaf(c, u.bi_snapshot)) {
+	/*
+	 * Not gated on the snapshot being a leaf: taking a snapshot rewrites
+	 * the root inode of the new subvolume, not of the old, so a live
+	 * subvolume's root inode key stays at a node that has since become
+	 * interior. Leaf-ness therefore skipped this block for every subvolume
+	 * that had ever been snapshotted - so a lost subvolume key was never
+	 * reconstructed and bi_subvol was never validated for exactly the
+	 * subvolumes with the most history behind them.
+	 *
+	 * Live versus stale is decided below instead, by inode_bi_subvol_wrong:
+	 * the subvolume's snapshot has to have this key's snapshot as an
+	 * ancestor, which is the actual question leaf-ness was standing in for.
+	 */
+	if (u.bi_subvol) {
 		struct bch_subvolume s;
 
 		ret = bch2_subvolume_get(trans, u.bi_subvol, false, &s);
@@ -1457,7 +1514,7 @@ static int check_inode(struct btree_trans *trans,
 		    ((c->sb.btrees_lost_data & BIT_ULL(BTREE_ID_subvolumes)) ||
 		     snapshot_agrees)) {
 			ret = 0;
-			try(reconstruct_subvol(trans, k.k->p.snapshot, u.bi_subvol, u.bi_inum));
+			try(bch2_reconstruct_subvol(trans, k.k->p.snapshot, u.bi_subvol, u.bi_inum));
 			goto do_update;
 		}
 
@@ -1763,9 +1820,49 @@ bail:
 	return 0;
 }
 
+/*
+ * Is this inode number a subvolume root? Answered once per inum, from the first
+ * version we see.
+ *
+ * bi_subvol cannot be read off an arbitrary version. Taking a snapshot updates
+ * the root inode of the new subvolume but not of the old, so the version left
+ * behind at the now-interior node is still the live root of the old subvolume
+ * and was never rewritten; versions older still may predate the subvolume
+ * entirely. An old version of a subvolume root legitimately reads bi_subvol ==
+ * 0, and trusting that is how we ended up reattaching one into lost+found.
+ *
+ * The first version we see for an inum is different, and one bool taken from it
+ * then carries to the rest:
+ *
+ *  1. We iterate BTREE_ID_inodes with all_snapshots from POS_MIN, and inode
+ *     keys sort by (inum, snapshot) - so within an inum we visit snapshot IDs
+ *     in ascending order.
+ *  2. A snapshot's ID is always strictly less than its parent's; the snapshot
+ *     key validator enforces it (snapshot_parent_bad, bch2_snapshot_validate()).
+ *     So every descendant of a node sorts before that node.
+ *  3. Version B shadows version A only if B lives at a descendant of A's
+ *     snapshot. By (2) B sorts before A, so by (1) we would already have seen
+ *     B when we reach A.
+ *  4. Hence nothing shadows the first version we see for an inum: some live
+ *     view resolves to it. That is the version fsck maintains bi_subvol on -
+ *     check_subvols() ran before us and repairs it there, and check_inode()
+ *     only validates bi_subvol where it is meaningful.
+ *  5. Whether an inum is a subvolume root is a property of the number, not of
+ *     any one version, so the answer is good for all of them.
+ *
+ * Only the boolean is carried, not the subvolume ID: the first version we land
+ * on may belong to any of the subvolumes rooted at this inum, and which one it
+ * is says nothing.
+ */
+struct subvol_root_seen {
+	u64	inum;
+	bool	is_subvol_root;
+};
+
 static int check_unreachable_inode(struct btree_trans *trans,
 				   struct btree_iter *iter,
-				   struct bkey_s_c k)
+				   struct bkey_s_c k,
+				   struct subvol_root_seen *seen)
 {
 	CLASS(printbuf, buf)();
 	int ret = 0;
@@ -1776,10 +1873,37 @@ static int check_unreachable_inode(struct btree_trans *trans,
 	struct bch_inode_unpacked inode;
 	bch2_inode_unpack(trans->c, k, &inode);
 
+	/* Before the early return below: every version has to advance this. */
+	if (inode.bi_inum != seen->inum) {
+		seen->inum		= inode.bi_inum;
+		seen->is_subvol_root	= inode.bi_subvol != 0;
+	}
+
 	if (!inode_should_reattach(&inode))
 		return 0;
 
-	try(find_oldest_inode_needs_reattach(trans, &inode));
+	/*
+	 * Not for a subvolume root. A subvolume root has exactly one dirent,
+	 * in the parent subvolume, and dirents to subvolumes aren't versioned
+	 * - so there is no chain of unreachable ancestor versions to walk back
+	 * to, and the version we were handed is the one to reattach.
+	 *
+	 * Note that leaf-ness can't stand in for this: taking a snapshot
+	 * updates the root inode of the new subvolume, but not of the old, so
+	 * a live subvolume's root inode key stays at a snapshot that has since
+	 * become interior.
+	 *
+	 * Climbing anyway picks some ancestor version, reattaches that - and
+	 * because the ancestor doesn't carry bi_subvol, it gets filed into
+	 * lost+found as a plain directory named after its inode number, whose
+	 * backpointer is then propagated back down over the live versions
+	 * below it. The subvolume root ends up reachable both by its own
+	 * DT_SUBVOL dirent and by the manufactured one, which is
+	 * inode_dir_multiple_links -> emergency read-only at runtime.
+	 * (field report, 2026-08-04)
+	 */
+	if (!seen->is_subvol_root)
+		try(find_oldest_inode_needs_reattach(trans, &inode));
 
 	/*
 	 * Attached in a descendant snapshot? Then this version has a proper
@@ -1824,13 +1948,15 @@ int bch2_check_unreachable_inodes(struct bch_fs *c)
 	struct progress_indicator progress;
 	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_inodes), 0);
 
+	struct subvol_root_seen seen = {};
+
 	CLASS(btree_trans, trans)(c);
 	return for_each_btree_key_commit(trans, iter, BTREE_ID_inodes,
 				POS_MIN,
 				BTREE_ITER_prefetch|BTREE_ITER_all_snapshots, k,
 				NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
 		bch2_progress_update_iter(trans, &progress, &iter) ?:
-		check_unreachable_inode(trans, &iter, k);
+		check_unreachable_inode(trans, &iter, k, &seen);
 	}));
 }
 
@@ -2178,7 +2304,7 @@ static int check_dirent_to_subvol(struct btree_trans *trans, struct btree_iter *
 		 * Couldn't find a subvol for dirent's snapshot - but we lost
 		 * subvols, so we need to reconstruct:
 		 */
-		try(reconstruct_subvol(trans, d.k->p.snapshot, parent_subvol, 0));
+		try(bch2_reconstruct_subvol(trans, d.k->p.snapshot, parent_subvol, 0));
 
 		parent_snapshot = d.k->p.snapshot;
 	}
@@ -2207,6 +2333,15 @@ static int check_dirent_to_subvol(struct btree_trans *trans, struct btree_iter *
 						BTREE_UPDATE_internal_snapshot_node, dirent));
 
 		new_dirent->v.d_parent_subvol = cpu_to_le32(new_parent_subvol);
+
+		/*
+		 * The fs_path_parent check below repairs the subvolume to agree
+		 * with the dirent, so it has to agree with the dirent we just
+		 * wrote and not the one we replaced - otherwise a single pass
+		 * writes two different answers, and each subsequent fsck moves
+		 * one to match the other's stale value.
+		 */
+		parent_subvol = new_parent_subvol;
 	}
 
 check_target:
@@ -2238,7 +2373,7 @@ check_target:
 	if (le32_to_cpu(s.v->fs_path_parent) != parent_subvol) {
 		printbuf_reset(&buf);
 
-		prt_printf(&buf, "subvol with wrong fs_path_parent, should be be %u\n",
+		prt_printf(&buf, "subvol with wrong fs_path_parent, should be %u\n",
 			   parent_subvol);
 
 		try(bch2_inum_to_path(trans, (subvol_inum) { s.k->p.offset,

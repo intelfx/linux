@@ -50,6 +50,16 @@ ifdef BCACHEFS_TESTS
 	bcachefs-config-cppflags += -DCONFIG_BCACHEFS_TESTS=1
 endif
 
+# Make bcachefs's own warnings fatal without CONFIG_WERROR for the whole
+# tree: make BCACHEFS_WERROR=1. subdir-ccflags-y scopes it to this directory
+# and below, so nothing else the invocation happens to compile is affected;
+# per-file CFLAGS_* -Wno-* waivers (e.g. rust/extern.o's) still apply on top.
+# For CI that wants exactly this subtree warning-clean, whatever kernel it is
+# built into.
+ifeq ($(BCACHEFS_WERROR),1)
+subdir-ccflags-y += -Werror
+endif
+
 # Verify the hand-copied struct getdents_callback64 in fs/dirent.c against
 # the target kernel's real layout (fs/scripts/getdents-layout.sh, pahole on
 # $(objtree)/vmlinux - present in external builds since kbuild needs it for
@@ -249,40 +259,83 @@ ifdef CONFIG_RUST
 # installed, fall back to the C-only module rather than failing the build
 # (reported by feedc0de). DKMS refines this further via the auto-probe below.
 bcachefs-rust-y := $(if $(shell command -v $(BINDGEN) 2>/dev/null),y,n)
+bcachefs-rust-why := bindgen ($(BINDGEN)) not found
 ifdef BCACHEFS_DKMS
 BCACHEFS_RUST ?= auto
 ifeq ($(BCACHEFS_RUST),1)
 bcachefs-rust-y := y
 else ifeq ($(BCACHEFS_RUST),0)
 bcachefs-rust-y := n
+bcachefs-rust-why := explicitly disabled at build time with BCACHEFS_RUST=0
 else
-bcachefs-rust-y := $(shell RUSTC='$(RUSTC)' HOSTRUSTC='$(HOSTRUSTC)'	\
+# The probe answers with "y" or with the reason it said no - see
+# scripts/rust-is-available-dkms.sh. Keeping the reason (rather than a bare n)
+# is what lets the module tell the user at mount time what was missing.
+bcachefs-rust-probe := $(shell RUSTC='$(RUSTC)' HOSTRUSTC='$(HOSTRUSTC)'	\
 	BINDGEN='$(BINDGEN)' CC='$(CC)' KERNEL_SRC='$(srctree)'		\
 	KERNEL_OBJ='$(objtree)' CONFIG_RUSTC_VERSION='$(CONFIG_RUSTC_VERSION)' \
 	$(CONFIG_SHELL) $(src)/scripts/rust-is-available-dkms.sh)
+bcachefs-rust-y := $(if $(filter y,$(bcachefs-rust-probe)),y,n)
+bcachefs-rust-why := $(if $(filter y,$(bcachefs-rust-probe)),,$(bcachefs-rust-probe))
 endif
 endif
 # Kernel ships Rust; use it, don't vendor.
 bcachefs-vendor-rust :=
 else
-# CONFIG_RUST=n: no kernel Rust to link against — build bcachefs's own vendored
-# stack instead (Makefile.rust.vendor), if we can. BCACHEFS_RUST=1 forces; auto
-# needs rustc + its rust-src + bindgen, plus the kernel's rustc_cfg (generated
-# unconditionally by syncconfig) and its target-spec generator source.
-# scripts/target.json itself is always-$(CONFIG_RUST), so a Rust-off tree
-# doesn't have one — we generate our own below rather than requiring it.
+# CONFIG_RUST=n: no kernel Rust to link against.
+#
+# Vendoring our own copy of the kernel's rust/ is a bridge for kernels older
+# than the distros turning CONFIG_RUST on, which happened at 7.0. Gate it on
+# that, so fs/vendor/kernel-rust can simply be deleted once < 7.0 is out of
+# support — carrying a fork of the kernel's Rust tree indefinitely is exactly
+# what this is meant to avoid.
+#
+# On 7.0+ with CONFIG_RUST=n there is no fallback and shouldn't be: the kernel
+# can supply this and wasn't asked to. Say so, rather than silently building a
+# C-only module.
+#
+# If VERSION is somehow unset, fall through to not vendoring: losing optional
+# Rust on an old kernel is a degradation, vendoring where we shouldn't is the
+# thing we're trying to stop doing.
+bcachefs-can-vendor-rust := $(shell [ '$(VERSION)' -lt 7 ] 2>/dev/null && echo y)
+
+ifneq ($(bcachefs-can-vendor-rust),y)
+bcachefs-rust-y := n
+bcachefs-rust-why := kernel $(KERNELVERSION) was built without CONFIG_RUST; enable it, or ask your distribution to
+bcachefs-vendor-rust :=
+else
+# Pre-7.0: build bcachefs's own vendored stack (Makefile.rust.vendor), if we
+# can. BCACHEFS_RUST=1 forces; auto needs rustc + its rust-src + bindgen, plus
+# the kernel's rustc_cfg (generated unconditionally by syncconfig) and its
+# target-spec generator source. scripts/target.json itself is
+# always-$(CONFIG_RUST), so a Rust-off tree doesn't have one — we generate our
+# own below rather than requiring it.
 BCACHEFS_RUST ?= auto
 ifeq ($(BCACHEFS_RUST),1)
 bcachefs-rust-y := y
 else ifeq ($(BCACHEFS_RUST),0)
 bcachefs-rust-y := n
+bcachefs-rust-why := explicitly disabled at build time with BCACHEFS_RUST=0
 else
-bcachefs-rust-y := $(shell command -v $(RUSTC) >/dev/null 2>&1 &&		\
-	command -v $(BINDGEN) >/dev/null 2>&1 &&				\
-	[ -r '$(objtree)/scripts/generate_rust_target.rs' ] &&		\
-	[ -r '$(objtree)/include/generated/rustc_cfg' ] && echo y || echo n)
+# Same protocol as the DKMS probe: say "y", or say what was missing. Reporting
+# the first failed prerequisite by name is the whole point - "no Rust support"
+# on its own sends people to their distro asking for CONFIG_RUST, which is not
+# what this path needs.
+bcachefs-rust-probe := $(shell					\
+	command -v $(RUSTC)   >/dev/null 2>&1 ||			\
+		{ echo 'rustc ($(RUSTC)) not found'; exit 0; };		\
+	command -v $(BINDGEN) >/dev/null 2>&1 ||			\
+		{ echo 'bindgen ($(BINDGEN)) not found'; exit 0; };	\
+	[ -r '$(objtree)/scripts/generate_rust_target.rs' ] ||		\
+		{ echo 'kernel tree has no scripts/generate_rust_target.rs'; exit 0; }; \
+	[ -r '$(objtree)/include/generated/rustc_cfg' ] ||		\
+		{ echo 'kernel tree has no include/generated/rustc_cfg'; exit 0; }; \
+	echo y)
+bcachefs-rust-y := $(if $(filter y,$(bcachefs-rust-probe)),y,n)
+bcachefs-rust-why := $(if $(filter y,$(bcachefs-rust-probe)),,$(bcachefs-rust-probe))
 endif
 bcachefs-vendor-rust := $(bcachefs-rust-y)
+endif # bcachefs-can-vendor-rust
 endif
 
 # The shared leaf crates (cmd_bch_library) link core/compiler_builtins from the
@@ -445,9 +498,18 @@ $(obj)/rust/bcachefs.rs: $(obj)/codegen $(obj)/rust/generic-radix-tree.h $(bcach
 
 # extern.c falls out of the same codegen run. Its wrappers are global functions
 # with no prior prototype (bindgen doesn't emit C declarations for them), so
-# silence -Wmissing-prototypes for just this generated object.
+# silence -Wmissing-prototypes: that one is inherent to what bindgen emits and
+# would warn on every build forever.
+#
+# -Wno-error for whatever else it emits. This is generated code - a bindgen bump
+# can invent a new warning at any time, and with CONFIG_WERROR=y (the defconfig
+# default) that breaks the build for whoever upgrades first. Naming them one at
+# a time does not scale: -Wno-duplicate-decl-specifier only got added here after
+# a user reported the build broken (#819). Warnings stay visible, they just
+# stop being fatal for code we did not write.
 $(obj)/rust/extern.c: $(obj)/rust/bcachefs.rs ;
-CFLAGS_rust/extern.o += -Wno-missing-prototypes -Wno-missing-declarations
+CFLAGS_rust/extern.o += -Wno-missing-prototypes -Wno-missing-declarations \
+			-Wno-error
 
 # Kernel trees < 6.18 pass -Zno-jump-tables in KBUILD_RUSTFLAGS, written for
 # their era's pinned rustc; newer rustc has it stabilized as -Cjump-tables=n.
@@ -483,12 +545,16 @@ rustflags-y += --cfg kernel
 # $(KBUILD_PROCMACROLDFLAGS)) are all global, so reachable here.
 # Proc-macro crate name is derived from the target: lib<name>.so.
 quiet_cmd_bch_procmacro = RUSTC P  $@
-      cmd_bch_procmacro = $(RUSTC) $(rust_common_flags) \
+      cmd_bch_procmacro = $(RUSTC) $(rust_common_flags) $(bch-procmacro-lints) \
 	-Clinker-flavor=gcc -Clinker=$(HOSTCC) \
 	-Clink-args='$(call escsq,$(KBUILD_PROCMACROLDFLAGS))' \
 	--emit=dep-info=$(depfile) --emit=link=$@ --extern proc_macro \
 	--crate-type proc-macro --crate-name $(patsubst lib%.so,%,$(notdir $@)) \
 	@$(objtree)/include/generated/rustc_cfg $<
+
+# paste is vendored, so it gets the same treatment as the leaf rlibs above.
+# typeinfo-macros is ours and stays subject to the kernel's lints.
+$(obj)/libpaste.so: private bch-procmacro-lints := --cap-lints=allow
 
 $(obj)/libpaste.so: $(src)/vendor/paste/src/lib.rs FORCE
 	$(call if_changed_dep,bch_procmacro)
@@ -497,9 +563,18 @@ $(obj)/libtypeinfo_macros.so: $(src)/typeinfo-macros/src/lib.rs FORCE
 	$(call if_changed_dep,bch_procmacro)
 
 # Generic leaf-rlib build (crate name derived from the object stem), shared by
-# the vendored macro_rules crates bitfield and bitflags.
+# the vendored crates bitfield, bitflags and uuid.
+#
+# --cap-lints=allow: every crate built by this rule is vendored, and the
+# kernel's lints are a statement about how we want our own code written - they
+# say nothing about whether someone else's crate is correct. This is what cargo
+# does for dependencies, and what Makefile.rust.vendor already does on the
+# CONFIG_RUST=n path. Doing it per-lint instead means a rustc bump breaks
+# defconfig builds for whoever upgrades first: uuid needed two lints allowed
+# (#830) and the only reason bitfield and bitflags needed none is that today's
+# rustc happens not to complain about them.
 quiet_cmd_bch_library = RUSTC L  $@
-      cmd_bch_library = $(RUSTC) $(rust_flags) \
+      cmd_bch_library = $(RUSTC) $(rust_flags) --cap-lints=allow \
 	--emit=dep-info=$(depfile) --emit=obj=$@ \
 	--emit=metadata=$(dir $@)lib$(patsubst %.o,%,$(notdir $@)).rmeta \
 	--crate-type rlib $(bch-rust-L) --sysroot=/dev/null \
@@ -510,19 +585,6 @@ $(obj)/bitfield.o: $(src)/vendor/bitfield/src/lib.rs FORCE
 
 $(obj)/bitflags.o: $(src)/vendor/bitflags/src/lib.rs FORCE
 	$(call if_changed_dep,bch_library)
-
-# The kernel builds Rust with -Wrust_2018_idioms, which CONFIG_WERROR turns
-# into -Dwarnings; the vendored uuid predates both of the lifetime lints that
-# implies and trips 11 of them. Those lints are a statement about how we want
-# our own code written - they say nothing about whether someone else's crate is
-# correct - so allow them here rather than patching a vendored tree we would
-# have to re-patch on every refresh.
-#
-# Both are needed: elided_lifetimes_in_paths accounts for 6 and
-# mismatched_lifetime_syntaxes for the other 5, so allowing only the one named
-# in the bug report leaves the build broken. bitfield and bitflags are clean
-# under the same flags, which is why this is scoped to uuid.o.
-RUSTFLAGS_uuid.o += -Aelided_lifetimes_in_paths -Amismatched_lifetime_syntaxes
 
 $(obj)/uuid.o: $(src)/vendor/uuid/src/lib.rs FORCE
 	$(call if_changed_dep,bch_library)
@@ -550,7 +612,13 @@ include $(src)/Makefile.rust.vendor
 endif
 
 else
-$(warning bcachefs: skipping optional Rust support for DKMS module; set BCACHEFS_RUST=1 to force)
+# Carry the reason into the module. Whoever hits this at mount time is on a
+# different machine, months later, with no build log - the string is the only
+# thing that will tell them what to install. Apostrophes come out: the reason is
+# single-quoted on the command line, and the script strips " \ $ ` for the same
+# reason.
+subdir-ccflags-y += -DBCACHEFS_NO_RUST_REASON='"$(subst ',,$(bcachefs-rust-why))"'
+$(warning bcachefs: building without Rust support - $(bcachefs-rust-why); set BCACHEFS_RUST=1 to force)
 endif # bcachefs-rust-y
 
 # Silence "note: xyz changed in GCC X.X" messages

@@ -1002,8 +1002,32 @@ static int read_super_and_backups(struct bch_sb_handle *sb,
 			opt_set(*opts, nochanges, true);
 	}
 
-	if (IS_ERR(sb->s_bdev_file))
-		return PTR_ERR(sb->s_bdev_file);
+	if (IS_ERR(sb->s_bdev_file)) {
+		int ret = PTR_ERR(sb->s_bdev_file);
+
+		/*
+		 * Detail only - bch2_read_super() has already printed the path
+		 * and the errno, and repeating them here just gets the same
+		 * words twice. The errno alone is not actionable: what the
+		 * user needs is what we asked the block layer for, since that
+		 * - not the device - is usually what's wrong.
+		 */
+		prt_printf(err, "  requested %s%s\n",
+			   sb->mode & BLK_OPEN_WRITE ? "read-write" : "read-only",
+			   sb->mode & BLK_OPEN_EXCL ? ", exclusive" : "");
+
+		switch (ret) {
+		case -EACCES:
+			prt_str(err, "  insufficient privilege (try root), or a write protected device\n"
+				     "  (check blockdev --getro)\n");
+			break;
+		case -EBUSY:
+			prt_str(err, "  device is in use: already mounted, or held by another process\n");
+			break;
+		}
+
+		return ret;
+	}
 
 	sb->bdev = file_bdev(sb->s_bdev_file);
 
@@ -1085,6 +1109,13 @@ int bch2_read_super(const char *path, struct bch_opts *opts,
 	int ret = __bch2_read_super(sb, path, opts, &err);
 	if (ret)
 		bch2_free_super(sb);
+
+	/*
+	 * We embed @err mid-format below, so a reason that came back
+	 * unterminated runs straight into whatever is printed next:
+	 * "Not a bcachefs superblock layouterror starting filesystem".
+	 */
+	bch2_printbuf_ensure_trailing_newline(&err);
 
 	if (ret && err.pos)
 		bch2_print_opts(opts, KERN_ERR "bcachefs (%s): error reading superblock: %s\n%s",
@@ -1424,8 +1455,14 @@ static int __bch2_write_super(struct bch_fs *c)
 		prt_printf(&msg.m, "Would not be able to mount with written devices\n");
 		bch2_can_read_fs_with_devs(c, &sb_written, degraded_flags, &msg.m);
 		bch2_fs_emergency_read_only(c, &msg.m);
+		return bch_err_throw(c, erofs_sb_err);
 	}
 
+	/*
+	 * Not fatal: we wrote to fewer devices than we wanted, but enough that
+	 * the filesystem still mounts. The superblock is on disk, so the caller
+	 * got what it asked for - the message above is a warning, not a failure.
+	 */
 	return 0;
 }
 
