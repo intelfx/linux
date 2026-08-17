@@ -680,12 +680,33 @@ static int bch2_inode_init_security(struct btree_trans *trans,
 				    struct bch_inode_info *inode,
 				    const struct qstr *name,
 				    subvol_inum inum,
-				    struct bch_inode_unpacked *inode_u)
+				    struct bch_inode_unpacked *inode_u,
+				    unsigned flags)
 {
 	struct bch2_initxattrs_ctx ctx = {
 		.trans	= trans,
 		.inum	= inum,
 	};
+
+	/*
+	 * A snapshot create doesn't create an inode: bch2_create_trans() looks
+	 * up the source subvolume's root and reuses it at the new snapshot ID,
+	 * so the source's security xattr is already visible there through
+	 * snapshot ancestry. Handing that inode to the LSM would have it
+	 * compute a fresh label and write it with XATTR_CREATE, which finds the
+	 * inherited key and fails the whole snapshot with EEXIST_str_hash_set.
+	 *
+	 * A snapshot inherits the source's label, which is also the semantics
+	 * we want - the new root is the same inode, not a new object to be
+	 * labelled from the calling task. bch2_create_trans() skips the ACLs
+	 * for a snapshot for the same reason; ACLs are xattrs too.
+	 *
+	 * The in-core label still gets set: the new subvolume root is
+	 * instantiated after commit, and the LSM's d_instantiate hook reads it
+	 * back off the inherited xattr.
+	 */
+	if (flags & BCH_CREATE_SNAPSHOT)
+		return 0;
 
 	/*
 	 * The LSM computes the new label from the task, the dir, and the new
@@ -777,7 +798,7 @@ retry:
 		bch2_inode_init_security(trans, dir, inode,
 					 !(flags & BCH_CREATE_TMPFILE)
 					 ? &dentry->d_name : NULL,
-					 inum, &inode_u) ?:
+					 inum, &inode_u, flags) ?:
 		bch2_trans_commit(trans, NULL, NULL, 0);
 	if (unlikely(ret)) {
 		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, -1,
@@ -2839,8 +2860,15 @@ out:
 err:
 	darray_exit(&devs_to_fs);
 	darray_exit_free_item(&devs, kfree);
+	/*
+	 * Last chance to name the error: bch2_err_class() below flattens it to
+	 * a POSIX errno. errorfc() rather than pr_err() because logfc() falls
+	 * back to printk when there's no fs_context log, so a mount(2) caller
+	 * still gets this in dmesg, and an fsconfig(2) one gets it on the
+	 * terminal.
+	 */
 	if (ret)
-		pr_err("error: %s", bch2_err_str(ret));
+		errorfc(fc, "%s", bch2_err_str(ret));
 	/*
 	 * On an inconsistency error in recovery we might see an -EROFS derived
 	 * errorcode (from the journal), but we don't want to return that to
@@ -2902,8 +2930,15 @@ static int bch2_fs_parse_param(struct fs_context *fc,
 					   &opts->parse_later, param->key,
 					   param->string,
 					   &err);
+	/*
+	 * @err only describes a bad value; the refusals bch2_parse_one_mount_opt()
+	 * returns directly (not a mount option, quota without
+	 * CONFIG_BCACHEFS_QUOTA) leave it empty, which is why this used to print
+	 * a bare "Error parsing option ".
+	 */
 	if (ret)
-		pr_err("Error parsing option %s", err.buf);
+		errorfc(fc, "option %s: %s", param->key,
+			err.pos ? err.buf : bch2_err_str(ret));
 
 	return bch2_err_class(ret);
 }
@@ -2919,6 +2954,23 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 
 	bch2_reconcile_wakeup(c);
 
+	/*
+	 * If we went read-only without being asked to, we hit an error and went
+	 * emergency read-only, and there's no coming back from that in this
+	 * mount.
+	 *
+	 * Test what was asked for - fc->sb_flags - and not c->opts.read_only:
+	 * emergency ro stops the filesystem without rewriting the mount option,
+	 * so c->opts.read_only still says read-write and the comparison below
+	 * finds nothing to do, reporting success while leaving the filesystem
+	 * read-only.
+	 */
+	if (!(fc->sb_flags & SB_RDONLY) &&
+	    test_bit(BCH_FS_emergency_ro, &c->flags)) {
+		errorfc(fc, "cannot go read-write: filesystem is in emergency read-only");
+		return bch_err_throw(c, emergency_ro);
+	}
+
 	if (opts->opts.read_only != c->opts.read_only) {
 		guard(rwsem_write)(&c->state_lock);
 
@@ -2931,7 +2983,10 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 		} else {
 			ret = bch2_fs_read_write(c);
 			if (ret) {
-				bch_err(c, "error going rw: %i", ret);
+				/* bch_err() says which filesystem, errorfc() reaches
+				 * the caller; the throw below discards the errcode. */
+				bch_err(c, "error going read-write: %s", bch2_err_str(ret));
+				errorfc(fc, "error going read-write: %s", bch2_err_str(ret));
 				return bch_err_throw(c, EINVAL_reconfigure_read_write);
 			}
 

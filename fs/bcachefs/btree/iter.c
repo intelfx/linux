@@ -883,7 +883,7 @@ void bch2_trans_node_verify_not_in_iters(struct btree_trans *trans, struct btree
 			bch2_btree_pos_to_text(&buf, trans->c, b);
 			prt_newline(&buf);
 			bch2_btree_path_to_text(&buf, trans, i, path);
-			panic("%s\n", buf.buf);
+			WARN_ONCE(1, "%s\n", buf.buf);
 		}
 }
 
@@ -1249,7 +1249,7 @@ static int bch2_btree_path_traverse_all(struct btree_trans *trans)
 	int ret = 0;
 
 	if (trans->in_traverse_all)
-		return bch_err_throw(trans->c, transaction_restart_in_traverse_all);
+		return btree_trans_restart(trans, BCH_ERR_transaction_restart_in_traverse_all);
 
 	/*
 	 * XXX: when restart reason is transaction_restart_lock_waitlist_alloc,
@@ -1489,6 +1489,16 @@ out_uptodate:
 	event_trace_fn(trans->c, btree_path_traverse_end,
 		       __btree_path_traverse_end_trace(trans, path_idx));
 out:
+	/*
+	 * Re-derive: the cached-path arm goes straight to out, jumping over
+	 * the re-derivation above, and bch2_btree_path_traverse_cached()
+	 * reaches bch2_path_get() through btree_key_cache_fill() - so by here
+	 * the local can point into the array btree_paths_realloc() retired.
+	 * Fix the local rather than one call's argument, so anything added
+	 * below is working from a live path too.
+	 */
+	path = &trans->paths[path_idx];
+
 	EBUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart) != !!trans->restarted);
 	bch2_btree_path_verify(trans, path);
 	return ret;
@@ -1547,12 +1557,12 @@ __flatten
 btree_path_idx_t __bch2_btree_path_make_mut(struct btree_trans *trans,
 			btree_path_idx_t path, bool intent, unsigned long ip)
 {
-	struct btree_path *old = trans->paths + path;
+	btree_path_idx_t old = path;
 	__btree_path_put(trans, trans->paths + path, intent);
 	path = btree_path_clone(trans, path, intent, ip);
 
 	event_trace_fn(trans->c, btree_path_clone,
-		       __btree_path_clone_trace(trans, old - trans->paths, path));
+		       __btree_path_clone_trace(trans, old, path));
 
 	trans->paths[path].preserve = false;
 	return path;
@@ -2028,6 +2038,35 @@ static noinline btree_path_idx_t btree_paths_realloc(struct btree_trans *trans,
 	memcpy(updates, trans->updates, trans->nr_paths * sizeof(struct btree_insert_entry));
 
 	unsigned long *old = trans->paths_allocated;
+
+	/*
+	 * Anything still holding a pointer into the old arrays is now stale,
+	 * and the RCU grace period means it stays readable for a while yet -
+	 * so a stale access reads a correct-looking copy and silently diverges
+	 * instead of faulting. That's the whole reason this bug class has been
+	 * so quiet: neither KASAN nor valgrind sees anything, because nothing
+	 * is freed at the point of the bad access.
+	 *
+	 * Poison the node pointers so a stale path is instead obviously wrong
+	 * the moment it's used. IS_ERR() paths already exist all over the
+	 * iterator code, so this lands as no_btree_node rather than as a wild
+	 * pointer, and the specific errcode names what happened.
+	 *
+	 * #ifdef and not IS_ENABLED: the tools build passes
+	 * -DCONFIG_BCACHEFS_DEBUG=y, and IS_ENABLED() only recognizes 1, so
+	 * IS_ENABLED(CONFIG_BCACHEFS_DEBUG) is silently 0 in userspace.
+	 *
+	 * Note the first realloc retires trans->_paths, which is embedded in
+	 * the trans and never freed - so that poison has to be cleared when a
+	 * trans is initialized, or it shows up in the next transaction's live
+	 * paths. See bch2_trans_get().
+	 */
+#ifdef CONFIG_BCACHEFS_DEBUG
+	for (unsigned i = 0; i < trans->nr_paths; i++)
+		for (unsigned l = 0; l < BTREE_MAX_DEPTH; l++)
+			trans->paths[i].l[l].b =
+				ERR_PTR(-BCH_ERR_no_btree_node_stale_paths);
+#endif
 
 	rcu_assign_pointer(trans->paths_allocated,	paths_allocated);
 	rcu_assign_pointer(trans->paths,		paths);
@@ -2579,6 +2618,16 @@ static struct bkey_s_c __bch2_btree_iter_peek(struct btree_iter *iter, struct bp
 		    btree_trans_peek_key_cache(iter, &k))
 			break;
 
+		/*
+		 * btree_trans_peek_key_cache() does bch2_path_get() and
+		 * bch2_btree_path_set_pos() on the key cache path, either of
+		 * which reallocates trans->paths. l is path->l + path->level -
+		 * a pointer into the path - so it dangles with it, and it's
+		 * read below to pick the next search_key.
+		 */
+		path = btree_iter_path(trans, iter);
+		l = path_l(path);
+
 		if (unlikely(iter->flags & BTREE_ITER_with_journal))
 			btree_trans_peek_journal(trans, iter, *search_key, &k);
 
@@ -2918,6 +2967,11 @@ static struct bkey_s_c __bch2_btree_iter_peek_prev(struct btree_iter *iter, stru
 		if (unlikely(iter->flags & BTREE_ITER_with_key_cache) &&
 		    btree_trans_peek_key_cache(iter, &k))
 			break;
+
+		/* See __bch2_btree_iter_peek(): peek_key_cache() reallocates
+		 * trans->paths, and l points into the path. */
+		path = btree_iter_path(trans, iter);
+		l = path_l(path);
 
 		if (unlikely(iter->flags & BTREE_ITER_with_journal))
 			btree_trans_peek_prev_journal(trans, iter, search_key, &k);
@@ -3698,8 +3752,7 @@ void *__bch2_trans_kmalloc(struct btree_trans *trans, size_t size, unsigned long
 	EBUG_ON(trans->mem_top);
 	EBUG_ON(new_bytes > BTREE_TRANS_MEM_MAX);
 
-	bool lock_dropped = false;
-	new_mem = allocate_dropping_locks_norelock(trans, lock_dropped,
+	new_mem = allocate_dropping_locks_norelock(trans,
 					kmalloc(new_bytes, _gfp|__GFP_NOWARN));
 	if (!new_mem) {
 		new_mem = mempool_alloc(&c->btree.trans.malloc_pool, GFP_KERNEL);
@@ -3712,11 +3765,9 @@ void *__bch2_trans_kmalloc(struct btree_trans *trans, size_t size, unsigned long
 	trans->mem = new_mem;
 	trans->mem_bytes = new_bytes;
 
-	if (unlikely(lock_dropped)) {
-		ret = bch2_trans_relock(trans);
-		if (ret)
-			return ERR_PTR(ret);
-	}
+	ret = bch2_trans_relock(trans);
+	if (ret)
+		return ERR_PTR(ret);
 
 	p = trans->mem;
 	trans->mem_top += size;
@@ -3800,10 +3851,8 @@ u32 bch2_trans_begin(struct btree_trans *trans)
 		EBUG_ON(!trans->mem);
 		EBUG_ON(!trans->mem_bytes);
 
-		bool lock_dropped = false;
-		void *new_mem = allocate_dropping_locks_norelock(trans, lock_dropped,
+		void *new_mem = allocate_dropping_locks_norelock(trans,
 					krealloc(trans->mem, new_bytes, _gfp));
-		(void)lock_dropped;
 
 		if (!new_mem) {
 			new_mem = mempool_alloc(&trans->c->btree.trans.malloc_pool, GFP_KERNEL);
@@ -3983,6 +4032,21 @@ struct btree_trans *__bch2_trans_get(struct bch_fs *c, unsigned fn_idx)
 	trans->sorted		= trans->_sorted;
 	trans->paths		= trans->_paths;
 	trans->updates		= trans->_updates;
+
+#ifdef CONFIG_BCACHEFS_DEBUG
+	/*
+	 * If this trans previously grew out of _paths, btree_paths_realloc()
+	 * poisoned it on the way out - and _paths is embedded in the trans, so
+	 * it isn't freed and the poison outlives the transaction that retired
+	 * it. A trans off the percpu cache would then start with poison sitting
+	 * in paths that are live for this transaction. Clear it here rather
+	 * than skip poisoning _paths: growing out of _paths is the common
+	 * realloc, so it's where stale pointers most want catching.
+	 */
+	for (unsigned i = 0; i < ARRAY_SIZE(trans->_paths); i++)
+		for (unsigned l = 0; l < BTREE_MAX_DEPTH; l++)
+			trans->_paths[i].l[l].b = NULL;
+#endif
 
 	*trans_paths_nr(trans->paths) = BTREE_ITER_INITIAL;
 

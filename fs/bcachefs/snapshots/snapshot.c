@@ -888,7 +888,7 @@ static u32 bch2_snapshot_right_child(struct snapshot_table *t, u32 id)
 
 u32 __bch2_snapshot_tree_next(struct bch_fs *c, struct snapshot_table *t, u32 id, unsigned *depth)
 {
-	int _depth;
+	unsigned _depth = 0;
 	if (!depth)
 		depth = &_depth;
 
@@ -899,7 +899,7 @@ u32 __bch2_snapshot_tree_next(struct bch_fs *c, struct snapshot_table *t, u32 id
 	}
 
 	u32 parent;
-	while ((parent = __bch2_snapshot_parent(c, t, id))) {
+	while ((parent = __bch2_snapshot_parent(t, id))) {
 		(*depth)--;
 		n = bch2_snapshot_right_child(t, parent);
 		if (n && n != id) {
@@ -1217,8 +1217,7 @@ static int snapshot_get_print(struct printbuf *out, struct btree_trans *trans, u
 
 	prt_newline(out);
 
-	bool lock_dropped = false;
-	allocate_dropping_locks_norelock(trans, lock_dropped,
+	allocate_dropping_locks_norelock(trans,
 			!bch2_printbuf_make_room_gfp(out, 1024, _gfp));
 	return 0;
 }

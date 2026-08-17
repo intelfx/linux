@@ -3635,6 +3635,33 @@ static int __bch2_btree_node_update_key(struct btree_trans *trans,
 						  BKEY_BTREE_PTR_U64s_MAX,
 						  skip_triggers ? BTREE_TRIGGER_norun : 0));
 		} else {
+			/*
+			 * has_interior_updates has exactly one setter,
+			 * btree_trans_update_by_path():
+			 *
+			 *	trans->has_interior_updates |= path->level != 0;
+			 *
+			 * so it is automatic for anything expressed as a
+			 * bch2_trans_update() - which is how the non-root case
+			 * above gets it, from the parent update at level + 1.
+			 * Updating the root is just as much an interior update,
+			 * but it goes out as journal entries and never touches
+			 * that path, so it has to say so itself.
+			 *
+			 * It matters because we hold b across the commit below
+			 * and write new_key into b->key afterwards. Without the
+			 * flag, a leaf that fills up during the commit is split
+			 * and the commit retried in place rather than restarted
+			 * (bch2_trans_commit_error()). The trigger below
+			 * inserts into the same btree b lives in, so it is our
+			 * own commit that can then grow the root - freeing b
+			 * with this key change still in flight, and stranding
+			 * the old key in the interior update's old_nodes[],
+			 * where trigger_old will later delete a backpointer
+			 * this commit already deleted.
+			 */
+			trans->has_interior_updates = true;
+
 			if (!skip_triggers)
 				try(bch2_key_trigger(trans, (struct btree_trigger_op) {
 					.btree		= b->c.btree_id,
@@ -3687,7 +3714,7 @@ static int __bch2_btree_node_update_key(struct btree_trans *trans,
 
 		if (!btree_node_will_make_reachable(b)) {
 			mutex_unlock(&c->btree.interior_updates.commit_lock);
-			return bch_err_throw(c, transaction_restart_nested);
+			return btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
 		}
 
 		struct btree_update *as = (void *) (READ_ONCE(b->will_make_reachable) & ~1UL);
@@ -3709,19 +3736,22 @@ int bch2_btree_node_update_key(struct btree_trans *trans, struct btree_iter *ite
 {
 	BUG_ON(btree_node_fake(b));
 
-	struct btree_path *path = btree_iter_path(trans, iter);
-
 	/*
 	 * Awkward - we can't rely on caller specifying BTREE_ITER_intent, and
 	 * the commit will downgrade locks
+	 *
+	 * Don't cache the path in a local across the update: it commits, which
+	 * reallocates trans->paths, and the decrement would then land in the
+	 * freed array while the live path keeps the ref forever.
 	 */
 
-	try(bch2_btree_path_upgrade(trans, path, b->c.level + 1));
+	try(bch2_btree_path_upgrade(trans, btree_iter_path(trans, iter),
+				    b->c.level + 1));
 
-	path->intent_ref++;
+	btree_iter_path(trans, iter)->intent_ref++;
 	int ret = __bch2_btree_node_update_key(trans, iter, b, new_key,
 					       commit_flags, skip_triggers);
-	--path->intent_ref;
+	--btree_iter_path(trans, iter)->intent_ref;
 	return ret;
 }
 
