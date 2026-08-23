@@ -676,6 +676,7 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(msi_domain_set_affinity);
 
 static int msi_domain_activate(struct irq_domain *domain,
 			       struct irq_data *irq_data, bool early)
