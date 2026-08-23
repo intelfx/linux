@@ -61,6 +61,7 @@ if ARCH_BCM
 
 config ARCH_BCM2835
 	bool "Broadcom BCM2835 family"
+	select ARCH_HAS_RESET_CONTROLLER
 	select TIMER_OF
 	select GPIOLIB
 	select MFD_CORE

@@ -566,8 +566,8 @@ config SERIAL_8250_TEGRA
 
 config SERIAL_8250_BCM7271
 	tristate "Broadcom 8250 based serial port"
-	depends on SERIAL_8250 && (ARCH_BRCMSTB || COMPILE_TEST)
-	default ARCH_BRCMSTB
+	depends on SERIAL_8250 && (ARCH_BRCMSTB || ARCH_BCM2835 || COMPILE_TEST)
+	default ARCH_BRCMSTB || ARCH_BCM2835
 	help
 	  If you have a Broadcom STB based board and want to use the
 	  enhanced features of the Broadcom 8250 based serial port,
