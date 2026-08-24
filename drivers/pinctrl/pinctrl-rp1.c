@@ -1546,6 +1546,7 @@ static const struct of_device_id rp1_pinctrl_match[] = {
 	},
 	{}
 };
+MODULE_DEVICE_TABLE(of, rp1_pinctrl_match);
 
 static inline void __iomem *devm_auto_iomap(struct platform_device *pdev,
 					    unsigned int index)
