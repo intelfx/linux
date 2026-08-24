@@ -18,7 +18,7 @@
 #define HAVE_ADD_DISK_RET 1
 
 /* Define if host toolchain supports AES */
-#define HAVE_AES 1
+/* #undef HAVE_AES */
 
 /* Define if you have [rt] */
 /* #undef HAVE_AIO_H */
@@ -27,37 +27,37 @@
 /* #undef HAVE_AS_CFI_PSEUDO_OP */
 
 /* Define if host toolchain supports AVX */
-#define HAVE_AVX 1
+/* #undef HAVE_AVX */
 
 /* Define if host toolchain supports AVX2 */
-#define HAVE_AVX2 1
+/* #undef HAVE_AVX2 */
 
 /* Define if host toolchain supports AVX512BW */
-#define HAVE_AVX512BW 1
+/* #undef HAVE_AVX512BW */
 
 /* Define if host toolchain supports AVX512CD */
-#define HAVE_AVX512CD 1
+/* #undef HAVE_AVX512CD */
 
 /* Define if host toolchain supports AVX512DQ */
-#define HAVE_AVX512DQ 1
+/* #undef HAVE_AVX512DQ */
 
 /* Define if host toolchain supports AVX512ER */
-#define HAVE_AVX512ER 1
+/* #undef HAVE_AVX512ER */
 
 /* Define if host toolchain supports AVX512F */
-#define HAVE_AVX512F 1
+/* #undef HAVE_AVX512F */
 
 /* Define if host toolchain supports AVX512IFMA */
-#define HAVE_AVX512IFMA 1
+/* #undef HAVE_AVX512IFMA */
 
 /* Define if host toolchain supports AVX512PF */
-#define HAVE_AVX512PF 1
+/* #undef HAVE_AVX512PF */
 
 /* Define if host toolchain supports AVX512VBMI */
-#define HAVE_AVX512VBMI 1
+/* #undef HAVE_AVX512VBMI */
 
 /* Define if host toolchain supports AVX512VL */
-#define HAVE_AVX512VL 1
+/* #undef HAVE_AVX512VL */
 
 /* backtrace() is available */
 /* #undef HAVE_BACKTRACE */
@@ -466,10 +466,10 @@
 /* #undef HAVE_KASAN_ENABLED_GPL_ONLY */
 
 /* kernel has kernel_fpu_* functions */
-#define HAVE_KERNEL_FPU 1
+/* #undef HAVE_KERNEL_FPU */
 
 /* kernel has asm/fpu/api.h */
-#define HAVE_KERNEL_FPU_API_HEADER 1
+/* #undef HAVE_KERNEL_FPU_API_HEADER */
 
 /* kernel has generic kernel_fpu_* API */
 /* #undef HAVE_KERNEL_FPU_GENERIC */
@@ -487,10 +487,10 @@
 #define HAVE_KERNEL_INTPTR_T 1
 
 /* kernel has kernel_neon_* functions */
-/* #undef HAVE_KERNEL_NEON */
+#define HAVE_KERNEL_NEON 1
 
 /* kernel does stack verification */
-#define HAVE_KERNEL_OBJTOOL 1
+/* #undef HAVE_KERNEL_OBJTOOL */
 
 /* kernel has linux/objtool.h */
 #define HAVE_KERNEL_OBJTOOL_HEADER 1
@@ -556,7 +556,7 @@
 /* #undef HAVE_MOUNT_SETATTR */
 
 /* Define if host toolchain supports MOVBE */
-#define HAVE_MOVBE 1
+/* #undef HAVE_MOVBE */
 
 /* Define if ns_type is accessible through ns_common */
 #define HAVE_NS_COMMON_TYPE 1
@@ -574,7 +574,7 @@
 /* #undef HAVE_PATH_IOPS_GETATTR */
 
 /* Define if host toolchain supports PCLMULQDQ */
-#define HAVE_PCLMULQDQ 1
+/* #undef HAVE_PCLMULQDQ */
 
 /* pin_user_pages_unlocked() is available */
 #define HAVE_PIN_USER_PAGES_UNLOCKED 1
@@ -646,28 +646,28 @@
 #define HAVE_SOPS_FREE_INODE 1
 
 /* Define if host toolchain supports SSE */
-#define HAVE_SSE 1
+/* #undef HAVE_SSE */
 
 /* Define if host toolchain supports SSE2 */
-#define HAVE_SSE2 1
+/* #undef HAVE_SSE2 */
 
 /* Define if host toolchain supports SSE3 */
-#define HAVE_SSE3 1
+/* #undef HAVE_SSE3 */
 
 /* Define if host toolchain supports SSE4.1 */
-#define HAVE_SSE4_1 1
+/* #undef HAVE_SSE4_1 */
 
 /* Define if host toolchain supports SSE4.2 */
-#define HAVE_SSE4_2 1
+/* #undef HAVE_SSE4_2 */
 
 /* Define if host toolchain supports SSSE3 */
-#define HAVE_SSSE3 1
+/* #undef HAVE_SSSE3 */
 
 /* STACK_FRAME_NON_STANDARD is defined */
-#define HAVE_STACK_FRAME_NON_STANDARD 1
+/* #undef HAVE_STACK_FRAME_NON_STANDARD */
 
 /* STACK_FRAME_NON_STANDARD asm macro is defined */
-#define HAVE_STACK_FRAME_NON_STANDARD_ASM 1
+/* #undef HAVE_STACK_FRAME_NON_STANDARD_ASM */
 
 /* standalone <linux/stdarg.h> exists */
 #define HAVE_STANDALONE_LINUX_STDARG 1
@@ -757,7 +757,7 @@
 /* #undef HAVE_USERNS_IOPS_SETATTR */
 
 /* Define if host toolchain supports VAES */
-#define HAVE_VAES 1
+/* #undef HAVE_VAES */
 
 /* fops->clone_file_range() is available */
 /* #undef HAVE_VFS_CLONE_FILE_RANGE */
@@ -805,7 +805,7 @@
 /* #undef HAVE_VMALLOC_PAGE_KERNEL */
 
 /* Define if host toolchain supports VPCLMULQDQ */
-#define HAVE_VPCLMULQDQ 1
+/* #undef HAVE_VPCLMULQDQ */
 
 /* int (*writepage_t)() takes struct folio* */
 /* #undef HAVE_WRITEPAGE_T_FOLIO */
@@ -826,13 +826,13 @@
 /* #undef HAVE_XATTR_SET_USERNS */
 
 /* Define if host toolchain supports XSAVE */
-#define HAVE_XSAVE 1
+/* #undef HAVE_XSAVE */
 
 /* Define if host toolchain supports XSAVEOPT */
-#define HAVE_XSAVEOPT 1
+/* #undef HAVE_XSAVEOPT */
 
 /* Define if host toolchain supports XSAVES */
-#define HAVE_XSAVES 1
+/* #undef HAVE_XSAVES */
 
 /* ZERO_PAGE() is GPL-only */
 /* #undef HAVE_ZERO_PAGE_GPL_ONLY */
@@ -844,7 +844,7 @@
 /* #undef IS_LIBUNWIND_LLVM */
 
 /* kernel exports FPU functions */
-#define KERNEL_EXPORTS_X86_FPU 1
+/* #undef KERNEL_EXPORTS_X86_FPU */
 
 /* whether the chosen libfetch is to be loaded at run-time */
 /* #undef LIBFETCH_DYNAMIC */
