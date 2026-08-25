@@ -240,7 +240,6 @@ menuconfig ARCH_VEXPRESS
 	select HAVE_ARM_SCU if SMP
 	select HAVE_ARM_TWD if SMP
 	select CLK_ICST
-	select NO_IOPORT_MAP
 	select PLAT_VERSATILE
 	select POWER_RESET
 	select POWER_RESET_VEXPRESS
