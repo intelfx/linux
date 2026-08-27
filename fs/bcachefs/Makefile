@@ -326,7 +326,7 @@ bcachefs-rust-probe := $(shell					\
 		{ echo 'rustc ($(RUSTC)) not found'; exit 0; };		\
 	command -v $(BINDGEN) >/dev/null 2>&1 ||			\
 		{ echo 'bindgen ($(BINDGEN)) not found'; exit 0; };	\
-	[ -r '$(objtree)/scripts/generate_rust_target.rs' ] ||		\
+	[ -r '$(srctree)/scripts/generate_rust_target.rs' ] ||		\
 		{ echo 'kernel tree has no scripts/generate_rust_target.rs'; exit 0; }; \
 	[ -r '$(objtree)/include/generated/rustc_cfg' ] ||		\
 		{ echo 'kernel tree has no include/generated/rustc_cfg'; exit 0; }; \
@@ -358,9 +358,9 @@ bch-rust-L := -L$(obj)/vrust
 bch-target-json := $(abspath $(obj))/vrust/target.json
 $(shell	mkdir -p '$(abspath $(obj))/vrust' &&				\
 	{ [ '$(abspath $(obj))/vrust/generate_rust_target' -nt		\
-	    '$(objtree)/scripts/generate_rust_target.rs' ] ||		\
+	    '$(srctree)/scripts/generate_rust_target.rs' ] ||		\
 	  $(HOSTRUSTC) --edition=2021 -Copt-level=0			\
-	    '$(objtree)/scripts/generate_rust_target.rs'		\
+	    '$(srctree)/scripts/generate_rust_target.rs'		\
 	    -o '$(abspath $(obj))/vrust/generate_rust_target'; } &&	\
 	'$(abspath $(obj))/vrust/generate_rust_target'			\
 	    < '$(objtree)/include/config/auto.conf' > '$(bch-target-json)')
