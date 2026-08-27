@@ -976,7 +976,7 @@ static int journal_retry_full_read(struct bch_fs *c, struct journal_list *jlist)
 
 		closure_call(&ca->journal.read,
 			     bch2_journal_read_device,
-			     system_unbound_wq,
+			     system_dfl_wq,
 			     &retry_jlist.cl);
 	}
 
