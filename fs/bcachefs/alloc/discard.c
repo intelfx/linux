@@ -3,7 +3,6 @@
 
 #include "alloc/background.h"
 #include "alloc/backpointers.h"
-#include "alloc/buckets_waiting_for_journal.h"
 #include "alloc/check.h"
 #include "alloc/discard.h"
 #include "alloc/foreground.h"
@@ -13,145 +12,191 @@
 #include "btree/update.h"
 #include "btree/write_buffer.h"
 
-static int discard_in_flight_add(struct bch_dev *ca, u64 bucket, bool in_progress)
+#include "init/damage.h"
+#include "init/fs.h"
+
+#include "journal/journal.h"
+
+static u32 dev_bucket_size(struct bch_fs *c, unsigned dev)
+{
+	guard(rcu)();
+	struct bch_dev *ca = bch2_dev_rcu_noerror(c, dev);
+	return ca ? ca->mi.bucket_size : 0;
+}
+
+static bool dev_bucket_nouse(struct bch_fs *c, struct bpos bucket)
+{
+	guard(rcu)();
+	struct bch_dev *ca = bch2_dev_rcu_noerror(c, bucket.inode);
+	return ca ? bch2_bucket_nouse(ca, bucket.offset) : true;
+}
+
+#define DEV_IN_FLIGHT_MAX		4
+
+static __cold void __discard_state_to_text(struct printbuf *out, struct discard_state *s)
+{
+	printbuf_tabstop_push(out, 32);
+	prt_printf(out, "seen:\t%llu\n",		s->seen);
+	prt_printf(out, "not_rw:\t%llu\n",		s->not_rw);
+	prt_printf(out, "eexist:\t%llu\n",		s->eexist);
+	prt_printf(out, "eagain:\t%llu\n",		s->eagain);
+	prt_printf(out, "open:\t%llu\n",		s->open);
+	prt_printf(out, "need_journal_commit:\t%llu\n",	s->need_journal_commit);
+	prt_printf(out, "need_rewind_advance:\t%llu\n",	s->need_rewind_advance);
+	prt_printf(out, "bad_data_type:\t%llu\n",	s->bad_data_type);
+	prt_printf(out, "discarded:\t%llu\n",		s->discarded);
+	prt_printf(out, "committed:\t%llu\n",		s->committed);
+}
+
+__cold void bch2_discards_to_text(struct printbuf *out, struct bch_fs *c, struct discard_state *s)
+{
+	__discard_state_to_text(out, s);
+
+	prt_printf(out, "Discard release:\n");
+	scoped_guard(printbuf_indent, out) {
+		prt_printf(out, "buffer:\t%llu\n",		s->r.buffer);
+		prt_printf(out, "pending_need_flush:\t%llu\n",	s->r.pending_need_flush);
+		prt_printf(out, "pending_need_rewind_advance:\t%llu\n", s->r.pending_need_rewind_advance);
+		prt_printf(out, "pending_total:\t%llu\n",	s->r.pending_total);
+		prt_printf(out, "free:\t%llu\n",		s->r.free);
+		prt_printf(out, "reserve:\t%llu\n",		s->r.reserve);
+		prt_printf(out, "buffer_clamped:\t%llu\n",	s->r.buffer_clamped);
+		prt_printf(out, "release:\t%lli\n",		s->r.release);
+		prt_printf(out, "flush_journal:\t%u\n",		s->r.flush_journal);
+		prt_printf(out, "flush_wb:\t%u\n",		s->r.flush_wb);
+	}
+
+	struct journal *j = &c->journal;
+	prt_printf(out, "journal seq:\t%llu\n",			journal_cur_seq(j));
+	prt_printf(out, "journal flushed seq:\t%llu -> %llu\n",
+		   atomic64_read(&j->flushing_seq), j->flushed_seq_ondisk);
+	prt_printf(out, "journal rewind seq:\t%llu -> %llu\n",	j->rewind_seq, j->rewind_seq_ondisk);
+
+	prt_printf(out, "In flight:\n");
+	struct bch_fs_discards *d = &c->discards;
+	guard(printbuf_indent)(out);
+	guard(printbuf_atomic)(out);
+	guard(spinlock_irq)(&d->lock);
+	darray_for_each(d->in_flight, i) {
+		prt_printf(out, "%s:%llu", i->ca->name, u64_to_bucket(i->dev_bucket).offset);
+		if (i->complete)
+			prt_str(out, " complete");
+		if (i->marking_free)
+			prt_str(out, " marking_free");
+		prt_newline(out);
+	}
+}
+
+struct discard_bio {
+	struct bch_dev			*ca;
+	u64				dev_bucket;
+	struct bio			bio;
+};
+
+static void discard_endio(struct bio *_bio)
+{
+	struct discard_bio *bio = container_of(_bio, struct discard_bio, bio);
+	struct bch_dev *ca = bio->ca;
+	struct bch_fs_discards *d = &ca->fs->discards;
+	struct bpos bucket = u64_to_bucket(bio->dev_bucket);
+
+	scoped_guard(spinlock_irqsave, &d->lock) {
+		darray_find_p(d->in_flight, i,
+			      i->dev_bucket == bio->dev_bucket)->complete = true;
+
+		BUG_ON(!d->refs[bucket.inode]);
+		BUG_ON(!d->ref);
+
+		--d->refs[bucket.inode];
+		if (!--d->ref)
+			closure_wake_up(&d->wait);
+	}
+
+	bio_put(&bio->bio);
+}
+
+static int discard_in_flight_add(struct bch_fs *c, struct bch_dev *ca,
+				 struct bpos bucket,
+				 bool fastpath, bool check)
+{
+	u64 dev_bucket = bucket_to_u64(bucket);
+	struct bch_fs_discards *d = &c->discards;
+	guard(spinlock_irq)(&d->lock);
+
+	if (darray_find_p(d->in_flight, i, i->dev_bucket == dev_bucket))
+		return -EEXIST;
+
+	if (d->refs[bucket.inode] >= DEV_IN_FLIGHT_MAX + fastpath)
+		return bch_err_throw(c, max_discards_in_flight);
+
+	if (!check) {
+		try(darray_push_gfp(&d->in_flight,
+				    ((discard_in_flight) {
+					.dev_bucket = dev_bucket,
+					.ca = ca,
+				    }),
+				    GFP_NOWAIT));
+
+		d->refs[bucket.inode]++;
+		d->ref++;
+	}
+
+	return 0;
+}
+
+static void discard_submit(struct bch_dev *ca, struct bpos bucket, bool fastpath)
 {
 	struct bch_fs *c = ca->fs;
 
-	guard(mutex)(&ca->discard_buckets_in_flight_lock);
-	struct discard_in_flight *i =
-		darray_find_p(ca->discard_buckets_in_flight, i, i->bucket == bucket);
-	if (i)
-		return bch_err_throw(c, EEXIST_discard_in_flight_add);
+	struct discard_bio *bio =
+		container_of(bio_alloc_bioset(ca->disk_sb.bdev, 0, REQ_OP_DISCARD, GFP_NOIO,
+					      &c->discards.bioset),
+			     struct discard_bio, bio);
 
-	return darray_push(&ca->discard_buckets_in_flight, ((struct discard_in_flight) {
-			   .in_progress = in_progress,
-			   .bucket	= bucket,
-	}));
+	bio->ca				= ca;
+	bio->dev_bucket			= bucket_to_u64(bucket);
+	bio->bio.bi_iter.bi_sector	= bucket_to_sector(ca, bucket.offset);
+	bio->bio.bi_iter.bi_size	= ca->mi.bucket_size << 9;
+	bio->bio.bi_end_io		= discard_endio;
+
+	submit_bio(&bio->bio);
 }
 
-static void discard_in_flight_remove(struct bch_dev *ca, u64 bucket)
-{
-	guard(mutex)(&ca->discard_buckets_in_flight_lock);
-	struct discard_in_flight *i =
-		darray_find_p(ca->discard_buckets_in_flight, i, i->bucket == bucket);
-	BUG_ON(!i || !i->in_progress);
-
-	darray_remove_item(&ca->discard_buckets_in_flight, i);
-}
-
-struct discard_buckets_state {
-	u64		seen;
-	u64		open;
-	u64		need_journal_commit;
-	u64		commit_in_flight;
-	u64		bad_data_type;
-	u64		already_discarding;
-	u64		discarded;
-};
-
-static void discard_buckets_state_to_text(struct printbuf *out, struct discard_buckets_state *s)
-{
-	printbuf_tabstop_push(out, 20);
-	prt_printf(out, "seen:\t%llu\n",		s->seen);
-	prt_printf(out, "open:\t%llu\n",		s->open);
-	prt_printf(out, "need_journal_commit:\t%llu\n",	s->need_journal_commit);
-	prt_printf(out, "commit_in_flight:\t%llu\n",	s->commit_in_flight);
-	prt_printf(out, "bad_data_type:\t%llu\n",	s->bad_data_type);
-	prt_printf(out, "already_discarding:\t%llu\n",	s->already_discarding);
-	prt_printf(out, "discarded:\t%llu\n",		s->discarded);
-}
-
-static int bch2_discard_one_bucket(struct btree_trans *trans,
-				   struct bch_dev *ca,
-				   struct btree_iter *need_discard_iter,
-				   struct bpos *discard_pos_done,
-				   struct discard_buckets_state *s,
-				   bool fastpath)
+static int __discard_mark_free(struct btree_trans *trans,
+			       struct discard_state *s,
+			       bool fastpath,
+			       struct btree_iter *iter,
+			       struct bkey_i_alloc_v4 *a)
 {
 	struct bch_fs *c = trans->c;
-	struct bpos pos = need_discard_iter->pos;
-	bool discard_locked = false;
-	int ret = 0;
 
-	s->seen++;
+	if (a->v.data_type != BCH_DATA_need_discard) {
+		struct bch_fs *c = trans->c;
+		CLASS(bch_log_msg, msg)(c);
+		prt_printf(&msg.m, "Discarded bucket that is no longer BCH_DATA_need_discard!\n");
+		bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&a->k_i));
 
-	if (bch2_bucket_is_open_safe(c, pos.inode, pos.offset)) {
-		s->open++;
-		return 0;
+		bch2_fs_emergency_read_only(c, &msg.m);
+		return bch_err_throw(c, emergency_ro);
 	}
-
-	u64 seq_ready = bch2_bucket_journal_seq_ready(&c->buckets_waiting_for_journal,
-						      pos.inode, pos.offset);
-	if (seq_ready > c->journal.flushed_seq_ondisk) {
-		if (seq_ready > c->journal.flushing_seq)
-			s->need_journal_commit++;
-		else
-			s->commit_in_flight++;
-		return 0;
-	}
-
-	CLASS(btree_iter, iter)(trans, BTREE_ID_alloc, need_discard_iter->pos, BTREE_ITER_cached);
-	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 
 	struct bkey_buf orig_k __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&orig_k);
-	bch2_bkey_buf_reassemble(&orig_k, k);
+	bch2_bkey_buf_copy(&orig_k, &a->k_i);
 
-	struct bkey_i_alloc_v4 *a = errptr_try(bch2_alloc_to_v4_mut(trans, k));
-
-	if (a->v.data_type != BCH_DATA_need_discard) {
-		s->bad_data_type++;
-
-		if (need_discard_or_freespace_err(trans, k, true, true, true)) {
-			try(bch2_btree_bit_mod_iter(trans, need_discard_iter, false));
-			goto commit;
-		}
-
-		return 0;
-	}
-
-	if (!fastpath) {
-		if (discard_in_flight_add(ca, iter.pos.offset, true)) {
-			s->already_discarding++;
-			goto out;
-		}
-
-		discard_locked = true;
-	}
-
-	if (!bkey_eq(*discard_pos_done, iter.pos)) {
-		s->discarded++;
-		*discard_pos_done = iter.pos;
-
-		if (bch2_discard_opt_enabled(c, ca) && !c->opts.nochanges) {
-			/*
-			 * This works without any other locks because this is the only
-			 * thread that removes items from the need_discard tree
-			 */
-			bch2_trans_unlock_long(trans);
-			blkdev_issue_discard(ca->disk_sb.bdev,
-					     k.k->p.offset * ca->mi.bucket_size,
-					     ca->mi.bucket_size,
-					     GFP_KERNEL);
-			ret = bch2_trans_relock_notrace(trans);
-			if (ret)
-				goto out;
-		}
-	}
-
+	/* Bit kept in sync for downgrade compat; alloc_data_type() no longer reads it. */
 	SET_BCH_ALLOC_V4_NEED_DISCARD(&a->v, false);
+	a->v.data_type = BCH_DATA_free;
+	a->v.journal_seq_nonempty = 0;
+	a->v.journal_seq_empty = 0;
 	alloc_data_type_set(&a->v, a->v.data_type);
 
-	ret = bch2_trans_update(trans, &iter, &a->k_i, 0);
-	if (ret)
-		goto out;
-commit:
-	ret = bch2_trans_commit(trans, NULL, NULL,
-				BCH_WATERMARK_btree|
-				BCH_TRANS_COMMIT_no_check_rw|
-				BCH_TRANS_COMMIT_no_enospc);
-	if (ret)
-		goto out;
+	try(bch2_trans_update(trans, iter, &a->k_i, BTREE_TRIGGER_is_discard));
+
+	try(bch2_trans_commit(trans, NULL, NULL,
+			      BCH_WATERMARK_reclaim|
+			      BCH_TRANS_COMMIT_no_check_rw|
+			      BCH_TRANS_COMMIT_no_enospc));
 
 	if (!fastpath)
 		event_inc_trace(c, bucket_discard, buf,
@@ -159,158 +204,451 @@ commit:
 	else
 		event_inc_trace(c, bucket_discard_fast, buf,
 			bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(orig_k.k)));
-out:
-fsck_err:
-	if (discard_locked)
-		discard_in_flight_remove(ca, iter.pos.offset);
+	s->committed += dev_bucket_size(c, iter->k.p.inode);
+
+	return 0;
+}
+
+static int discard_mark_free(struct btree_trans *trans,
+			     struct bpos bucket,
+			     struct discard_state *s,
+			     bool fastpath)
+{
+	CLASS(btree_iter, iter)(trans, BTREE_ID_alloc, bucket, BTREE_ITER_cached|BTREE_ITER_intent);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
+	struct bkey_i_alloc_v4 *a = errptr_try(bch2_alloc_to_v4_mut(trans, k));
+
+	return __discard_mark_free(trans, s, fastpath, &iter, a);
+}
+
+static u64 next_to_complete(struct bch_fs_discards *d, size_t *iter)
+{
+	guard(spinlock_irq)(&d->lock);
+	darray_for_each_from(d->in_flight, i, d->in_flight.data + *iter)
+		if (i->complete && !i->marking_free) {
+			*iter = i - d->in_flight.data;
+			i->marking_free = true;
+			return i->dev_bucket;
+		}
+
+	return 0;
+}
+
+static bool discards_pending(struct bch_fs_discards *d, bool fastpath, bool all)
+{
+	guard(spinlock_irq)(&d->lock);
+	if (all)
+		return d->ref != 0;
+	for (unsigned i = 0; i < ARRAY_SIZE(d->refs); i++)
+		if (d->refs[i] >= DEV_IN_FLIGHT_MAX + fastpath)
+			return true;
+	return false;
+}
+
+/*
+ * The io_ref taken in discard_mark_free is held until here (rather than
+ * dropped at discard_endio) to block dev_remove from reaching
+ * bch2_dev_remove_alloc — which deletes the alloc btree range for the
+ * dev — until our discard_mark_free alloc updates have committed.
+ * Otherwise dev_remove and discards_complete would race on the same
+ * alloc-btree range.
+ */
+static int bch2_discards_complete(struct btree_trans *trans,
+				  struct discard_state *s,
+				  bool fastpath, bool all)
+{
+	struct bch_fs *c = trans->c;
+	struct bch_fs_discards *d = &c->discards;
+	int ret = 0;
+
+	trans_wait_event(trans, &d->wait, !discards_pending(d, fastpath, all));
+
+	u64 dev_bucket = 0;
+	size_t iter = 0;
+
+	while ((dev_bucket = next_to_complete(d, &iter))) {
+		struct bpos bucket = u64_to_bucket(dev_bucket);
+		struct bch_dev *ca;
+
+		ret = lockrestart_do(trans, discard_mark_free(trans, bucket, s, fastpath)) ?: ret;
+
+		scoped_guard(spinlock_irq, &d->lock) {
+			discard_in_flight *i = d->in_flight.data + iter;
+
+			if (i > &darray_last(d->in_flight) || i->dev_bucket != dev_bucket)
+				i = darray_find_p(d->in_flight, i, i->dev_bucket == dev_bucket);
+			BUG_ON(!i->marking_free);
+			ca = i->ca;
+			darray_remove_item(&d->in_flight, i);
+		}
+
+		enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_discard_bucket);
+	}
+
 	return ret;
 }
 
-static void __bch2_dev_do_discards(struct bch_dev *ca)
+static int bch2_discard_one_bucket(struct btree_trans *trans,
+				   struct bpos bucket,
+				   u32 bucket_size,
+				   struct discard_state *s,
+				   bool fastpath)
 {
-	struct bch_fs *c = ca->fs;
-	struct discard_buckets_state s = {};
-	struct bpos discard_pos_done = POS_MAX;
-	int ret;
+	struct bch_fs *c = trans->c;
+
+	if (unlikely(dev_bucket_nouse(c, bucket)))
+		return 0;
+
+	int ret = discard_in_flight_add(c, NULL, bucket, fastpath, true);
+	if (ret) {
+		if (ret == -EEXIST) {
+			s->eexist += bucket_size;
+			ret = 0;
+		} else {
+			s->eagain += bucket_size;
+		}
+
+		return ret;
+	}
+
+	CLASS(btree_iter, iter)(trans, BTREE_ID_alloc, bucket, BTREE_ITER_cached);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
+
+	struct bkey_i_alloc_v4 *a = errptr_try(bch2_alloc_to_v4_mut(trans, k));
+
+	if (fastpath && a->v.journal_seq_empty) {
+		/*
+		 * Queued to the discard fastpath (skip journal commit), but
+		 * multiple nonempty <-> need_discard transitions mean it wasn't
+		 * actually a fastpath discard
+		 */
+		s->need_journal_commit += bucket_size;
+		return 0;
+	}
+
+	if (a->v.journal_seq_empty > c->journal.flushed_seq_ondisk) {
+		s->need_journal_commit += bucket_size;
+		return 0;
+	}
+
+	if (a->v.journal_seq_empty >= c->journal.rewind_seq_ondisk) {
+		s->need_rewind_advance += bucket_size;
+		return 0;
+	}
+
+	if (a->v.data_type != BCH_DATA_need_discard) {
+		/* expected race - btree write buffer */
+		s->bad_data_type += bucket_size;
+		return 0;
+	}
+
+	/* Must check after we've looked at and locked the alloc key: */
+	if (bch2_bucket_is_open_safe(c, bucket.inode, bucket.offset)) {
+		s->open += bucket_size;
+		return 0;
+	}
+
+	struct bch_dev *ca = bch2_dev_get_ioref(trans->c, bucket.inode, WRITE,
+						BCH_DEV_WRITE_REF_discard_bucket);
+	if (!ca) {
+		s->not_rw += bucket_size;
+		return 0;
+	}
+
+	if (bch2_discard_opt_enabled(c, ca) &&
+	    bdev_max_discard_sectors(ca->disk_sb.bdev) &&
+	    !c->opts.nochanges) {
+		ret = discard_in_flight_add(c, ca, bucket, fastpath, false);
+		if (!ret) {
+			bch2_trans_unlock(trans);
+			/* consumes ioref */
+			discard_submit(ca, bucket, fastpath);
+			s->discarded += bucket_size;
+			return 0;
+		}
+
+		if (ret == -EEXIST) {
+			s->eexist += bucket_size;
+			ret = 0;
+		} else {
+			s->eagain += bucket_size;
+		}
+	} else {
+		ret = __discard_mark_free(trans, s, fastpath, &iter, a);
+	}
+
+	enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_discard_bucket);
+
+	return ret;
+}
+
+static void calculate_discard_sectors_to_release(struct btree_trans *trans)
+{
+	struct bch_fs *c = trans->c;
+	struct discard_state *s = &c->discards.s;
 
 	/*
-	 * We're doing the commit in bch2_discard_one_bucket instead of using
-	 * for_each_btree_key_commit() so that we can increment counters after
-	 * successful commit:
+	 * Compute the rewind-advance budget per-device: a single device
+	 * starving for free buckets needs to drive rewind advance by its own
+	 * pressure, not by the fs-wide aggregate. With an fs-wide buffer, a
+	 * comfortable fs total can mask one device's need_discard pile-up
+	 * indefinitely, leaving its discard worker iterating but finding no
+	 * journal-eligible candidates.
 	 */
-	ret = bch2_trans_run(c,
-		for_each_btree_key_max(trans, iter,
-				   BTREE_ID_need_discard,
-				   POS(ca->dev_idx, 0),
-				   POS(ca->dev_idx, U64_MAX), 0, k,
-			bch2_discard_one_bucket(trans, ca, &iter, &discard_pos_done, &s, false)));
+	scoped_guard(rcu)
+		for_each_rw_member_rcu(c, ca) {
+			struct bch_dev_usage u	= bch2_dev_usage_read(ca);
+			u64 sectors		= ca->mi.bucket_size;
 
-	if (s.need_journal_commit > dev_buckets_available(ca, BCH_WATERMARK_normal))
-		bch2_journal_flush_async(&c->journal, NULL);
+			u64 dev_pending		= sectors * u.buckets[BCH_DATA_need_discard];
+			u64 dev_free		= sectors * u.buckets[BCH_DATA_free];
+			u64 dev_reserve		= sectors * bch2_dev_buckets_reserved(ca, BCH_WATERMARK_stripe);
+			u64 dev_capacity	= sectors * ca->mi.nbuckets;
+			u64 dev_buffer		= dev_capacity * c->opts.journal_rewind_discard_buffer_percent / 100;
+			s64 dev_buffer_clamped	= min_t(s64, dev_buffer,
+							max_t(s64, 0,
+							      (s64) dev_free - (s64) dev_reserve * 4));
+			s64 dev_release		= (s64) dev_pending - dev_buffer_clamped;
 
-	event_inc_trace(c, bucket_discard_worker, buf, ({
-		prt_printf(&buf, "ret %s\ndev %s\n", bch2_err_str(ret), ca->name);
-		discard_buckets_state_to_text(&buf, &s);
+			s->r.pending_total	+= dev_pending;
+			s->r.free		+= dev_free;
+			s->r.reserve		+= dev_reserve;
+			s->r.buffer		+= dev_buffer;
+			s->r.buffer_clamped	+= dev_buffer_clamped;
+			if (dev_release > 0)
+				s->r.release	+= dev_release;
+		}
+
+	u64 seen = s->seen - s->bad_data_type - s->not_rw;
+
+	s->r.flush_wb		= seen * 2 <= s->r.pending_total && s->r.free < s->r.reserve * 2;
+
+	if (s->r.release <= 0)
+		return;
+
+	s64 release = s->r.release;
+
+	for_each_btree_key(trans, iter, BTREE_ID_need_discard, c->discards.s.pos, 0, k, ({
+		u64 journal_seq		= k.k->p.inode;
+		struct bpos bucket	= u64_to_bucket(k.k->p.offset);
+		u32 bucket_size		= dev_bucket_size(c, bucket.inode);
+
+		if (bch2_bucket_is_open_safe(c, bucket.inode, bucket.offset))
+			continue;
+
+		s->r.new_rewind_seq = max(s->r.new_rewind_seq, journal_seq + 1);
+
+		if (s->r.free < s->r.reserve * 2 &&
+		    c->journal.flushed_seq_ondisk < journal_cur_seq(&c->journal))
+			s->r.flush_journal = true;
+
+		release -= bucket_size;
+		if (release <= 0)
+			break;
+
+		0;
 	}));
 
-	enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_dev_do_discards);
+	if (s->r.free < s->r.reserve * 2 &&
+	    s->r.new_rewind_seq > c->journal.rewind_seq)
+		s->r.flush_journal = true;
+}
+
+static void bch2_do_discards(struct bch_fs *c)
+{
+	struct bch_fs_discards *d = &c->discards;
+	int ret = 0;
+	bool again;
+	unsigned flushed_wb = 0;
+
+	CLASS(btree_trans, trans)(c);
+
+	do {
+		again = false;
+
+		struct discard_state *s = &c->discards.s;
+		memset(s, 0, sizeof(*s));
+
+		/*
+		 * Iterate need_discard btree (sorted by journal_seq).
+		 * Stop when we hit a seq beyond rewind_seq_ondisk.
+		 */
+		ret = for_each_btree_key(trans, iter,
+				BTREE_ID_need_discard, POS_MIN, 0, k, ({
+			u64 journal_seq		= k.k->p.inode;
+			struct bpos bucket	= u64_to_bucket(k.k->p.offset);
+			u32 bucket_size		= dev_bucket_size(c, bucket.inode);
+
+			if (journal_seq >= min(c->journal.rewind_seq_ondisk,
+					       c->journal.flushed_seq_ondisk + 1))
+				break;
+
+			if (!bpos_eq(s->pos, iter.pos))
+				s->seen += bucket_size;
+			s->pos = iter.pos;
+
+			int ret2 = bch2_discard_one_bucket(trans,
+						bucket, bucket_size,
+						s, false);
+			/*
+			 * Reap completed discards as we go: in_flight entries
+			 * are only freed in bch2_discards_complete(), so if we
+			 * never reach DEV_IN_FLIGHT_MAX - the device completes
+			 * discards inline, or doesn't support REQ_OP_DISCARD -
+			 * the in_flight darray would otherwise grow without
+			 * bound and turn the linear scans in
+			 * discard_in_flight_add()/discard_endio() into O(n^2).
+			 * in_flight.nr > ref means there are completed entries
+			 * waiting to be reaped.
+			 *
+			 * On success the bucket's been handled, so advance the
+			 * iterator before the nested restart so we don't
+			 * reprocess it; on -max_discards_in_flight leave it put
+			 * so we retry the bucket after draining.
+			 */
+			if (ret2 == -BCH_ERR_max_discards_in_flight ||
+			    (!ret2 && READ_ONCE(d->in_flight.nr) > READ_ONCE(d->ref))) {
+				if (!ret2)
+					bch2_btree_iter_advance(&iter);
+				ret2 = bch2_discards_complete(trans, s, false, false) ?:
+				btree_trans_restart(trans, BCH_ERR_transaction_restart_nested);
+			}
+			ret2;
+		}));
+
+		ret = bch2_discards_complete(trans, s, false, true) ?: ret;
+
+		/*
+		 * Rewind buffer policy: advance rewind_seq when free space
+		 * is tight, releasing more buckets for discard.
+		 */
+		calculate_discard_sectors_to_release(trans);
+
+		if (!ret && s->r.new_rewind_seq)
+			bch2_journal_advance_rewind_seq(&c->journal, s->r.new_rewind_seq);
+
+		if (!ret && s->r.flush_journal) {
+			bch2_trans_unlock_long(trans);
+			u64 start_time = local_clock();
+			ret = bch2_journal_flush(&c->journal);
+			bch2_time_stats_update(&c->times[BCH_TIME_blocked_discard_journal_flush],
+					       start_time);
+			again = true;
+		}
+
+		/*
+		 * If the FIFO is empty but we need free buckets, flush the
+		 * write buffer — need_discard keys may be buffered from
+		 * the alloc trigger's atomic section:
+		 */
+		if (!ret && s->r.flush_wb && flushed_wb < 2) {
+			ret = bch2_btree_write_buffer_flush_sync(trans);
+			if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
+				ret = 0;
+			again = true;
+			flushed_wb++;
+		}
+
+		event_inc_trace(c, bucket_discard_worker, buf, ({
+			prt_printf(&buf, "ret %s\n", bch2_err_str(ret));
+			bch2_discards_to_text(&buf, c, s);
+		}));
+	} while (!ret && again);
+
+	if (!bch2_err_matches(ret, EROFS))
+		bch_err_fn(c, ret);
 }
 
 void bch2_do_discards_going_ro(struct bch_fs *c)
 {
-	for_each_member_device(c, ca)
-		if (bch2_dev_get_ioref(c, ca->dev_idx, WRITE, BCH_DEV_WRITE_REF_dev_do_discards))
-			__bch2_dev_do_discards(ca);
+	bool must_discard = false;
+
+	scoped_guard(rcu)
+		for_each_rw_member_rcu(c, ca) {
+			struct bch_dev_usage u	= bch2_dev_usage_read(ca);
+
+			if (u.buckets[BCH_DATA_free] <
+			    bch2_dev_buckets_reserved(ca, BCH_WATERMARK_stripe) * 4 &&
+			    u.buckets[BCH_DATA_need_discard])
+				must_discard = true;
+		}
+
+	if (must_discard)
+		bch2_do_discards(c);
 }
 
 void bch2_do_discards_work(struct work_struct *work)
 {
-	struct bch_dev *ca = container_of(work, struct bch_dev, discard_work);
-	struct bch_fs *c = ca->fs;
+	struct bch_fs *c = container_of(work, struct bch_fs, discards.work);
 
-	__bch2_dev_do_discards(ca);
+	bch2_do_discards(c);
 
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_discard);
 }
 
-void bch2_dev_do_discards(struct bch_dev *ca)
+void bch2_do_discards_async(struct bch_fs *c)
 {
-	struct bch_fs *c = ca->fs;
-
 	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_discard))
 		return;
 
-	if (!bch2_dev_get_ioref(c, ca->dev_idx, WRITE, BCH_DEV_WRITE_REF_dev_do_discards))
-		goto put_write_ref;
-
-	if (queue_work(c->write_ref_wq, &ca->discard_work))
+	if (queue_work(c->write_ref_wq, &c->discards.work))
 		return;
 
-	enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_dev_do_discards);
-put_write_ref:
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_discard);
-}
-
-void bch2_do_discards(struct bch_fs *c)
-{
-	for_each_member_device(c, ca)
-		bch2_dev_do_discards(ca);
-}
-
-static int bch2_do_discards_fast_one(struct btree_trans *trans,
-				     struct bch_dev *ca,
-				     u64 bucket,
-				     struct bpos *discard_pos_done,
-				     struct discard_buckets_state *s)
-{
-	CLASS(btree_iter, need_discard_iter)(trans, BTREE_ID_need_discard, POS(ca->dev_idx, bucket), 0);
-	struct bkey_s_c discard_k = bkey_try(bch2_btree_iter_peek_slot(&need_discard_iter));
-
-	int ret = 0;
-	if (log_fsck_err_on(discard_k.k->type != KEY_TYPE_set,
-			    trans, discarding_bucket_not_in_need_discard_btree,
-			    "attempting to discard bucket %u:%llu not in need_discard btree",
-			    ca->dev_idx, bucket))
-		return 0;
-
-	return bch2_discard_one_bucket(trans, ca, &need_discard_iter, discard_pos_done, s, true);
-fsck_err:
-	return ret;
 }
 
 void bch2_do_discards_fast_work(struct work_struct *work)
 {
 	struct bch_dev *ca = container_of(work, struct bch_dev, discard_fast_work);
 	struct bch_fs *c = ca->fs;
-	struct discard_buckets_state s = {};
-	struct bpos discard_pos_done = POS_MAX;
-	struct btree_trans *trans = bch2_trans_get(c);
+	struct discard_state s = {};
 	int ret = 0;
 
-	while (1) {
-		bool got_bucket = false;
-		u64 bucket;
+	{
+		CLASS(btree_trans, trans)(c);
 
-		scoped_guard(mutex, &ca->discard_buckets_in_flight_lock)
-			darray_for_each(ca->discard_buckets_in_flight, i) {
-				if (i->in_progress)
-					continue;
+		while (1) {
+			u64 bucket;
 
-				got_bucket = true;
-				bucket = i->bucket;
-				i->in_progress = true;
-				break;
+			scoped_guard(mutex, &ca->discard_fast_lock) {
+				bucket = ca->discard_fast.nr
+					? darray_pop(&ca->discard_fast)
+					: 0;
 			}
 
-		if (!got_bucket)
-			break;
+			if (!bucket)
+				break;
 
-		ret = lockrestart_do(trans,
-			bch2_do_discards_fast_one(trans, ca, bucket, &discard_pos_done, &s));
-		bch_err_fn(c, ret);
+			do {
+				ret = lockrestart_do(trans,
+					bch2_discard_one_bucket(trans, POS(ca->dev_idx, bucket),
+								ca->mi.bucket_size, &s, true));
+				if (ret == -BCH_ERR_max_discards_in_flight)
+					ret = bch2_discards_complete(trans, &s, true, false);
+			} while (ret == -BCH_ERR_max_discards_in_flight);
 
-		discard_in_flight_remove(ca, bucket);
+			ret = bch2_discards_complete(trans, &s, false, true) ?: ret;
+			if (ret)
+				break;
+		}
 
-		if (ret)
-			break;
+		event_inc_trace(c, bucket_discard_fast_worker, buf, ({
+			prt_printf(&buf, "dev %s: ret %s\n", ca->name, bch2_err_str(ret));
+			__discard_state_to_text(&buf, &s);
+		}));
 	}
 
-	event_inc_trace(c, bucket_discard_fast_worker, buf, ({
-		prt_printf(&buf, "ret %s\ndev %s\n", bch2_err_str(ret), ca->name);
-		discard_buckets_state_to_text(&buf, &s);
-	}));
-
-	bch2_trans_put(trans);
 	enumerated_ref_put(&ca->io_ref[WRITE], BCH_DEV_WRITE_REF_discard_one_bucket_fast);
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_discard_fast);
 }
 
-void bch2_discard_one_bucket_fast(struct bch_dev *ca, u64 bucket)
+void bch2_fast_discard_bucket_add(struct bch_dev *ca, u64 bucket)
 {
 	struct bch_fs *c = ca->fs;
 
-	if (discard_in_flight_add(ca, bucket, false))
-		return;
+	scoped_guard(mutex, &ca->discard_fast_lock)
+		if (darray_push(&ca->discard_fast, bucket))
+			return;
 
 	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_discard_fast))
 		return;
@@ -325,6 +663,13 @@ void bch2_discard_one_bucket_fast(struct bch_dev *ca, u64 bucket)
 put_ref:
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_discard_fast);
 }
+
+__cold void bch2_fast_discards_to_text(struct printbuf *out, struct bch_dev *ca)
+{
+	prt_printf(out, "%zu\n", ca->discard_fast.nr);
+}
+
+/* Invalidates */
 
 static int invalidate_one_bp(struct btree_trans *trans,
 			     struct bch_dev *ca,
@@ -343,8 +688,11 @@ static int invalidate_one_bp(struct btree_trans *trans,
 
 	bch2_bkey_drop_device_noerror(c, bkey_i_to_s(n), ca->dev_idx);
 
-	if (!bch2_bkey_can_read(c, bkey_i_to_s_c(n)))
+	if (!bch2_bkey_can_read(c, bkey_i_to_s_c(n))) {
 		bch2_set_bkey_error(c, n, KEY_TYPE_ERROR_device_removed);
+		try(bch2_damage_record_data_loss(trans, bp.v->btree_id, n->k.p,
+						 BCH_FSCK_ERR_data_lost_device_removed));
+	}
 
 	return 0;
 }
@@ -357,10 +705,11 @@ static int invalidate_one_bucket_by_bps(struct btree_trans *trans,
 {
 	struct bpos bp_start	= bucket_pos_to_bp_start(ca,	bucket);
 	struct bpos bp_end	= bucket_pos_to_bp_end(ca,	bucket);
+	CLASS(disk_reservation, res)(trans->c);
 
 	return for_each_btree_key_max_commit(trans, iter, BTREE_ID_backpointers,
 				      bp_start, bp_end, 0, k,
-				      NULL, NULL,
+				      &res.r, NULL,
 				      BCH_WATERMARK_btree|
 				      BCH_TRANS_COMMIT_no_enospc, ({
 		if (k.k->type != KEY_TYPE_backpointer)
@@ -425,7 +774,7 @@ static int invalidate_one_bucket(struct btree_trans *trans,
 		return 0;
 	}
 
-	u8 gen = a->gen;
+	u8 gen = a->generation;
 
 	struct bkey_buf orig_alloc_k __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&orig_alloc_k);
@@ -444,7 +793,8 @@ static struct bkey_s_c next_lru_key(struct btree_trans *trans, struct btree_iter
 				    struct bch_dev *ca, bool *wrapped)
 {
 	while (true) {
-		struct bkey_s_c k = bch2_btree_iter_peek_max(iter, lru_pos(ca->dev_idx, U64_MAX, LRU_TIME_MAX));
+		struct bpos end = lru_pos(ca->dev_idx, U64_MAX, LRU_TIME_MAX);
+		struct bkey_s_c k = bch2_btree_iter_peek_max(iter, &end);
 		if (k.k || *wrapped)
 			return k;
 
@@ -538,4 +888,37 @@ void bch2_do_invalidates(struct bch_fs *c)
 {
 	for_each_member_device(c, ca)
 		bch2_dev_do_invalidates(ca);
+}
+
+void bch2_dev_discards_exit(struct bch_dev *ca)
+{
+	darray_exit(&ca->discard_fast);
+}
+
+int bch2_dev_discards_init(struct bch_dev *ca)
+{
+	INIT_WORK(&ca->invalidate_work, bch2_do_invalidates_work);
+	INIT_WORK(&ca->discard_fast_work, bch2_do_discards_fast_work);
+	mutex_init(&ca->discard_fast_lock);
+	return 0;
+}
+
+void bch2_fs_discards_exit(struct bch_fs *c)
+{
+	darray_exit(&c->discards.in_flight);
+	bioset_exit(&c->discards.bioset);
+}
+
+int bch2_fs_discards_init(struct bch_fs *c)
+{
+	darray_make_room(&c->discards.in_flight, 256);
+
+	try(bioset_init(&c->discards.bioset, 4, offsetof(struct discard_bio, bio), 0));
+	return 0;
+}
+
+void bch2_fs_discards_init_early(struct bch_fs *c)
+{
+	INIT_WORK(&c->discards.work, bch2_do_discards_work);
+	spin_lock_init(&c->discards.lock);
 }

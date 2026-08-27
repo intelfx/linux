@@ -43,151 +43,7 @@
 static struct dentry *bch_debug;
 #endif
 
-static bool bch2_btree_verify_replica(struct bch_fs *c, struct btree *b,
-				      struct extent_ptr_decoded pick)
-{
-	struct btree *v = c->verify_data;
-	struct btree_node *n_ondisk = c->verify_ondisk;
-	struct btree_node *n_sorted = c->verify_data->data;
-	struct bset *sorted, *inmemory = &b->data->keys;
-	struct bio *bio;
-	bool failed = false;
-
-	struct bch_dev *ca = bch2_dev_get_ioref(c, pick.ptr.dev, READ,
-				BCH_DEV_READ_REF_btree_verify_replicas);
-	if (!ca)
-		return false;
-
-	bio = bio_alloc_bioset(ca->disk_sb.bdev,
-			       buf_pages(n_sorted, btree_buf_bytes(b)),
-			       REQ_OP_READ|REQ_META,
-			       GFP_NOFS,
-			       &c->btree.bio);
-	bio->bi_iter.bi_sector	= pick.ptr.offset;
-	bch2_bio_map(bio, n_sorted, btree_buf_bytes(b));
-
-	submit_bio_wait(bio);
-
-	bio_put(bio);
-	enumerated_ref_put(&ca->io_ref[READ],
-			   BCH_DEV_READ_REF_btree_verify_replicas);
-
-	memcpy(n_ondisk, n_sorted, btree_buf_bytes(b));
-
-	v->written = 0;
-	if (bch2_btree_node_read_done(c, ca, v, NULL, NULL))
-		return false;
-
-	n_sorted = c->verify_data->data;
-	sorted = &n_sorted->keys;
-
-	if (inmemory->u64s != sorted->u64s ||
-	    memcmp(inmemory->start,
-		   sorted->start,
-		   vstruct_end(inmemory) - (void *) inmemory->start)) {
-		unsigned offset = 0, sectors;
-		struct bset *i;
-		unsigned j;
-
-		CLASS(printbuf, buf)();
-
-		prt_str(&buf, "*** in memory:\n");
-		bch2_bset_to_text(&buf, c, b, inmemory, 0);
-
-		prt_str(&buf, "*** read back in:\n");
-		bch2_bset_to_text(&buf, c, b, sorted, 0);
-
-		while (offset < v->written) {
-			if (!offset) {
-				i = &n_ondisk->keys;
-				sectors = vstruct_blocks(n_ondisk, c->block_bits) <<
-					c->block_bits;
-			} else {
-				struct btree_node_entry *bne =
-					(void *) n_ondisk + (offset << 9);
-				i = &bne->keys;
-
-				sectors = vstruct_blocks(bne, c->block_bits) <<
-					c->block_bits;
-			}
-
-			prt_printf(&buf, "*** on disk block %u:\n", offset);
-			bch2_bset_to_text(&buf, c, b, i, offset);
-
-			offset += sectors;
-		}
-
-		for (j = 0; j < le16_to_cpu(inmemory->u64s); j++)
-			if (inmemory->_data[j] != sorted->_data[j])
-				break;
-
-		prt_printf(&buf, "verify failed at key %u\n", j);
-		bch2_print_string_as_lines(KERN_ERR, buf.buf);
-
-		failed = true;
-	}
-
-	if (v->written != b->written) {
-		bch_err(c, "written wrong: expected %u, got %u",
-			b->written, v->written);
-		failed = true;
-	}
-
-	return failed;
-}
-
-void __bch2_btree_verify(struct bch_fs *c, struct btree *b)
-{
-	struct bkey_ptrs_c ptrs;
-	struct extent_ptr_decoded p;
-	const union bch_extent_entry *entry;
-	struct btree *v;
-	struct bset *inmemory = &b->data->keys;
-	struct bkey_packed *k;
-	bool failed = false;
-
-	if (c->opts.nochanges)
-		return;
-
-	guard(btree_node_io_lock)(b);
-	guard(mutex)(&c->verify_lock);
-
-	if (!c->verify_ondisk) {
-		c->verify_ondisk = kvmalloc(btree_buf_bytes(b), GFP_KERNEL);
-		if (!c->verify_ondisk)
-			return;
-	}
-
-	if (!c->verify_data) {
-		c->verify_data = __bch2_btree_node_mem_alloc(c);
-		if (!c->verify_data)
-			return;
-	}
-
-	BUG_ON(b->nsets != 1);
-
-	for (k = inmemory->start; k != vstruct_last(inmemory); k = bkey_p_next(k))
-		if (k->type == KEY_TYPE_btree_ptr_v2)
-			((struct bch_btree_ptr_v2 *) bkeyp_val(&b->format, k))->mem_ptr = 0;
-
-	v = c->verify_data;
-	bkey_copy(&v->key, &b->key);
-	v->c.level	= b->c.level;
-	v->c.btree_id	= b->c.btree_id;
-	bch2_btree_keys_init(v);
-
-	ptrs = bch2_bkey_ptrs_c(bkey_i_to_s_c(&b->key));
-	bkey_for_each_ptr_decode(&b->key.k, ptrs, p, entry)
-		failed |= bch2_btree_verify_replica(c, b, p);
-
-	if (failed) {
-		CLASS(printbuf, buf)();
-		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(&b->key));
-		bch2_fs_fatal_error(c, ": btree node verify failed for: %s\n", buf.buf);
-	}
-}
-
-void bch2_btree_node_ondisk_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_btree_node_ondisk_to_text(struct printbuf *out, struct bch_fs *c,
 				    const struct btree *b)
 {
 	struct btree_node *n_ondisk = NULL;
@@ -216,9 +72,9 @@ void bch2_btree_node_ondisk_to_text(struct printbuf *out, struct bch_fs *c,
 	}
 
 	bio = bio_alloc_bioset(ca->disk_sb.bdev,
-			       buf_pages(n_ondisk, btree_buf_bytes(b)),
+			       buf_nr_bvecs(n_ondisk, btree_buf_bytes(b)),
 			       REQ_OP_READ|REQ_META,
-			       GFP_NOFS,
+			       GFP_NOIO,
 			       &c->btree.bio);
 	bio->bi_iter.bi_sector	= pick.ptr.offset;
 	bch2_bio_map(bio, n_ondisk, btree_buf_bytes(b));
@@ -411,18 +267,18 @@ static ssize_t bch2_read_btree_formats(struct file *file, char __user *buf,
 
 	try(bch2_debugfs_flush_buf(i));
 
-	if (bpos_eq(SPOS_MAX, i->from))
-		return i->ret;
-
 	CLASS(btree_trans, trans)(i->c);
-	return for_each_btree_node(trans, iter, i->id, i->from, 0, b, ({
-		bch2_btree_node_to_text(&i->buf, i->c, b);
-		i->from = !bpos_eq(SPOS_MAX, b->key.k.p)
-			? bpos_successor(b->key.k.p)
-			: b->key.k.p;
+	for (; i->level < BTREE_MAX_DEPTH; i->level++, i->from = POS_MIN)
+		try(for_each_btree_node(trans, iter, i->id, i->from, i->level, 0, b, ({
+			bch2_btree_node_to_text(&i->buf, i->c, b);
+			i->from = !bpos_eq(SPOS_MAX, b->key.k.p)
+				? bpos_successor(b->key.k.p)
+				: b->key.k.p;
 
-		drop_locks_do(trans, bch2_debugfs_flush_buf(i));
-	})) ?: i->ret;
+			drop_locks_do(trans, bch2_debugfs_flush_buf(i));
+		})));
+
+	return i->ret;
 }
 
 static const struct file_operations btree_format_debug_ops = {
@@ -459,7 +315,8 @@ static ssize_t bch2_read_bfloat_failed(struct file *file, char __user *buf,
 				i->prev_node = l->b->key.k.p;
 			}
 
-			bch2_bfloat_to_text(&i->buf, l->b, _k);
+			if (_k)
+				bch2_bfloat_to_text(&i->buf, l->b, _k);
 			bch2_trans_unlock(trans);
 			i->from = bpos_successor(iter.pos);
 			bch2_debugfs_flush_buf(i);
@@ -474,7 +331,7 @@ static const struct file_operations bfloat_failed_debug_ops = {
 	.read		= bch2_read_bfloat_failed,
 };
 
-static void bch2_cached_btree_node_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void bch2_cached_btree_node_to_text(struct printbuf *out, struct bch_fs *c,
 					   struct btree *b)
 {
 	if (!out->nr_tabstops)
@@ -673,7 +530,7 @@ static ssize_t bch2_journal_pins_read(struct file *file, char __user *buf,
 		if (done)
 			break;
 
-		done = bch2_journal_seq_pins_to_text(&i->buf, &c->journal, &i->iter);
+		done = bch2_journal_seq_pins_to_text(&i->buf, &c->journal, &i->iter, NULL);
 		i->iter++;
 	}
 
@@ -796,6 +653,11 @@ static ssize_t btree_transaction_stats_read(struct file *file, char __user *buf,
 
 			scoped_guard(printbuf_indent, &i->buf)
 				bch2_time_stats_to_text(&i->buf, &s->lock_hold_times);
+
+			prt_printf(&i->buf, "Lock wait times:\n");
+
+			scoped_guard(printbuf_indent, &i->buf)
+				bch2_time_stats_to_text(&i->buf, &s->lock_wait_times);
 		}
 
 		if (s->max_paths_text) {
@@ -823,7 +685,7 @@ static const struct file_operations btree_transaction_stats_op = {
 };
 
 /* walk btree transactions until we find a deadlock and print it */
-static void btree_deadlock_to_text(struct printbuf *out, struct bch_fs *c)
+static __cold void btree_deadlock_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct btree_trans *trans;
 	ulong iter = 0;
@@ -842,6 +704,7 @@ restart:
 
 		u32 seq = seqmutex_unlock(&c->btree.trans.lock);
 
+		guard(printbuf_atomic)(out);
 		bool found = bch2_check_for_deadlock(trans, out) != 0;
 
 		closure_put(&trans->ref);
@@ -948,42 +811,58 @@ static const struct file_operations btree_node_scan_ops = {
 	.read		= bch2_btree_node_scan_read,
 };
 
-static ssize_t bch2_subvolumes_read(struct file *file, char __user *buf,
-					size_t size, loff_t *ppos)
+/*
+ * The full fsck damaged-paths list, untruncated: the end-of-fsck summary
+ * prints only the first FSCK_DAMAGED_PATHS_PRINT entries, which isn't enough
+ * when triaging a badly damaged filesystem. Interim surface until the damage
+ * btree lands.
+ */
+static ssize_t bch2_fsck_damaged_paths_read(struct file *file, char __user *buf,
+					    size_t size, loff_t *ppos)
 {
 	struct dump_iter *i = file->private_data;
+	struct bch_fs *c = i->c;
 
-	if (!test_bit(BCH_FS_may_go_rw, &i->c->flags) ||
-	    !i->c->snapshots.table)
+	i->ubuf = buf;
+	i->size	= size;
+	i->ret	= 0;
+
+	if (!test_bit(BCH_FS_may_go_rw, &c->flags))
 		return 0;
 
-	return bch2_simple_print(file, buf, size, ppos, bch2_subvolumes_list_to_text);
+	CLASS(btree_trans, trans)(c);
+
+	while (1) {
+		try(bch2_debugfs_flush_buf(i));
+
+		/*
+		 * Snapshot the entry under the lock, resolve outside it: path
+		 * resolution takes btree locks, and fsck error paths take
+		 * msgs_lock under those.
+		 */
+		struct fsck_damaged_path entry;
+		bool done;
+
+		scoped_guard(mutex, &c->errors.msgs_lock) {
+			done = i->iter >= c->errors.damaged_paths.nr;
+			if (!done)
+				entry = c->errors.damaged_paths.data[i->iter];
+		}
+		if (done)
+			break;
+
+		bch2_fsck_damaged_path_to_text(&i->buf, trans, &entry);
+		i->iter++;
+	}
+
+	return bch2_debugfs_flush_buf(i) ?: i->ret;
 }
 
-static const struct file_operations subvolumes_ops = {
+static const struct file_operations fsck_damaged_paths_ops = {
 	.owner		= THIS_MODULE,
 	.open		= bch2_dump_open,
 	.release	= bch2_dump_release,
-	.read		= bch2_subvolumes_read,
-};
-
-static ssize_t bch2_snapshot_trees_read(struct file *file, char __user *buf,
-					size_t size, loff_t *ppos)
-{
-	struct dump_iter *i = file->private_data;
-
-	if (!test_bit(BCH_FS_may_go_rw, &i->c->flags) ||
-	    !i->c->snapshots.table)
-		return 0;
-
-	return bch2_simple_print(file, buf, size, ppos, bch2_snapshot_trees_to_text);
-}
-
-static const struct file_operations snapshot_trees_ops = {
-	.owner		= THIS_MODULE,
-	.open		= bch2_dump_open,
-	.release	= bch2_dump_release,
-	.read		= bch2_snapshot_trees_read,
+	.read		= bch2_fsck_damaged_paths_read,
 };
 
 void bch2_fs_debug_exit(struct bch_fs *c)
@@ -1045,14 +924,11 @@ void bch2_fs_debug_init(struct bch_fs *c)
 	debugfs_create_file("btree_node_scan", 0400, c->fs_debug_dir,
 			    c->btree_debug, &btree_node_scan_ops);
 
+	debugfs_create_file("fsck_damaged_paths", 0400, c->fs_debug_dir,
+			    c->btree_debug, &fsck_damaged_paths_ops);
+
 	debugfs_create_file("write_points", 0400, c->fs_debug_dir,
 			    c->btree_debug, &write_points_ops);
-
-	debugfs_create_file("subvolumes", 0400, c->fs_debug_dir,
-			    c->btree_debug, &subvolumes_ops);
-
-	debugfs_create_file("snapshot_trees", 0400, c->fs_debug_dir,
-			    c->btree_debug, &snapshot_trees_ops);
 
 	bch2_fs_async_obj_debugfs_init(c);
 

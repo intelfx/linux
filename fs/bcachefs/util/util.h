@@ -56,14 +56,30 @@ static inline struct bio_vec *bio_inline_vecs(struct bio *bio)
 }
 #endif
 
+/*
+ * 7.1 introduced bdev_rot() and removed bdev_nonrot(). Shim bdev_rot for
+ * older kernels and userspace so call sites can always use bdev_rot.
+ */
+#if !defined(__KERNEL__) || LINUX_VERSION_CODE < KERNEL_VERSION(7,0,0)
+static inline bool bdev_rot(struct block_device *bdev)
+{
+	return !bdev_nonrot(bdev);
+}
+#endif
+
 DEFINE_FREE(bio_put, struct bio *, if (_T) bio_put(_T))
 
-/* Userspace doesn't align allocations as nicely as the kernel allocators: */
-static inline size_t buf_pages(void *p, size_t len)
+/*
+ * Number of bvecs needed to describe [p, p+len) in a bio, matching how
+ * bch2_bio_map() will add it: physically contiguous buffers take one bvec,
+ * vmalloc buffers take one bvec per page.
+ */
+static inline size_t buf_nr_bvecs(void *p, size_t len)
 {
-	return DIV_ROUND_UP(len +
-			    ((unsigned long) p & (PAGE_SIZE - 1)),
-			    PAGE_SIZE);
+	return is_vmalloc_addr(p)
+		? DIV_ROUND_UP(len + ((unsigned long) p & (PAGE_SIZE - 1)),
+			       PAGE_SIZE)
+		: 1;
 }
 
 static inline void *bch2_kvmalloc_noprof(size_t n, gfp_t flags)
@@ -224,6 +240,7 @@ static inline int bch2_strtoul_h(const char *cp, long *res)
 
 bool bch2_is_zero(const void *, size_t);
 
+u64 bch2_read_flag_list_mask(const char *, const char * const[], u64);
 u64 bch2_read_flag_list(const char *, const char * const[]);
 
 void bch2_prt_u64_base2_nbits(struct printbuf *, u64, unsigned);
@@ -374,6 +391,10 @@ static inline unsigned fract_exp_two(unsigned x, unsigned fract_bits)
 }
 
 void bch2_bio_map(struct bio *bio, void *base, size_t);
+struct bio *bch2_bio_map_and_chain(struct block_device *, void *, size_t,
+				   sector_t, blk_opf_t, gfp_t,
+				   struct bio_set *);
+int bch2_bio_submit_buf_wait(struct block_device *, void *, size_t, sector_t, blk_opf_t);
 int bch2_bio_alloc_pages(struct bio *, unsigned, size_t, gfp_t);
 
 #define closure_bio_submit(bio, cl)					\
@@ -424,8 +445,40 @@ do {									\
 
 u64 bch2_get_random_u64_below(u64);
 
+/*
+ * Rust-facing wrappers: local_clock() is a static inline and cond_resched() is a
+ * macro, so neither binds through bindgen. Wrapping them as bch2_* static
+ * inlines (allowlisted, so the codegen's wrap_static_fns emits callable
+ * wrappers) lets fs/ Rust call them uniformly across the kernel and userspace
+ * builds, with the macro expanded at C-compile time.
+ */
+static inline u64 bch2_local_clock(void)
+{
+	return local_clock();
+}
+
+static inline void bch2_cond_resched(void)
+{
+	cond_resched();
+}
+
+/*
+ * All-ones mask of width @bits, defined for the full range 0..64 — unlike
+ * (1ULL << bits) - 1 (UB at 64) or ~0ULL >> (64 - bits) (UB at 0).
+ * Compiles branchless (cmov).
+ */
+static inline u64 u64_bitmask(unsigned bits)
+{
+	return bits ? ~0ULL >> (64 - bits) : 0;
+}
+
 void memcpy_to_bio(struct bio *, struct bvec_iter, const void *);
 void memcpy_from_bio(void *, struct bio *, struct bvec_iter);
+void bch2_bio_copy_data_iter(struct bio *, struct bvec_iter *,
+			     struct bio *, struct bvec_iter *);
+void bch2_zero_fill_bio_iter(struct bio *, struct bvec_iter);
+void bch2_bio_set_pages_dirty(struct bio *);
+void bch2_bio_check_pages_dirty(struct bio *);
 
 #ifdef CONFIG_BCACHEFS_DEBUG
 void bch2_corrupt_bio(struct bio *);
@@ -441,6 +494,19 @@ static inline void bch2_maybe_corrupt_bio(struct bio *bio, unsigned ratio)
 
 void bch2_bio_to_text(struct printbuf *, struct bio *);
 
+static inline void __memcpy_u64s(void *dst, const void *src,
+				 unsigned u64s)
+{
+	unsafe_memcpy(dst, src, u64s * 8,
+		      "dst is a u64s array sized by the caller, not a single field");
+}
+
+/*
+ * For small, bounded copies (a key, a handful of u64s): the open-coded loop is
+ * tighter codegen than a memcpy() call / its inline expansion. For larger or
+ * variable-size copies (key + value, bulk), use memcpy_u64s() so we get the
+ * fast-string path.
+ */
 static inline void memcpy_u64s_small(void *dst, const void *src,
 				     unsigned u64s)
 {
@@ -449,25 +515,6 @@ static inline void memcpy_u64s_small(void *dst, const void *src,
 
 	while (u64s--)
 		*d++ = *s++;
-}
-
-static inline void __memcpy_u64s(void *dst, const void *src,
-				 unsigned u64s)
-{
-#if defined(CONFIG_X86_64) && !defined(CONFIG_KMSAN)
-	long d0, d1, d2;
-
-	asm volatile("rep ; movsq"
-		     : "=&c" (d0), "=&D" (d1), "=&S" (d2)
-		     : "0" (u64s), "1" (dst), "2" (src)
-		     : "memory");
-#else
-	u64 *d = dst;
-	const u64 *s = src;
-
-	while (u64s--)
-		*d++ = *s++;
-#endif
 }
 
 static inline void memcpy_u64s(void *dst, const void *src,
@@ -479,10 +526,28 @@ static inline void memcpy_u64s(void *dst, const void *src,
 	__memcpy_u64s(dst, src, u64s);
 }
 
-static inline void __memmove_u64s_down(void *dst, const void *src,
-				       unsigned u64s)
+static inline void memset_u64s_small(void *dst, u64 c,
+			       unsigned u64s)
 {
-	__memcpy_u64s(dst, src, u64s);
+	u64 *d = dst;
+
+	while (u64s--)
+		*d++ = c;
+}
+
+/*
+ * Fortify can't see the real object size for u64s-array copies, same as
+ * __memcpy_u64s() - but there's no unsafe_memmove(), so go underneath
+ * fortify by hand:
+ */
+static inline void __memmove_u64s(void *dst, const void *src,
+				  unsigned u64s)
+{
+#ifdef _LINUX_FORTIFY_STRING_H_
+	__underlying_memmove(dst, src, u64s * 8);
+#else
+	memmove(dst, src, u64s * 8);
+#endif
 }
 
 static inline void memmove_u64s_down(void *dst, const void *src,
@@ -490,12 +555,13 @@ static inline void memmove_u64s_down(void *dst, const void *src,
 {
 	EBUG_ON(dst > src);
 
-	__memmove_u64s_down(dst, src, u64s);
+	__memmove_u64s(dst, src, u64s);
 }
 
 static inline void __memmove_u64s_down_small(void *dst, const void *src,
 				       unsigned u64s)
 {
+	/* dst <= src: a forward copy can't clobber unread source */
 	memcpy_u64s_small(dst, src, u64s);
 }
 
@@ -525,50 +591,27 @@ static inline void memmove_u64s_up_small(void *dst, const void *src,
 	__memmove_u64s_up_small(dst, src, u64s);
 }
 
-static inline void __memmove_u64s_up(void *_dst, const void *_src,
-				     unsigned u64s)
-{
-	u64 *dst = (u64 *) _dst + u64s - 1;
-	u64 *src = (u64 *) _src + u64s - 1;
-
-#if defined(CONFIG_X86_64) && !defined(CONFIG_KMSAN)
-	long d0, d1, d2;
-
-	asm volatile("std ;\n"
-		     "rep ; movsq\n"
-		     "cld ;\n"
-		     : "=&c" (d0), "=&D" (d1), "=&S" (d2)
-		     : "0" (u64s), "1" (dst), "2" (src)
-		     : "memory");
-#else
-	while (u64s--)
-		*dst-- = *src--;
-#endif
-}
-
-static inline void memmove_u64s_up(void *dst, const void *src,
+static inline void memmove_u64s_up(void *dst, void *src,
 				   unsigned u64s)
 {
 	EBUG_ON(dst < src);
 
-	__memmove_u64s_up(dst, src, u64s);
+	__memmove_u64s(dst, src, u64s);
 }
 
-static inline void memmove_u64s(void *dst, const void *src,
+static inline void memmove_u64s(void *dst, void *src,
 				unsigned u64s)
 {
-	if (dst < src)
-		__memmove_u64s_down(dst, src, u64s);
-	else
-		__memmove_u64s_up(dst, src, u64s);
+	__memmove_u64s(dst, src, u64s);
 }
 
 /* Set the last few bytes up to a u64 boundary given an offset into a buffer. */
 static inline void memset_u64s_tail(void *s, int c, unsigned bytes)
 {
-	unsigned rem = round_up(bytes, sizeof(u64)) - bytes;
-
-	memset(s + bytes, c, rem);
+	while (bytes & 7) {
+		((char *) s)[bytes] = c;
+		bytes++;
+	}
 }
 
 /* just the memmove, doesn't update @_nr */
@@ -847,5 +890,65 @@ static inline mempool_t *mempool_create_kvmalloc_pool(int min_nr, size_t size)
         return mempool_create(min_nr, mempool_kvmalloc, mempool_kvfree, (void *) size);
 }
 #endif
+
+#include <linux/wait_bit.h>
+
+int bch2_bit_wait_io_timeout(struct wait_bit_key *, int);
+
+/*
+ * wait_on_bit_io_timeout() - missing from <linux/wait_bit.h>; same as
+ * wait_on_bit_timeout() but uses io_schedule_timeout() so the wait is
+ * accounted as iowait.
+ */
+static inline int wait_on_bit_io_timeout(unsigned long *word, int bit,
+					 unsigned mode, unsigned long timeout)
+{
+	might_sleep();
+	if (!test_bit_acquire(bit, word))
+		return 0;
+	return out_of_line_wait_on_bit_timeout(word, bit,
+					       bch2_bit_wait_io_timeout,
+					       mode, timeout);
+}
+
+/*
+ * bch2_alloc_percpu_init(): run init() on every per-cpu instance of a
+ * dynamically-allocated percpu variable.
+ *
+ * Kernel: iterates for_each_possible_cpu and calls init() once per cpu
+ * at allocation time.
+ *
+ * Userspace: alloc_percpu() returns an offset into a per-thread chunk;
+ * threads come and go dynamically, so init() must also be called for
+ * each thread that's spawned later. The userspace shim stashes the
+ * (init, ctx) pair alongside the percpu variable so it can call init()
+ * for every existing chunk now and every future chunk at thread
+ * creation time.
+ *
+ * The init function takes (per-instance ptr, caller ctx, cpu id).
+ */
+#ifdef __KERNEL__
+#define bch2_alloc_percpu_init(_pcv, _init, _ctx)			\
+do {									\
+	int _cpu;							\
+	for_each_possible_cpu(_cpu)					\
+		(_init)(per_cpu_ptr((_pcv), _cpu), (_ctx), _cpu);	\
+} while (0)
+#else
+void __bch2_alloc_percpu_init(void *pcv,
+			      void (*init)(void *, void *, unsigned),
+			      void *ctx);
+#define bch2_alloc_percpu_init(_pcv, _init, _ctx)			\
+	__bch2_alloc_percpu_init((_pcv),				\
+		(void (*)(void *, void *, unsigned))(_init), (_ctx))
+#endif
+
+static inline u64 system_totalram_bytes(void)
+{
+	struct sysinfo i;
+	si_meminfo(&i);
+
+	return i.totalram * i.mem_unit;
+}
 
 #endif /* _BCACHEFS_UTIL_H */

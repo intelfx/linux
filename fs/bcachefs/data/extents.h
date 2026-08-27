@@ -3,6 +3,7 @@
 #define _BCACHEFS_EXTENTS_H
 
 #include "bcachefs.h"
+#include "alloc/check_data.h"
 #include "btree/bkey.h"
 #include "extents_types.h"
 
@@ -380,6 +381,16 @@ out:									\
 
 /* utility code common to all keys with pointers: */
 
+static inline void bch2_io_failures_exit(struct bch_io_failures *f)
+{
+	printbuf_exit(&f->ec_msg);
+}
+
+DEFINE_CLASS(bch_io_failures, struct bch_io_failures,
+	     bch2_io_failures_exit(&_T),
+	     ((struct bch_io_failures) { .ec_msg = PRINTBUF }),
+	     void)
+
 void bch2_io_failures_to_text(struct printbuf *, struct bch_fs *,
 			      struct bch_io_failures *);
 struct bch_dev_io_failures *bch2_dev_io_failures(struct bch_io_failures *, unsigned);
@@ -394,12 +405,12 @@ int bch2_bkey_pick_read_device(struct bch_fs *, struct bkey_s_c,
 /* KEY_TYPE_btree_ptr: */
 
 int bch2_btree_ptr_validate(struct bch_fs *, struct bkey_s_c,
-			    struct bkey_validate_context);
+			    const struct bkey_validate_context *);
 void bch2_btree_ptr_to_text(struct printbuf *, struct bch_fs *,
 			    struct bkey_s_c);
 
 int bch2_btree_ptr_v2_validate(struct bch_fs *, struct bkey_s_c,
-			       struct bkey_validate_context);
+			       const struct bkey_validate_context *);
 void bch2_btree_ptr_v2_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 void bch2_btree_ptr_v2_compat(enum btree_id, unsigned, unsigned,
 			      int, struct bkey_s);
@@ -409,6 +420,7 @@ void bch2_btree_ptr_v2_compat(enum btree_id, unsigned, unsigned,
 	.val_to_text	= bch2_btree_ptr_to_text,		\
 	.swab		= bch2_ptr_swab,			\
 	.trigger	= bch2_trigger_extent,			\
+	.check_repair	= bch2_check_fix_ptrs,			\
 })
 
 #define bch2_bkey_ops_btree_ptr_v2 ((struct bkey_ops) {		\
@@ -417,6 +429,7 @@ void bch2_btree_ptr_v2_compat(enum btree_id, unsigned, unsigned,
 	.swab		= bch2_ptr_swab,			\
 	.compat		= bch2_btree_ptr_v2_compat,		\
 	.trigger	= bch2_trigger_extent,			\
+	.check_repair	= bch2_check_fix_ptrs,			\
 	.min_val_size	= 40,					\
 })
 
@@ -430,12 +443,13 @@ bool bch2_extent_merge(struct bch_fs *, struct bkey_s, struct bkey_s_c);
 	.swab		= bch2_ptr_swab,			\
 	.key_merge	= bch2_extent_merge,			\
 	.trigger	= bch2_trigger_extent,			\
+	.check_repair	= bch2_check_fix_ptrs,			\
 })
 
 /* KEY_TYPE_reservation: */
 
 int bch2_reservation_validate(struct bch_fs *, struct bkey_s_c,
-			      struct bkey_validate_context);
+			      const struct bkey_validate_context *);
 void bch2_reservation_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 bool bch2_reservation_merge(struct bch_fs *, struct bkey_s, struct bkey_s_c);
 
@@ -566,25 +580,83 @@ static inline struct bch_devs_list bch2_bkey_devs(const struct bch_fs *c, struct
 	return ret;
 }
 
-unsigned bch2_bkey_nr_dirty_ptrs(const struct bch_fs *, struct bkey_s_c);
-unsigned bch2_bkey_nr_ptrs_allocated(const struct bch_fs *, struct bkey_s_c);
-unsigned bch2_bkey_nr_ptrs_fully_allocated(const struct bch_fs *, struct bkey_s_c);
 bool bch2_bkey_is_incompressible(const struct bch_fs *, struct bkey_s_c);
 void bch2_bkey_propagate_incompressible(const struct bch_fs *, struct bkey_i *, struct bkey_s_c);
-unsigned bch2_bkey_sectors_compressed(const struct bch_fs *, struct bkey_s_c);
 
-unsigned bch2_bkey_replicas(struct bch_fs *, struct bkey_s_c);
 
 unsigned bch2_dev_durability(struct bch_fs *, unsigned);
-int bch2_extent_ptr_desired_durability(struct btree_trans *, struct extent_ptr_decoded *);
-int bch2_extent_ptr_durability(struct btree_trans *, struct extent_ptr_decoded *);
 
+int __bch2_extent_ptr_durability(struct btree_trans *, struct extent_ptr_decoded *, bool);
+
+static inline int bch2_extent_ptr_desired_durability(struct btree_trans *trans, struct extent_ptr_decoded *p)
+{
+	return __bch2_extent_ptr_durability(trans, p, true);
+}
+
+static inline int bch2_extent_ptr_durability(struct btree_trans *trans, struct extent_ptr_decoded *p)
+{
+	return __bch2_extent_ptr_durability(trans, p, false);
+}
+
+/*
+ * Everything one walk of a key's pointer list can say about its replication.
+ *
+ * Gathered together because the walk is the expensive part - and for the exact
+ * version, a stripe read per erasure coded pointer - while callers routinely
+ * want several of these at once. bch2_sum_sector_overwrites() asks four
+ * separate single-value helpers for them, on the same two keys, three of the
+ * calls inside a loop.
+ *
+ * The durability counts are weighted by each device's mi.durability and skip
+ * BCH_SB_MEMBER_INVALID placeholders - those are added by
+ * bch2_bkey_set_needs_reconcile() on a degraded write, to stand for a replica
+ * that isn't there. The raw counts below are unweighted.
+ *
+ * u8 except the sector count: BCH_MEMBER_DURABILITY is a two bit field and
+ * BCH_REPLICAS_MAX is 4, so none of these can come near 255.
+ *
+ * Not handled here: KEY_TYPE_reservation, which several of the older
+ * single-value helpers report as v->nr_replicas. Callers that need that still
+ * special-case it themselves.
+ */
 struct bkey_durability {
-	unsigned	online, total;
+	u8		online, total;
+	u8		acct, min_durability;
+
+	u8		nr_ptrs;		/* real device pointers */
+	u8		nr_overwritable;	/* uncompressed - an overwrite reclaims these */
+	unsigned	sectors_compressed;
+
+	/*
+	 * Copies this key occupies, for disk space accounting.
+	 *
+	 * Deliberately not weighted by mi.durability, unlike the counts above:
+	 * durability is OPT_RUNTIME, and accounting is persistent, so a
+	 * durability change would retroactively invalidate space already
+	 * accounted for. This has to be a function of what is physically on
+	 * disk.
+	 *
+	 * Differs from nr_ptrs only for a reservation, which occupies the space
+	 * it reserved while having no pointers at all.
+	 */
+	u8		nr_replicas;
+
+	/*
+	 * Copies for the purpose of "does this write increase replication" -
+	 * erasure coding counts, because a stripe genuinely provides it.
+	 *
+	 * Distinct from nr_replicas on purpose: parity is accounted separately
+	 * as BCH_DATA_parity at the stripe, so counting redundancy in a
+	 * per-extent space figure would charge the same parity to every extent
+	 * sharing the stripe. Space and replication are different questions.
+	 */
+	u8		replicas;
 };
 
 int bch2_bkey_durability(struct btree_trans *, struct bkey_s_c, struct bkey_durability *);
+struct bkey_durability bch2_bkey_durability_safe(const struct bch_fs *, struct bkey_s_c);
 struct bkey_durability bch2_btree_ptr_durability(struct bch_fs *, struct bkey_s_c);
+
 bool bch2_bkey_can_read(const struct bch_fs *, struct bkey_s_c);
 
 const struct bch_extent_ptr *bch2_bkey_has_device_c(const struct bch_fs *,
@@ -596,6 +668,19 @@ static inline struct bch_extent_ptr *bch2_bkey_has_device(const struct bch_fs *c
 							  struct bkey_s k, unsigned dev)
 {
 	return (void *) bch2_bkey_has_device_c(c, k.s_c, dev);
+}
+
+/* Returns the ptr_bit (bit-position-as-mask) of the first ptr matching @dev,
+ * or 0 if no such ptr exists. */
+static inline unsigned bch2_bkey_dev_ptr_bit(struct bch_fs *c, struct bkey_s_c k, unsigned dev)
+{
+	unsigned ptr_bit = 1;
+	bkey_for_each_ptr(bch2_bkey_ptrs_c(k), ptr) {
+		if (ptr->dev == dev)
+			return ptr_bit;
+		ptr_bit <<= 1;
+	}
+	return 0;
 }
 
 bool bch2_bkey_devs_rw(struct bch_fs *, struct bkey_s_c);
@@ -701,7 +786,7 @@ void bch2_extent_ptr_to_text(struct printbuf *out, struct bch_fs *, const struct
 void bch2_bkey_ptrs_to_text(struct printbuf *, struct bch_fs *,
 			    struct bkey_s_c);
 int bch2_bkey_ptrs_validate(struct bch_fs *, struct bkey_s_c,
-			    struct bkey_validate_context);
+			    const struct bkey_validate_context *);
 
 static inline bool bch2_extent_ptr_eq(struct bch_extent_ptr ptr1,
 				      struct bch_extent_ptr ptr2)
@@ -710,7 +795,7 @@ static inline bool bch2_extent_ptr_eq(struct bch_extent_ptr ptr1,
 		ptr1.unwritten	== ptr2.unwritten &&
 		ptr1.offset	== ptr2.offset &&
 		ptr1.dev	== ptr2.dev &&
-		ptr1.gen	== ptr2.gen);
+		ptr1.generation	== ptr2.generation);
 }
 
 void bch2_ptr_swab(const struct bch_fs *, struct bkey_s);

@@ -8,8 +8,11 @@
 #include "btree/update.h"
 #include "btree/write_buffer.h"
 
+#include "data/ec/create.h"
+#include "data/ec/trigger.h"
 #include "data/reconcile/check.h"
 #include "data/reconcile/trigger.h"
+#include "data/reconcile/work.h"
 
 #include "init/error.h"
 #include "init/progress.h"
@@ -254,17 +257,6 @@ static int check_reconcile_work_phys(struct btree_trans *trans)
 	}
 }
 
-static int btree_node_update_key_get_node(struct btree_trans *trans, struct btree_iter *iter,
-					  unsigned level, struct bkey_i *new_key)
-{
-	BUG_ON(!bkey_is_btree_ptr(&new_key->k));
-
-	CLASS(btree_node_iter, iter2)(trans, iter->btree_id, iter->pos, 0, level - 1, 0);
-	struct btree *b = errptr_try(bch2_btree_iter_peek_node(&iter2));
-
-	return bch2_btree_node_update_key(trans, &iter2, b, new_key, BCH_TRANS_COMMIT_no_enospc, false);
-}
-
 static int check_reconcile_work_btree_key(struct btree_trans *trans,
 					  struct btree_iter *iter,
 					  unsigned level, struct bkey_s_c k)
@@ -284,25 +276,29 @@ static int check_reconcile_work_btree_key(struct btree_trans *trans,
 			trans, btree_ptr_with_no_reconcile_bp,
 			"btree ptr with no reconcile \n%s",
 			(bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
-		struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans, bkey_bytes(k.k) + sizeof(struct bch_extent_reconcile_bp)));
+		struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans,
+						BKEY_BTREE_PTR_U64s_MAX * sizeof(u64)));
 
 		bkey_reassemble(n, k);
 
 		try(reconcile_bp_add(trans, iter->btree_id, level, bkey_i_to_s(n), &bp_pos));
-		bch2_bkey_set_reconcile_bp(c, bkey_i_to_s(n), bp_pos.offset);
-		return btree_node_update_key_get_node(trans, iter, level, n);
+		bch2_bkey_set_reconcile_bp(c, bkey_i_to_s(n),
+					   BKEY_BTREE_PTR_U64s_MAX, bp_pos.offset);
+		return bch2_btree_node_update_key_at_pos(trans, iter->btree_id, level, n);
 	}
 
 	if (ret_fsck_err_on(!bp_pos.inode && bp_pos.offset,
 			trans, btree_ptr_with_bad_reconcile_bp,
 			"btree ptr with bad reconcile \n%s",
 			(bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
-		struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans, bkey_bytes(k.k) + sizeof(struct bch_extent_reconcile_bp)));
+		struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans,
+						BKEY_BTREE_PTR_U64s_MAX * sizeof(u64)));
 
 		bkey_reassemble(n, k);
-		bch2_bkey_set_reconcile_bp(c, bkey_i_to_s(n), 0);
+		bch2_bkey_set_reconcile_bp(c, bkey_i_to_s(n),
+					   BKEY_BTREE_PTR_U64s_MAX, 0);
 
-		return btree_node_update_key_get_node(trans, iter, level, n);
+		return bch2_btree_node_update_key_at_pos(trans, iter->btree_id, level, n);
 	}
 
 	if (!bpos_eq(bp_pos, POS_MIN)) {
@@ -330,12 +326,15 @@ static int check_reconcile_work_btree_key(struct btree_trans *trans,
 				struct bkey_i_backpointer *new_bp = errptr_try(bch2_bkey_alloc(trans, &rb_iter, 0, backpointer));
 				new_bp->v = bp;
 
-				struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans, bkey_bytes(k.k)));
+				struct bkey_i *n = errptr_try(bch2_trans_kmalloc(trans,
+						BKEY_BTREE_PTR_U64s_MAX * sizeof(u64)));
 				bkey_reassemble(n, k);
 
-				bch2_bkey_set_reconcile_bp(c, bkey_i_to_s(n), rb_iter.pos.offset);
+				bch2_bkey_set_reconcile_bp(c, bkey_i_to_s(n),
+							   BKEY_BTREE_PTR_U64s_MAX,
+							   rb_iter.pos.offset);
 
-				return btree_node_update_key_get_node(trans, iter, level, n);
+				return bch2_btree_node_update_key_at_pos(trans, iter->btree_id, level, n);
 			}
 		}
 	}
@@ -405,6 +404,83 @@ static int check_reconcile_btree_bps(struct btree_trans *trans)
 	}));
 }
 
+/*
+ * Verify each stripe's stored can_widen matches the disk_label's RW-member
+ * count (the canonical widening target). The reconcile_scan_stripes pass
+ * refreshes can_widen when devs change RW state, and get_old_stripe demotes
+ * lazily at reuse time, but fsck verifies it explicitly so a stripe stuck
+ * out of sync gets surfaced and fixed.
+ *
+ * If the stripes scan cookie is set, a refresh is already pending — drift is
+ * expected, so don't flag.
+ */
+static int check_stripe_can_widen_one(struct btree_trans *trans,
+				      struct btree_iter *iter,
+				      struct bkey_s_c k,
+				      widen_cache *cache,
+				      bool scan_pending)
+{
+	struct bch_fs *c = trans->c;
+	int ret = 0;
+
+	if (k.k->type != KEY_TYPE_stripe)
+		return 0;
+
+	const struct bch_stripe *s = bkey_s_c_to_stripe(k).v;
+	unsigned nr_devs;
+	try(bch2_widen_cache_lookup(cache, c,
+				    s->disk_label, le16_to_cpu(s->sectors),
+				    &nr_devs));
+
+	u8 correct_can_widen = stripe_widen_value(
+		stripe_widen_target_nr_data(nr_devs, s->nr_redundant,
+					    c->opts.ec_max_data_blocks),
+		s->nr_blocks - s->nr_redundant);
+
+	if (s->can_widen == correct_can_widen)
+		return 0;
+
+	if (scan_pending)
+		return 0;
+
+	CLASS(printbuf, buf)();
+	prt_printf(&buf, "stripe can_widen=%u, should be %u\n",
+		   s->can_widen, correct_can_widen);
+	bch2_bkey_val_to_text(&buf, c, k);
+
+	if (fsck_err(trans, stripe_can_widen_wrong, "%s", buf.buf)) {
+		struct bkey_i_stripe *update =
+			errptr_try(bch2_bkey_make_mut_typed(trans, iter, &k, 0, stripe));
+		update->v.can_widen = correct_can_widen;
+	}
+fsck_err:
+	return ret;
+}
+
+noinline_for_stack
+static int check_stripe_can_widen(struct btree_trans *trans)
+{
+	struct bch_fs *c = trans->c;
+	struct progress_indicator progress;
+	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_stripes), 0);
+
+	CLASS(widen_cache, cache)();
+	try(bch2_widen_cache_init(&cache));
+
+	int cookie = lockrestart_do(trans,
+		bch2_reconcile_scan_cookie_is_set(trans, RECONCILE_SCAN_COOKIE_stripes));
+	if (cookie < 0)
+		return cookie;
+	bool scan_pending = cookie > 0;
+
+	return for_each_btree_key_commit(trans, iter, BTREE_ID_stripes,
+			POS_MIN, BTREE_ITER_prefetch, k,
+			NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
+		bch2_progress_update_iter(trans, &progress, &iter) ?:
+		check_stripe_can_widen_one(trans, &iter, k, &cache, scan_pending);
+	}));
+}
+
 int bch2_check_reconcile_work(struct bch_fs *c)
 {
 	CLASS(btree_trans, trans)(c);
@@ -440,6 +516,7 @@ int bch2_check_reconcile_work(struct bch_fs *c)
 	try(check_reconcile_work_phys(trans));
 	try(check_reconcile_work_btrees(trans));
 	try(check_reconcile_btree_bps(trans));
+	try(check_stripe_can_widen(trans));
 
 	return 0;
 }

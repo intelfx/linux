@@ -26,6 +26,7 @@
 
 #include "sb/io.h"
 
+#include "init/damage.h"
 #include "init/progress.h"
 
 static struct bkey_i *drop_dev_ptrs(struct btree_trans *trans, struct bkey_s_c k, unsigned dev_idx,
@@ -40,9 +41,10 @@ static struct bkey_i *drop_dev_ptrs(struct btree_trans *trans, struct bkey_s_c k
 	if (!bch2_bkey_has_device_c(c, k, dev_idx))
 		return NULL;
 
-	struct bkey_i *n = bch2_trans_kmalloc(trans, bkey_bytes(k.k) +
-					      sizeof(struct bch_extent_reconcile) +
-					      sizeof(struct bch_extent_ptr) * BCH_REPLICAS_MAX);
+	unsigned n_buf_u64s = metadata
+		? BKEY_BTREE_PTR_U64s_MAX
+		: BKEY_EXTENT_U64s_MAX;
+	struct bkey_i *n = bch2_trans_kmalloc(trans, n_buf_u64s * sizeof(u64));
 	if (IS_ERR(n))
 		return n;
 	bkey_reassemble(n, k);
@@ -65,7 +67,8 @@ static struct bkey_i *drop_dev_ptrs(struct btree_trans *trans, struct bkey_s_c k
 	if (bch2_bkey_can_read(c, bkey_i_to_s_c(n))) {
 		struct bch_inode_opts opts;
 		int ret = bch2_bkey_get_io_opts(trans, NULL, k, &opts) ?:
-			  bch2_bkey_set_needs_reconcile(trans, NULL, &opts, n,
+			  bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(n),
+							n_buf_u64s,
 							SET_NEEDS_RECONCILE_opt_change, 0);
 		if (ret)
 			return ERR_PTR(ret);
@@ -96,6 +99,10 @@ static int bch2_dev_usrdata_drop_key(struct btree_trans *trans,
 	struct bkey_i *n = errptr_try(drop_dev_ptrs(trans, k, dev_idx, flags, err));
 	if (!n)
 		return 0;
+
+	if (n->k.type == KEY_TYPE_error)
+		try(bch2_damage_record_data_loss(trans, iter->btree_id, k.k->p,
+						 BCH_FSCK_ERR_data_lost_device_removed));
 
 	/*
 	 * Since we're not inserting through an extent iterator
@@ -152,53 +159,32 @@ static int bch2_dev_usrdata_drop(struct bch_fs *c,
 	return 0;
 }
 
-static int dev_metadata_drop_one(struct btree_trans *trans,
-				 struct btree_iter *iter,
-				 struct progress_indicator *progress,
-				 unsigned dev_idx,
-				 unsigned flags, struct printbuf *err)
-{
-	struct btree *b = errptr_try(bch2_btree_iter_peek_node(iter));
-	if (!b)
-		return 1;
-
-	try(bch2_progress_update_iter(trans, progress, iter));
-	try(drop_btree_ptrs(trans, iter, b, dev_idx, flags, err));
-	return 0;
-}
-
 static int bch2_dev_metadata_drop(struct bch_fs *c,
 				  struct progress_indicator *progress,
 				  unsigned dev_idx,
 				  unsigned flags, struct printbuf *err)
 {
-	int ret = 0;
-
 	/* don't handle this yet: */
 	if (flags & BCH_FORCE_IF_METADATA_LOST)
 		return bch_err_throw(c, remove_with_metadata_missing_unimplemented);
 
 	CLASS(btree_trans, trans)(c);
 
-	for (unsigned id = 0; id < btree_id_nr_alive(c) && !ret; id++) {
-		CLASS(btree_node_iter, iter)(trans, id, POS_MIN, 0, 0, BTREE_ITER_prefetch);
-
-		while (!(ret = lockrestart_do(trans,
-					dev_metadata_drop_one(trans, &iter, progress, dev_idx, flags, err))))
-			bch2_btree_iter_next_node(&iter);
-	}
+	for (unsigned btree = 0; btree < btree_id_nr_alive(c); btree++)
+		for (unsigned level = 0; level < BTREE_MAX_DEPTH; level++)
+			try(for_each_btree_node(trans, iter, btree, POS_MIN, level, 0, b, ({
+				bch2_progress_update_iter(trans, progress, &iter) ?:
+				drop_btree_ptrs(trans, &iter, b, dev_idx, flags, err);
+			})));
 
 	bch2_trans_unlock(trans);
 	bch2_btree_interior_updates_flush(c);
-
-	BUG_ON(bch2_err_matches(ret, BCH_ERR_transaction_restart));
-
-	return min(ret, 0);
+	return 0;
 }
 
 static int data_drop_bp(struct btree_trans *trans, unsigned dev_idx,
 			struct bkey_s_c_backpointer bp, struct wb_maybe_flush *last_flushed,
-			unsigned flags, struct printbuf *err)
+			unsigned flags, struct printbuf *err, bool *had_open_stripe)
 {
 	CLASS(btree_iter_uninit, iter)(trans);
 	struct bkey_s_c k = bch2_backpointer_get_key(trans, bp, &iter, BTREE_ITER_intent,
@@ -220,19 +206,21 @@ static int data_drop_bp(struct btree_trans *trans, unsigned dev_idx,
 	if (bkey_is_btree_ptr(k.k))
 		return bch2_dev_btree_drop_key(trans, bp, dev_idx, last_flushed, flags, err);
 	else if (k.k->type == KEY_TYPE_stripe)
-		return bch2_invalidate_stripe_to_dev(trans, &iter, k, dev_idx, flags, err);
+		return bch2_invalidate_stripe_to_dev(trans, &iter, k, dev_idx, flags, err,
+						     had_open_stripe);
 	else
 		return bch2_dev_usrdata_drop_key(trans, &iter, k, dev_idx, flags, err);
 }
 
-static bool dev_has_data(struct bch_fs *c, struct bch_dev *ca)
+static u64 dev_data_buckets(struct bch_dev *ca)
 {
 	struct bch_dev_usage usage = bch2_dev_usage_read(ca);
+	u64 nr = 0;
 	for (unsigned i = 0; i < BCH_DATA_NR; i++)
-		if (!data_type_is_empty(i) && !data_type_is_hidden(i) && usage.buckets[i])
-			return true;
+		if (!data_type_is_empty(i) && !data_type_is_hidden(i))
+			nr += usage.buckets[i];
 
-	return false;
+	return nr;
 }
 
 int bch2_dev_data_drop_by_backpointers(struct bch_fs *c, struct bch_dev *ca,
@@ -249,30 +237,70 @@ int bch2_dev_data_drop_by_backpointers(struct bch_fs *c, struct bch_dev *ca,
 	bch2_progress_init(&progress, "dropping device data", c,
 			   BIT(BTREE_ID_backpointers), 0);
 
-	for (unsigned i = 0; i < 3; i++) {
+	/*
+	 * Backpointers on RO devices may be updated (primarily via reconcile),
+	 * even when we're not updating the data on those devices (e.g.
+	 * propagating pending/hipri bits); stripe reshape — which deletes the
+	 * old stripe and writes a new one at a different stripe index — can
+	 * also drop a backpointer for an extant ptr-to-dev and re-add it
+	 * outside the scan's already-walked range. Both create races with the
+	 * scan that can only be handled by retrying.
+	 */
+	/*
+	 * Terminate on progress, not a fixed iteration count. An EC evacuation
+	 * off a failing device can take many scan/flush cycles to drain: the
+	 * migration creates that move data off the device are deliberately not
+	 * fenced (see "Fence stripe creates against device removal"), so they
+	 * run concurrently with the scan as open stripes that we skip and flush.
+	 * A fixed cap fires mid-migration. Instead, track the device's data and
+	 * keep going as long as it keeps hitting new lows - that's forward
+	 * progress. Only bail after max_stalled scans in a row with no new low,
+	 * which catches a genuine livelock (or a flush that never drains)
+	 * without aborting a slow-but-working drain.
+	 */
+	const unsigned max_stalled = 10;
+	u64 min_data_buckets = U64_MAX;
+	unsigned nr_stalled = 0;
+
+	while (true) {
+		bool had_open_stripe = false;
+
 		try(bch2_btree_write_buffer_flush_sync(trans));
 
-		/*
-		 * Backpointers on RO devices may be updated (primarily via
-		 * reconcile), even when we're not updating the data on those
-		 * devices (e.g. propagating pending/hipri bits); this creates a
-		 * race with device removal that's difficult to deal with except
-		 * by retrying:
-		 */
-
-		try(backpointer_scan_for_each(trans, iter, POS(dev_idx, 0), POS(dev_idx, U64_MAX),
+		try(backpointer_scan_for_each(trans, iter, BTREE_ID_backpointers,
+					      POS(dev_idx, 0), POS(dev_idx, U64_MAX),
 						  &last_flushed, &progress, bp, ({
 			wb_maybe_flush_inc(&last_flushed);
 			CLASS(disk_reservation, res)(c);
-			data_drop_bp(trans, dev_idx, bp, &last_flushed, flags, err) ?:
+			data_drop_bp(trans, dev_idx, bp, &last_flushed, flags, err,
+				     &had_open_stripe) ?:
 			bch2_trans_commit(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc);
 		})));
 
-		if (!dev_has_data(c, ca))
-			break;
-	}
+		u64 data_buckets = dev_data_buckets(ca);
+		if (!data_buckets)
+			return 0;
 
-	return 0;
+		if (data_buckets < min_data_buckets) {
+			min_data_buckets = data_buckets;
+			nr_stalled = 0;
+		} else if (++nr_stalled >= max_stalled) {
+			prt_printf(err, "%s(): no progress after %u scans, %llu data buckets remain\n",
+				   __func__, nr_stalled, data_buckets);
+			return bch_err_throw(c, remove_by_backpointer_did_not_terminate);
+		}
+
+		/*
+		 * Skipped open stripes are owned by in-flight stripe creates;
+		 * wait for those to close before rescanning so the next scan can
+		 * invalidate them. The flush isn't itself counted as progress: if
+		 * it never drains, the stall counter still terminates us.
+		 */
+		if (had_open_stripe) {
+			bch2_trans_unlock(trans);
+			bch2_fs_ec_flush_outstanding(c);
+		}
+	}
 }
 
 int bch2_dev_data_drop(struct bch_fs *c, unsigned dev_idx,
@@ -284,7 +312,7 @@ int bch2_dev_data_drop(struct bch_fs *c, unsigned dev_idx,
 
 	try(bch2_dev_usrdata_drop(c, &progress, dev_idx, flags, err));
 
-	bch2_progress_init(&progress, "dropping metadata", c, 0, ~0ULL);
+	bch2_progress_init(&progress, "dropping metadata", c, ~0ULL, ~0ULL);
 
 	return bch2_dev_metadata_drop(c, &progress, dev_idx, flags, err);
 }

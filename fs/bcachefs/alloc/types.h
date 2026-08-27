@@ -7,8 +7,10 @@
 
 #include "init/dev_types.h"
 
+#include "alloc/buckets_types.h"
 #include "util/clock_types.h"
 #include "util/fifo.h"
+#include "util/locking.h"
 
 #define BCH_WATERMARKS()		\
 	x(stripe)			\
@@ -50,12 +52,13 @@ struct open_bucket {
 	 * the block in the stripe this open_bucket corresponds to:
 	 */
 	u8			ec_idx;
-	enum bch_data_type	data_type:6;
-	unsigned		valid:1;
-	unsigned		on_partial_list:1;
+	enum bch_data_type	data_type:5;
+	bool			valid:1;
+	bool			on_partial_list:1;
+	bool			do_discards_fast:1;
 
 	u8			dev;
-	u8			gen;
+	u8			generation;
 	u32			sectors_free;
 	u64			bucket;
 	struct ec_stripe_new	*ec;
@@ -66,8 +69,22 @@ struct open_buckets {
 	open_bucket_idx_t	v[BCH_BKEY_PTRS_MAX];
 };
 
+/*
+ * Per-(write_point, target) WFQ state: next_alloc[i] is the virtual time at
+ * which device i should next be served. The smallest hand wins; the per-pick
+ * increment is 1/free_space[i], so devs with more free space win more often -
+ * the proportional bias is in the increment size.
+ *
+ * cached_devs records which dev mask the next_alloc values are valid for.
+ * On mask change (target switch, rw_devs change, write_point recycled to a
+ * different stream) we bump newly-included devs to min(next_alloc[i] of devs
+ * that were already in scope), so they join at "current virtual time" rather
+ * than at 0 - which would otherwise win every comparison until catching up
+ * to the rest of the hands, starving the other devs in the meantime.
+ */
 struct dev_stripe_state {
 	u64			next_alloc[BCH_SB_MEMBERS_MAX];
+	struct bch_devs_mask	cached_devs;
 };
 
 #define WRITE_POINT_STATES()		\
@@ -119,9 +136,8 @@ struct write_point_specifier {
 	unsigned long		v;
 };
 
-struct bch_fs_usage_base;
-
 struct bch_fs_capacity_pcpu {
+	struct bch_fs_usage_base	usage;
 	u64			sectors_available;
 	u64			online_reserved;
 };
@@ -139,19 +155,19 @@ struct bch_fs_capacity {
 	unsigned		bucket_size_max;
 
 	atomic64_t		sectors_available;
-	struct mutex		sectors_available_lock;
+	spinlock_t		sectors_available_lock;
 
 	struct bch_fs_capacity_pcpu __percpu	*pcpu;
 
-	struct percpu_rw_semaphore	mark_lock;
-
-	seqcount_t			usage_lock;
-	struct bch_fs_usage_base __percpu *usage;
+	struct percpu_rwsem_noio	mark_lock;
 };
 
 struct bch_fs_allocator {
 	struct bch_devs_mask	rw_devs[BCH_DATA_NR];
 	unsigned long		rw_devs_change_count;
+
+	/* fs-wide allocator wake generation; see bch2_alloc_wake_all() */
+	atomic_t		wake_all_counter;
 
 	spinlock_t		freelist_lock;
 	struct closure_waitlist	freelist_wait;
@@ -173,6 +189,60 @@ struct bch_fs_allocator {
 
 	struct write_point	btree_write_point;
 	struct write_point	reconcile_write_point;
+};
+
+typedef struct {
+	u64				dev_bucket;
+	/*
+	 * Stashed at add time so completion doesn't have to re-derive ca via
+	 * c->devs[idx], which dev_remove may have cleared while our io_ref
+	 * still pins the dev object.
+	 */
+	struct bch_dev			*ca;
+	bool				complete;
+	bool				marking_free;
+} discard_in_flight;
+
+struct discard_release {
+	u64		buffer;
+	u64		pending_need_flush;
+	u64		pending_need_rewind_advance;
+	u64		pending_total;
+	u64		free;
+	u64		reserve;
+	u64		buffer_clamped;
+	s64		release;
+	u64		new_rewind_seq;
+	bool		flush_journal;
+	bool		flush_wb;
+};
+
+struct discard_state {
+	u64			seen;
+	u64			not_rw;
+	u64			eexist;
+	u64			eagain;
+	u64			open;
+	u64			need_journal_commit;
+	u64			need_rewind_advance;
+	u64			bad_data_type;
+	u64			discarded;
+	u64			committed;
+	struct bpos		pos;
+	struct discard_release	r;
+};
+
+struct bch_fs_discards {
+	struct work_struct		work;
+	struct bio_set			bioset;
+
+	DARRAY(discard_in_flight)	in_flight;
+	spinlock_t			lock;
+	u32				ref;
+	u8				refs[BCH_SB_MEMBERS_MAX];
+	struct closure_waitlist		wait;
+
+	struct discard_state		s;
 };
 
 #endif /* _BCACHEFS_ALLOC_TYPES_H */

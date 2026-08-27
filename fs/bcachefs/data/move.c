@@ -17,7 +17,9 @@
 
 #include "data/compress.h"
 #include "data/keylist.h"
+#include "data/extents.h"
 #include "data/move.h"
+#include "data/update.h"
 #include "data/read.h"
 #include "data/reconcile/trigger.h"
 #include "data/reflink.h"
@@ -46,7 +48,8 @@ const char * const bch2_data_ops_strs[] = {
 
 struct evacuate_bucket_arg {
 	struct bpos		bucket;
-	int			gen;
+	int			generation;
+	u32			sectors;
 	struct data_update_opts	data_opts;
 };
 
@@ -54,6 +57,14 @@ static int evacuate_bucket_pred(struct btree_trans *, void *,
 				enum btree_id, struct bkey_s_c,
 				struct bch_inode_opts *,
 				struct data_update_opts *);
+
+static void data_update_free_rcu(struct rcu_head *rcu)
+{
+	struct data_update *u = container_of(rcu, struct data_update, rcu);
+
+	bch2_bkey_buf_exit(&u->k);
+	kfree(u);
+}
 
 static void move_write_done(struct bch_write_op *op)
 {
@@ -63,8 +74,16 @@ static void move_write_done(struct bch_write_op *op)
 	atomic_sub(u->k.k->k.size, &ctxt->write_sectors);
 	atomic_dec(&ctxt->write_ios);
 
+	/*
+	 * EC allocation failed — the write never happened but the extent
+	 * still needs erasure coding. Mark it pending so reconcile retries
+	 * from the pending list instead of the main scan.
+	 */
+	if (bch2_err_matches(op->error, BCH_ERR_ec_alloc_failed))
+		bch2_data_update_ec_alloc_failed(u);
+
 	bch2_data_update_exit(u, op->error);
-	kfree_rcu(u, rcu);
+	call_rcu(&u->rcu, data_update_free_rcu);
 	closure_put(&ctxt->cl);
 }
 
@@ -74,10 +93,12 @@ static void move_write(struct data_update *u)
 	struct bch_read_bio *rbio = &u->rbio;
 
 	if (ctxt->stats) {
-		if (rbio->ret)
+		if (rbio->ret) {
 			atomic64_add(u->rbio.bvec_iter.bi_size >> 9,
 				     &ctxt->stats->sectors_error_uncorrected);
-		else if (rbio->saw_error)
+			set_bit(rbio->pick.ptr.dev,
+				ctxt->stats->devs_error_uncorrected.d);
+		} else if (rbio->saw_error)
 			atomic64_add(u->rbio.bvec_iter.bi_size >> 9,
 				     &ctxt->stats->sectors_error_corrected);
 	}
@@ -234,13 +255,7 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	u->rbio.bio.bi_end_io	= move_read_endio;
 	u->rbio.bio.bi_ioprio	= IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0);
 
-	if (ctxt->rate)
-		bch2_ratelimit_increment(ctxt->rate, k.k->size);
-
-	if (ctxt->stats) {
-		atomic64_inc(&ctxt->stats->keys_moved);
-		atomic64_add(u->k.k->k.size, &ctxt->stats->sectors_moved);
-	}
+	u32 size = k.k->size;
 
 	if (bucket_in_flight) {
 		u->b = bucket_in_flight;
@@ -253,6 +268,8 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 
 		list_add_tail(&u->read_list, &ctxt->reads);
 		list_add_tail(&u->io_list, &ctxt->ios);
+
+		u->io_seq = ctxt->io_seq++;
 	}
 
 	/*
@@ -260,15 +277,75 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 	 * ctxt when doing wakeup
 	 */
 	closure_get(&ctxt->cl);
-	__bch2_read_extent(trans, &u->rbio,
-			   u->rbio.bio.bi_iter,
-			   bkey_start_pos(k.k),
-			   iter->btree_id, k, 0,
-			   NULL,
-			   data_opts->read_flags|BCH_READ_last_fragment,
-			   data_opts->read_dev);
+	ret = __bch2_read_extent(trans, &u->rbio,
+				 u->rbio.bio.bi_iter,
+				 bkey_start_pos(k.k),
+				 iter->btree_id, k, 0,
+				 NULL,
+				 data_opts->read_flags|BCH_READ_last_fragment,
+				 data_opts->read_dev);
+	if (ret) {
+		/*
+		 * __bch2_read_extent() only returns an error synchronously
+		 * (transaction restart or ENOMEM during promote setup) before it
+		 * has touched the rbio - move_read_endio() never runs, so the
+		 * read-side setup above has to be unwound by hand.
+		 *
+		 * bch2_data_update_exit() reverses bch2_data_update_init() and
+		 * also drops the in-flight bucket count we took above (update->b
+		 * is its only decrement, tree-wide). What it does NOT cover is
+		 * move.c's own read-side state: the closure ref, the read
+		 * accounting, and read_list.
+		 */
+		closure_put(&ctxt->cl);
+
+		scoped_guard(mutex, &ctxt->lock) {
+			atomic_sub(u->k.k->k.size, &ctxt->read_sectors);
+			atomic_dec(&ctxt->read_ios);
+			list_del(&u->read_list);
+		}
+
+		bch2_data_update_exit(u, ret);
+		u = NULL;
+		return ret;
+	}
 	u = NULL;
+
+	if (ctxt->rate)
+		bch2_ratelimit_increment(ctxt->rate, size);
+
+	if (ctxt->stats) {
+		atomic64_inc(&ctxt->stats->keys_moved);
+		atomic64_add(size, &ctxt->stats->sectors_moved);
+	}
 	return 0;
+}
+
+/*
+ * Btree node rewrites don't construct a data_update, so they don't get
+ * data_update_trace()'s success/failure events on exit - record the
+ * outcome here so btree moves trace like extent moves. @k was copied
+ * before the rewrite: the rewrite frees the node the original key's
+ * memory lived in.
+ */
+static void move_btree_node_trace(struct bch_fs *c,
+				  struct bch_inode_opts *opts,
+				  struct data_update_opts *data_opts,
+				  struct bkey_s_c k, int ret)
+{
+	if (!ret)
+		event_add_trace(c, data_update, c->opts.btree_node_size >> 9, buf, ({
+			bch2_bkey_val_to_text(&buf, c, k);
+			prt_newline(&buf);
+			bch2_data_update_opts_to_text(&buf, c, opts, data_opts);
+		}));
+	else if (bch2_data_update_fail_should_trace(data_opts->type, ret))
+		event_add_trace(c, data_update_fail, c->opts.btree_node_size >> 9, buf, ({
+			bch2_bkey_val_to_text(&buf, c, k);
+			prt_newline(&buf);
+			bch2_data_update_opts_to_text(&buf, c, opts, data_opts);
+			prt_printf(&buf, "\nret:\t%s\n", bch2_err_str(ret));
+		}));
 }
 
 int bch2_move_extent(struct moving_context *ctxt,
@@ -288,8 +365,23 @@ int bch2_move_extent(struct moving_context *ctxt,
 	if (!bkey_is_btree_ptr(k.k))
 		ret = __bch2_move_extent(ctxt, bucket_in_flight, iter, k, opts, data_opts);
 	else if (data_opts->type != BCH_DATA_UPDATE_scrub) {
-		if (data_opts->type != BCH_DATA_UPDATE_copygc)
-			try(bch2_can_do_data_update(trans, opts, data_opts, k, NULL));
+		if (data_opts->type != BCH_DATA_UPDATE_copygc) {
+			ret = bch2_can_do_data_update(trans, opts, data_opts, k, NULL);
+			if (ret) {
+				/*
+				 * The extent leg records pre-check refusals via
+				 * data_update_exit(); no data_update exists here,
+				 * so trace them ourselves:
+				 */
+				if (!bch2_err_matches(ret, BCH_ERR_transaction_restart))
+					move_btree_node_trace(c, opts, data_opts, k, ret);
+				return ret;
+			}
+		}
+
+		struct bkey_buf node_key __cleanup(bch2_bkey_buf_exit);
+		bch2_bkey_buf_init(&node_key);
+		bch2_bkey_buf_reassemble(&node_key, k);
 
 		enum bch_trans_commit_flags commit_flags = data_opts->commit_flags;
 		if ((commit_flags & BCH_WATERMARK_MASK) == BCH_WATERMARK_copygc)
@@ -299,6 +391,12 @@ int bch2_move_extent(struct moving_context *ctxt,
 						  data_opts->target,
 						  data_opts->commit_flags,
 						  data_opts->write_flags);
+
+		/* ENOMEM becomes a restart below and gets retried - not an outcome */
+		if (!bch2_err_matches(ret, BCH_ERR_transaction_restart) &&
+		    !bch2_err_matches(ret, ENOMEM))
+			move_btree_node_trace(c, opts, data_opts,
+					      bkey_i_to_s_c(node_key.k), ret);
 	} else
 		ret = bch2_btree_node_scrub(trans, iter->btree_id, level, k, data_opts->read_dev);
 
@@ -308,7 +406,8 @@ int bch2_move_extent(struct moving_context *ctxt,
 		ret = bch_err_throw(c, transaction_restart_nested);
 	}
 
-	if (!bch2_err_matches(ret, BCH_ERR_transaction_restart) && ctxt->stats)
+	if (!bch2_err_matches(ret, BCH_ERR_transaction_restart) && ctxt->stats &&
+	    !ctxt->stats->phys)
 		atomic64_add(!bkey_is_btree_ptr(k.k)
 			     ? k.k->size
 			     : c->opts.btree_node_size >> 9, &ctxt->stats->sectors_seen);
@@ -344,7 +443,7 @@ static int bch2_move_extent_pred(struct moving_context *ctxt,
 
 		if (pred == evacuate_bucket_pred) {
 			struct evacuate_bucket_arg *e = arg;
-			prt_printf(&buf, " gen=%u", e->gen);
+			prt_printf(&buf, " gen=%u", e->generation);
 		}
 
 		prt_newline(&buf);
@@ -375,8 +474,10 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 	do {
 		delay = ctxt->rate ? bch2_ratelimit_delay(ctxt->rate) : 0;
 
-		if (is_kthread && kthread_should_stop())
-			return 1;
+		try(bch2_kthread_cancelled(c));
+
+		if (unlikely(test_bit(BCH_FS_going_ro, &c->flags)))
+			return bch_err_throw(c, erofs_no_writes);
 
 		if (delay)
 			move_ctxt_wait_event_timeout(ctxt,
@@ -482,11 +583,38 @@ next_nondata:
 	return ret;
 }
 
+/*
+ * Specifies a backpointer namespace to walk.
+ *
+ * BP_WALK_DEV walks BTREE_ID_backpointers for a real device — the common case
+ * for evacuating extents off a device or out of a bucket.
+ *
+ * BP_WALK_EC_ORPHAN walks BTREE_ID_stripe_backpointers at the synthetic
+ * (ec_idx, ec_block) position used for extents whose data device was removed
+ * but who still hold an EC association — see bch2_extent_ptr_to_bp_pos() and
+ * bp_dev_for_ec_removed_dev().
+ */
+struct bp_walk {
+	enum {
+		BP_WALK_DEV,
+		BP_WALK_EC_ORPHAN,
+	} type;
+	union {
+		struct {
+			unsigned	dev;
+		} dev;
+		struct {
+			u64		ec_idx;
+			unsigned	ec_block;
+		} ec_orphan;
+	};
+	u64	sector_start;
+	u64	sector_end;
+};
+
 static int __bch2_move_data_phys(struct moving_context *ctxt,
 			struct move_bucket *bucket_in_flight,
-			unsigned dev,
-			u64 sector_start,
-			u64 sector_end,
+			const struct bp_walk *w,
 			unsigned data_types,
 			bool copygc,
 			move_pred_fn pred, void *arg)
@@ -496,17 +624,37 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 	struct bkey_s_c k;
 	int ret = 0;
 
-	/* Userspace might have supplied @dev: */
-	CLASS(bch2_dev_tryget_noerror, ca)(c, dev);
-	if (!ca)
-		return 0;
+	enum btree_id bp_btree;
+	u64 bp_pos_inode;
+	struct bch_dev *ca __free(bch2_dev_put) = NULL;
 
-	sector_end = min(sector_end, bucket_to_sector(ca, ca->mi.nbuckets));
+	switch (w->type) {
+	case BP_WALK_DEV:
+		bp_btree	= BTREE_ID_backpointers;
+		bp_pos_inode	= w->dev.dev;
+		/* Userspace might have supplied @dev: */
+		ca		= bch2_dev_tryget_noerror(c, w->dev.dev);
+		break;
+	case BP_WALK_EC_ORPHAN:
+		bp_btree	= BTREE_ID_stripe_backpointers;
+		bp_pos_inode	= bp_dev_for_ec_removed_dev(w->ec_orphan.ec_idx,
+							    w->ec_orphan.ec_block);
+		break;
+	default:
+		BUG();
+	}
 
-	u64 check_mismatch_done = sector_to_bucket(ca, sector_start);
+	u64 sector_start = w->sector_start;
+	u64 sector_end	 = w->sector_end;
 
-	struct bpos bp_start	= POS(dev, sector_start	<< c->sb.extent_bp_shift);
-	struct bpos bp_end	= POS(dev, sector_end	<< c->sb.extent_bp_shift);
+	u64 check_mismatch_done = 0;
+	if (ca) {
+		sector_end		= min(sector_end, bucket_to_sector(ca, ca->mi.nbuckets));
+		check_mismatch_done	= sector_to_bucket(ca, sector_start);
+	}
+
+	struct bpos bp_start	= POS(bp_pos_inode, sector_start << c->sb.extent_bp_shift);
+	struct bpos bp_end	= POS(bp_pos_inode, sector_end	 << c->sb.extent_bp_shift);
 
 	struct wb_maybe_flush last_flushed __cleanup(wb_maybe_flush_exit);
 	wb_maybe_flush_init(&last_flushed);
@@ -516,7 +664,7 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 	 */
 	bch2_trans_begin(trans);
 
-	CLASS(btree_iter, bp_iter)(trans, BTREE_ID_backpointers, bp_start, 0);
+	CLASS(btree_iter, bp_iter)(trans, bp_btree, bp_start, 0);
 
 	ret = bch2_btree_write_buffer_tryflush(trans);
 	if (!bch2_err_matches(ret, EROFS))
@@ -537,7 +685,8 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 		if (!k.k || bkey_gt(k.k->p, bp_end))
 			break;
 
-		if (check_mismatch_done < bp_pos_to_bucket(ca, k.k->p).offset) {
+		if (ca &&
+		    check_mismatch_done < bp_pos_to_bucket(ca, k.k->p).offset) {
 			while (check_mismatch_done < bp_pos_to_bucket(ca, k.k->p).offset)
 				bch2_check_bucket_backpointer_mismatch(trans, ca, check_mismatch_done++,
 								       copygc, &last_flushed);
@@ -554,12 +703,18 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 		if (ctxt->stats)
 			ctxt->stats->offset = bp.k->p.offset >> c->sb.extent_bp_shift;
 
-		if (!(data_types & BIT(bp.v->data_type)) ||
-		    (!bp.v->level && bp.v->btree_id == BTREE_ID_stripes)) {
-			bch2_btree_iter_advance(&bp_iter);
-			continue;
-		}
-
+		/*
+		 * Resolve every backpointer we walk, including ones we're not
+		 * moving: resolution is what repairs a dangling backpointer
+		 * (backpointer_to_missing_ptr, autofix), and the per-bucket
+		 * accounting check (bch2_check_bucket_backpointer_mismatch,
+		 * above) can only detect missing backpointers reliably if
+		 * dangling ones have been deleted first - a skipped dangling
+		 * backpointer keeps contributing its data_type/gen/len to the
+		 * sums, hiding the mismatch forever. Copygc then livelocks:
+		 * is_movable keeps approving the bucket, evacuation skips all
+		 * its backpointers and moves nothing, repeat.
+		 */
 		CLASS(btree_iter_uninit, iter)(trans);
 		k = bch2_backpointer_get_key(trans, bp, &iter, 0, &last_flushed);
 		ret = bkey_err(k);
@@ -572,10 +727,21 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 			continue;
 		}
 
+		/* Not moving these; resolving them above still verified them: */
+		if (!(data_types & BIT(bp.v->data_type)) ||
+		    (!bp.v->level && bp.v->btree_id == BTREE_ID_stripes)) {
+			bch2_btree_iter_advance(&bp_iter);
+			continue;
+		}
+
+		u32 bucket_len = bp.v->bucket_len;
+
 		ret = bch2_move_extent_pred(ctxt, bucket_in_flight, NULL, pred, arg, &iter, bp.v->level, k);
 
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			continue;
+		if (ctxt->stats)
+			atomic64_add(bucket_len, &ctxt->stats->sectors_seen);
 		if (bch2_err_matches(ret, BCH_ERR_data_update_fail))
 			ret = 0; /* failure for this extent, keep going */
 		if (bch2_err_matches(ret, EAGAIN) ||
@@ -587,7 +753,15 @@ static int __bch2_move_data_phys(struct moving_context *ctxt,
 		bch2_btree_iter_advance(&bp_iter);
 	}
 
-	while (check_mismatch_done < sector_to_bucket(ca, sector_end))
+	/*
+	 * Audit the buckets the walk didn't reach - but only if it actually
+	 * finished. If we were cancelled or hit an error we didn't skip those
+	 * buckets because they had nothing to walk, we just stopped; auditing
+	 * them is then both wrong and slow, and this loop is slow enough to be
+	 * the thing a user waits on after hitting ctrl-C.
+	 */
+	while (!ret && ca &&
+	       check_mismatch_done < sector_to_bucket(ca, sector_end))
 		bch2_check_bucket_backpointer_mismatch(trans, ca, check_mismatch_done++,
 						       copygc, &last_flushed);
 
@@ -616,7 +790,14 @@ int bch2_move_data_phys(struct bch_fs *c,
 
 	bch2_btree_write_buffer_flush_sync(ctxt.trans);
 
-	return __bch2_move_data_phys(&ctxt, NULL, dev, start, end, data_types, false, pred, arg);
+	struct bp_walk w = {
+		.type		= BP_WALK_DEV,
+		.dev		= { .dev = dev },
+		.sector_start	= start,
+		.sector_end	= end,
+	};
+
+	return __bch2_move_data_phys(&ctxt, NULL, &w, data_types, false, pred, arg);
 }
 
 struct evacuate_arg {
@@ -648,11 +829,74 @@ int bch2_evacuate_data(struct moving_context *ctxt,
 {
 	struct evacuate_arg arg = { .dev = dev };
 
-	return __bch2_move_data_phys(ctxt, NULL,
-				     dev, start, end,
-				     ~0,
-				     false,
+	struct bp_walk w = {
+		.type		= BP_WALK_DEV,
+		.dev		= { .dev = dev },
+		.sector_start	= start,
+		.sector_end	= end,
+	};
+
+	return __bch2_move_data_phys(ctxt, NULL, &w, ~0, false,
 				     evacuate_pred, &arg);
+}
+
+struct evacuate_ec_orphan_arg {
+	u64		ec_idx;
+	unsigned	ec_block;
+};
+
+/*
+ * Evacuate predicate for stripe blocks whose underlying device has been
+ * removed: the extent's bch_extent_ptr.dev is BCH_SB_MEMBER_INVALID and the
+ * stripe association lives in the bch_extent_stripe_ptr that pairs with it.
+ * We can't match on ptr->dev here (it's the sentinel for *every* removed-dev
+ * extent); we have to match on the (stripe idx, block) pair carried in the
+ * decoded ec entry.
+ */
+static int evacuate_ec_orphan_pred(struct btree_trans *trans, void *_arg,
+				   enum btree_id btree, struct bkey_s_c k,
+				   struct bch_inode_opts *io_opts,
+				   struct data_update_opts *data_opts)
+{
+	struct bch_fs *c = trans->c;
+	struct evacuate_ec_orphan_arg *arg = _arg;
+	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
+	const union bch_extent_entry *entry;
+	struct extent_ptr_decoded p = {};
+	unsigned ptr_bit = 1;
+
+	data_opts->read_dev = -1;
+
+	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+		if (p.ptr.dev == BCH_SB_MEMBER_INVALID &&
+		    p.has_ec &&
+		    p.ec.idx == arg->ec_idx &&
+		    p.ec.block == arg->ec_block)
+			data_opts->ptrs_kill |= ptr_bit;
+		ptr_bit <<= 1;
+	}
+
+	return data_opts->ptrs_kill != 0;
+}
+
+int bch2_evacuate_ec_orphan(struct moving_context *ctxt,
+			    u64 ec_idx, unsigned ec_block,
+			    u64 start, u64 end)
+{
+	struct evacuate_ec_orphan_arg arg = {
+		.ec_idx		= ec_idx,
+		.ec_block	= ec_block,
+	};
+
+	struct bp_walk w = {
+		.type		= BP_WALK_EC_ORPHAN,
+		.ec_orphan	= { .ec_idx = ec_idx, .ec_block = ec_block },
+		.sector_start	= start,
+		.sector_end	= end,
+	};
+
+	return __bch2_move_data_phys(ctxt, NULL, &w, ~0, false,
+				     evacuate_ec_orphan_pred, &arg);
 }
 
 static int evacuate_bucket_pred(struct btree_trans *trans, void *_arg,
@@ -666,12 +910,16 @@ static int evacuate_bucket_pred(struct btree_trans *trans, void *_arg,
 	*data_opts = arg->data_opts;
 	data_opts->read_dev = -1;
 
+	const union bch_extent_entry *entry;
+	struct extent_ptr_decoded p = {};
 	unsigned i = 0;
-	bkey_for_each_ptr(bch2_bkey_ptrs_c(k), ptr) {
-		if (ptr->dev == arg->bucket.inode &&
-		    (arg->gen < 0 || arg->gen == ptr->gen) &&
-		    !ptr->cached)
+	bkey_for_each_ptr_decode(k.k, bch2_bkey_ptrs_c(k), p, entry) {
+		if (p.ptr.dev == arg->bucket.inode &&
+		    (arg->generation < 0 || arg->generation == p.ptr.generation) &&
+		    !p.ptr.cached) {
 			data_opts->ptrs_kill |= BIT(i);
+			arg->sectors += p.crc.compressed_size;
+		}
 		i++;
 	}
 
@@ -684,25 +932,28 @@ int bch2_evacuate_bucket(struct moving_context *ctxt,
 			 struct data_update_opts data_opts)
 {
 	struct bch_fs *c = ctxt->trans->c;
-	struct evacuate_bucket_arg arg = { bucket, gen, data_opts, };
+	struct evacuate_bucket_arg arg = { bucket, gen, 0, data_opts, };
 
 	/* Userspace might have supplied @dev: */
 	CLASS(bch2_dev_tryget_noerror, ca)(c, bucket.inode);
 	if (!ca)
 		return 0;
 
-	int ret = __bch2_move_data_phys(ctxt, bucket_in_flight,
-					bucket.inode,
-					bucket_to_sector(ca, bucket.offset),
-					bucket_to_sector(ca, bucket.offset + 1),
-					~0,
-					true,
+	struct bp_walk w = {
+		.type		= BP_WALK_DEV,
+		.dev		= { .dev = bucket.inode },
+		.sector_start	= bucket_to_sector(ca, bucket.offset),
+		.sector_end	= bucket_to_sector(ca, bucket.offset + 1),
+	};
+
+	int ret = __bch2_move_data_phys(ctxt, bucket_in_flight, &w, ~0, true,
 					evacuate_bucket_pred, &arg);
 
 	event_inc_trace(c, evacuate_bucket, buf, ({
 		prt_printf(&buf, "bucket: ");
 		bch2_bpos_to_text(&buf, bucket);
 		prt_printf(&buf, " gen: %i ret %s\n", gen, bch2_err_str(ret));
+		prt_printf(&buf, "%u/%u sectors\n", arg.sectors, ca->mi.bucket_size);
 	}));
 
 	return ret;
@@ -734,6 +985,219 @@ static int scrub_pred(struct btree_trans *trans, void *_arg,
 	return true;
 }
 
+#include "journal/read.h"
+#include "btree/journal_overlay.h"
+
+int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
+{
+	CLASS(darray_u64, flushes)();
+	int ret = 0;
+
+	u64 last_entry_time = 0;
+	*rewind_seq = 0;
+
+	struct journal_replay **_i;
+	struct genradix_iter radix_iter;
+	genradix_for_each(&c->journal_entries, radix_iter, _i) {
+		struct journal_replay *i = *_i;
+
+		if (!journal_replay_ignore(i) &&
+		    !JSET_NO_FLUSH(&i->j)) {
+			u64 t = jset_datetime(&i->j);
+			if (!last_entry_time)
+				last_entry_time = t;
+			else if (time_before64(t + c->opts.scrub_journal_max_rewind_secs, last_entry_time))
+				break;
+
+			try(darray_push(&flushes, le64_to_cpu(i->j.seq)));
+		}
+	}
+
+	if (!flushes.nr) {
+		bch_info(c, "%s(): No journal flushes found", __func__);
+		return 0;
+	}
+
+	bch_info(c, "journal scrub: checking %zu flush ranges",
+		 flushes.nr);
+
+	struct bch_move_stats stats;
+	bch2_move_stats_init(&stats, "journal_scrub");
+
+	struct moving_context ctxt __cleanup(bch2_moving_ctxt_exit);
+	bch2_moving_ctxt_init(&ctxt, c, NULL, &stats, (struct write_point_specifier) {}, false);
+
+	struct btree_trans *trans = ctxt.trans;
+	struct journal_keys *keys = &c->journal_keys;
+
+	/*
+	 * Scrub one flush range at a time, newest first. Within each range,
+	 * fire off all reads asynchronously, then flush once to check for
+	 * errors. Walk backwards until we find a good range — everything
+	 * newer is tainted.
+	 *
+	 * Stop if we've gone further back than scrub_journal_max_rewind_secs seconds.
+	 */
+	unsigned nr_good = 0;
+
+	for (int f = flushes.nr - 1; f > 0; f--) {
+		u64 range_start = flushes.data[f - 1];
+		u64 range_end   = flushes.data[f];
+		u64 errors_before = atomic64_read(&stats.sectors_error_uncorrected);
+		memset(&stats.devs_error_uncorrected, 0, sizeof(stats.devs_error_uncorrected));
+		int move_ret = 0;
+
+		darray_for_each(*keys, jk) {
+			u64 seq = c->journal_entries_base_seq + jk->journal_seq_offset;
+			struct bkey_s_c k = bkey_i_to_s_c(journal_key_k(c, jk));
+
+
+			if (seq <= range_start || seq > range_end)
+				continue;
+
+			struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
+			if (!ptrs.start)
+				continue;
+
+			struct bch_inode_opts io_opts;
+			bch2_inode_opts_get(c, &io_opts, bkey_is_btree_ptr(k.k));
+
+			bkey_for_each_ptr(ptrs, ptr) {
+				struct data_update_opts data_opts = {
+					.type		= BCH_DATA_UPDATE_scrub_no_repair,
+					.read_flags	= BCH_READ_hard_require_read_device,
+					.read_dev	= ptr->dev,
+				};
+				ret = lockrestart_do(trans, ({
+					struct bkey_s_c k2;
+
+					CLASS(btree_node_iter, iter)(trans, jk->btree_id, k.k->p, 0, jk->level,
+								     BTREE_ITER_all_snapshots);
+					int ret2 = bkey_err(k2 = bch2_btree_iter_peek_slot(&iter));
+
+					BUG_ON(!ret2 && !bkey_and_val_eq(k, k2));
+
+					ret2 ?:
+					bch2_move_extent(&ctxt, NULL, &io_opts, &data_opts, &iter, jk->level, k);
+				}));
+
+				if (ret)
+					move_ret = ret;
+			}
+		}
+
+		bch2_moving_ctxt_flush_all(&ctxt);
+
+		if (move_ret)
+			bch_err(c, "journal scrub: move error %s in flush range seq %llu-%llu",
+				bch2_err_str(move_ret),
+				range_start + 1, range_end == U64_MAX ? range_start : range_end);
+
+		bool checksum_err = atomic64_read(&stats.sectors_error_uncorrected) != errors_before;
+
+		if (checksum_err) {
+			bch2_sb_error_count(c, BCH_FSCK_ERR_device_bad_flush);
+			CLASS(bch_log_msg, msg)(c);
+			prt_printf(&msg.m, "journal scrub: checksum errors in flush range seq %llu-%llu, "
+				"device(s) not honoring flush/FUA:",
+				range_start + 1, range_end == U64_MAX ? range_start : range_end);
+
+			unsigned i;
+			for_each_set_bit(i, stats.devs_error_uncorrected.d, BCH_SB_MEMBERS_MAX) {
+				CLASS(bch2_dev_tryget_noerror, ca)(c, i);
+				if (ca)
+					prt_printf(&msg.m, " %s", ca->name);
+				else
+					prt_printf(&msg.m, " dev%u", i);
+			}
+
+			guard(mutex_noio)(&c->sb_lock);
+			for_each_set_bit(i, stats.devs_error_uncorrected.d, BCH_SB_MEMBERS_MAX) {
+				struct bch_member *m = bch2_members_v2_get_mut(c->disk_sb.sb, i);
+				if (m)
+					le64_add_cpu(&m->flush_errors, 1);
+			}
+			bch2_write_super(c);
+
+			*rewind_seq = range_start;
+			nr_good = 0;
+		} else if (++nr_good >= 2) {
+			/* Two consecutive good ranges — safe to stop */
+			break;
+		}
+	}
+
+	return 0;
+}
+
+static int scrub_journal_repair_one(struct moving_context *ctxt,
+				    scrub_journal_repair *r)
+{
+	struct btree_trans *trans = ctxt->trans;
+	struct bch_fs *c = trans->c;
+	struct bkey_s_c stashed = bkey_i_to_s_c(&r->k);
+
+	CLASS(btree_iter, iter)(trans, r->btree_id, bkey_start_pos(stashed.k),
+				BTREE_ITER_intent);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
+
+	if (!bch2_extents_match(c, k, stashed))
+		return 0;
+
+	/*
+	 * Trim both keys to the overlapping range before remapping,
+	 * same as data_update_index_update_key does.
+	 */
+	struct bkey_i *trimmed = errptr_try(bch2_trans_kmalloc(trans, bkey_bytes(k.k)));
+	bkey_reassemble(trimmed, k);
+	bch2_cut_front(c, bkey_start_pos(stashed.k), trimmed);
+	bch2_cut_back(stashed.k->p, trimmed);
+
+	unsigned bad_devs = ptr_mask_remap(c, stashed, r->bad_devs, bkey_i_to_s_c(trimmed));
+	if (!bad_devs)
+		return 0;
+
+	struct bch_inode_opts io_opts;
+	bch2_inode_opts_get(c, &io_opts, bkey_is_btree_ptr(k.k));
+
+	struct data_update_opts data_opts = {
+		.type		= BCH_DATA_UPDATE_self_heal,
+		.ptrs_io_error	= bad_devs,
+		.ptrs_kill	= bad_devs,
+	};
+
+	return bch2_move_extent(ctxt, NULL, &io_opts, &data_opts, &iter, 0, k);
+}
+
+int bch2_scrub_journal_do_repairs(struct bch_fs *c)
+{
+	CLASS(darray_scrub_journal_repair, repairs)();
+
+	mutex_lock(&c->scrub_journal_repairs_lock);
+	swap(repairs, c->scrub_journal_repairs);
+	mutex_unlock(&c->scrub_journal_repairs_lock);
+
+	if (!repairs.nr)
+		return 0;
+
+	bch_info(c, "journal scrub: repairing %zu extents with bad replicas", repairs.nr);
+
+	struct bch_move_stats stats;
+	bch2_move_stats_init(&stats, "journal_scrub_repair");
+
+	struct moving_context ctxt __cleanup(bch2_moving_ctxt_exit);
+	bch2_moving_ctxt_init(&ctxt, c, NULL, &stats,
+			      writepoint_ptr(&c->allocator.reconcile_write_point),
+			      true);
+
+	darray_for_each(repairs, r) {
+		/* Ignore errors - don't want them blocking mount */
+		lockrestart_do(ctxt.trans, scrub_journal_repair_one(&ctxt, r));
+	}
+
+	return 0;
+}
+
 int bch2_data_job(struct bch_fs *c,
 		  struct bch_move_stats *stats,
 		  struct bch_ioctl_data *op)
@@ -741,7 +1205,7 @@ int bch2_data_job(struct bch_fs *c,
 	int ret = 0;
 
 	if (op->op >= BCH_DATA_OP_NR)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_data_job_bad_op);
 
 	bch2_move_stats_init(stats, bch2_data_ops_strs[op->op]);
 
@@ -770,7 +1234,7 @@ int bch2_data_job(struct bch_fs *c,
 	return ret;
 }
 
-void bch2_move_stats_to_text(struct printbuf *out, struct bch_move_stats *stats)
+__cold void bch2_move_stats_to_text(struct printbuf *out, struct bch_move_stats *stats)
 {
 	prt_printf(out, "%s: data type==", stats->name);
 	bch2_prt_data_type(out, stats->data_type);
@@ -794,7 +1258,7 @@ void bch2_move_stats_to_text(struct printbuf *out, struct bch_move_stats *stats)
 	prt_newline(out);
 }
 
-static void bch2_moving_ctxt_to_text(struct printbuf *out, struct bch_fs *c, struct moving_context *ctxt)
+static __cold void bch2_moving_ctxt_to_text(struct printbuf *out, struct bch_fs *c, struct moving_context *ctxt)
 {
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 32);
@@ -823,7 +1287,7 @@ static void bch2_moving_ctxt_to_text(struct printbuf *out, struct bch_fs *c, str
 	}
 }
 
-void bch2_fs_moving_ctxts_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_fs_moving_ctxts_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	struct moving_context *ctxt;
 
@@ -832,8 +1296,15 @@ void bch2_fs_moving_ctxts_to_text(struct printbuf *out, struct bch_fs *c)
 			bch2_moving_ctxt_to_text(out, c, ctxt);
 }
 
+void bch2_fs_move_exit(struct bch_fs *c)
+{
+	darray_exit(&c->scrub_journal_repairs);
+}
+
 void bch2_fs_move_init(struct bch_fs *c)
 {
 	INIT_LIST_HEAD(&c->moving_context_list);
 	mutex_init(&c->moving_context_lock);
+	darray_init(&c->scrub_journal_repairs);
+	mutex_init(&c->scrub_journal_repairs_lock);
 }

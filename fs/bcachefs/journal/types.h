@@ -21,41 +21,75 @@
 #define JOURNAL_STATE_BUF_NR	(1U << JOURNAL_STATE_BUF_BITS)
 #define JOURNAL_STATE_BUF_MASK	(JOURNAL_STATE_BUF_NR - 1)
 
-#define JOURNAL_BUF_BITS	4
-#define JOURNAL_BUF_NR		(1U << JOURNAL_BUF_BITS)
-#define JOURNAL_BUF_MASK	(JOURNAL_BUF_NR - 1)
+struct journal;
 
 /*
- * We put JOURNAL_BUF_NR of these in struct journal; we used them for writes to
- * the journal that are being staged or in flight.
+ * One journal buffer: staging area for a journal entry. Dynamically
+ * allocated per journal entry (one per seq), rides j->in_flight from
+ * the moment the entry is opened until its write completes and
+ * seq_ondisk advances past it.
+ *
+ * Reservation concurrency is bounded by JOURNAL_STATE_BUF_NR via the
+ * reservation state encoded in j->reservations; in-flight depth is
+ * bounded only by the in_flight FIFO capacity (grown on demand) and
+ * natural memory/device backpressure.
  */
 struct journal_buf {
 	struct closure		io;
+	struct journal		*j;		/* for container_of-equivalent recovery */
 	struct jset		*data;
 
 	__BKEY_PADDED(key, BCH_REPLICAS_MAX);
+	/*
+	 * @cas mirrors the dev ptrs in @key in append order: cas[i] is the
+	 * bch_dev * for which __journal_write_alloc holds an io_ref.  Stashed
+	 * so the alloc → submit (or alloc → no_io) gap doesn't have to
+	 * re-derive ca via c->devs[idx], which dev_remove may have cleared
+	 * while our io_ref still pins the dev object.
+	 */
+	struct bch_dev		*cas[BCH_REPLICAS_MAX];
 	struct bch_devs_list	devs_written;
 	struct bch_io_failures	failed;
 
-	struct closure_waitlist	wait;
 	u64			last_seq;	/* copy of data->last_seq */
-	long			expires;
-	u64			flush_time;
 
 	unsigned		buf_size;	/* size in bytes of @data */
 	unsigned		sectors;	/* maximum size for current entry */
 	unsigned		disk_sectors;	/* maximum size entry could have been, if
 						   buf_size was bigger */
 	unsigned		u64s_reserved;
-	bool			noflush:1;	/* write has already been kicked off, and was noflush */
-	bool			must_flush:1;	/* something wants a flush */
+
+	/* write has already been or waiting to be kicked off */
+	bool			flush_picked:1;
+	bool			flush:1;
+
 	bool			separate_flush:1;
 	bool			need_flush_to_write_buffer:1;
 	bool			write_started:1;
 	bool			write_allocated:1;
 	bool			write_done:1;
 	bool			empty:1;
-	u8			idx;
+	bool			has_overwrites:1;
+
+	/* must not be memset, only manipulated by xchg/cmpxchg */
+	struct closure_waitlist	wait;
+};
+
+/*
+ * Ring slot for open reservations. Cache of the journal_buf pointer and
+ * its data pointer, indexed by seq & JOURNAL_STATE_BUF_MASK. The
+ * reservation fastpath reads .data directly to avoid the extra
+ * indirection through .buf.
+ *
+ * A ring slot is overwritten in journal_entry_open() when a new seq is
+ * assigned to that state index. Stale entries are never dereferenced
+ * because the only readers are reservation holders (trusted: the
+ * reservation pins the buf) or journal_res_entry() via those reservations.
+ * All non-reservation seq→buf lookups go through j->in_flight.
+ */
+struct journal_ringbuf {
+	struct journal_buf	*buf;
+	struct jset		*data;
 };
 
 /*
@@ -74,11 +108,16 @@ enum journal_pin_type {
 };
 
 struct journal_entry_pin_list {
-	struct list_head		unflushed[JOURNAL_PIN_TYPE_NR];
-	struct list_head		flushed[JOURNAL_PIN_TYPE_NR];
+	spinlock_t			lock;
 	atomic_t			count;
-	union bch_replicas_padded	devs;
-	size_t				bytes;
+	struct list_head		unflushed[JOURNAL_PIN_TYPE_NR];
+	struct list_head		flushed;
+	bool				unreplayed;
+	struct {
+		u8			nr;
+		u8			data[BCH_REPLICAS_MAX];
+	}				devs;
+	unsigned			bytes;
 };
 
 struct journal;
@@ -94,6 +133,7 @@ struct journal_entry_pin {
 
 struct journal_res {
 	bool			ref;
+	bool			has_overwrites;
 	u16			u64s;
 	u32			offset;
 	u64			seq;
@@ -108,15 +148,34 @@ union journal_res_state {
 		u64		v;
 	};
 
+	/*
+	 * Field order is reversed on big-endian so the on-word bit layout is
+	 * identical on both: cur_entry_offset at bit 0, idx at 22, then the four
+	 * counts at bit 24 + idx*10. That invariant lets journal_state_count() /
+	 * _inc() / _buf_put() index a count with a single shift, not a switch.
+	 */
 	struct {
+#ifdef __LITTLE_ENDIAN_BITFIELD
 		u64		cur_entry_offset:22,
 				idx:2,
 				buf0_count:10,
 				buf1_count:10,
 				buf2_count:10,
 				buf3_count:10;
+#else
+		u64		buf3_count:10,
+				buf2_count:10,
+				buf1_count:10,
+				buf0_count:10,
+				idx:2,
+				cur_entry_offset:22;
+#endif
 	};
 };
+
+#define JOURNAL_STATE_BUF_COUNT_BITS	10	/* matches bufN_count:10 above */
+#define JOURNAL_STATE_BUF_COUNT_MAX	((1U << JOURNAL_STATE_BUF_COUNT_BITS) - 1)
+#define JOURNAL_STATE_BUF0_SHIFT	24	/* cur_entry_offset:22 + idx:2 */
 
 /* bytes: */
 #define JOURNAL_ENTRY_SIZE_MIN		(64U << 10) /* 64k */
@@ -159,9 +218,11 @@ enum journal_space_from {
 	x(running)			\
 	x(may_skip_flush)		\
 	x(need_flush_write)		\
+	x(med_on_space)			\
 	x(low_on_space)			\
 	x(low_on_pin)			\
-	x(low_on_wb)
+	x(low_on_wb)			\
+	x(low_on_open_buckets)
 
 enum journal_flags {
 #define x(n)	JOURNAL_##n,
@@ -171,10 +232,15 @@ enum journal_flags {
 
 struct journal_bio {
 	struct bch_dev		*ca;
-	unsigned		buf_idx;
+	struct journal_buf	*buf;
 	u64			submit_time;
 
 	struct bio		bio;
+};
+
+struct journal_rewind_range {
+	u64			from;
+	u64			to;
 };
 
 /* Embedded in struct bch_fs */
@@ -188,6 +254,9 @@ struct journal {
 	} __aligned(SMP_CACHE_BYTES);
 
 	unsigned long		flags;
+#ifdef CONFIG_BCACHEFS_DEBUG
+	struct task_struct	*stop_thread;
+#endif
 
 	/* Max size of current journal entry */
 	unsigned		cur_entry_u64s;
@@ -216,12 +285,30 @@ struct journal {
 	 * reservation: for synchronization between the btree write buffer code
 	 * and the journal write path:
 	 */
-	struct mutex		buf_lock;
+	struct mutex_noio	buf_lock;
 	/*
-	 * Two journal entries -- one is currently open for new entries, the
-	 * other is possibly being written out.
+	 * Ring of slots indexed by seq & JOURNAL_STATE_BUF_MASK; only used by
+	 * the reservation fastpath. Updated in journal_entry_open() when a new
+	 * seq is assigned to the slot's state index.
 	 */
-	struct journal_buf	buf[JOURNAL_BUF_NR];
+	struct journal_ringbuf	ring[JOURNAL_STATE_BUF_NR];
+
+	/*
+	 * FIFO of in-flight journal bufs, one entry per seq in
+	 * (seq_ondisk, cur_seq]. fifo.front = seq_ondisk + 1, fifo.back =
+	 * cur_seq + 1, so seq-indexed lookup is O(1) via fifo_entry().
+	 * Bufs live inline in the FIFO's backing array: pushed (and zeroed)
+	 * in journal_entry_open(), freed (front-advanced) in
+	 * journal_write_done() as seq_ondisk advances.
+	 */
+	FIFO_U64_IDX(struct journal_buf) in_flight;
+
+	/*
+	 * When we need a flush but no open journal entry was flushable, wait
+	 * here - transferred to journal_buf.wait on entry open
+	 */
+	struct closure_waitlist	flush_wait;
+
 	void			*free_buf;
 	unsigned		free_buf_size;
 
@@ -229,9 +316,9 @@ struct journal {
 
 	/* if nonzero, we may not open a new journal entry: */
 	unsigned		blocked;
+	unsigned		flushes_outstanding;
 
 	/* Used when waiting because the journal was full */
-	wait_queue_head_t	wait;
 	struct closure_waitlist	async_wait;
 	struct closure_waitlist	reclaim_flush_wait;
 
@@ -246,11 +333,23 @@ struct journal {
 	/* seq, last_seq from the most recent journal entry successfully written */
 	u64			seq_ondisk;
 	u64			flushed_seq_ondisk;
-	u64			flushing_seq;
+	atomic64_t		flushing_seq;
 	u64			last_seq_ondisk;
 	u64			err_seq;
 	u64			last_empty_seq;
 	u64			oldest_seq_found_ondisk;
+
+	/* Oldest journal seq that is safe to rewind to — discards of buckets
+	 * freed at >= this seq have not yet been issued */
+	u64			rewind_seq;
+	u64			rewind_seq_ondisk;
+
+	/*
+	 * Rewind ranges: keys from journal entries with seq
+	 * in (to, from] use overwrite entries instead of
+	 * btree_keys entries.
+	 */
+	DARRAY(struct journal_rewind_range) rewind_ranges;
 
 	/*
 	 * FIFO of journal entries whose btree updates have not yet been
@@ -268,10 +367,13 @@ struct journal {
 	 * needed. When all journal entries in the oldest journal bucket are no
 	 * longer needed, the bucket can be discarded and reused.
 	 */
-	struct {
-		u64 front, back, size, mask;
-		struct journal_entry_pin_list *data;
-	}			pin;
+	FIFO_U64_IDX(struct journal_entry_pin_list) pin;
+	struct percpu_rw_semaphore pin_resize_lock;
+	struct work_struct	pin_resize_work;
+
+	/* Flushes under-replicated pins when a device comes back: */
+	struct work_struct	flush_degraded_work;
+
 	u64			last_seq;
 
 	size_t			dirty_entry_bytes;
@@ -282,6 +384,11 @@ struct journal {
 	u64			replay_journal_seq_end;
 
 	struct write_point	wp;
+	/*
+	 * Failure domain keys scratch for journal_write_alloc() - like
+	 * wp.stripe, protected by journal writes being allocated in order:
+	 */
+	u64			wp_domain_keys[BCH_SB_MEMBERS_MAX];
 	spinlock_t		err_lock;
 
 	struct mutex		reclaim_lock;
@@ -344,8 +451,12 @@ struct journal_device {
 
 	u64			*buckets;
 
-	/* Bio for journal reads/writes to this device */
-	struct journal_bio	*bio[JOURNAL_BUF_NR];
+	/*
+	 * Bioset for journal write bios. Journal writes allocate from this at
+	 * submit time and free on completion; the pool size bounds the
+	 * mempool reserve, not in-flight depth.
+	 */
+	struct bio_set		bio_set;
 
 	struct mutex		discard_lock;
 	struct work_struct	discard;
@@ -362,10 +473,36 @@ struct journal_entry_res {
 	unsigned		u64s;
 };
 
+/*
+ * Computed by bch2_journal_read(), consumed by bch2_fs_recovery() and
+ * bch2_fs_journal_start():
+ *
+ * After journal read we have three sequence number zones:
+ *
+ *   [last_seq ... replay_end]  [replay_end+1 ... cur_seq-1]  [cur_seq ...]
+ *         replay these              blacklist these            new writes
+ *
+ * @last_seq:	Start of replay window — from last flush entry's last_seq.
+ *		All entries >= last_seq are needed for recovery.
+ *
+ * @replay_end:	End of replay window — last flush entry's seq.
+ *		Entries past this may exist on disk (noflush/torn writes)
+ *		but are unreliable.
+ *
+ * @cur_seq:	First sequence number available for new journal writes.
+ *		Initialized to highest on-disk entry + 1, then bumped
+ *		further by recovery (+64 for unclean
+ *		shutdown) and max'd with last blacklisted seq.
+ *		Must be strictly greater than every entry found on disk,
+ *		including noflush/blacklisted entries — we must never
+ *		reuse a sequence number that was already written.
+ *
+ * @clean:	Last flush entry was empty (filesystem was clean).
+ */
 struct journal_start_info {
-	u64	seq_read_start;
-	u64	seq_read_end;
-	u64	start_seq;
+	u64	last_seq;
+	u64	replay_end;
+	u64	cur_seq;
 	bool	clean;
 };
 

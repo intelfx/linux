@@ -54,22 +54,30 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 
 	sectors = min_t(u64, sectors, k.k->p.offset - iter->pos.offset);
 	new_replicas = max(0, (int) opts.data_replicas -
-			   (int) bch2_bkey_nr_ptrs_fully_allocated(c, k));
+			   (int) bch2_bkey_durability_safe(c, k).nr_overwritable);
 
 	/*
 	 * Get a disk reservation before (in the nocow case) calling
 	 * into the allocator:
 	 */
-	ret = bch2_disk_reservation_get(c, &res.r, sectors, new_replicas, 0);
-	if (unlikely(ret))
+	ret = bch2_disk_reservation_get(c, &res.r, sectors, new_replicas,
+				       BCH_DISK_RESERVATION_PARTIAL);
+	if (unlikely(!res.r.sectors && new_replicas)) {
+		ret = bch_err_throw(c, ENOSPC_disk_reservation);
 		goto err_noprint;
+	}
+
+	if (new_replicas)
+		sectors = div_u64(res.r.sectors, new_replicas);
 
 	bch2_bkey_buf_reassemble(&old, k);
 
+	unsigned new_buf_u64s;
 	if (!unwritten) {
 		struct bkey_i_reservation *reservation;
 
-		bch2_bkey_buf_realloc(&new, sizeof(*reservation) / sizeof(u64));
+		new_buf_u64s = sizeof(*reservation) / sizeof(u64);
+		bch2_bkey_buf_realloc(&new, new_buf_u64s);
 		reservation = bkey_reservation_init(new.k);
 		reservation->k.p = iter->pos;
 		bch2_key_resize(&reservation->k, sectors);
@@ -81,12 +89,13 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 
 		devs_have.nr = 0;
 
-		bch2_bkey_buf_realloc(&new, BKEY_EXTENT_U64s_MAX);
+		new_buf_u64s = BKEY_EXTENT_U64s_MAX;
+		bch2_bkey_buf_realloc(&new, new_buf_u64s);
 
 		e = bkey_extent_init(new.k);
 		e->k.p = iter->pos;
 
-		struct alloc_request *req;
+		struct alloc_request *req __free(alloc_request_put) = NULL;
 		ret = PTR_ERR_OR_ZERO(req = alloc_request_get(trans,
 						opts.foreground_target,
 						false,
@@ -97,8 +106,7 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 						0, &cl)) ?:
 			bch2_alloc_sectors_req(trans, req, write_point, &wp);
 		if (bch2_err_matches(ret, BCH_ERR_operation_blocked)) {
-			bch2_trans_unlock_long(trans);
-			bch2_wait_on_allocator(c, req, ret, &cl);
+			bch2_wait_on_allocator(trans, req, ret, &cl);
 			ret = bch_err_throw(c, transaction_restart_nested);
 		}
 		if (ret)
@@ -117,8 +125,8 @@ int bch2_extent_fallocate(struct btree_trans *trans,
 			ptr->unwritten = true;
 	}
 
-	ret = bch2_extent_update(trans, inum, iter, new.k, &res.r,
-				 0, i_sectors_delta, true, 0);
+	ret = bch2_extent_update(trans, inum, iter, new.k, new_buf_u64s, &res.r,
+				 0, i_sectors_delta, true, 0, NULL);
 err:
 	if (!ret && sectors_allocated)
 		bch2_increment_clock(c, sectors_allocated, WRITE);
@@ -141,6 +149,16 @@ int bch2_fpunch_snapshot(struct btree_trans *trans, struct bpos start, struct bp
 	struct bch_fs *c = trans->c;
 	CLASS(disk_reservation, res)(c);
 	unsigned max_sectors	= KEY_SIZE_MAX & (~0 << c->block_bits);
+
+	/*
+	 * We run our own commit loop, and its leading trans_begin() would
+	 * discard the caller's queued updates — commit them instead: fsck
+	 * callers reach us right after an fsck_err() that queued the journal
+	 * log entry recording the repair, and once we've punched the extents
+	 * the repair won't re-trigger to re-queue it
+	 */
+	if (bch2_trans_has_updates(trans))
+		try(bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc));
 
 	return for_each_btree_key_max_commit(trans, iter, BTREE_ID_extents,
 			start, end, 0, k,
@@ -166,7 +184,6 @@ int bch2_fpunch_at(struct btree_trans *trans, struct btree_iter *iter,
 		   s64 *i_sectors_delta)
 {
 	struct bch_fs *c	= trans->c;
-	unsigned max_sectors	= KEY_SIZE_MAX & (~0 << c->block_bits);
 	struct bpos end_pos = POS(inum.inum, end);
 	struct bkey_s_c k;
 	int ret = 0, ret2 = 0;
@@ -174,9 +191,7 @@ int bch2_fpunch_at(struct btree_trans *trans, struct btree_iter *iter,
 
 	while (!ret ||
 	       bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
-		struct disk_reservation disk_res =
-			bch2_disk_reservation_init(c, 0);
-		struct bkey_i delete;
+		CLASS(disk_reservation, res)(c);
 
 		if (ret)
 			ret2 = ret;
@@ -192,7 +207,7 @@ int bch2_fpunch_at(struct btree_trans *trans, struct btree_iter *iter,
 		/*
 		 * peek_max() doesn't have ideal semantics for extents:
 		 */
-		k = bch2_btree_iter_peek_max(iter, end_pos);
+		k = bch2_btree_iter_peek_max(iter, &end_pos);
 		if (!k.k)
 			break;
 
@@ -200,16 +215,14 @@ int bch2_fpunch_at(struct btree_trans *trans, struct btree_iter *iter,
 		if (ret)
 			continue;
 
+		struct bkey_i delete;
 		bkey_init(&delete.k);
 		delete.k.p = iter->pos;
 
-		/* create the biggest key we can */
-		bch2_key_resize(&delete.k, max_sectors);
-		bch2_cut_back(end_pos, &delete);
+		bch2_key_resize(&delete.k, min(end, k.k->p.offset) - iter->pos.offset);
 
-		ret = bch2_extent_update(trans, inum, iter, &delete,
-				&disk_res, 0, i_sectors_delta, false, 0);
-		bch2_disk_reservation_put(c, &disk_res);
+		ret = bch2_extent_update(trans, inum, iter, &delete, delete.k.u64s,
+				&res.r, 0, i_sectors_delta, false, 0, NULL);
 	}
 
 	return ret ?: ret2;
@@ -229,7 +242,7 @@ int bch2_fpunch(struct bch_fs *c, subvol_inum inum, u64 start, u64 end,
 
 /* truncate: */
 
-void bch2_logged_op_truncate_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+__cold void bch2_logged_op_truncate_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_logged_op_truncate op = bkey_s_c_to_logged_op_truncate(k);
 
@@ -302,7 +315,7 @@ int bch2_truncate(struct bch_fs *c, subvol_inum inum, u64 new_i_size, u64 *i_sec
 	 * snapshot while they're in progress, then crashing, will result in the
 	 * resume only proceeding in one of the snapshots
 	 */
-	guard(rwsem_read)(&c->snapshots.create_lock);
+	guard(percpu_read)(&c->snapshots.create_lock);
 	CLASS(btree_trans, trans)(c);
 	try(bch2_logged_op_start(trans, &op.k_i));
 	int ret = __bch2_resume_logged_op_truncate(trans, &op.k_i, i_sectors_delta);
@@ -312,7 +325,7 @@ int bch2_truncate(struct bch_fs *c, subvol_inum inum, u64 new_i_size, u64 *i_sec
 
 /* finsert/fcollapse: */
 
-void bch2_logged_op_finsert_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
+__cold void bch2_logged_op_finsert_to_text(struct printbuf *out, struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_s_c_logged_op_finsert op = bkey_s_c_to_logged_op_finsert(k);
 
@@ -339,7 +352,7 @@ static int adjust_i_size(struct btree_trans *trans, subvol_inum inum,
 			return -EFBIG;
 
 		if (offset >= inode_u.bi_size)
-			return -EINVAL;
+			return bch_err_throw(trans->c, EINVAL_finsert_offset_past_eof);
 	}
 
 	inode_u.bi_size += len;
@@ -415,7 +428,7 @@ case LOGGED_OP_FINSERT_shift_extents:
 
 		k = insert
 			? bch2_btree_iter_peek_prev_min(&iter, POS(inum.inum, 0))
-			: bch2_btree_iter_peek_max(&iter, POS(inum.inum, U64_MAX));
+			: bch2_btree_iter_peek_max(&iter, &POS(inum.inum, U64_MAX));
 		if ((ret = bkey_err(k)))
 			goto btree_err;
 
@@ -431,19 +444,21 @@ case LOGGED_OP_FINSERT_shift_extents:
 		if (snapshot != k.k->p.snapshot) {
 			ret = bch2_disk_reservation_add(c, &disk_res,
 					copy->k.size *
-					bch2_bkey_nr_ptrs_allocated(c, bkey_i_to_s_c(copy)),
+					bch2_bkey_durability_safe(c, bkey_i_to_s_c(copy)).total,
 					0);
 			if (ret)
 				goto btree_err;
-		} else if (insert &&
-			   bkey_lt(bkey_start_pos(k.k), src_pos)) {
+		}
+
+		if (bkey_lt(bkey_start_pos(k.k), src_pos)) {
 			bch2_cut_front(c, src_pos, copy);
 
 			/* Splitting compressed extent? */
-			bch2_disk_reservation_add(c, &disk_res,
-					copy->k.size *
-					bch2_bkey_nr_ptrs_allocated(c, bkey_i_to_s_c(copy)),
-					BCH_DISK_RESERVATION_NOFAIL);
+			if (snapshot == k.k->p.snapshot)
+				bch2_disk_reservation_add(c, &disk_res,
+							  copy->k.size *
+							  bch2_bkey_durability_safe(c, bkey_i_to_s_c(copy)).total,
+							  BCH_DISK_RESERVATION_NOFAIL);
 		}
 
 		bkey_init(&delete.k);
@@ -518,7 +533,7 @@ int bch2_fcollapse_finsert(struct bch_fs *c, subvol_inum inum,
 	 * snapshot while they're in progress, then crashing, will result in the
 	 * resume only proceeding in one of the snapshots
 	 */
-	guard(rwsem_read)(&c->snapshots.create_lock);
+	guard(percpu_read)(&c->snapshots.create_lock);
 	CLASS(btree_trans, trans)(c);
 	try(bch2_logged_op_start(trans, &op.k_i));
 	int ret = __bch2_resume_logged_op_finsert(trans, &op.k_i, i_sectors_delta);

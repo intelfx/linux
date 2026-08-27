@@ -56,7 +56,7 @@ static const char * const bch2_gc_phase_strs[] = {
 	NULL
 };
 
-void bch2_gc_pos_to_text(struct printbuf *out, struct gc_pos *p)
+__cold void bch2_gc_pos_to_text(struct printbuf *out, struct gc_pos *p)
 {
 	prt_str(out, bch2_gc_phase_strs[p->phase]);
 	prt_char(out, ' ');
@@ -179,13 +179,31 @@ static int set_node_max(struct bch_fs *c, struct btree *b, struct bpos new_max)
 
 	bch2_btree_node_drop_keys_outside_node(b);
 
-	guard(mutex)(&c->btree.cache.lock);
-	__bch2_btree_node_hash_remove(&c->btree.cache, b);
+	struct bch_fs_btree_cache *bc = &c->btree.cache;
 
+	/* unhash, rehash */
+	BUG_ON(bch2_btree_node_transition_state(bc, b, BTREE_NODE_CACHE_FREEABLE));
 	bkey_copy(&b->key, &new->k_i);
-	ret = __bch2_btree_node_hash_insert(&c->btree.cache, b);
-	BUG_ON(ret);
+	BUG_ON(bch2_btree_node_transition_state(bc, b, btree_node_live_state(b)));
 	return 0;
+}
+
+/*
+ * Commit the fsck "repaired" log entry queued by mustfix_fsck_err().
+ *
+ * Topology repair runs before we go rw and applies its fixes through journal
+ * keys (not transactional updates), so nothing else here commits - but the log
+ * is a transaction update, and the next bch2_trans_begin() would silently drop
+ * it. Commit it here, at the check, *before* the mutation: a commit can return
+ * a transaction restart (fault injection, journal, ...), and doing it first
+ * means the restart re-runs only the check - which re-queues the log - never
+ * the non-transactional mutation, which must run exactly once.
+ */
+static int commit_topology_repair_log(struct btree_trans *trans)
+{
+	return bch2_trans_has_updates(trans)
+		? bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc)
+		: 0;
 }
 
 static int btree_check_node_boundaries(struct btree_trans *trans, struct btree *b,
@@ -234,6 +252,7 @@ static int btree_check_node_boundaries(struct btree_trans *trans, struct btree *
 
 		if (mustfix_fsck_err(trans, btree_node_topology_gap_between_nodes,
 				     "gap between btree nodes%s", buf.buf)) {
+			try(commit_topology_repair_log(trans));
 			if (nodes_found)
 				return bch_err_throw(c, topology_repair_did_fill_from_scan);
 			else
@@ -243,22 +262,30 @@ static int btree_check_node_boundaries(struct btree_trans *trans, struct btree *
 		if (prev && BTREE_NODE_SEQ(cur->data) > BTREE_NODE_SEQ(prev->data)) {	/* cur overwrites prev */
 			if (bpos_ge(prev->data->min_key, cur->data->min_key)) {		/* fully? */
 				if (mustfix_fsck_err(trans, btree_node_topology_overwritten_by_next_node,
-						     "btree node overwritten by next node%s", buf.buf))
+						     "btree node overwritten by next node%s", buf.buf)) {
+					try(commit_topology_repair_log(trans));
 					return bch_err_throw(c, topology_repair_drop_prev_node);
+				}
 			} else {
 				if (mustfix_fsck_err(trans, btree_node_topology_bad_max_key,
-						     "btree node with incorrect max_key%s", buf.buf))
+						     "btree node with incorrect max_key%s", buf.buf)) {
+					try(commit_topology_repair_log(trans));
 					return set_node_max(c, prev, bpos_predecessor(cur->data->min_key));
+				}
 			}
 		} else {
 			if (bpos_ge(expected_start, cur->data->max_key)) {		/* fully? */
 				if (mustfix_fsck_err(trans, btree_node_topology_overwritten_by_prev_node,
-						     "btree node overwritten by prev node%s", buf.buf))
+						     "btree node overwritten by prev node%s", buf.buf)) {
+					try(commit_topology_repair_log(trans));
 					return bch_err_throw(c, topology_repair_drop_this_node);
+				}
 			} else {
 				if (mustfix_fsck_err(trans, btree_node_topology_bad_min_key,
-						     "btree node with incorrect min_key%s", buf.buf))
+						     "btree node with incorrect min_key%s", buf.buf)) {
+					try(commit_topology_repair_log(trans));
 					return set_node_min(c, cur, expected_start);
+				}
 			}
 		}
 	}
@@ -317,6 +344,7 @@ static int btree_repair_node_end(struct btree_trans *trans, struct btree *b, str
 
 	if (mustfix_fsck_err(trans, btree_node_topology_bad_max_key,
 			     "btree node with incorrect max_key%s", buf.buf)) {
+		try(commit_topology_repair_log(trans));
 
 		if (nodes_found)
 			return bch_err_throw(c, topology_repair_did_fill_from_scan);
@@ -425,6 +453,14 @@ again:
 						      b->c.level, prev_k.k->k.p);
 			if (ret)
 				break;
+
+			/*
+			 * cur is still read-locked, and goto again jumps over the
+			 * unlock at the end of the loop; drop it here or it leaks
+			 * (and later self-deadlocks a write lock on the same node).
+			 */
+			six_unlock_read(&cur->c.lock);
+			cur = NULL;
 
 			bch2_btree_and_journal_iter_exit(&iter);
 			goto again;
@@ -579,7 +615,13 @@ static int bch2_topology_check_root(struct btree_trans *trans, enum btree_id btr
 		}
 	}
 
-	return 0;
+	/*
+	 * Commit any fsck_err log entry queued above before returning: this
+	 * runs pre-RW (so the commit is queued for journal replay), and the
+	 * caller's per-btree loop starts each iteration with a bch2_trans_begin
+	 * that would otherwise discard it.
+	 */
+	return bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc);
 }
 
 static void ratelimit_reset(struct ratelimit_state *rs)
@@ -595,7 +637,7 @@ int bch2_check_topology(struct bch_fs *c)
 {
 	CLASS(btree_trans, trans)(c);
 
-	bch2_trans_srcu_unlock(trans);
+	bch2_trans_unlock_long(trans);
 
 	for (unsigned i = 0; i < btree_id_nr_alive(c); i++) {
 		bool reconstructed_root = false;
@@ -605,16 +647,52 @@ recover:
 		struct btree_root *r = bch2_btree_id_root(c, i);
 		struct btree *b = r->b;
 
-		btree_node_lock_nopath_nofail(trans, &b->c, SIX_LOCK_read);
+		/*
+		 * XXX: _nofail() locks need to die in a fire.
+		 *
+		 * Any nofail lock take is invisible to the cycle detector
+		 * (the caller isn't recorded as a holder via any path), and
+		 * in multithreaded mode nofail takers piling up on a single
+		 * contended lock can blow through the wait_fifo cap and BUG.
+		 * The cycle detector can't unwind deadlocks it can't see.
+		 *
+		 * The correct shape is may-fail: take the lock via a path,
+		 * wrap in lockrestart_do, propagate transaction_restart up.
+		 * But topology repair is old code that walks the btree with
+		 * its own bch2_btree_and_journal_iter_* infrastructure, not
+		 * via paths — and shoving a synthetic "I locked the root"
+		 * path into that walking code doesn't work (the path's state
+		 * isn't maintained by the walk, and verify_locks on mem_alloc
+		 * slow paths blows up on the mismatch).
+		 *
+		 * Keeping nofail here is only OK because topology repair
+		 * runs at mount/recovery time, before any worker threads are
+		 * started, so there's physically nothing else that could be
+		 * contending for these locks — wait_fifo can't fill up, cycle
+		 * detection isn't needed.
+		 *
+		 * Proper fix is either (a) rewrite topology repair on top of
+		 * paths, or (b) redo the whole nofail → may-fail plumbing so
+		 * nofail callers can still get cycle-detector visibility via
+		 * a thin "lock holder record" that isn't a full path. Either
+		 * is bigger than this commit wants to be.
+		 */
+		trans->locking_hash_val = 0;
+		trans->locking_root_id	= -1;
+		btree_node_lock_nopath(trans, &b->c, SIX_LOCK_read, true, _THIS_IP_, false);
 		int ret = btree_check_root_boundaries(trans, b) ?:
 			  bch2_btree_repair_topology_recurse(trans, b);
 		six_unlock_read(&b->c.lock);
 
 		if (bch2_err_matches(ret, BCH_ERR_topology_repair_drop_this_node)) {
-			scoped_guard(mutex, &c->btree.cache.lock)
-				bch2_btree_node_hash_remove(&c->btree.cache, b);
+			bch2_btree_node_transition_state(&c->btree.cache, b,
+								  BTREE_NODE_CACHE_FREEABLE);
 
-			r->b = NULL;
+			scoped_guard(mutex, &c->btree.cache.root_lock) {
+				r->b = NULL;
+				if (likely(i < BTREE_ID_NR))
+					WRITE_ONCE(c->btree.cache.roots_b[i], 0);
+			}
 
 			if (!reconstructed_root) {
 				r->error = -EIO;
@@ -689,15 +767,7 @@ static int bch2_gc_mark_key(struct btree_trans *trans, enum btree_id btree_id,
 				 buf.buf)))
 		bch2_dev_btree_bitmap_mark(c, k);
 
-	/*
-	 * We require a commit before key_trigger() because
-	 * key_trigger(BTREE_TRIGGER_GC) is not idempotant; we'll calculate the
-	 * wrong result if we run it multiple times.
-	 */
-	unsigned flags = !iter ? BTREE_TRIGGER_is_root : 0;
-
-	try(bch2_key_trigger(trans, btree_id, level, old, unsafe_bkey_s_c_to_s(k),
-			     BTREE_TRIGGER_check_repair|flags));
+	try(bch2_bkey_check_repair(trans, iter, btree_id, level, k));
 
 	if (bch2_trans_has_updates(trans)) {
 		CLASS(disk_reservation, res)(c);
@@ -705,8 +775,15 @@ static int bch2_gc_mark_key(struct btree_trans *trans, enum btree_id btree_id,
 			bch_err_throw(c, transaction_restart_commit);
 	}
 
-	try(bch2_key_trigger(trans, btree_id, level, old, unsafe_bkey_s_c_to_s(k),
-			     BTREE_TRIGGER_gc|BTREE_TRIGGER_insert|flags));
+	struct btree_trigger_op op = {
+		.btree		= btree_id,
+		.level		= level,
+		.old		= old,
+		.new		= unsafe_bkey_s_c_to_s(k),
+		.new_buf_u64s	= k.k->u64s,
+		.flags		= BTREE_TRIGGER_gc|BTREE_TRIGGER_insert,
+	};
+	try(bch2_key_trigger(trans, op));
 fsck_err:
 	return ret;
 }
@@ -821,7 +898,7 @@ static int bch2_gc_start(struct bch_fs *c)
 static inline bool bch2_alloc_v4_cmp(struct bch_alloc_v4 l,
 				     struct bch_alloc_v4 r)
 {
-	return  l.gen != r.gen				||
+	return  l.generation != r.generation				||
 		l.oldest_gen != r.oldest_gen		||
 		l.data_type != r.data_type		||
 		l.dirty_sectors	!= r.dirty_sectors	||
@@ -858,10 +935,23 @@ static int bch2_alloc_write_key(struct btree_trans *trans,
 	}
 
 	/*
-	 * gc.data_type doesn't yet include need_discard & need_gc_gen states -
-	 * fix that here:
+	 * gc tracks sector counts via extent triggers but does not follow
+	 * empty-state transitions (need_discard, need_gc_gens) - those are
+	 * decided by bch2_trigger_alloc() using old vs new state and stick
+	 * in data_type until the discard / gc_gens path clears them.
+	 *
+	 * For nonempty buckets gc.data_type is authoritative from the
+	 * extent walk. For empty buckets gc.data_type is BCH_DATA_free
+	 * (gc never sets need_*); use the on-disk hint instead so a bucket
+	 * correctly in need_discard or need_gc_gens compares equal.
+	 *
+	 * Using new.data_type unconditionally would break reconstruct_alloc:
+	 * post-kill_btree the on-disk key is zeros, hint=free, and
+	 * alloc_data_type() falls into bucket_data_type(free) → free even
+	 * with dirty_sectors > 0, contradicting the rebuilt counters.
 	 */
-	alloc_data_type_set(&gc, gc.data_type);
+	alloc_data_type_set(&gc,
+		!data_type_is_empty(gc.data_type) ? gc.data_type : new.data_type);
 	if (gc.data_type != old_gc.data_type ||
 	    gc.dirty_sectors != old_gc.dirty_sectors) {
 		try(bch2_alloc_key_to_dev_counters(trans, ca, &old_gc, &gc, BTREE_TRIGGER_gc));
@@ -881,10 +971,22 @@ static int bch2_alloc_write_key(struct btree_trans *trans,
 			"bucket %llu:%llu gen %u has wrong data_type"
 			": got %s, should be %s",
 			iter->pos.inode, iter->pos.offset,
-			gc.gen,
+			gc.generation,
 			bch2_data_type_str(new.data_type),
-			bch2_data_type_str(gc.data_type)))
+			bch2_data_type_str(gc.data_type))) {
 		new.data_type = gc.data_type;
+
+		/*
+		 * Reconstruct runs under BTREE_TRIGGER_gc which skips the
+		 * transactional path that maintains NEED_DISCARD. Set it
+		 * here on non-empty buckets for downgrade compat (older
+		 * kernels read the bit to decide need_discard state).
+		 */
+		if (!data_type_is_empty(new.data_type) &&
+		    new.data_type != BCH_DATA_sb &&
+		    new.data_type != BCH_DATA_journal)
+			SET_BCH_ALLOC_V4_NEED_DISCARD(&new, true);
+	}
 
 #define copy_bucket_field(_errtype, _f)					\
 	if (ret_fsck_err_on(new._f != gc._f,				\
@@ -892,12 +994,12 @@ static int bch2_alloc_write_key(struct btree_trans *trans,
 			"bucket %llu:%llu gen %u data type %s has wrong " #_f	\
 			": got %llu, should be %llu",			\
 			iter->pos.inode, iter->pos.offset,		\
-			gc.gen,						\
+			gc.generation,						\
 			bch2_data_type_str(gc.data_type),		\
 			(u64) new._f, (u64) gc._f))				\
 		new._f = gc._f;						\
 
-	copy_bucket_field(alloc_key_gen_wrong,			gen);
+	copy_bucket_field(alloc_key_gen_wrong,			generation);
 	copy_bucket_field(alloc_key_dirty_sectors_wrong,	dirty_sectors);
 	copy_bucket_field(alloc_key_stripe_sectors_wrong,	stripe_sectors);
 	copy_bucket_field(alloc_key_cached_sectors_wrong,	cached_sectors);
@@ -960,7 +1062,10 @@ static int bch2_gc_write_stripes_key(struct btree_trans *trans,
 	const struct bch_stripe *s = bkey_s_c_to_stripe(k).v;
 	struct gc_stripe *m = genradix_ptr(&c->ec.gc_stripes, k.k->p.offset);
 
+	unsigned nr_data = s->nr_blocks - s->nr_redundant;
+
 	bool bad = false;
+	bool parity_bad = false;
 	for (unsigned i = 0; i < s->nr_blocks; i++) {
 		u32 old = stripe_blockcount_get(s, i);
 		u32 new = (m ? m->block_sectors[i] : 0);
@@ -970,12 +1075,18 @@ static int bch2_gc_write_stripes_key(struct btree_trans *trans,
 				   i, old, new);
 			bad = true;
 		}
+
+		parity_bad |= i >= nr_data && old;
 	}
 
-	if (bad)
+	if (bad || parity_bad)
 		bch2_bkey_val_to_text(&buf, c, k);
 
-	if (ret_fsck_err_on(bad,
+	if (ret_fsck_err_on(parity_bad,
+			trans, stripe_parity_block_sector_count_wrong,
+			"stripe parity block with nonzero sector count\n%s",
+			buf.buf) ||
+	    ret_fsck_err_on(bad,
 			trans, stripe_sector_count_wrong,
 			"%s", buf.buf)) {
 		struct bkey_i_stripe *new =
@@ -984,7 +1095,8 @@ static int bch2_gc_write_stripes_key(struct btree_trans *trans,
 		bkey_reassemble(&new->k_i, k);
 
 		for (unsigned i = 0; i < new->v.nr_blocks; i++)
-			stripe_blockcount_set(&new->v, i, m ? m->block_sectors[i] : 0);
+			stripe_blockcount_set(&new->v, i,
+				i < nr_data ? (m ? m->block_sectors[i] : 0) : 0);
 
 		try(bch2_trans_update(trans, iter, &new->k_i, 0));
 	}
@@ -1056,9 +1168,7 @@ int bch2_check_allocations(struct bch_fs *c)
 		bch2_gc_stripes_done(c) ?:
 		bch2_gc_reflink_done(c);
 out:
-	scoped_guard(percpu_write, &c->capacity.mark_lock) {
-		guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-
+	scoped_guard(percpu_write_noio, &c->capacity.mark_lock) {
 		/* Indicates that gc is no longer in progress: */
 		__gc_pos_set(c, gc_phase(GC_PHASE_not_running));
 		bch2_gc_free(c);
@@ -1068,7 +1178,7 @@ out:
 	 * At startup, allocations can happen directly instead of via the
 	 * allocator thread - issue wakeup in case they blocked on gc_lock:
 	 */
-	closure_wake_up(&c->allocator.freelist_wait);
+	bch2_alloc_wake_all(c);
 
 	if (!ret && !test_bit(BCH_FS_errors_not_fixed, &c->flags))
 		bch2_sb_members_clean_deleted(c);
@@ -1182,8 +1292,7 @@ int bch2_gc_gens(struct bch_fs *c)
 	event_inc_trace(c, gc_gens_end, buf);
 
 	if (!(c->sb.compat & BIT_ULL(BCH_COMPAT_no_stale_ptrs))) {
-		guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-		guard(mutex)(&c->sb_lock);
+		guard(mutex_noio)(&c->sb_lock);
 		c->disk_sb.sb->compat[0] |= cpu_to_le64(BIT_ULL(BCH_COMPAT_no_stale_ptrs));
 		bch2_write_super(c);
 	}
@@ -1229,7 +1338,7 @@ static int merge_btree_node_one(struct btree_trans *trans,
 
 	try(bch2_progress_update_iter(trans, progress, iter));
 
-	if (!btree_node_needs_merge(trans, b, 0)) {
+	if (!btree_node_needs_merge(trans->c, b, 0)) {
 		if (bpos_eq(b->key.k.p, SPOS_MAX))
 			return 1;
 
@@ -1275,6 +1384,86 @@ int bch2_merge_btree_nodes(struct bch_fs *c)
 	}
 
 	return 0;
+}
+
+/*
+ * For each shard boundary in each shard-aware btree, look up the leaf
+ * containing it; if the leaf spans the boundary, rewrite it (which forces
+ * a split at the boundary, since bch2_btree_node_alloc_replacement honors
+ * the "leaves don't cross shard boundaries" constraint).
+ */
+static int presplit_shard_boundary_one(struct btree_trans *trans,
+				       enum btree_id btree, struct bpos pos,
+				       u64 *split_count)
+{
+	struct bch_fs *c = trans->c;
+	CLASS(btree_node_iter, iter)(trans, btree, pos, 0, 0, 0);
+	try(bch2_btree_iter_traverse(&iter));
+
+	struct btree *b = path_l(btree_iter_path(trans, &iter))->b;
+
+	struct bpos pivot = bch2_btree_node_shard_pivot(c, b);
+	if (bpos_eq(pivot, POS_MIN) || bpos_eq(pivot, b->key.k.p))
+		return 1;
+
+	int ret = bch2_btree_split_leaf(trans, iter.path, 0, 0);
+	(*split_count) += !ret;
+	return ret;
+}
+
+int bch2_presplit_shard_boundaries(struct bch_fs *c)
+{
+	if (!c->opts.shard_inode_numbers_bits)
+		return 0;
+
+	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_presplit_shard_boundaries))
+		return 0;
+
+	static const enum btree_id sharded_btrees[] = {
+		BTREE_ID_inodes,
+		BTREE_ID_extents,
+		BTREE_ID_dirents,
+		BTREE_ID_xattrs,
+	};
+
+	unsigned shard_bits = c->opts.shard_inode_numbers_bits;
+	unsigned bits = 63 - shard_bits;
+	unsigned n_shards = 1U << shard_bits;
+	int ret = 0;
+
+	CLASS(btree_trans, trans)(c);
+
+	for (unsigned i = 0; i < ARRAY_SIZE(sharded_btrees); i++) {
+		u64 split_count = 0;
+		enum btree_id btree = sharded_btrees[i];
+
+		for (unsigned shard = 1; shard < n_shards; shard++) {
+			u64 boundary = (u64) shard << bits;
+			struct bpos pos = btree == BTREE_ID_inodes
+				? SPOS(0, boundary, 0)
+				: SPOS(boundary, 0, 0);
+			do {
+				ret = lockrestart_do(trans,
+					presplit_shard_boundary_one(trans, btree, pos, &split_count));
+			} while (!ret);
+
+			if (ret < 0) {
+				if (bch2_err_matches(ret, ENOSPC))
+					ret = 0;
+				break;
+			}
+			ret = 0;
+		}
+
+		if (split_count) {
+			CLASS(bch_log_msg_level, msg)(c, LOGLEVEL_info);
+			prt_printf(&msg.m, "presplit_shard_boundaries: %llu splits in btree ", split_count);
+			bch2_btree_id_to_text(&msg.m, btree);
+		}
+	}
+
+	enumerated_ref_put(&c->writes, BCH_WRITE_REF_presplit_shard_boundaries);
+	return ret;
 }
 
 void bch2_fs_btree_gc_init_early(struct bch_fs *c)

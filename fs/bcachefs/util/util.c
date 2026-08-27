@@ -23,6 +23,8 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/sched/clock.h>
+#include <linux/sched/debug.h>
+#include <linux/sched/signal.h>
 
 #include "eytzinger.h"
 #include "mean_and_variance.h"
@@ -192,7 +194,7 @@ STRTO_H(strtoll, long long)
 STRTO_H(strtoull, unsigned long long)
 STRTO_H(strtou64, u64)
 
-u64 bch2_read_flag_list(const char *opt, const char * const list[])
+u64 bch2_read_flag_list_mask(const char *opt, const char * const list[], u64 choices_allowed_mask)
 {
 	u64 ret = 0;
 
@@ -201,15 +203,35 @@ u64 bch2_read_flag_list(const char *opt, const char * const list[])
 		return -ENOMEM;
 
 	char *p, *s = strim(d);
+
+	bool invert = *s == '-';
+	if (invert)
+		s++;
+
 	while ((p = strsep(&s, ",;"))) {
 		int flag = match_string(list, -1, p);
 		if (flag < 0)
+			return -1;
+		if (!(choices_allowed_mask & BIT_ULL(flag)))
 			return -1;
 
 		ret |= BIT_ULL(flag);
 	}
 
+	if (invert) {
+		u64 choices_mask = 0;
+		for (unsigned i = 0; list[i]; i++)
+			choices_mask |= BIT_ULL(i);
+
+		ret = ~ret & choices_mask & choices_allowed_mask;
+	}
+
 	return ret;
+}
+
+u64 bch2_read_flag_list(const char *opt, const char * const list[])
+{
+	return bch2_read_flag_list_mask(opt, list, U64_MAX);
 }
 
 bool bch2_is_zero(const void *_p, size_t n)
@@ -362,7 +384,7 @@ static inline void pr_name_and_units(struct printbuf *out, const char *name, u64
 
 #define TABSTOP_SIZE 12
 
-void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats)
+__cold void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats)
 {
 	struct quantiles *quantiles = time_stats_to_quantiles(stats);
 	s64 f_mean = 0, d_mean = 0;
@@ -415,13 +437,13 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 		prt_printf(out, "mean:\t");
 		bch2_pr_time_units_aligned(out, d_mean);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_mean(stats->duration_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_median(stats->duration_stats_weighted));
 		prt_newline(out);
 
 		prt_printf(out, "stddev:\t");
 		bch2_pr_time_units_aligned(out, d_stddev);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_stddev(stats->duration_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_stddev(stats->duration_stats_weighted));
 		prt_newline(out);
 	}
 
@@ -433,13 +455,13 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 		prt_printf(out, "mean:\t");
 		bch2_pr_time_units_aligned(out, f_mean);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_mean(stats->freq_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_median(stats->freq_stats_weighted));
 		prt_newline(out);
 
 		prt_printf(out, "stddev:\t");
 		bch2_pr_time_units_aligned(out, f_stddev);
 		prt_tab(out);
-		bch2_pr_time_units_aligned(out, mean_and_variance_weighted_get_stddev(stats->freq_stats_weighted, TIME_STATS_MV_WEIGHT));
+		bch2_pr_time_units_aligned(out, mean_and_variance_get_stddev(stats->freq_stats_weighted));
 		prt_newline(out);
 	}
 
@@ -464,7 +486,7 @@ void bch2_time_stats_to_text(struct printbuf *out, struct bch2_time_stats *stats
 	}
 }
 
-void bch2_time_stats_json_to_text(struct printbuf *out, struct bch2_time_stats *stats,
+__cold void bch2_time_stats_json_to_text(struct printbuf *out, struct bch2_time_stats *stats,
 				  const char *epoch_name, unsigned int flags)
 {
 	char buf[1024];
@@ -574,7 +596,7 @@ void bch2_pd_controller_init(struct bch_pd_controller *pd)
 	pd->backpressure	= 1;
 }
 
-void bch2_pd_controller_debug_to_text(struct printbuf *out, struct bch_pd_controller *pd)
+__cold void bch2_pd_controller_debug_to_text(struct printbuf *out, struct bch_pd_controller *pd)
 {
 	if (!out->nr_tabstops)
 		printbuf_tabstop_push(out, 20);
@@ -614,6 +636,86 @@ void bch2_bio_map(struct bio *bio, void *base, size_t size)
 		bio_add_vmalloc(bio, base, size);
 	else
 		bio_add_virt_nofail(bio, base, size);
+}
+
+/*
+ * Allocate a bio (possibly a chain of bios via bio_chain()) covering
+ * [base, base+size) on @bdev starting at sector @sector. Each bio in the
+ * chain is capped at BIO_MAX_VECS bvecs; physically contiguous buffers fit
+ * in one bvec and the chain typically has length 1.
+ *
+ * The returned bio is the tail of the chain (the last chunk in sector
+ * order), left unsubmitted for the caller to configure (bi_end_io,
+ * bi_private, any wrapper state) and submit. Earlier chunks are chained
+ * to the bio that immediately follows them and submitted here in sector
+ * order, so the block layer sees requests in forward order; callers
+ * should wrap their submission in blk_start_plug()/blk_finish_plug() to
+ * give the driver a chance to merge.
+ *
+ * When the caller's tail bio completes, the chain's bi_status reflects
+ * any error propagated from the earlier chunks.
+ *
+ * REQ_PREFLUSH, if set in @opf, applies only to the first (sector-lowest)
+ * bio in the chain.
+ */
+struct bio *bch2_bio_map_and_chain(struct block_device *bdev,
+				   void *base, size_t size,
+				   sector_t sector,
+				   blk_opf_t opf, gfp_t gfp,
+				   struct bio_set *bs)
+{
+	struct bio *tail	= NULL;
+	unsigned nr_bvecs	= buf_nr_bvecs(base, size);
+
+	while (size) {
+		size_t chunk_size = size;
+		unsigned chunk_bvecs = nr_bvecs;
+
+		if (chunk_bvecs > BIO_MAX_VECS) {
+			unsigned offset = (unsigned long) base & (PAGE_SIZE - 1);
+
+			chunk_size = (size_t)BIO_MAX_VECS * PAGE_SIZE - offset;
+			chunk_bvecs = BIO_MAX_VECS;
+			BUG_ON(chunk_size > size);
+		}
+
+		struct bio *bio = bio_alloc_bioset(bdev, chunk_bvecs,
+						   opf, gfp, bs);
+		opf &= ~REQ_PREFLUSH; /* only on the first bio */
+
+		bch2_bio_map(bio, base, chunk_size);
+		bio->bi_iter.bi_sector = sector;
+
+		if (tail) {
+			/*
+			 * Chain the previous (earlier-sector) bio to this one
+			 * and submit it now: submission order is sector-forward
+			 * so the elevator can merge with adjacent writes.
+			 */
+			bio_chain(tail, bio);
+			submit_bio(tail);
+		}
+		tail = bio;
+
+		base		+= chunk_size;
+		sector		+= chunk_size >> 9;
+		size		-= chunk_size;
+		nr_bvecs	-= chunk_bvecs;
+	}
+
+	return tail;
+}
+
+int bch2_bio_submit_buf_wait(struct block_device *bdev,
+			     void *buf, size_t count,
+			     sector_t offset,
+			     blk_opf_t opf)
+{
+	struct bio *bio = bch2_bio_map_and_chain(bdev, buf, count, offset, opf,
+						 GFP_KERNEL, &fs_bio_set);
+	int ret = submit_bio_wait(bio);
+	bio_put(bio);
+	return ret;
 }
 
 int bch2_bio_alloc_pages(struct bio *bio, unsigned bs, size_t size, gfp_t gfp_mask)
@@ -695,6 +797,117 @@ void memcpy_from_bio(void *dst, struct bio *src, struct bvec_iter src_iter)
 	}
 }
 
+/*
+ * Copy between two bios at caller-supplied iters, advancing both. Equivalent to
+ * the kernel's old bio_copy_data_iter(), which 7.2 removed in favour of the
+ * whole-bio bio_copy_data().
+ */
+void bch2_bio_copy_data_iter(struct bio *dst, struct bvec_iter *dst_iter,
+			     struct bio *src, struct bvec_iter *src_iter)
+{
+	while (src_iter->bi_size && dst_iter->bi_size) {
+		struct bio_vec src_bv = bio_iter_iovec(src, *src_iter);
+		struct bio_vec dst_bv = bio_iter_iovec(dst, *dst_iter);
+		unsigned int bytes = min(src_bv.bv_len, dst_bv.bv_len);
+		void *src_buf = bvec_kmap_local(&src_bv);
+		void *dst_buf = bvec_kmap_local(&dst_bv);
+
+		memcpy(dst_buf, src_buf, bytes);
+
+		kunmap_local(dst_buf);
+		kunmap_local(src_buf);
+
+		bio_advance_iter(src, src_iter, bytes);
+		bio_advance_iter(dst, dst_iter, bytes);
+	}
+}
+
+/*
+ * Zero-fill a bio starting at a caller-supplied iter. Equivalent to the kernel's
+ * old zero_fill_bio_iter(), which 7.2 removed in favour of the whole-bio
+ * zero_fill_bio().
+ */
+void bch2_zero_fill_bio_iter(struct bio *bio, struct bvec_iter start)
+{
+	struct bio_vec bv;
+	struct bvec_iter iter;
+
+	__bio_for_each_segment(bv, bio, iter, start) {
+		void *p = bvec_kmap_local(&bv);
+
+		memset(p, 0, bv.bv_len);
+		kunmap_local(p);
+	}
+}
+
+#ifdef __KERNEL__
+#include <linux/pagemap.h>	/* folio_lock()/folio_unlock() */
+
+/*
+ * DIO read dirty-page handling. 7.2 unexported bio_set_pages_dirty() and
+ * bio_check_pages_dirty(); reinstate them (the kernel's implementation) as
+ * bcachefs helpers. bio_set_pages_dirty() marks the destination pages dirty on
+ * the (sleepable) submit side; bio_check_pages_dirty() runs at completion, which
+ * can be atomic (bio endio), so the rare "a page was cleaned mid-IO, re-dirty it"
+ * case — which needs folio_lock() — is punted to a workqueue.
+ */
+void bch2_bio_set_pages_dirty(struct bio *bio)
+{
+	struct folio_iter fi;
+
+	bio_for_each_folio_all(fi, bio) {
+		folio_lock(fi.folio);
+		folio_mark_dirty(fi.folio);
+		folio_unlock(fi.folio);
+	}
+}
+
+static void bch2_bio_dirty_fn(struct work_struct *work);
+
+static DECLARE_WORK(bch2_bio_dirty_work, bch2_bio_dirty_fn);
+static DEFINE_SPINLOCK(bch2_bio_dirty_lock);
+static struct bio *bch2_bio_dirty_list;
+
+/* runs in process context */
+static void bch2_bio_dirty_fn(struct work_struct *work)
+{
+	struct bio *bio, *next;
+
+	spin_lock_irq(&bch2_bio_dirty_lock);
+	next = bch2_bio_dirty_list;
+	bch2_bio_dirty_list = NULL;
+	spin_unlock_irq(&bch2_bio_dirty_lock);
+
+	while ((bio = next) != NULL) {
+		next = bio->bi_private;
+
+		bio_release_pages(bio, true);
+		bio_put(bio);
+	}
+}
+
+void bch2_bio_check_pages_dirty(struct bio *bio)
+{
+	struct folio_iter fi;
+	unsigned long flags;
+
+	bio_for_each_folio_all(fi, bio) {
+		if (!folio_test_dirty(fi.folio))
+			goto defer;
+	}
+
+	bio_release_pages(bio, false);
+	bio_put(bio);
+	return;
+defer:
+	spin_lock_irqsave(&bch2_bio_dirty_lock, flags);
+	bio->bi_private = bch2_bio_dirty_list;
+	bch2_bio_dirty_list = bio;
+	spin_unlock_irqrestore(&bch2_bio_dirty_lock, flags);
+	schedule_work(&bch2_bio_dirty_work);
+}
+#endif /* __KERNEL__ */
+
 #ifdef CONFIG_BCACHEFS_DEBUG
 void bch2_corrupt_bio(struct bio *bio)
 {
@@ -716,14 +929,114 @@ void bch2_corrupt_bio(struct bio *bio)
 }
 #endif
 
-void bch2_bio_to_text(struct printbuf *out, struct bio *bio)
+#define REQUEST_OPS()			\
+	x(REQ_OP_READ)			\
+	x(REQ_OP_WRITE)			\
+	x(REQ_OP_FLUSH)			\
+	x(REQ_OP_DISCARD)		\
+	x(REQ_OP_SECURE_ERASE)		\
+	x(REQ_OP_ZONE_APPEND)		\
+	x(REQ_OP_WRITE_ZEROES)		\
+	x(REQ_OP_ZONE_OPEN)		\
+	x(REQ_OP_ZONE_CLOSE)		\
+	x(REQ_OP_ZONE_FINISH)		\
+	x(REQ_OP_ZONE_RESET)		\
+	x(REQ_OP_ZONE_RESET_ALL)	\
+	x(REQ_OP_DRV_IN)		\
+	x(REQ_OP_DRV_OUT)		\
+
+#define REQUEST_FLAGS()			\
+	x(REQ_FAILFAST_DEV)		\
+	x(REQ_FAILFAST_TRANSPORT)	\
+	x(REQ_FAILFAST_DRIVER)		\
+	x(REQ_SYNC)			\
+	x(REQ_META)			\
+	x(REQ_PRIO)			\
+	x(REQ_NOMERGE)			\
+	x(REQ_IDLE)			\
+	x(REQ_INTEGRITY)		\
+	x(REQ_FUA)			\
+	x(REQ_PREFLUSH)			\
+	x(REQ_RAHEAD)			\
+	x(REQ_BACKGROUND)		\
+	x(REQ_NOWAIT)			\
+	x(REQ_POLLED)			\
+	x(REQ_ALLOC_CACHE)		\
+	x(REQ_SWAP)			\
+	x(REQ_DRV)			\
+	x(REQ_FS_PRIVATE)		\
+	x(REQ_ATOMIC)			\
+	x(REQ_P2PDMA)			\
+	x(REQ_NOUNMAP)			\
+
+#define BIO_FLAGS()			\
+	x(BIO_PAGE_PINNED)		\
+	x(BIO_CLONED)			\
+	x(BIO_QUIET)			\
+	x(BIO_CHAIN)			\
+	x(BIO_REFFED)			\
+	x(BIO_BPS_THROTTLED)		\
+	x(BIO_TRACE_COMPLETION)		\
+	x(BIO_CGROUP_ACCT)		\
+	x(BIO_QOS_THROTTLED)		\
+	x(BIO_QOS_MERGED)		\
+	x(BIO_REMAPPED)			\
+	x(BIO_ZONE_WRITE_PLUGGING)	\
+	x(BIO_EMULATES_ZONE_APPEND)	\
+
+static const char * const bch2_request_op_strs[] = {
+#define x(n) [n]	= #n,
+	REQUEST_OPS()
+#undef x
+	NULL
+};
+
+static const char * const bch2_request_flag_strs[] = {
+#define x(n) #n,
+	REQUEST_FLAGS()
+#undef x
+	NULL
+};
+
+static const char * const bch2_bio_flag_strs[] = {
+#define x(n) #n,
+	BIO_FLAGS()
+#undef x
+	NULL
+};
+
+__cold void bch2_bio_to_text(struct printbuf *out, struct bio *bio)
 {
-	prt_printf(out, "bi_remaining:\t%u\n",
-		   atomic_read(&bio->__bi_remaining));
-	prt_printf(out, "bi_end_io:\t%ps\n",
-		   bio->bi_end_io);
-	prt_printf(out, "bi_status:\t%u\n",
-		   bio->bi_status);
+	if (!out->nr_tabstops)
+		printbuf_tabstop_push(out, 24);
+
+	prt_printf(out, "bi_bdev:\t");
+	if (bio->bi_bdev)
+		prt_bdevname(out, bio->bi_bdev);
+	else
+		prt_str(out, "(null|");
+	prt_newline(out);
+
+	prt_printf(out, "bi_opf:\t%s ", bch2_request_op_strs[bio_op(bio)]);
+	prt_bitflags(out, bch2_request_flag_strs, bio->bi_opf >> REQ_OP_BITS);
+	prt_newline(out);
+
+	prt_str(out, "bi_flags:\t");
+	prt_bitflags(out, bch2_bio_flag_strs, bio->bi_flags);
+	prt_newline(out);
+
+	prt_printf(out, "bi_status:\t%u\n", bio->bi_status);
+
+	prt_printf(out, "bi_iter.bi_sector\t%llu\n",	(u64) bio->bi_iter.bi_sector);
+	prt_printf(out, "bi_iter.bi_size\t%u\n",	bio->bi_iter.bi_size);
+	prt_printf(out, "bi_iter.bi_idx\t%u\n",		bio->bi_iter.bi_idx);
+	prt_printf(out, "bi_iter.bi_bvec_done\t%u\n",	bio->bi_iter.bi_bvec_done);
+
+	prt_printf(out, "bi_remaining:\t%u\n",		atomic_read(&bio->__bi_remaining));
+	prt_printf(out, "bi_end_io:\t%ps\n",		bio->bi_end_io);
+
+	prt_printf(out, "bi_vcnt\t%u\n",		bio->bi_vcnt);
+	prt_printf(out, "bi_max_vecs\t%u\n",		bio->bi_max_vecs);
 }
 
 #if 0
@@ -1040,3 +1353,16 @@ void mempool_kvfree(void *element, void *pool_data)
 	kvfree(element);
 }
 #endif
+
+__sched int bch2_bit_wait_io_timeout(struct wait_bit_key *word, int mode)
+{
+	unsigned long now = jiffies;
+
+	if (time_after_eq(now, word->timeout))
+		return -EAGAIN;
+	io_schedule_timeout(word->timeout - now);
+	if (signal_pending_state(mode, current))
+		return -EINTR;
+
+	return 0;
+}

@@ -12,31 +12,43 @@ struct btree_iter;
 
 void bch2_recalc_btree_reserve(struct bch_fs *);
 
-void bch2_btree_node_to_freelist(struct bch_fs *, struct btree *);
+void bch2_btree_node_mem_free(struct bch_fs *, struct btree *);
 
-void __bch2_btree_node_hash_remove(struct bch_fs_btree_cache *, struct btree *);
-void bch2_btree_node_hash_remove(struct bch_fs_btree_cache *, struct btree *);
+int bch2_btree_node_transition_state(struct bch_fs_btree_cache *, struct btree *,
+				     enum btree_node_cache_state);
+int bch2_btree_node_transition_state_locked(struct bch_fs_btree_cache *, struct btree *,
+					    enum btree_node_cache_state);
 
-int __bch2_btree_node_hash_insert(struct bch_fs_btree_cache *, struct btree *);
-int bch2_btree_node_hash_insert(struct bch_fs_btree_cache *, struct btree *,
-				unsigned, enum btree_id);
+/*
+ * The memory the fsck passes may spend on pinned btree nodes. They prefetch
+ * and pin a keyspace range so that the random-order lookups they're about to
+ * make against it become cache hits, and stop once they've spent this much -
+ * pinning is always best effort, the passes are correct either way.
+ */
+static inline u64 bch2_btree_cache_pin_budget(struct bch_fs *c)
+{
+	return div_u64(system_totalram_bytes() * c->opts.fsck_memory_usage_percent, 100);
+}
 
 void bch2_node_pin(struct bch_fs *, struct btree *);
 void bch2_btree_cache_unpin(struct bch_fs *);
+int bch2_btree_cache_pin_range(struct btree_trans *, enum btree_id,
+			       struct bpos, struct bpos);
 
-void bch2_btree_node_update_key_early(struct btree_trans *, enum btree_id, unsigned,
-				      struct bkey_s_c, struct bkey_i *);
+void bch2_btree_node_set_dirty(struct bch_fs *, struct btree *);
+void bch2_btree_node_write_done_clean(struct bch_fs *, struct btree *);
 
 void bch2_btree_cache_cannibalize_unlock(struct btree_trans *);
 int bch2_btree_cache_cannibalize_lock(struct btree_trans *, struct closure *);
 
-void bch2_btree_node_data_free_locked(struct btree *);
+void bch2_btree_node_data_free(struct btree *);
 struct btree *__bch2_btree_node_mem_alloc(struct bch_fs *);
 struct btree *bch2_btree_node_mem_alloc(struct btree_trans *, bool);
 
 struct btree *bch2_btree_node_get(struct btree_trans *, struct btree_path *,
 				  const struct bkey_i *, unsigned,
-				  enum six_lock_type, unsigned long);
+				  enum six_lock_type,
+				  enum btree_iter_update_trigger_flags);
 
 struct btree *bch2_btree_node_get_noiter(struct btree_trans *, const struct bkey_i *,
 					 enum btree_id, unsigned, bool);
@@ -49,6 +61,40 @@ void bch2_btree_node_evict(struct btree_trans *, const struct bkey_i *);
 void bch2_fs_btree_cache_exit(struct bch_fs *);
 int bch2_fs_btree_cache_init(struct bch_fs *);
 void bch2_fs_btree_cache_init_early(struct bch_fs_btree_cache *);
+
+int bch2_fs_btree_evicted_size_init(struct bch_fs *);
+void bch2_fs_btree_evicted_size_exit(struct bch_fs *);
+
+static inline u64 btree_evicted_size_pack(u64 hash, u16 live_u64s)
+{
+	return ((hash & BTREE_EVICTED_SIZE_HASH_MASK) << 16) | live_u64s;
+}
+
+static inline void bch2_btree_evicted_size_record(struct bch_fs *c,
+						  u64 hash, u16 live_u64s)
+{
+	struct btree_evicted_size *e = &c->btree.evicted_size;
+
+	if (e->entries)
+		WRITE_ONCE(e->entries[hash & e->mask],
+			   btree_evicted_size_pack(hash, live_u64s));
+}
+
+static inline bool bch2_btree_evicted_size_lookup(struct bch_fs *c, u64 hash,
+						  u16 *out)
+{
+	struct btree_evicted_size *e = &c->btree.evicted_size;
+
+	if (!e->entries)
+		return false;
+
+	u64 entry = READ_ONCE(e->entries[hash & e->mask]);
+	if ((entry >> 16) != (hash & BTREE_EVICTED_SIZE_HASH_MASK))
+		return false;
+
+	*out = (u16) entry;
+	return true;
+}
 
 static inline u64 btree_ptr_hash_val(const struct bkey_i *k)
 {
@@ -69,7 +115,7 @@ static inline u64 btree_ptr_hash_val(const struct bkey_i *k)
 static inline struct btree *btree_node_mem_ptr(const struct bkey_i *k)
 {
 	return k->k.type == KEY_TYPE_btree_ptr_v2
-		? (void *)(unsigned long)bkey_i_to_btree_ptr_v2_c(k)->v.mem_ptr
+		? (void *)(unsigned long)READ_ONCE(bkey_i_to_btree_ptr_v2_c(k)->v.mem_ptr)
 		: NULL;
 }
 
@@ -77,6 +123,29 @@ static inline struct btree *btree_node_mem_ptr(const struct bkey_i *k)
 static inline bool btree_node_hashed(struct btree *b)
 {
 	return b->hash_val != 0;
+}
+
+static inline enum btree_node_cache_state btree_node_cache_state(struct btree *b)
+{
+	return b->cache_state;
+}
+
+/*
+ * The hashed (live) cache state derived from b's flag bits. A node belongs on
+ * live[].dirty whenever there's pending work — either BTREE_NODE_dirty (needs
+ * a write) or BTREE_NODE_write_in_flight (one is outstanding); otherwise it
+ * belongs on live[].clean.
+ *
+ * Use this anywhere you need to compute the right cache_state from the
+ * current bits — passing it to bch2_btree_node_transition_state_locked() is a
+ * no-op when the node is already in the right state, so callers don't need
+ * "do we need to transition?" conditionals.
+ */
+static inline enum btree_node_cache_state btree_node_live_state(const struct btree *b)
+{
+	return (btree_node_dirty(b) || btree_node_write_in_flight(b))
+		? BTREE_NODE_CACHE_DIRTY
+		: BTREE_NODE_CACHE_CLEAN;
 }
 
 #define for_each_cached_btree(_b, _c, _tbl, _iter, _pos)		\
@@ -110,9 +179,29 @@ static inline unsigned btree_blocks(const struct bch_fs *c)
 	return btree_sectors(c) >> c->block_bits;
 }
 
-#define BTREE_SPLIT_THRESHOLD(c)		(btree_max_u64s(c) * 2 / 3)
+#define BTREE_WRITE_IO_LIMIT(c)			64
+
+static inline bool bch2_btree_cache_should_throttle(struct bch_fs *c)
+{
+	return READ_ONCE(c->btree.cache.should_throttle);
+}
+
+static inline void bch2_btree_cache_update_throttle(struct bch_fs *c)
+{
+	struct bch_fs_btree_cache *bc = &c->btree.cache;
+	size_t live	= btree_cache_nr_live(bc);
+	size_t dirty	= btree_cache_nr_dirty(bc);
+	bool throttle	= atomic_long_read(&bc->nr_in_flight_inner) > BTREE_WRITE_IO_LIMIT(c) ||
+			  (live && dirty > live * 3 / 4);
+
+	if (throttle != READ_ONCE(bc->should_throttle))
+		WRITE_ONCE(bc->should_throttle, throttle);
+}
+
+#define BTREE_SPLIT_THRESHOLD(c)		(btree_max_u64s(c) * 3 / 4)
 
 #define BTREE_FOREGROUND_MERGE_THRESHOLD(c)	(btree_max_u64s(c) * 1 / 3)
+#define BTREE_FOREGROUND_MERGE_HIGHER_THRESHOLD(c)	(btree_max_u64s(c) * 3 / 5)
 #define BTREE_FOREGROUND_MERGE_HYSTERESIS(c)			\
 	(BTREE_FOREGROUND_MERGE_THRESHOLD(c) +			\
 	 (BTREE_FOREGROUND_MERGE_THRESHOLD(c) >> 2))
@@ -137,6 +226,59 @@ static inline struct btree_root *bch2_btree_id_root(struct bch_fs *c, unsigned i
 	}
 }
 
+/*
+ * Pack root pointer + level: low 3 bits encode b->c.level (BTREE_MAX_DEPTH
+ * is 4, so values 0..3 fit comfortably; we reserve 3 bits to leave slack
+ * for future depth bumps). struct btree alignment is well over 8 bytes so
+ * the low bits are guaranteed free. Packing into a single word makes the
+ * read in btree_path_lock_root naturally atomic — no torn read across b
+ * and b->c.level — and avoids the cold-cacheline miss into the btree
+ * node just to learn its level.
+ */
+#define BTREE_ROOT_LEVEL_BITS	3
+#define BTREE_ROOT_LEVEL_MASK	((1UL << BTREE_ROOT_LEVEL_BITS) - 1)
+
+static inline unsigned long bch2_btree_root_pack(struct btree *b)
+{
+	BUILD_BUG_ON(BTREE_MAX_DEPTH > (1U << BTREE_ROOT_LEVEL_BITS));
+	if (!b)
+		return 0;
+	EBUG_ON((unsigned long)b & BTREE_ROOT_LEVEL_MASK);
+	EBUG_ON(b->c.level & ~BTREE_ROOT_LEVEL_MASK);
+	return (unsigned long)b | b->c.level;
+}
+
+static inline struct btree *bch2_btree_root_unpack_b(unsigned long v)
+{
+	return (struct btree *)(v & ~BTREE_ROOT_LEVEL_MASK);
+}
+
+static inline unsigned bch2_btree_root_unpack_level(unsigned long v)
+{
+	return v & BTREE_ROOT_LEVEL_MASK;
+}
+
+/*
+ * Hot read of packed root pointer + level — avoids touching struct
+ * btree_root, which is ~0xb0 (176 bytes) per entry, by reading from the
+ * dedicated side-array. For id < BTREE_ID_NR this is a tight L1 access
+ * (4 cache lines cover all standard btree roots); roots_extra still
+ * falls through to the full struct.
+ */
+static inline unsigned long bch2_btree_id_root_packed(struct bch_fs *c, unsigned btree_id)
+{
+	if (likely(btree_id < BTREE_ID_NR))
+		return READ_ONCE(c->btree.cache.roots_b[btree_id]);
+
+	struct btree_root *r = bch2_btree_id_root(c, btree_id);
+	return r ? bch2_btree_root_pack(READ_ONCE(r->b)) : 0;
+}
+
+static inline struct btree *bch2_btree_id_root_b(struct bch_fs *c, unsigned btree_id)
+{
+	return bch2_btree_root_unpack_b(bch2_btree_id_root_packed(c, btree_id));
+}
+
 static inline struct btree *btree_node_root(struct bch_fs *c, struct btree *b)
 {
 	struct btree_root *r = bch2_btree_id_root(c, b->c.btree_id);
@@ -159,7 +301,7 @@ static inline void btree_node_buf_swap_account(struct bch_fs *c, void *old, void
 		(int) is_vmalloc_addr(old);
 
 	if (vmalloc_delta) {
-		guard(mutex)(&c->btree.cache.lock);
+		guard(mutex_noio)(&c->btree.cache.lock);
 		c->btree.cache.nr_vmalloc += vmalloc_delta;
 	}
 }

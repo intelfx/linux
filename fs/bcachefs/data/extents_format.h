@@ -2,6 +2,57 @@
 #ifndef _BCACHEFS_EXTENTS_FORMAT_H
 #define _BCACHEFS_EXTENTS_FORMAT_H
 
+/* DOC_LATEX(extent-checksums)
+ *
+ * \paragraph{Why checksums are stored with keys}
+ *
+ * bcachefs stores checksums in the btree alongside extent pointers, not with
+ * the data on disk. This is a deliberate design choice: if the checksum is
+ * stored with the data, verifying it only tells you that you got \emph{a}
+ * checksum that matches \emph{some} data---not that you got the data you
+ * actually wanted. If a write never completed, or you're reading stale data
+ * from an old location, a checksum stored with that data would still verify.
+ *
+ * By storing checksums in the btree, we create a chain of trust: the btree
+ * says ``this extent should contain data with this checksum,'' and reading
+ * the wrong data (or old data, or no data) is detected.
+ *
+ * \paragraph{Partial extents}
+ *
+ * This creates a complication: what happens when an extent is partially
+ * overwritten? We can't compute a checksum for just the live portion without
+ * reading the data, and the original checksum covers the original extent.
+ *
+ * The solution is to remember the original extent bounds. When reading a
+ * trimmed extent, we read the entire original extent, verify its checksum,
+ * then return only the live portion. Compression has the same constraint:
+ * we can't decompress a slice, only the whole extent.
+ *
+ * This is handled by the \texttt{bch\_extent\_crc} structures, which store:
+ * \begin{itemize}
+ * \item \texttt{compressed\_size}, \texttt{uncompressed\_size}: original extent bounds
+ * \item \texttt{offset}: offset into original extent where live data starts
+ * \item The \texttt{size} field in the key: current live size
+ * \end{itemize}
+ *
+ * Bucket-based allocation simplifies this: since buckets are reused all at
+ * once, as long as any part of an extent is live, the rest of it remains on
+ * disk. We don't need separate accounting for ``live'' vs ``needed for
+ * checksum/decompression.''
+ *
+ * \paragraph{Per-replica formats}
+ *
+ * Different replicas of an extent may have different formats. When copygc or
+ * tiering moves one replica, it writes only the live portion (otherwise we
+ * could never reclaim the dead portions). The moved replica gets a new
+ * \texttt{bch\_extent\_crc} reflecting its new bounds, while other replicas
+ * keep their original format.
+ *
+ * To avoid storing one crc structure per pointer, extents use a compact
+ * encoding: crc entries and pointers are interleaved, and each crc applies
+ * to all following pointers until the next crc entry.
+ */
+
 /*
  * In extent bkeys, the value is a list of pointers (bch_extent_ptr), optionally
  * preceded by checksum/compression information (bch_extent_crc32 or
@@ -178,9 +229,9 @@ struct bch_extent_ptr {
 				unwritten:1,
 				offset:44, /* 8 petabytes */
 				dev:8,
-				gen:8;
+				generation:8;
 #elif defined (__BIG_ENDIAN_BITFIELD)
-	__u64			gen:8,
+	__u64			generation:8,
 				dev:8,
 				offset:44,
 				unwritten:1,
@@ -276,17 +327,33 @@ struct bch_extent {
 	((sizeof(struct bch_extent_crc128) +			\
 	  sizeof(struct bch_extent_ptr)) / sizeof(__u64))
 
-/* Maximum possible size of an entire extent value: */
+/*
+ * Maximum possible size of an entire extent value:
+ *
+ * BCH_REPLICAS_MAX * 2 pointers because evacuating devices have durability=0
+ * and don't count toward durability accounting, but their pointers remain
+ * until the data is moved. Reconcile adds BCH_SB_MEMBER_INVALID placeholder
+ * pointers to bring durability accounting up to the desired level, so both
+ * sets of pointers coexist.
+ */
 #define BKEY_EXTENT_VAL_U64s_MAX				\
-	(5 + BKEY_EXTENT_PTR_U64s_MAX * (BCH_REPLICAS_MAX + 1))
+	(5 + BKEY_EXTENT_PTR_U64s_MAX * (BCH_REPLICAS_MAX * 2 + 1))
 
 /* * Maximum possible size of an entire extent, key + value: */
 #define BKEY_EXTENT_U64s_MAX		(BKEY_U64s + BKEY_EXTENT_VAL_U64s_MAX)
 
-/* Btree pointers don't carry around checksums: */
+/*
+ * Btree pointers don't carry around checksums:
+ *
+ * BCH_REPLICAS_MAX * 2 pointers because evacuating devices have durability=0
+ * and don't count toward durability accounting, but their pointers remain
+ * until the data is moved. Reconcile adds BCH_SB_MEMBER_INVALID placeholder
+ * pointers to bring durability accounting up to the desired level, so both
+ * sets of pointers coexist.
+ */
 #define BKEY_BTREE_PTR_VAL_U64s_MAX				\
 	((sizeof(struct bch_btree_ptr_v2) +			\
-	  sizeof(struct bch_extent_ptr) * BCH_REPLICAS_MAX +	\
+	  sizeof(struct bch_extent_ptr) * BCH_REPLICAS_MAX * 2 +\
 	  sizeof(struct bch_extent_reconcile) +		\
 	  sizeof(struct bch_extent_reconcile_bp)) / sizeof(__u64))
 #define BKEY_BTREE_PTR_U64s_MAX					\

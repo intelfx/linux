@@ -95,11 +95,8 @@ static int check_nlinks_find_hardlinks(struct bch_fs *c,
 			if (!bkey_is_inode(k.k))
 				continue;
 
-			/* Should never fail, checked by bch2_inode_invalid: */
 			struct bch_inode_unpacked u;
-			_ret3 = bch2_inode_unpack(k, &u);
-			if (_ret3)
-				break;
+			bch2_inode_unpack(c, k, &u);
 
 			/*
 			 * Backpointer and directory structure checks are sufficient for
@@ -165,6 +162,7 @@ static int check_nlinks_update_inode(struct btree_trans *trans, struct btree_ite
 {
 	struct bch_inode_unpacked u;
 	struct nlink *link = &links->d[*idx];
+	CLASS(printbuf, buf)();
 	int ret = 0;
 
 	if (k.k->p.offset >= range_end)
@@ -173,7 +171,7 @@ static int check_nlinks_update_inode(struct btree_trans *trans, struct btree_ite
 	if (!bkey_is_inode(k.k))
 		return 0;
 
-	try(bch2_inode_unpack(k, &u));
+	bch2_inode_unpack(trans->c, k, &u);
 
 	if (S_ISDIR(u.bi_mode))
 		return 0;
@@ -187,11 +185,13 @@ static int check_nlinks_update_inode(struct btree_trans *trans, struct btree_ite
 		link = &links->d[++*idx];
 	}
 
-	if (fsck_err_on(bch2_inode_nlink_get(&u) != link->count,
+	if (fsck_err_on(bch2_inode_nlink_get(&u) != link->count ||
+			((u.bi_flags & BCH_INODE_unlinked) &&
+			 u.bi_nlink),
 			trans, inode_wrong_nlink,
-			"inode %llu type %s has wrong i_nlink (%u, should be %u)",
-			u.bi_inum, bch2_d_types[mode_to_type(u.bi_mode)],
-			bch2_inode_nlink_get(&u), link->count)) {
+			"inode has wrong i_nlink (%u, should be %u)\n%s",
+			bch2_inode_nlink_get(&u), link->count,
+			(bch2_inode_unpacked_to_text(&buf, &u), buf.buf))) {
 		bch2_inode_nlink_set(&u, link->count);
 		ret = __bch2_fsck_write_inode(trans, &u);
 	}

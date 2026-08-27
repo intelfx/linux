@@ -5,6 +5,7 @@
 #include "btree/bkey_buf.h"
 #include "btree/update.h"
 
+#include "data/ec/create.h"
 #include "data/io_misc.h"
 
 #include "fs/logged_ops.h"
@@ -71,7 +72,7 @@ int bch2_resume_logged_ops(struct bch_fs *c)
 			resume_logged_op(trans, &iter, k));
 }
 
-static int __bch2_logged_op_start(struct btree_trans *trans, struct bkey_i *k)
+int __bch2_logged_op_start(struct btree_trans *trans, struct bkey_i *k)
 {
 	CLASS(btree_iter_uninit, iter)(trans);
 	try(bch2_bkey_get_empty_slot(trans, &iter, BTREE_ID_logged_ops,
@@ -88,9 +89,22 @@ int bch2_logged_op_start(struct btree_trans *trans, struct bkey_i *k)
 			 __bch2_logged_op_start(trans, k));
 }
 
+/*
+ * Callers must hold a write ref (BCH_WRITE_REF_stripe_create,
+ * BCH_WRITE_REF_fallocate, VFS sb->s_writers, or recovery context).
+ *
+ * We use no_check_rw because the logged operation has already completed
+ * and the cleanup delete must succeed regardless of fs shutdown state —
+ * otherwise we get spurious EROFS during umount.
+ *
+ * TODO: post Rust conversion, encode the write ref requirement in the
+ * type system so the compiler enforces it.
+ */
 int bch2_logged_op_finish(struct btree_trans *trans, struct bkey_i *k)
 {
-	int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
+	int ret = commit_do(trans, NULL, NULL,
+			    BCH_TRANS_COMMIT_no_check_rw|
+			    BCH_TRANS_COMMIT_no_enospc,
 			    bch2_btree_delete(trans, BTREE_ID_logged_ops, k->k.p, 0));
 	/*
 	 * This needs to be a fatal error because we've left an unfinished

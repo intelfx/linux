@@ -2,6 +2,9 @@
 #ifndef _BCACHEFS_JOURNAL_RECLAIM_H
 #define _BCACHEFS_JOURNAL_RECLAIM_H
 
+#include "alloc/replicas.h"
+#include "sb/members.h"
+
 #define JOURNAL_PIN	(32 * 1024)
 
 static inline void journal_reclaim_kick(struct journal *j)
@@ -23,11 +26,42 @@ static inline void journal_pin_list_init(struct journal_entry_pin_list *p, int c
 {
 	for (unsigned i = 0; i < ARRAY_SIZE(p->unflushed); i++)
 		INIT_LIST_HEAD(&p->unflushed[i]);
-	for (unsigned i = 0; i < ARRAY_SIZE(p->flushed); i++)
-		INIT_LIST_HEAD(&p->flushed[i]);
+	INIT_LIST_HEAD(&p->flushed);
 	atomic_set(&p->count, count);
-	p->devs.e.nr_devs = 0;
+	p->unreplayed = false;
+	p->devs.nr = 0;
 	p->bytes = 0;
+}
+
+static inline bool journal_pin_has_dev(const struct journal_entry_pin_list *p, unsigned dev)
+{
+	for (unsigned i = 0; i < p->devs.nr; i++)
+		if (p->devs.data[i] == dev)
+			return true;
+	return false;
+}
+
+/*
+ * The pin only stores the device list (the key); the refcount lives in the
+ * superblock replicas table. Rebuild a replicas entry from the compact list
+ * for the get/put/eq/to_text calls.
+ */
+static inline void journal_pin_devs_to_replicas(union bch_replicas_padded *r,
+						const struct journal_entry_pin_list *p)
+{
+	struct bch_devs_list devs = {};
+	for (unsigned i = 0; i < p->devs.nr; i++)
+		bch2_dev_list_add_dev(&devs, p->devs.data[i]);
+	bch2_devlist_to_replicas(&r->e, BCH_DATA_journal, devs);
+}
+
+/* @devs is bounded by metadata_replicas <= BCH_REPLICAS_MAX (journal write) */
+static inline void journal_pin_set_devs(struct journal_entry_pin_list *p,
+					const struct bch_devs_list *devs)
+{
+	p->devs.nr = 0;
+	for (unsigned i = 0; i < devs->nr; i++)
+		p->devs.data[p->devs.nr++] = devs->data[i];
 }
 
 static inline bool journal_pin_active(struct journal_entry_pin *pin)
@@ -38,9 +72,10 @@ static inline bool journal_pin_active(struct journal_entry_pin *pin)
 static inline struct journal_entry_pin_list *
 journal_seq_pin(struct journal *j, u64 seq)
 {
+	lockdep_assert_held(&j->pin_resize_lock);
 	EBUG_ON(seq < j->pin.front || seq >= j->pin.back);
 
-	return &j->pin.data[seq & j->pin.mask];
+	return &fifo_entry(&j->pin, seq);
 }
 
 void bch2_journal_update_last_seq(struct journal *);
@@ -55,8 +90,14 @@ DEFINE_DARRAY_PREALLOCATED(replicas_entry_refs, 16);
 int bch2_journal_update_last_seq_ondisk(struct journal *, u64,
 					darray_replicas_entry_refs *);
 
-bool __bch2_journal_pin_put(struct journal *, u64);
-void bch2_journal_pin_put(struct journal *, u64);
+static inline bool __bch2_journal_pin_put(struct journal *j, u64 seq)
+{
+	struct journal_entry_pin_list *pin_list = journal_seq_pin(j, seq);
+
+	return atomic_dec_and_test(&pin_list->count);
+}
+
+void bch2_journal_replay_pins_put(struct journal *, u64);
 void bch2_journal_pin_drop(struct journal *, struct journal_entry_pin *);
 
 void bch2_journal_pin_set(struct journal *, u64, struct journal_entry_pin *,
@@ -99,9 +140,16 @@ static inline bool bch2_journal_flush_all_pins(struct journal *j)
 	return bch2_journal_flush_pins(j, U64_MAX);
 }
 
-int bch2_journal_flush_device_pins(struct journal *, int);
+static inline bool bch2_journal_flush_outstanding_pins(struct journal *j)
+{
+	return bch2_journal_flush_pins(j, journal_cur_seq(j));
+}
 
-void bch2_journal_pins_to_text(struct printbuf *, struct journal *);
-bool bch2_journal_seq_pins_to_text(struct printbuf *, struct journal *, u64 *);
+int bch2_journal_flush_device_pins(struct journal *, int);
+void bch2_journal_flush_dev_ro(struct journal *, unsigned);
+
+bool bch2_journal_seq_pins_to_text(struct printbuf *, struct journal *, u64 *, unsigned *);
+void bch2_journal_pins_to_text(struct printbuf *, struct journal *, unsigned);
+void bch2_journal_reclaim_to_text(struct printbuf *, struct journal *);
 
 #endif /* _BCACHEFS_JOURNAL_RECLAIM_H */

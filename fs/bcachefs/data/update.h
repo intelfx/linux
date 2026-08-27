@@ -16,7 +16,8 @@ struct moving_context;
 	x(reconcile)		\
 	x(promote)		\
 	x(self_heal)		\
-	x(scrub)
+	x(scrub)		\
+	x(scrub_no_repair)
 
 enum bch_data_update_types {
 #define x(n)	BCH_DATA_UPDATE_##n,
@@ -49,7 +50,15 @@ struct data_update {
 
 	bool			on_hashtable;
 	bool			read_done;
-	u8			ptrs_held;
+	/*
+	 * cas[i] is the bch_dev * for which we hold a ref (taken in
+	 * bkey_get_dev_refs), parallel to the ptrs in @k.  Stashed so the
+	 * exit path doesn't have to re-derive ca via c->devs[idx], which
+	 * dev_remove may have cleared while our ref still pins the dev.
+	 * NULL = no ref held for that ptr position; also serves as the
+	 * "we locked this bucket" indicator for nocow lock/unlock.
+	 */
+	struct bch_dev		*cas[BCH_BKEY_PTRS_MAX];
 
 	struct rhlist_head	hash;
 	struct bbpos		pos;
@@ -57,6 +66,7 @@ struct data_update {
 	/* associated with @ctxt */
 	struct list_head	read_list;
 	struct list_head	io_list;
+	u64			io_seq;
 	struct move_bucket	*b;
 	struct moving_context	*ctxt;
 	struct bch_move_stats	*stats;
@@ -82,7 +92,8 @@ void bch2_data_update_opts_to_text(struct printbuf *, struct bch_fs *,
 				   struct bch_inode_opts *, struct data_update_opts *);
 void bch2_data_update_to_text(struct printbuf *, struct data_update *);
 void bch2_data_update_inflight_to_text(struct printbuf *, struct data_update *);
-bool bch2_data_update_in_flight(struct bch_fs *, struct bbpos *);
+bool bch2_data_update_in_flight(struct bch_fs *, struct bbpos *,
+				enum bch_data_update_types);
 
 int bch2_data_update_index_update(struct bch_write_op *);
 
@@ -92,6 +103,9 @@ int bch2_can_do_data_update(struct btree_trans *, struct bch_inode_opts *,
 			    struct data_update_opts *, struct bkey_s_c,
 			    struct printbuf *);
 
+bool bch2_data_update_fail_should_trace(enum bch_data_update_types, int);
+
+void bch2_data_update_ec_alloc_failed(struct data_update *);
 void bch2_data_update_exit(struct data_update *, int);
 int bch2_data_update_init(struct btree_trans *, struct btree_iter *,
 			  struct moving_context *,
@@ -99,6 +113,8 @@ int bch2_data_update_init(struct btree_trans *, struct btree_iter *,
 			  struct write_point_specifier,
 			  struct bch_inode_opts *, struct data_update_opts,
 			  enum btree_id, struct bkey_s_c);
+
+unsigned ptr_mask_remap(struct bch_fs *, struct bkey_s_c, unsigned, struct bkey_s_c);
 
 void bch2_fs_data_update_exit(struct bch_fs *);
 int bch2_fs_data_update_init(struct bch_fs *);

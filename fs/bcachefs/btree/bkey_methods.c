@@ -10,6 +10,7 @@
 #include "btree/bkey_methods.h"
 #include "btree/cache.h"
 
+#include "data/ec/create.h"
 #include "data/ec/trigger.h"
 #include "data/extents.h"
 #include "data/io_misc.h"
@@ -20,6 +21,7 @@
 #include "fs/quota.h"
 #include "fs/xattr.h"
 
+#include "init/damage.h"
 #include "init/error.h"
 
 #include "sb/io.h"
@@ -35,7 +37,7 @@ const char * const bch2_bkey_types[] = {
 };
 
 static int deleted_key_validate(struct bch_fs *c, struct bkey_s_c k,
-				struct bkey_validate_context from)
+				const struct bkey_validate_context *from)
 {
 	return 0;
 }
@@ -53,7 +55,7 @@ static int deleted_key_validate(struct bch_fs *c, struct bkey_s_c k,
 })
 
 static int empty_val_key_validate(struct bch_fs *c, struct bkey_s_c k,
-				  struct bkey_validate_context from)
+				  const struct bkey_validate_context *from)
 {
 	int ret = 0;
 
@@ -66,12 +68,12 @@ fsck_err:
 }
 
 static int key_type_error_validate(struct bch_fs *c, struct bkey_s_c k,
-				   struct bkey_validate_context from)
+				   const struct bkey_validate_context *from)
 {
 	return 0;
 }
 
-static void key_type_error_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void key_type_error_to_text(struct printbuf *out, struct bch_fs *c,
 				    struct bkey_s_c k)
 {
 	struct bch_error e;
@@ -102,12 +104,12 @@ void bch2_set_bkey_error(struct bch_fs *c, struct bkey_i *k, enum bch_key_type_e
 }
 
 static int key_type_cookie_validate(struct bch_fs *c, struct bkey_s_c k,
-				    struct bkey_validate_context from)
+				    const struct bkey_validate_context *from)
 {
 	return 0;
 }
 
-static void key_type_cookie_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void key_type_cookie_to_text(struct printbuf *out, struct bch_fs *c,
 				    struct bkey_s_c k)
 {
 	struct bkey_s_c_cookie ck = bkey_s_c_to_cookie(k);
@@ -126,19 +128,19 @@ static void key_type_cookie_to_text(struct printbuf *out, struct bch_fs *c,
 })
 
 static int key_type_inline_data_validate(struct bch_fs *c, struct bkey_s_c k,
-					 struct bkey_validate_context from)
+					 const struct bkey_validate_context *from)
 {
 	return 0;
 }
 
-static void key_type_inline_data_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void key_type_inline_data_to_text(struct printbuf *out, struct bch_fs *c,
 					 struct bkey_s_c k)
 {
 	struct bkey_s_c_inline_data d = bkey_s_c_to_inline_data(k);
 	unsigned datalen = bkey_inline_data_bytes(k.k);
 
-	prt_printf(out, "datalen %u: %*phN",
-	       datalen, min(datalen, 32U), d.v->data);
+	prt_printf(out, "datalen %u: ", datalen);
+	prt_hex_bytes(out, d.v->data, min(datalen, 32U));
 }
 
 #define bch2_bkey_ops_inline_data ((struct bkey_ops) {		\
@@ -167,7 +169,7 @@ const struct bkey_ops bch2_bkey_null_ops = {
 };
 
 int bch2_bkey_val_validate(struct bch_fs *c, struct bkey_s_c k,
-			   struct bkey_validate_context from)
+			   const struct bkey_validate_context *from)
 {
 	if (test_bit(BCH_FS_no_invalid_checks, &c->flags))
 		return 0;
@@ -193,13 +195,13 @@ static u64 bch2_key_types_allowed[] = {
 		BIT_ULL(KEY_TYPE_deleted)|
 		BIT_ULL(KEY_TYPE_btree_ptr)|
 		BIT_ULL(KEY_TYPE_btree_ptr_v2),
-#define x(name, nr, flags, keys)	[BKEY_TYPE_##name] = BIT_ULL(KEY_TYPE_deleted)|keys,
+#define x(name, nr, flags, keys, ...)	[BKEY_TYPE_##name] = BIT_ULL(KEY_TYPE_deleted)|keys,
 	BCH_BTREE_IDS()
 #undef x
 };
 
 static const enum bch_bkey_type_flags bch2_bkey_type_flags[] = {
-#define x(name, nr, flags)	[KEY_TYPE_##name] = flags,
+#define x(name, nr, flags, ...)	[KEY_TYPE_##name] = flags,
 	BCH_BKEY_TYPES()
 #undef x
 };
@@ -210,9 +212,9 @@ const char *bch2_btree_node_type_str(enum btree_node_type type)
 }
 
 int __bch2_bkey_validate(struct bch_fs *c, struct bkey_s_c k,
-			 struct bkey_validate_context from)
+			 const struct bkey_validate_context *from)
 {
-	enum btree_node_type type = __btree_node_type(from.level, from.btree);
+	enum btree_node_type type = __btree_node_type(from->level, from->btree);
 
 	if (test_bit(BCH_FS_no_invalid_checks, &c->flags))
 		return 0;
@@ -231,9 +233,9 @@ int __bch2_bkey_validate(struct bch_fs *c, struct bkey_s_c k,
 		: 0;
 
 	bool strict_key_type_allowed =
-		(from.flags & BCH_VALIDATE_commit) ||
+		(from->flags & BCH_VALIDATE_commit) ||
 		type == BKEY_TYPE_btree ||
-		(from.btree < BTREE_ID_NR &&
+		(from->btree < BTREE_ID_NR &&
 		 (bkey_flags & BKEY_TYPE_strict_btree_checks));
 
 	bkey_fsck_err_on(strict_key_type_allowed &&
@@ -288,30 +290,13 @@ fsck_err:
 }
 
 int bch2_bkey_validate(struct bch_fs *c, struct bkey_s_c k,
-		       struct bkey_validate_context from)
+		       const struct bkey_validate_context *from)
 {
 	return __bch2_bkey_validate(c, k, from) ?:
 		bch2_bkey_val_validate(c, k, from);
 }
 
-int bch2_bkey_in_btree_node(struct bch_fs *c, struct btree *b,
-			    struct bkey_s_c k,
-			    struct bkey_validate_context from)
-{
-	int ret = 0;
-
-	bkey_fsck_err_on(bpos_lt(k.k->p, b->data->min_key),
-			 c, bkey_before_start_of_btree_node,
-			 "key before start of btree node");
-
-	bkey_fsck_err_on(bpos_gt(k.k->p, b->data->max_key),
-			 c, bkey_after_end_of_btree_node,
-			 "key past end of btree node");
-fsck_err:
-	return ret;
-}
-
-void bch2_bpos_to_text(struct printbuf *out, struct bpos pos)
+__cold void bch2_bpos_to_text(struct printbuf *out, struct bpos pos)
 {
 	if (bpos_eq(pos, POS_MIN))
 		prt_printf(out, "POS_MIN");
@@ -337,7 +322,7 @@ void bch2_bpos_to_text(struct printbuf *out, struct bpos pos)
 	}
 }
 
-void bch2_bkey_to_text(struct printbuf *out, const struct bkey *k)
+__cold void bch2_bkey_to_text(struct printbuf *out, const struct bkey *k)
 {
 	if (k) {
 		prt_printf(out, "u64s %u type ", k->u64s);
@@ -355,7 +340,7 @@ void bch2_bkey_to_text(struct printbuf *out, const struct bkey *k)
 	}
 }
 
-void bch2_val_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_val_to_text(struct printbuf *out, struct bch_fs *c,
 		      struct bkey_s_c k)
 {
 	const struct bkey_ops *ops = bch2_bkey_type_ops(k.k->type);
@@ -364,7 +349,7 @@ void bch2_val_to_text(struct printbuf *out, struct bch_fs *c,
 		ops->val_to_text(out, c, k);
 }
 
-void bch2_bkey_val_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_bkey_val_to_text(struct printbuf *out, struct bch_fs *c,
 			   struct bkey_s_c k)
 {
 	bch2_bkey_to_text(out, k.k);
@@ -479,7 +464,7 @@ void __bch2_bkey_compat(const struct bch_fs *c,
 				if (!write)
 					swap(in, out);
 
-				uk = __bch2_bkey_unpack_key(in, k);
+				__bch2_bkey_unpack_key(in, &uk, k);
 				swap(uk.p.inode, uk.p.offset);
 				BUG_ON(!bch2_bkey_pack_key(k, &uk, out));
 			}
@@ -498,7 +483,7 @@ void __bch2_bkey_compat(const struct bch_fs *c,
 				u64 max_packed = min_packed +
 					~(~0ULL << f->bits_per_field[BKEY_FIELD_SNAPSHOT]);
 
-				uk = __bch2_bkey_unpack_key(f, k);
+				__bch2_bkey_unpack_key(f, &uk, k);
 				uk.p.snapshot = write
 					? min_packed : min_t(u64, U32_MAX, max_packed);
 
@@ -513,7 +498,7 @@ void __bch2_bkey_compat(const struct bch_fs *c,
 		if (!bkey_packed(k)) {
 			u = bkey_i_to_s(packed_to_bkey(k));
 		} else {
-			uk = __bch2_bkey_unpack_key(f, k);
+			__bch2_bkey_unpack_key(f, &uk, k);
 			u.k = &uk;
 			u.v = bkeyp_val(f, k);
 		}

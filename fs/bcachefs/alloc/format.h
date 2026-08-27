@@ -5,7 +5,7 @@
 struct bch_alloc {
 	struct bch_val		v;
 	__u8			fields;
-	__u8			gen;
+	__u8			generation;
 	__u8			data[];
 } __packed __aligned(8);
 
@@ -28,7 +28,7 @@ enum {
 struct bch_alloc_v2 {
 	struct bch_val		v;
 	__u8			nr_fields;
-	__u8			gen;
+	__u8			generation;
 	__u8			oldest_gen;
 	__u8			data_type;
 	__u8			data[];
@@ -47,7 +47,7 @@ struct bch_alloc_v3 {
 	__le64			journal_seq;
 	__le32			flags;
 	__u8			nr_fields;
-	__u8			gen;
+	__u8			generation;
 	__u8			oldest_gen;
 	__u8			data_type;
 	__u8			data[];
@@ -56,11 +56,34 @@ struct bch_alloc_v3 {
 LE32_BITMASK(BCH_ALLOC_V3_NEED_DISCARD,struct bch_alloc_v3, flags,  0,  1)
 LE32_BITMASK(BCH_ALLOC_V3_NEED_INC_GEN,struct bch_alloc_v3, flags,  1,  2)
 
+/*
+ * Per-bucket allocation state, stored in the alloc btree (cached).
+ *
+ * data_type is the bucket's state. For non-empty buckets, alloc_data_type()
+ * derives it from sector counts and stripe_refcount. The empty-state
+ * transitions are decided explicitly:
+ *   stripe_refcount > 0	→ BCH_DATA_stripe/parity
+ *   dirty_sectors > 0		→ data type from bucket contents
+ *   cached_sectors > 0		→ BCH_DATA_cached
+ *   nonempty → empty		→ BCH_DATA_need_discard (set in bch2_trigger_alloc)
+ *   need_discard → empty	→ BCH_DATA_free (set in bch2_discard_one_bucket)
+ *   gc_gen >= MAX, free	→ BCH_DATA_need_gc_gens (in alloc_data_type)
+ *
+ * NEED_DISCARD flag is no longer read by alloc_data_type(); it's still
+ * written for forward/back compatibility with kernels that do read it.
+ *
+ * journal_seq_nonempty/journal_seq_empty track bucket state transitions for
+ * the noflush optimization and discard path:
+ *   journal_seq_nonempty: set on empty→nonempty transition
+ *   journal_seq_empty:    set on nonempty→empty transition;
+ *     bucket can't be reused until this seq is flushed to disk.
+ *     0 means no journal delay needed (noflush/fast discard path).
+ */
 struct bch_alloc_v4 {
 	struct bch_val		v;
 	__u64			journal_seq_nonempty;
 	__u32			flags;
-	__u8			gen;
+	__u8			generation;
 	__u8			oldest_gen;
 	__u8			data_type;
 	__u8			stripe_redundancy_obsolete;
@@ -91,5 +114,36 @@ struct bch_bucket_gens {
 	struct bch_val		v;
 	u8			gens[KEY_TYPE_BUCKET_GENS_NR];
 } __packed __aligned(8);
+
+/* Data type computation */
+
+/*
+ * Normalize data_type to the type of data stored in the bucket: cached and
+ * stripe data are both user data from the bucket's perspective.
+ */
+static inline enum bch_data_type bucket_data_type(enum bch_data_type data_type)
+{
+	switch (data_type) {
+	case BCH_DATA_cached:
+	case BCH_DATA_stripe:
+		return BCH_DATA_user;
+	default:
+		return data_type;
+	}
+}
+
+static inline bool bucket_data_type_mismatch(enum bch_data_type bucket,
+					     enum bch_data_type ptr)
+{
+	return !data_type_is_empty(bucket) &&
+		bucket != BCH_DATA_multiple &&
+		bucket_data_type(bucket) != bucket_data_type(ptr);
+}
+
+#define DATA_TYPES_MOVABLE		\
+	(BIT(BCH_DATA_btree)|		\
+	 BIT(BCH_DATA_user)|		\
+	 BIT(BCH_DATA_stripe)|		\
+	 BIT(BCH_DATA_multiple))
 
 #endif /* _BCACHEFS_ALLOC_BACKGROUND_FORMAT_H */

@@ -22,7 +22,7 @@ static inline u64 swab40(u64 x)
 }
 
 int bch2_backpointer_validate(struct bch_fs *, struct bkey_s_c k,
-			      struct bkey_validate_context);
+			      const struct bkey_validate_context *);
 void bch2_backpointer_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 void bch2_backpointer_swab(const struct bch_fs *, struct bkey_s);
 
@@ -97,6 +97,14 @@ int bch2_bucket_backpointer_mod_nowritebuffer(struct btree_trans *,
 				struct bkey_i_backpointer *,
 				bool);
 
+static inline enum btree_id backpointer_btree(struct bch_backpointer *bp)
+{
+
+	return BACKPOINTER_STRIPE_PTR(bp)
+		? BTREE_ID_stripe_backpointers
+		: BTREE_ID_backpointers;
+}
+
 static inline int bch2_bucket_backpointer_mod(struct btree_trans *trans,
 				struct bkey_s_c orig_k,
 				struct bkey_i_backpointer *bp,
@@ -115,7 +123,7 @@ static inline int bch2_bucket_backpointer_mod(struct btree_trans *trans,
 		set_bkey_val_u64s(&bp->k, 0);
 	}
 
-	return bch2_trans_update_buffered(trans, BTREE_ID_backpointers, &bp->k_i);
+	return bch2_trans_update_buffered(trans, backpointer_btree(&bp->v), &bp->k_i);
 }
 
 static inline enum bch_data_type bch2_bkey_ptr_data_type(struct bkey_s_c k,
@@ -150,13 +158,22 @@ static inline enum bch_data_type bch2_bkey_ptr_data_type(struct bkey_s_c k,
 	}
 }
 
+static inline u64 bp_dev_for_ec_removed_dev(u64 ec_idx, unsigned ec_block)
+{
+	return (ec_idx << 8) | ec_block;
+}
+
 static inline struct bpos bch2_extent_ptr_to_bp_pos(const struct bch_fs *c, struct bkey_s_c k,
 						    struct extent_ptr_decoded p)
 {
-	if (k.k->type != KEY_TYPE_stripe)
-		return POS(p.ptr.dev,
+	if (k.k->type != KEY_TYPE_stripe) {
+		struct bpos pos = POS(p.ptr.dev,
 			   ((u64) p.ptr.offset << c->sb.extent_bp_shift) + p.crc.offset);
-	else {
+
+		if (p.ptr.dev == BCH_SB_MEMBER_INVALID && p.has_ec)
+			pos.inode = bp_dev_for_ec_removed_dev(p.ec.idx, p.ec.block);
+		return pos;
+	} else {
 		/*
 		 * Put stripe backpointers where they won't collide with the
 		 * extent backpointers within the stripe:
@@ -180,7 +197,7 @@ static inline void bch2_extent_ptr_to_bp(struct bch_fs *c,
 		.btree_id	= btree_id,
 		.level		= level,
 		.data_type	= bch2_bkey_ptr_data_type(k, p, entry),
-		.bucket_gen	= p.ptr.gen,
+		.bucket_gen	= p.ptr.generation,
 		.bucket_len	= ptr_disk_sectors(level ? btree_sectors(c) : k.k->size, p),
 		.pos		= k.k->p,
 	};
@@ -188,6 +205,9 @@ static inline void bch2_extent_ptr_to_bp(struct bch_fs *c,
 	if (!level && bch2_dev_rotational(c, p.ptr.dev))
 		SET_BACKPOINTER_RECONCILE_PHYS(&bp->v,
 				rb_work_id_phys(bch2_bkey_reconcile_work_id(c, k)));
+
+	SET_BACKPOINTER_ERASURE_CODED(&bp->v, p.has_ec);
+	SET_BACKPOINTER_STRIPE_PTR(&bp->v, p.has_ec && p.ptr.dev == BCH_SB_MEMBER_INVALID);
 }
 
 struct wb_maybe_flush;
@@ -213,6 +233,8 @@ DEFINE_DARRAY_NAMED(darray_bkey_i_backpointer, struct bkey_i_backpointer);
 
 struct progress_indicator;
 struct bp_scan_iter {
+	/* BTREE_ID_backpointers, BTREE_ID_stripe_backpointers */
+	enum btree_id			btree;
 	struct bpos			pos;
 	u64				nr_flushes;
 	struct progress_indicator	*progress;
@@ -221,8 +243,8 @@ struct bp_scan_iter {
 
 DEFINE_CLASS(backpointer_scan_iter, struct bp_scan_iter,
 	     darray_exit(&_T.bps),
-	     ((struct bp_scan_iter) { .pos = pos, .progress = progress }),
-	     struct bpos pos, struct progress_indicator *progress)
+	     ((struct bp_scan_iter) { .btree = btree, .pos = pos, .progress = progress }),
+	     enum btree_id btree, struct bpos pos, struct progress_indicator *progress)
 
 struct bkey_s_c_backpointer bch2_bp_scan_iter_peek(struct btree_trans *, struct bp_scan_iter *,
 						   struct bpos, struct wb_maybe_flush *);
@@ -233,23 +255,28 @@ static inline void bch2_bp_scan_iter_advance(struct bp_scan_iter *iter)
 	--iter->bps.nr;
 }
 
-#define backpointer_scan_for_each(_trans, _bp_iter, _start, _end,				\
+#define backpointer_scan_for_each(_trans, _bp_iter, _btree, _start, _end,			\
 				  _last_flushed, _progress, _bp, _do)				\
 ({												\
-	CLASS(backpointer_scan_iter, _bp_iter)(_start, _progress);				\
+	CLASS(backpointer_scan_iter, _bp_iter)(_btree, _start, _progress);			\
 	int _ret3 = 0;										\
 												\
 	while (true) {										\
-		_ret3 = lockrestart_do(trans, ({						\
-			struct bkey_s_c_backpointer _bp =					\
-				bch2_bp_scan_iter_peek(_trans, &_bp_iter, _end, _last_flushed);	\
-			if (!_bp.k)								\
-				break;								\
-			bkey_err(_bp) ?: (_do);							\
-		}));										\
+		u32 _restart_count = bch2_trans_begin(_trans);					\
+		_ret3 = 0;									\
+												\
+		struct bkey_s_c_backpointer _bp =						\
+			bch2_bp_scan_iter_peek(_trans, &_bp_iter, _end, _last_flushed);		\
+		if (!_bp.k)									\
+			break;									\
+												\
+		_ret3 = bkey_err(_bp) ?: (_do);							\
+		if (bch2_err_matches(_ret3, BCH_ERR_transaction_restart))			\
+			continue;								\
 		if (_ret3)									\
 			break;									\
 												\
+		bch2_trans_verify_not_restarted(_trans, _restart_count);			\
 		bch2_bp_scan_iter_advance(&_bp_iter);						\
 	}											\
 												\

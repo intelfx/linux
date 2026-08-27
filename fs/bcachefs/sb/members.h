@@ -6,6 +6,8 @@
 #include "util/enumerated_ref.h"
 #include "util/darray.h"
 
+/* Superblock member access: */
+
 extern char * const bch2_member_error_strs[];
 
 static inline struct bch_member *
@@ -44,20 +46,27 @@ void bch2_member_to_text(struct printbuf *, struct bch_member *,
 			 struct bch_sb_field_disk_groups *,
 			 struct bch_sb *, unsigned);
 
+void bch2_member_to_text_short_locked(struct printbuf *, struct bch_fs *, struct bch_dev *);
 void bch2_member_to_text_short(struct printbuf *, struct bch_fs *, struct bch_dev *);
 void bch2_devs_mask_to_text_locked(struct printbuf *, struct bch_fs *, struct bch_devs_mask *);
+
+unsigned long bch2_dev_latency_max(struct bch_fs *, struct bch_devs_mask *, int);
+
+/* Device online state: */
 
 static inline bool bch2_dev_is_online(struct bch_dev *ca)
 {
 	return !enumerated_ref_is_zero(&ca->io_ref[READ]);
 }
 
-static inline struct bch_dev *bch2_dev_rcu_noerror(struct bch_fs *, unsigned);
+static inline struct bch_dev *bch2_dev_rcu_noerror(const struct bch_fs *, unsigned);
 
 static inline bool bch2_dev_idx_is_online(struct bch_fs *c, unsigned dev)
 {
 	return test_bit(dev, c->devs_online.d);
 }
+
+/* Device masks and lists: */
 
 static inline unsigned dev_mask_nr(const struct bch_devs_mask *devs)
 {
@@ -94,6 +103,8 @@ static inline struct bch_devs_list bch2_dev_list_single(unsigned dev)
 	return (struct bch_devs_list) { .nr = 1, .data[0] = dev };
 }
 
+/* Device iteration (RCU): */
+
 static inline struct bch_dev *__bch2_next_dev_idx(struct bch_fs *c, unsigned idx,
 						  const struct bch_devs_mask *mask)
 {
@@ -125,6 +136,8 @@ static inline struct bch_dev *__bch2_next_dev(struct bch_fs *c, struct bch_dev *
 #define for_each_rw_member_rcu(_c, _ca)					\
 	for_each_member_device_rcu(_c, _ca, &(_c)->allocator.rw_devs[BCH_DATA_free])
 
+/* Device refcounting: */
+
 static inline void bch2_dev_get(struct bch_dev *ca)
 {
 #ifdef CONFIG_BCACHEFS_DEBUG
@@ -154,6 +167,28 @@ static inline void bch2_dev_put(struct bch_dev *ca)
 		__bch2_dev_put(ca);
 }
 DEFINE_FREE(bch2_dev_put, struct bch_dev *, bch2_dev_put(_T))
+
+/*
+ * Memory-lifetime-only reference: keeps the bch_dev allocation alive, but
+ * does NOT imply the device is still a member of the filesystem - removal
+ * can complete while you hold this. Use it (never ca->ref) in any context
+ * that blocks on state_lock, and recheck ca->removing under the lock
+ * before touching member state. Drained by bch2_dev_free(), outside
+ * state_lock. See the comment at ca->ref_outer.
+ */
+static inline void bch2_dev_get_outer(struct bch_dev *ca)
+{
+	refcount_inc(&ca->ref_outer);
+}
+
+static inline void bch2_dev_put_outer(struct bch_dev *ca)
+{
+	if (!IS_ERR_OR_NULL(ca) &&
+	    refcount_dec_and_test(&ca->ref_outer))
+		complete(&ca->ref_outer_completion);
+}
+
+/* Device iteration (refcounted): */
 
 static inline struct bch_dev *bch2_get_next_dev(struct bch_fs *c, struct bch_dev *ca)
 {
@@ -198,6 +233,8 @@ static inline struct bch_dev *bch2_get_next_online_dev(struct bch_fs *c,
 #define for_each_readable_member(c, ca, ref_idx)				\
 	__for_each_online_member(c, ca,	BIT( BCH_MEMBER_STATE_rw)|BIT(BCH_MEMBER_STATE_ro), READ, ref_idx)
 
+/* Device lookup: */
+
 static inline bool bch2_dev_exists(const struct bch_fs *c, unsigned dev)
 {
 	return dev < c->sb.nr_devices && c->devs[dev];
@@ -221,11 +258,11 @@ static inline struct bch_dev *bch2_dev_locked(struct bch_fs *c, unsigned dev)
 	EBUG_ON(!bch2_dev_exists(c, dev));
 
 	return rcu_dereference_protected(c->devs[dev],
-					 lockdep_is_held(&c->sb_lock) ||
+					 lockdep_is_held(&c->sb_lock.lock) ||
 					 lockdep_is_held(&c->state_lock));
 }
 
-static inline struct bch_dev *bch2_dev_rcu_noerror(struct bch_fs *c, unsigned dev)
+static inline struct bch_dev *bch2_dev_rcu_noerror(const struct bch_fs *c, unsigned dev)
 {
 	return c && dev < c->sb.nr_devices
 		? rcu_dereference(c->devs[dev])
@@ -354,6 +391,8 @@ static inline struct bch_dev *bch2_dev_get_ioref(struct bch_fs *c, unsigned dev,
 	return NULL;
 }
 
+/* Member properties: */
+
 extern const struct bch_sb_field_ops bch_sb_field_ops_members_v1;
 extern const struct bch_sb_field_ops bch_sb_field_ops_members_v2;
 
@@ -383,6 +422,7 @@ static inline struct bch_member_cpu bch2_mi_to_cpu(struct bch_member *mi)
 		.first_bucket	= le16_to_cpu(mi->first_bucket),
 		.bucket_size	= le16_to_cpu(mi->bucket_size),
 		.group		= BCH_MEMBER_GROUP(mi),
+		/* .failure_domain is interned in bch2_sb_members_to_cpu() */
 		.state		= BCH_MEMBER_STATE(mi),
 		.discard	= BCH_MEMBER_DISCARD(mi),
 		.data_allowed	= BCH_MEMBER_DATA_ALLOWED(mi),
@@ -390,6 +430,7 @@ static inline struct bch_member_cpu bch2_mi_to_cpu(struct bch_member *mi)
 			? BCH_MEMBER_DURABILITY(mi) - 1
 			: 1,
 		.freespace_initialized = BCH_MEMBER_FREESPACE_INITIALIZED(mi),
+		.initialized		= BCH_MEMBER_INITIALIZED(mi),
 		.resize_on_mount	= BCH_MEMBER_RESIZE_ON_MOUNT(mi),
 		.rotational		= BCH_MEMBER_ROTATIONAL(mi),
 		.valid			= bch2_member_alive(mi),
@@ -403,6 +444,8 @@ void bch2_sb_members_to_cpu(struct bch_fs *);
 
 void bch2_dev_io_errors_to_text(struct printbuf *, struct bch_dev *);
 void bch2_dev_errors_reset(struct bch_dev *);
+
+/* Btree allocation bitmap: */
 
 static inline bool __bch2_dev_btree_bitmap_marked_sectors(struct bch_dev *ca, u64 start,
 							  unsigned sectors, bool with_gc)
@@ -455,10 +498,21 @@ int bch2_btree_bitmap_gc(struct bch_fs *);
 void bch2_maybe_schedule_btree_bitmap_gc_stop(struct bch_fs *);
 void bch2_maybe_schedule_btree_bitmap_gc(struct bch_fs *);
 
+/* Member management: */
+
 int bch2_sb_member_alloc(struct bch_fs *);
 void bch2_sb_members_clean_deleted(struct bch_fs *);
 
-void __bch2_dev_mi_field_upgrades(struct bch_fs *, struct bch_dev *, bool *);
+struct bch_dev_identity {
+	char name[sizeof(((struct bch_member *) NULL)->device_name) + 1];
+	char model[sizeof(((struct bch_member *) NULL)->device_model) + 1];
+	char serial[sizeof(((struct bch_member *) NULL)->device_serial) + 1];
+	bool rotational;
+};
+
+void bch2_dev_mi_field_read(struct bch_dev *, struct bch_dev_identity *);
+void bch2_dev_mi_field_upgrades_locked(struct bch_fs *, struct bch_dev *,
+				       const struct bch_dev_identity *, bool *);
 void bch2_dev_mi_field_upgrades(struct bch_dev *);
 void bch2_fs_mi_field_upgrades(struct bch_fs *);
 

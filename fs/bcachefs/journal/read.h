@@ -41,6 +41,16 @@ static inline struct jset_entry *__jset_entry_type_next(struct jset *jset,
 	for_each_jset_entry_type(entry, jset, BCH_JSET_ENTRY_btree_keys)\
 		jset_entry_for_each_key(entry, k)
 
+static inline time64_t jset_datetime(struct jset *j)
+{
+	for_each_jset_entry_type(entry, j, BCH_JSET_ENTRY_datetime) {
+		struct jset_entry_datetime *dt =
+			container_of(entry, struct jset_entry_datetime, entry);
+		return le64_to_cpu(dt->seconds);
+	}
+	return 0;
+}
+
 static inline struct nonce journal_nonce(const struct jset *jset)
 {
 	return (struct nonce) {{
@@ -51,17 +61,8 @@ static inline struct nonce journal_nonce(const struct jset *jset)
 	}};
 }
 
-int bch2_journal_entry_validate(struct bch_fs *, struct jset *,
-				struct jset_entry *, unsigned, int,
-				struct bkey_validate_context);
-void bch2_journal_entry_to_text(struct printbuf *, struct bch_fs *,
-				struct jset_entry *);
-
 void bch2_journal_ptrs_to_text(struct printbuf *, struct bch_fs *,
 			       struct journal_replay *);
-
-int bch2_jset_validate(struct bch_fs *, struct bch_dev *, struct jset *,
-		       u64, enum bch_validate_flags);
 
 typedef struct u64_range {
 	u64	start;
@@ -72,6 +73,8 @@ DEFINE_DARRAY(u64_range);
 
 struct u64_range bch2_journal_entry_missing_range(struct bch_fs *, u64, u64);
 
+void bch2_journal_seq_datetime_to_text(struct printbuf *, struct bch_fs *, u64);
+int bch2_journal_reread_for_rewind(struct bch_fs *);
 int bch2_journal_read(struct bch_fs *, struct journal_start_info *);
 
 #endif /* _BCACHEFS_JOURNAL_READ_H */

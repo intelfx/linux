@@ -9,6 +9,8 @@
 #include "alloc/background.h"
 #include "alloc/disk_groups.h"
 
+#include "btree/update.h"
+
 #include "data/compress.h"
 #include "data/copygc.h"
 #include "data/reconcile/work.h"
@@ -20,6 +22,20 @@
 #include "sb/io.h"
 
 #include "util/util.h"
+
+/*
+ * fs/fs_parser.c marked the standard bool_names static in 7.1, so carry our
+ * own copy. Same six tokens as the original — strict, no looser parsing.
+ */
+static const struct constant_table bch2_bool_names[] = {
+	{ "0",		false },
+	{ "1",		true  },
+	{ "false",	false },
+	{ "no",		false },
+	{ "true",	true  },
+	{ "yes",	true  },
+	{ },
+};
 
 #define x(t, n, ...) [n] = #t,
 
@@ -118,6 +134,11 @@ static const char * const __bch2_key_type_error_reasons[] = {
 	NULL
 };
 
+const char * const bch2_scrub_journal_opts[] = {
+	BCH_SCRUB_JOURNAL_OPTS()
+	NULL
+};
+
 #undef x
 
 static void prt_str_opt_boundscheck(struct printbuf *out, const char * const opts[],
@@ -163,7 +184,7 @@ static int bch2_opt_fix_errors_parse(struct bch_fs *c, const char *val, u64 *res
 	return 0;
 }
 
-static void bch2_opt_fix_errors_to_text(struct printbuf *out,
+static __cold void bch2_opt_fix_errors_to_text(struct printbuf *out,
 					struct bch_fs *c,
 					struct bch_sb *sb,
 					u64 v)
@@ -244,29 +265,39 @@ typedef u64 (*sb_opt_get_fn)(const struct bch_sb *);
 typedef void (*sb_opt_set_fn)(struct bch_sb *, u64);
 typedef u64 (*member_opt_get_fn)(const struct bch_member *);
 typedef void (*member_opt_set_fn)(struct bch_member *, u64);
+typedef u64 (*ext_opt_get_fn)(const struct bch_sb_field_ext *);
+typedef void (*ext_opt_set_fn)(struct bch_sb_field_ext *, u64);
 
 __maybe_unused static const sb_opt_get_fn	BCH2_NO_SB_OPT = NULL;
 __maybe_unused static const sb_opt_set_fn	SET_BCH2_NO_SB_OPT = NULL;
 __maybe_unused static const member_opt_get_fn	BCH2_NO_MEMBER_OPT = NULL;
 __maybe_unused static const member_opt_set_fn	SET_BCH2_NO_MEMBER_OPT = NULL;
+__maybe_unused static const ext_opt_get_fn	BCH2_NO_EXT_OPT = NULL;
+__maybe_unused static const ext_opt_set_fn	SET_BCH2_NO_EXT_OPT = NULL;
 
 #define type_compatible_or_null(_p, _type)				\
 	__builtin_choose_expr(						\
 		__builtin_types_compatible_p(typeof(_p), typeof(_type)), _p, NULL)
 
 const struct bch_option bch2_opt_table[] = {
-#define OPT_BOOL()		.type = BCH_OPT_BOOL, .min = 0, .max = 2
+/* .min and .max are both inclusive bounds; a value is valid iff min <= v <= max */
+#define OPT_BOOL()		.type = BCH_OPT_BOOL, .min = 0, .max = 1
 #define OPT_UINT(_min, _max)	.type = BCH_OPT_UINT,			\
 				.min = _min, .max = _max
 #define OPT_STR(_choices)	.type = BCH_OPT_STR,			\
-				.min = 0, .max = ARRAY_SIZE(_choices) - 1, \
+				.min = 0, .max = ARRAY_SIZE(_choices) - 2, \
 				.choices = _choices
 #define OPT_STR_NOLIMIT(_choices)	.type = BCH_OPT_STR,		\
 				.min = 0, .max = U64_MAX,		\
 				.choices = _choices
-#define OPT_BITFIELD(_choices)	.type = BCH_OPT_BITFIELD,		\
-				.choices = _choices
+#define OPT_BITFIELD(_choices)	OPT_BITFIELD_MASK(_choices, U64_MAX)
+#define OPT_BITFIELD_MASK(_choices, _choices_allowed_mask)	.type = BCH_OPT_BITFIELD,\
+				.choices = _choices,			\
+				.choices_allowed_mask = _choices_allowed_mask
 #define OPT_FN(_fn)		.type = BCH_OPT_FN, .fn	= _fn
+#define OPT_STR_MEMBER(_field)	.type = BCH_OPT_STR_MEMBER,		\
+				.member_offset = offsetof(struct bch_member, _field),\
+				.member_size = sizeof(((struct bch_member *) NULL)->_field)
 
 #define x(_name, _bits, _flags, _type, _sb_opt, _default, _hint, _help)	\
 	[Opt_##_name] = {						\
@@ -279,6 +310,8 @@ const struct bch_option bch2_opt_table[] = {
 		.set_sb		= type_compatible_or_null(SET_##_sb_opt,*SET_BCH2_NO_SB_OPT),	\
 		.get_member	= type_compatible_or_null(_sb_opt,	*BCH2_NO_MEMBER_OPT),	\
 		.set_member	= type_compatible_or_null(SET_##_sb_opt,*SET_BCH2_NO_MEMBER_OPT),\
+		.get_ext	= type_compatible_or_null(_sb_opt,	*BCH2_NO_EXT_OPT),	\
+		.set_ext	= type_compatible_or_null(SET_##_sb_opt,*SET_BCH2_NO_EXT_OPT),	\
 		_type							\
 	},
 
@@ -353,7 +386,7 @@ int bch2_opt_validate(const struct bch_option *opt, u64 v, struct printbuf *err)
 		return -BCH_ERR_ERANGE_option_too_small;
 	}
 
-	if (opt->max && v >= opt->max) {
+	if (opt->max && v > opt->max) {
 		if (err)
 			prt_printf(err, "%s: too big (max %llu)",
 			       opt->attr.name, opt->max);
@@ -395,7 +428,7 @@ int bch2_opt_parse(struct bch_fs *c,
 		if (!val)
 			val = "1";
 
-		ret = lookup_constant(bool_names, val, -BCH_ERR_option_not_bool);
+		ret = lookup_constant(bch2_bool_names, val, -BCH_ERR_option_not_bool);
 		if (ret != -BCH_ERR_option_not_bool) {
 			*res = ret;
 		} else {
@@ -408,7 +441,7 @@ int bch2_opt_parse(struct bch_fs *c,
 		if (!val) {
 			prt_printf(err, "%s: required value",
 				   opt->attr.name);
-			return -EINVAL;
+			return -BCH_ERR_EINVAL_opt_parse_uint_required;
 		}
 
 		if (*val != '-') {
@@ -431,7 +464,7 @@ int bch2_opt_parse(struct bch_fs *c,
 		if (!val) {
 			prt_printf(err, "%s: required value",
 				   opt->attr.name);
-			return -EINVAL;
+			return -BCH_ERR_EINVAL_opt_parse_str_required;
 		}
 
 		ret = match_string(opt->choices, -1, val);
@@ -445,12 +478,26 @@ int bch2_opt_parse(struct bch_fs *c,
 		*res = ret;
 		break;
 	case BCH_OPT_BITFIELD: {
-		s64 v = bch2_read_flag_list(val, opt->choices);
+		s64 v = bch2_read_flag_list_mask(val, opt->choices, opt->choices_allowed_mask);
 		if (v < 0)
 			return v;
 		*res = v;
 		break;
 	}
+	case BCH_OPT_STR_MEMBER:
+		if (!val) {
+			prt_printf(err, "%s: required value", opt->attr.name);
+			return -BCH_ERR_EINVAL_opt_parse_str_required;
+		}
+		if (strlen(val) > opt->member_size) {
+			if (err)
+				prt_printf(err, "%s: too long (max %u bytes)",
+					   opt->attr.name, opt->member_size);
+			return -ENAMETOOLONG;
+		}
+		/* Applied to the member directly in __bch2_opt_set_sb(): */
+		*res = 0;
+		break;
 	case BCH_OPT_FN:
 		ret = opt->fn.parse(c, val, res, err);
 
@@ -468,7 +515,7 @@ int bch2_opt_parse(struct bch_fs *c,
 	return bch2_opt_validate(opt, *res, err);
 }
 
-void bch2_opt_to_text(struct printbuf *out,
+__cold void bch2_opt_to_text(struct printbuf *out,
 		      struct bch_fs *c, struct bch_sb *sb,
 		      const struct bch_option *opt, u64 v,
 		      unsigned flags)
@@ -493,7 +540,7 @@ void bch2_opt_to_text(struct printbuf *out,
 			prt_printf(out, "%lli", v);
 		break;
 	case BCH_OPT_STR:
-		if (v < opt->min || v >= opt->max)
+		if (v < opt->min || v > opt->max)
 			prt_printf(out, "(invalid option %lli)", v);
 		else if (flags & OPT_SHOW_FULL_LIST)
 			prt_string_option(out, opt->choices, v);
@@ -506,12 +553,15 @@ void bch2_opt_to_text(struct printbuf *out,
 	case BCH_OPT_FN:
 		opt->fn.to_text(out, c, sb, v);
 		break;
+	case BCH_OPT_STR_MEMBER:
+		/* Rendered per-device from the member (see bch2_member_to_text) */
+		break;
 	default:
 		BUG();
 	}
 }
 
-void bch2_opts_to_text(struct printbuf *out,
+__cold void bch2_opts_to_text(struct printbuf *out,
 		       struct bch_opts opts,
 		       struct bch_fs *c, struct bch_sb *sb,
 		       struct bch_opts_mask *mask,
@@ -541,8 +591,16 @@ void bch2_opts_to_text(struct printbuf *out,
 	}
 }
 
+static int reconcile_scan_bracket(struct bch_fs *c, struct reconcile_scan s, bool post,
+				  struct opt_change_scope *scope)
+{
+	return post
+		? bch2_set_reconcile_needs_scan_post(c, s)
+		: bch2_set_reconcile_needs_scan_pre(c, s, scope);
+}
+
 static int opt_hook_io(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum bch_opt_id id,
-		       u64 v, bool post)
+		       u64 v, bool post, struct opt_change_scope *scope)
 {
 	if (!test_bit(BCH_FS_started, &c->flags))
 		return 0;
@@ -562,22 +620,52 @@ static int opt_hook_io(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum bch_
 			.inum = inum,
 		};
 
-		try(bch2_set_reconcile_needs_scan(c, s, post));
+		try(reconcile_scan_bracket(c, s, post, scope));
 		break;
 	}
 	case Opt_metadata_target:
 	case Opt_metadata_checksum:
 	case Opt_metadata_replicas:
-		try(bch2_set_reconcile_needs_scan(c,
-			(struct reconcile_scan) { .type = RECONCILE_SCAN_metadata, .dev = inum }, post));
+		try(reconcile_scan_bracket(c,
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_metadata, .dev = inum }, post, scope));
 		break;
 	case Opt_durability:
 		if (!post && v > ca->mi.durability)
 			try(bch2_set_reconcile_needs_scan(c,
-				(struct reconcile_scan) { .type = RECONCILE_SCAN_pending}, post));
+				(struct reconcile_scan) { .type = RECONCILE_SCAN_pending}, false));
 
-		try(bch2_set_reconcile_needs_scan(c,
-			(struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = inum }, post));
+		try(reconcile_scan_bracket(c,
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = inum }, post, scope));
+		break;
+	case Opt_ec_max_data_blocks:
+		/*
+		 * Cap participates in stripe.can_widen (via
+		 * stripe_widen_target_nr_data); bracket the change with a
+		 * stripes scan so existing stripes converge to the new
+		 * target.
+		 */
+		try(reconcile_scan_bracket(c,
+			(struct reconcile_scan) { .type = RECONCILE_SCAN_stripes }, post, scope));
+		break;
+	case Opt_label:
+	case Opt_failure_domain:
+		/*
+		 * Refresh the cpu label tree before the scan wakes: reconcile
+		 * reads the group devs masks. Errors here (ENOMEM) just leave
+		 * the cpu copy stale until the next superblock swap:
+		 */
+		if (post) {
+			scoped_guard(mutex_noio, &c->sb_lock)
+				bch_err_fn(c, bch2_sb_disk_groups_to_cpu(c));
+		}
+
+		/*
+		 * Only the label affects targeting - a failure domain change
+		 * only affects the spreading of future allocations, no rescan:
+		 */
+		if (id == Opt_label)
+			try(reconcile_scan_bracket(c,
+				(struct reconcile_scan) { .type = RECONCILE_SCAN_pending }, post, scope));
 		break;
 	default:
 		break;
@@ -587,7 +675,7 @@ static int opt_hook_io(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum bch_
 }
 
 int bch2_opt_hook_pre_set(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum bch_opt_id id, u64 v,
-			  bool change)
+			  bool change, struct opt_change_scope *scope)
 {
 	switch (id) {
 	case Opt_state:
@@ -614,7 +702,7 @@ int bch2_opt_hook_pre_set(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum b
 	}
 
 	if (change)
-		try(opt_hook_io(c, ca, inum, id, v, false));
+		try(opt_hook_io(c, ca, inum, id, v, false, scope));
 
 	return 0;
 }
@@ -622,7 +710,7 @@ int bch2_opt_hook_pre_set(struct bch_fs *c, struct bch_dev *ca, u64 inum, enum b
 int bch2_opts_hooks_pre_set(struct bch_fs *c)
 {
 	for (unsigned i = 0; i < bch2_opts_nr; i++)
-		try(bch2_opt_hook_pre_set(c, NULL, 0, i, bch2_opt_get_by_id(&c->opts, i), false));
+		try(bch2_opt_hook_pre_set(c, NULL, 0, i, bch2_opt_get_by_id(&c->opts, i), false, NULL));
 
 	return 0;
 }
@@ -630,7 +718,18 @@ int bch2_opts_hooks_pre_set(struct bch_fs *c)
 void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 			    enum bch_opt_id id, u64 v)
 {
-	opt_hook_io(c, ca, inum, id, v, true);
+	if (test_bit(BCH_FS_started, &c->flags)) {
+		CLASS(printbuf, buf)();
+		prt_printf(&buf, "opt change: %s=", bch2_opt_table[id].attr.name);
+		bch2_opt_to_text(&buf, c, c->disk_sb.sb, &bch2_opt_table[id], v, 0);
+		if (ca)
+			prt_printf(&buf, " dev %u", ca->dev_idx);
+		if (inum)
+			prt_printf(&buf, " inum %llu", inum);
+		bch2_fs_log_msg(c, "%s", buf.buf);
+	}
+
+	opt_hook_io(c, ca, inum, id, v, true, NULL);
 
 	switch (id) {
 	case Opt_reconcile_enabled:
@@ -641,8 +740,7 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 		break;
 	case Opt_discard:
 		if (!ca) {
-			guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-			guard(mutex)(&c->sb_lock);
+			guard(mutex_noio)(&c->sb_lock);
 			for_each_member_device(c, ca) {
 				struct bch_member *m =
 					bch2_members_v2_get_mut(ca->disk_sb.sb, ca->dev_idx);
@@ -674,6 +772,15 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 	case Opt_read_only:
 		bch2_reconcile_wakeup(c);
 		break;
+	case Opt_btree_cache_shrinker_seeks: {
+		struct bch_fs_btree_cache *bc = &c->btree.cache;
+
+		if (bc->live[0].shrink)
+			bc->live[0].shrink->seeks = v;
+		if (bc->live[1].shrink)
+			bc->live[1].shrink->seeks = v * 4;
+		break;
+	}
 	default:
 		break;
 	}
@@ -681,7 +788,8 @@ void bch2_opt_hook_post_set(struct bch_fs *c, struct bch_dev *ca, u64 inum,
 
 int bch2_parse_one_mount_opt(struct bch_fs *c, struct bch_opts *opts,
 			     struct printbuf *parse_later,
-			     const char *name, const char *val)
+			     const char *name, const char *val,
+			     struct printbuf *err)
 {
 	u64 v;
 	int ret, id;
@@ -715,8 +823,7 @@ int bch2_parse_one_mount_opt(struct bch_fs *c, struct bch_opts *opts,
 	    !IS_ENABLED(CONFIG_BCACHEFS_QUOTA))
 		return -BCH_ERR_option_name;
 
-	CLASS(printbuf, err)();
-	ret = bch2_opt_parse(c, &bch2_opt_table[id], val, &v, &err);
+	ret = bch2_opt_parse(c, &bch2_opt_table[id], val, &v, err);
 	if (ret == -BCH_ERR_option_needs_open_fs) {
 		if (parse_later) {
 			prt_printf(parse_later, "%s=%s,", name, val);
@@ -728,7 +835,7 @@ int bch2_parse_one_mount_opt(struct bch_fs *c, struct bch_opts *opts,
 	}
 
 	if (ret < 0)
-		return -BCH_ERR_option_value;
+		return ret;
 
 	if (bch2_opt_table[id].flags & OPT_MOUNT_OLD) {
 		pr_err("option %s may no longer be specified at mount time; set via sysfs opts dir",
@@ -746,10 +853,6 @@ int bch2_parse_mount_opts(struct bch_fs *c, struct bch_opts *opts,
 			  struct printbuf *parse_later, char *options,
 			  bool ignore_unknown)
 {
-	char *copied_opts, *copied_opts_start;
-	char *opt, *name, *val;
-	int ret = 0;
-
 	if (!options)
 		return 0;
 
@@ -760,28 +863,31 @@ int bch2_parse_mount_opts(struct bch_fs *c, struct bch_opts *opts,
 	if (*options == ',')
 		options++;
 
-	copied_opts = kstrdup(options, GFP_KERNEL);
+	char *copied_opts __free(kfree) = kstrdup(options, GFP_KERNEL);
 	if (!copied_opts)
 		return -ENOMEM;
-	copied_opts_start = copied_opts;
 
-	while ((opt = strsep(&copied_opts, ",")) != NULL) {
+	char *optstr = copied_opts;
+	char *opt, *name, *val;
+	int ret = 0;
+
+	while ((opt = strsep(&optstr, ",")) != NULL) {
 		if (!*opt)
 			continue;
 
 		name	= strsep(&opt, "=");
 		val	= opt;
 
-		ret = bch2_parse_one_mount_opt(c, opts, parse_later, name, val);
+		CLASS(printbuf, err)();
+		ret = bch2_parse_one_mount_opt(c, opts, parse_later, name, val, &err);
 		if (ret == -BCH_ERR_option_name && ignore_unknown)
 			ret = 0;
 		if (ret) {
-			pr_err("Error parsing option %s: %s", name, bch2_err_str(ret));
+			pr_err("Error parsing option %s", err.buf);
 			break;
 		}
 	}
 
-	kfree(copied_opts_start);
 	return ret;
 }
 
@@ -791,7 +897,14 @@ u64 bch2_opt_from_sb(struct bch_sb *sb, enum bch_opt_id id, int dev_idx)
 	u64 v;
 
 	if (dev_idx < 0) {
-		v = opt->get_sb(sb);
+		if (opt->get_sb) {
+			v = opt->get_sb(sb);
+		} else if (opt->get_ext) {
+			const struct bch_sb_field_ext *ext = bch2_sb_field_get(sb, ext);
+			v = ext ? opt->get_ext(ext) : 0;
+		} else {
+			v = 0;
+		}
 	} else {
 		if (WARN(!bch2_member_exists(sb, dev_idx),
 			 "tried to set device option %s on nonexistent device %i",
@@ -823,7 +936,7 @@ int bch2_opts_from_sb(struct bch_opts *opts, struct bch_sb *sb)
 	for (unsigned id = 0; id < bch2_opts_nr; id++) {
 		const struct bch_option *opt = bch2_opt_table + id;
 
-		if (opt->get_sb)
+		if (opt->get_sb || opt->get_ext)
 			bch2_opt_set_by_id(opts, id, bch2_opt_from_sb(sb, id, -1));
 	}
 
@@ -831,7 +944,7 @@ int bch2_opts_from_sb(struct bch_opts *opts, struct bch_sb *sb)
 }
 
 bool __bch2_opt_set_sb(struct bch_sb *sb, int dev_idx,
-		       const struct bch_option *opt, u64 v)
+		       const struct bch_option *opt, u64 v, const char *val)
 {
 	bool changed = false;
 
@@ -844,10 +957,15 @@ bool __bch2_opt_set_sb(struct bch_sb *sb, int dev_idx,
 	if (opt->flags & OPT_SB_FIELD_ONE_BIAS)
 		v++;
 
-	if ((opt->flags & OPT_FS) && opt->set_sb && dev_idx < 0) {
-		changed = v != opt->get_sb(sb);
-
-		opt->set_sb(sb, v);
+	if ((opt->flags & OPT_FS) && dev_idx < 0) {
+		if (opt->set_sb) {
+			changed = v != opt->get_sb(sb);
+			opt->set_sb(sb, v);
+		} else if (opt->set_ext) {
+			struct bch_sb_field_ext *ext = bch2_sb_field_get(sb, ext);
+			changed = v != opt->get_ext(ext);
+			opt->set_ext(ext, v);
+		}
 	}
 
 	if ((opt->flags & OPT_DEVICE) && opt->set_member && dev_idx >= 0) {
@@ -861,15 +979,33 @@ bool __bch2_opt_set_sb(struct bch_sb *sb, int dev_idx,
 		opt->set_member(m, v);
 	}
 
+	if (opt->type == BCH_OPT_STR_MEMBER &&
+	    (opt->flags & OPT_DEVICE) && dev_idx >= 0) {
+		if (WARN(!bch2_member_exists(sb, dev_idx),
+			 "tried to set device option %s on nonexistent device %i",
+			 opt->attr.name, dev_idx))
+			return false;
+
+		struct bch_member *m = bch2_members_v2_get_mut(sb, dev_idx);
+		char *field = (char *) m + opt->member_offset;
+		size_t len = val ? strlen(val) : 0;
+
+		/* zero-padded, so equal strings compare equal in the interning: */
+		for (unsigned i = 0; i < opt->member_size; i++) {
+			char want = i < len ? val[i] : 0;
+			changed |= field[i] != want;
+			field[i] = want;
+		}
+	}
+
 	return changed;
 }
 
 bool bch2_opt_set_sb(struct bch_fs *c, struct bch_dev *ca,
-		     const struct bch_option *opt, u64 v)
+		     const struct bch_option *opt, u64 v, const char *val)
 {
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-	guard(mutex)(&c->sb_lock);
-	bool changed = __bch2_opt_set_sb(c->disk_sb.sb, ca ? ca->dev_idx : -1, opt, v);
+	guard(mutex_noio)(&c->sb_lock);
+	bool changed = __bch2_opt_set_sb(c->disk_sb.sb, ca ? ca->dev_idx : -1, opt, v, val);
 	if (changed)
 		bch2_write_super(c);
 	return changed;
@@ -924,7 +1060,7 @@ bool bch2_opt_is_inode_opt(enum bch_opt_id id)
 	return false;
 }
 
-void bch2_inode_opts_to_text(struct printbuf *out, struct bch_fs *c, struct bch_inode_opts opts)
+__cold void bch2_inode_opts_to_text(struct printbuf *out, struct bch_fs *c, struct bch_inode_opts opts)
 {
 	bool first = true;
 

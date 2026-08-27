@@ -119,7 +119,29 @@
 	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_info)|		\
 	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_to_lru_refs),	\
 	  BCH_FSCK_ERR_alloc_key_stripe_refcount_wrong,		\
-	  BCH_FSCK_ERR_stripe_to_missing_bucket_ref)
+	  BCH_FSCK_ERR_stripe_to_missing_bucket_ref)		\
+	x(need_discard_by_journal_seq,				\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_info),		\
+	  BCH_FSCK_ERR_need_discard_freespace_key_bad,		\
+	  BCH_FSCK_ERR_need_discard_key_wrong,			\
+	  BCH_FSCK_ERR_need_discard_freespace_key_to_invalid_dev_bucket)\
+	x(per_dev_fragmentation_lru,				\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_allocations)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_lrus)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_to_lru_refs)|	\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_inodes)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_xattrs)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_snapshots)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_subvols)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_delete_dead_snapshots),	\
+	  BCH_FSCK_ERR_accounting_mismatch,			\
+	  BCH_FSCK_ERR_lru_entry_bad,				\
+	  BCH_FSCK_ERR_alloc_key_to_missing_lru_entry,		\
+	  BCH_FSCK_ERR_inode_has_inode_opts_flag_wrong,		\
+	  BCH_FSCK_ERR_inode_has_access_acl_flag_wrong,		\
+	  BCH_FSCK_ERR_inode_has_default_acl_flag_wrong,	\
+	  BCH_FSCK_ERR_snapshot_state_bad,			\
+	  BCH_FSCK_ERR_subvol_state_bad)
 
 #define UPGRADE_TABLE_INCOMPAT()				\
 	x(reconcile,						\
@@ -179,7 +201,19 @@
 	  BCH_FSCK_ERR_accounting_key_nr_counters_wrong)	\
 	x(bucket_stripe_index,					\
 	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_info)|		\
-	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_to_lru_refs))
+	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_to_lru_refs))	\
+	x(need_discard_by_journal_seq,				\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_info),		\
+	  BCH_FSCK_ERR_need_discard_freespace_key_bad,		\
+	  BCH_FSCK_ERR_need_discard_key_wrong,			\
+	  BCH_FSCK_ERR_need_discard_freespace_key_to_invalid_dev_bucket)\
+	x(per_dev_fragmentation_lru,				\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_allocations)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_lrus)|		\
+	  BIT_ULL(BCH_RECOVERY_PASS_check_alloc_to_lru_refs),	\
+	  BCH_FSCK_ERR_lru_entry_bad,				\
+	  BCH_FSCK_ERR_alloc_key_to_missing_lru_entry,		\
+	  BCH_FSCK_ERR_accounting_mismatch)
 
 struct upgrade_downgrade_entry {
 	u64		recovery_passes;
@@ -233,8 +267,7 @@ int bch2_sb_set_upgrade_extra(struct bch_fs *c)
 	bool write_sb = false;
 	int ret = 0;
 
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-	guard(mutex)(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
 
 	if (old_version <  bcachefs_metadata_version_bucket_stripe_sectors &&
@@ -258,7 +291,7 @@ static void __bch2_sb_set_upgrade(struct bch_fs *c,
 				  const struct upgrade_downgrade_entry *table,
 				  size_t nr_entries)
 {
-	lockdep_assert_held(&c->sb_lock);
+	lockdep_assert_held(&c->sb_lock.lock);
 
 	struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
 
@@ -389,7 +422,7 @@ static int bch2_sb_downgrade_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_downgrade_to_text(struct printbuf *out,
+static __cold void bch2_sb_downgrade_to_text(struct printbuf *out,
 				      struct bch_fs *c, struct bch_sb *sb,
 				      struct bch_sb_field *f)
 {

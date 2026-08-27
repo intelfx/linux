@@ -27,6 +27,10 @@ struct gc_stripe {
 };
 
 struct bch_fs_ec {
+	long			stripe_buf_bytes;
+	spinlock_t		stripe_buf_lock;
+	struct closure_waitlist	stripe_buf_wait;
+
 	struct hlist_head	stripes_new[32];
 	struct hlist_head	stripes_new_buckets[64];
 	spinlock_t		stripes_new_lock;
@@ -40,8 +44,9 @@ struct bch_fs_ec {
 	struct list_head	stripe_new_list;
 	struct mutex		stripe_new_lock;
 	wait_queue_head_t	stripe_new_wait;
+	atomic64_t		stripe_new_seq;
 
-	struct work_struct	stripe_create_work;
+	struct workqueue_struct	*stripe_create_wq;
 	u64			stripe_hint;
 
 	struct work_struct	stripe_delete_work;

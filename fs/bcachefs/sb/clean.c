@@ -9,6 +9,7 @@
 
 #include "journal/read.h"
 #include "journal/write.h"
+#include "journal/validate.h"
 
 #include "sb/clean.h"
 #include "sb/io.h"
@@ -149,8 +150,7 @@ struct bch_sb_field_clean *bch2_read_superblock_clean(struct bch_fs *c)
 	struct bch_sb_field_clean *clean, *sb_clean;
 	int ret;
 
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-	guard(mutex)(&c->sb_lock);
+	guard(mutex_noio)(&c->sb_lock);
 	sb_clean = bch2_sb_field_get(c->disk_sb.sb, clean);
 
 	if (fsck_err_on(!sb_clean, c,
@@ -227,7 +227,7 @@ static int bch2_sb_clean_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_clean_to_text(struct printbuf *out,
+static __cold void bch2_sb_clean_to_text(struct printbuf *out,
 				  struct bch_fs *c,
 				  struct bch_sb *sb,
 				  struct bch_sb_field *f)

@@ -23,7 +23,7 @@ struct find_btree_nodes_worker {
 	struct bch_dev		*ca;
 };
 
-void bch2_found_btree_node_to_text(struct printbuf *out, struct bch_fs *c, const struct found_btree_node *n)
+__cold void bch2_found_btree_node_to_text(struct printbuf *out, struct bch_fs *c, const struct found_btree_node *n)
 {
 	bch2_btree_id_level_to_text(out, n->btree_id, n->level);
 	prt_printf(out, " seq=%u journal_seq=%llu cookie=%llx ",
@@ -46,7 +46,7 @@ void bch2_found_btree_node_to_text(struct printbuf *out, struct bch_fs *c, const
 	}
 }
 
-static void found_btree_nodes_to_text(struct printbuf *out, struct bch_fs *c,
+static __cold void found_btree_nodes_to_text(struct printbuf *out, struct bch_fs *c,
 				      darray_found_btree_node nodes)
 {
 	guard(printbuf_indent)(out);
@@ -174,7 +174,7 @@ static void try_read_btree_node(struct find_btree_nodes *f, struct bch_dev *ca,
 		.ptrs[0].type	= 1 << BCH_EXTENT_ENTRY_ptr,
 		.ptrs[0].offset	= offset,
 		.ptrs[0].dev	= ca->dev_idx,
-		.ptrs[0].gen	= bucket_gen_get(ca, sector_to_bucket(ca, offset)),
+		.ptrs[0].generation	= bucket_gen_get(ca, sector_to_bucket(ca, offset)),
 	};
 	rcu_read_unlock();
 
@@ -228,7 +228,7 @@ static int read_btree_nodes_worker(void *p)
 		goto err;
 	}
 
-	bio = bio_alloc(NULL, buf_pages(b->data, c->opts.btree_node_size), 0, GFP_KERNEL);
+	bio = bio_alloc(NULL, buf_nr_bvecs(b->data, c->opts.btree_node_size), 0, GFP_KERNEL);
 	if (!bio) {
 		bch_err(c, "read_btree_nodes_worker: error allocating bio");
 		w->f->ret = -ENOMEM;
@@ -260,9 +260,10 @@ static int read_btree_nodes_worker(void *p)
 		}
 	}
 err:
-	if (b)
-		bch2_btree_node_data_free_locked(b);
-	kfree(b);
+	if (b) {
+		bch2_btree_node_data_free(b);
+		bch2_btree_node_mem_free(c, b);
+	}
 	bio_put(bio);
 	enumerated_ref_put(&ca->io_ref[READ], BCH_DEV_READ_REF_btree_node_scan);
 	closure_put(w->cl);
@@ -385,7 +386,7 @@ int bch2_scan_for_btree_nodes(struct bch_fs *c)
 
 	if (!f->nodes.nr) {
 		bch_err(c, "%s: no btree nodes found", __func__);
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_node_scan_no_nodes);
 	}
 
 	if (0 && c->opts.verbose) {
@@ -405,7 +406,7 @@ int bch2_scan_for_btree_nodes(struct bch_fs *c)
 		    prev->cookie == i->cookie) {
 			if (prev->nr_ptrs == ARRAY_SIZE(prev->ptrs)) {
 				bch_err(c, "%s: found too many replicas for btree node", __func__);
-				return -EINVAL;
+				return bch_err_throw(c, EINVAL_node_scan_too_many_replicas);
 			}
 			prev->ptrs[prev->nr_ptrs++] = i->ptrs[0];
 		} else {
@@ -565,12 +566,12 @@ int bch2_get_scanned_nodes(struct bch_fs *c, enum btree_id btree,
 
 		found_btree_node_to_key(&tmp.k, &n);
 
-		BUG_ON(bch2_bkey_validate(c, bkey_i_to_s_c(&tmp.k),
-					  (struct bkey_validate_context) {
-						.from	= BKEY_VALIDATE_btree_node,
-						.level	= level + 1,
-						.btree	= btree,
-					  }));
+		struct bkey_validate_context from = {
+			.from	= BKEY_VALIDATE_btree_node,
+			.level	= level + 1,
+			.btree	= btree,
+		};
+		BUG_ON(bch2_bkey_validate(c, bkey_i_to_s_c(&tmp.k), &from));
 
 		if (!*nodes_found) {
 			prt_printf(out, "recovering from btree node scan at ");

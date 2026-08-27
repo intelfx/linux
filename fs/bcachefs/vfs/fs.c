@@ -4,6 +4,7 @@
 #include "bcachefs.h"
 
 #include "alloc/accounting.h"
+#include "alloc/background.h"
 #include "alloc/buckets.h"
 
 #include "btree/update.h"
@@ -21,6 +22,7 @@
 #include "init/chardev.h"
 #include "init/dev.h"
 #include "init/fs.h"
+#include "init/passes.h"
 
 #include "journal/journal.h"
 
@@ -34,6 +36,7 @@
 
 #include <linux/aio.h>
 #include <linux/backing-dev.h>
+#include <linux/compat.h>
 #include <linux/exportfs.h>
 #include <linux/fileattr.h>
 #include <linux/fs_context.h>
@@ -41,29 +44,13 @@
 #include <linux/pagemap.h>
 #include <linux/posix_acl.h>
 #include <linux/random.h>
+#include <linux/security.h>
 #include <linux/seq_file.h>
 #include <linux/siphash.h>
 #include <linux/statfs.h>
 #include <linux/string.h>
 #include <linux/version.h>
 #include <linux/xattr.h>
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,19,0)
-static inline unsigned inode_state_read(struct inode *inode)
-{
-	return inode->i_state;
-}
-
-static inline unsigned inode_state_read_once(struct inode *inode)
-{
-	return READ_ONCE(inode->i_state);
-}
-
-static inline void inode_state_set_raw(struct inode *inode, unsigned flags)
-{
-	WRITE_ONCE(inode->i_state, inode->i_state|flags);
-}
-#endif
 
 static struct kmem_cache *bch2_inode_cache;
 
@@ -97,7 +84,7 @@ void bch2_inode_update_after_write(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 
-	BUG_ON(bi->bi_inum != inode->v.i_ino);
+	BUG_ON(bi->bi_inum != inode_inum(inode).inum);
 
 	bch2_assert_pos_locked(trans, BTREE_ID_inodes, POS(0, bi->bi_inum));
 
@@ -121,6 +108,34 @@ void bch2_inode_update_after_write(struct btree_trans *trans,
 	bch2_inode_flags_to_vfs(c, inode);
 }
 
+/*
+ * The VFS inode - not the btree - is the source of truth for atime, and ONLY
+ * atime: a btree transaction per atime update would be too expensive, so the
+ * VFS tracks it (I_DIRTY_TIME) and persists it via ->write_inode: sync,
+ * eviction, dirtytime expiry. Every other inode field is btree-truth and must
+ * never be copied from the VFS inode.
+ *
+ * That covers every lazytime persistence point except one: "inode written for
+ * an unrelated change" (see mount(8)). Traditional filesystems get that leg
+ * from their setattr calling mark_inode_dirty; our out-of-band btree updates
+ * never dirty the VFS inode. So fold the VFS-truth atime into every
+ * transactional inode update we're already doing - the atime then lands
+ * atomically with the change itself, with no writeback window. generic/622
+ * tests exactly this (atime update, chmod, crash).
+ *
+ * Straight assignment, not max(): timestamps aren't monotonic - userspace can
+ * set atime backwards (utimensat) - and the VFS copy is the truth
+ * unconditionally. Callers run this before their own modifications, so an
+ * explicit ATTR_ATIME setattr still overwrites the fold.
+ */
+static void bch2_inode_fold_atime(struct bch_inode_info *inode,
+				  struct bch_inode_unpacked *inode_u)
+{
+	struct bch_fs *c = inode->v.i_sb->s_fs_info;
+
+	inode_u->bi_atime = timespec_to_bch2_time(c, inode_get_atime(&inode->v));
+}
+
 static int bch2_write_inode_trans(struct btree_trans *trans,
 				  struct bch_inode_info *inode,
 				  inode_set_fn set,
@@ -133,6 +148,8 @@ static int bch2_write_inode_trans(struct btree_trans *trans,
 	try(bch2_inode_peek(trans, &iter, &inode_u, inode_inum(inode), BTREE_ITER_intent));
 
 	struct bch_extent_reconcile old_r = bch2_inode_reconcile_opts_get(c, &inode_u);
+
+	bch2_inode_fold_atime(inode, &inode_u);
 
 	if (set)
 	       try(set(trans, inode, &inode_u, p));
@@ -220,7 +237,7 @@ static u32 bch2_vfs_inode_obj_hash_fn(const void *data, u32 len, u32 seed)
 {
 	const struct bch_inode_info *inode = data;
 
-	return bch2_vfs_inode_hash_fn(&inode->ei_inum, sizeof(inode->ei_inum), seed);
+	return bch2_vfs_inode_hash_fn(&inode->ei_inum_hash.inum, sizeof(inode->ei_inum_hash.inum), seed);
 }
 
 static int bch2_vfs_inode_cmp_fn(struct rhashtable_compare_arg *arg,
@@ -229,12 +246,12 @@ static int bch2_vfs_inode_cmp_fn(struct rhashtable_compare_arg *arg,
 	const struct bch_inode_info *inode = obj;
 	const subvol_inum *v = arg->key;
 
-	return !subvol_inum_eq(inode->ei_inum, *v);
+	return !subvol_inum_eq(inode_inum(inode), *v);
 }
 
 static const struct rhashtable_params bch2_vfs_inodes_params = {
 	.head_offset		= offsetof(struct bch_inode_info, hash),
-	.key_offset		= offsetof(struct bch_inode_info, ei_inum),
+	.key_offset		= offsetof(struct bch_inode_info, ei_inum_hash.inum),
 	.key_len		= sizeof(subvol_inum),
 	.hashfn			= bch2_vfs_inode_hash_fn,
 	.obj_hashfn		= bch2_vfs_inode_obj_hash_fn,
@@ -242,9 +259,13 @@ static const struct rhashtable_params bch2_vfs_inodes_params = {
 	.automatic_shrinking	= true,
 };
 
+/*
+ * Offsets are relative to bch_inum_hash_entry, not bch_inode_info: entries in
+ * this table are not required to be embedded in one.
+ */
 static const struct rhashtable_params bch2_vfs_inodes_by_inum_params = {
-	.head_offset		= offsetof(struct bch_inode_info, by_inum_hash),
-	.key_offset		= offsetof(struct bch_inode_info, ei_inum.inum),
+	.head_offset		= offsetof(struct bch_inum_hash_entry, hash),
+	.key_offset		= offsetof(struct bch_inum_hash_entry, inum.inum),
 	.key_len		= sizeof(u64),
 	.automatic_shrinking	= true,
 };
@@ -282,11 +303,11 @@ restart:
 	hash = rht_key_hashfn(&ht->ht, tbl, &inum, bch2_vfs_inodes_by_inum_params);
 	bkt = rht_bucket(tbl, hash);
 	do {
-		struct bch_inode_info *inode;
+		struct bch_inum_hash_entry *e;
 
-		rht_for_each_entry_rcu_from(inode, he, rht_ptr_rcu(bkt), tbl, hash, hash) {
-			if (inode->ei_inum.inum == inum) {
-				int ret = darray_push_gfp(&subvols, inode->ei_inum.subvol, GFP_NOWAIT);
+		rht_for_each_entry_rcu_from(e, he, rht_ptr_rcu(bkt), tbl, hash, hash.rhead) {
+			if (e->inum.inum == inum) {
+				int ret = darray_push_gfp(&subvols, e->inum.subvol, GFP_NOWAIT);
 				if (ret) {
 					rcu_read_unlock();
 					try(darray_make_room(&subvols, 1));
@@ -376,7 +397,7 @@ static void bch2_inode_hash_remove(struct bch_fs *c, struct bch_inode_info *inod
 
 	if (remove) {
 		int ret = rhltable_remove(&c->vfs.inodes_by_inum_table,
-					&inode->by_inum_hash, bch2_vfs_inodes_by_inum_params);
+					&inode->ei_inum_hash.hash, bch2_vfs_inodes_by_inum_params);
 		BUG_ON(ret);
 
 		ret = rhashtable_remove_fast(&c->vfs.inodes_table,
@@ -391,6 +412,75 @@ static void bch2_inode_hash_remove(struct bch_fs *c, struct bch_inode_info *inod
 	}
 }
 
+/*
+ * Marks an inode number as held for as long as the guard is in scope, without
+ * an inode to hang it on.
+ *
+ * O_TMPFILE commits an inode that is already unlinked, so from
+ * bch2_trans_commit() onwards a scanning fsck pass can see the key - while
+ * __bch2_create() is still several steps away from having a hashed VFS inode.
+ * bch2_inode_or_descendents_is_open() would answer "not open" for a file the
+ * caller is about to be handed a descriptor for, and check_inode() deletes
+ * exactly that.
+ *
+ * The entry is freed through RCU: rhltable_remove() unlinks it but leaves it
+ * traversable, so a reader already inside bch2_inode_or_descendents_is_open()
+ * may still be walking it.
+ */
+struct guard_inum_entry {
+	struct bch_inum_hash_entry	e;
+	struct rcu_head			rcu;
+};
+
+struct inum_hash_guard {
+	struct bch_fs		*c;
+	struct guard_inum_entry	*e;
+};
+
+static void inum_hash_guard_exit(struct inum_hash_guard *g)
+{
+	if (g->e) {
+		int ret = rhltable_remove(&g->c->vfs.inodes_by_inum_table,
+					  &g->e->e.hash, bch2_vfs_inodes_by_inum_params);
+		BUG_ON(ret);
+		kfree_rcu(g->e, rcu);
+		g->e = NULL;
+	}
+}
+
+static struct inum_hash_guard inum_hash_guard_init(struct bch_fs *c)
+{
+	return (struct inum_hash_guard) { .c = c };
+}
+
+DEFINE_CLASS(inum_hash_guard, struct inum_hash_guard,
+	     inum_hash_guard_exit(&_T),
+	     inum_hash_guard_init(c), struct bch_fs *c)
+
+/*
+ * Re-arms: the caller's arm point is inside a transaction retry loop, and a
+ * restart can allocate a different inode number.
+ */
+static int inum_hash_guard_set(struct inum_hash_guard *g, subvol_inum inum)
+{
+	inum_hash_guard_exit(g);
+
+	struct guard_inum_entry *e = kmalloc(sizeof(*e), GFP_NOFS);
+	if (!e)
+		return -ENOMEM;
+
+	e->e.inum = inum;
+	int ret = rhltable_insert(&g->c->vfs.inodes_by_inum_table,
+				  &e->e.hash, bch2_vfs_inodes_by_inum_params);
+	if (ret) {
+		kfree(e);
+		return ret;
+	}
+
+	g->e = e;
+	return 0;
+}
+
 static struct bch_inode_info *bch2_inode_hash_insert(struct bch_fs *c,
 						     struct btree_trans *trans,
 						     struct bch_inode_info *inode)
@@ -400,10 +490,10 @@ static struct bch_inode_info *bch2_inode_hash_insert(struct bch_fs *c,
 	set_bit(EI_INODE_HASHED, &inode->ei_flags);
 retry:
 	if (unlikely(rhashtable_lookup_insert_key(&c->vfs.inodes_table,
-					&inode->ei_inum,
+					&inode->ei_inum_hash.inum,
 					&inode->hash,
 					bch2_vfs_inodes_params))) {
-		old = bch2_inode_hash_find(c, trans, inode->ei_inum);
+		old = bch2_inode_hash_find(c, trans, inode_inum(inode));
 		if (!old)
 			goto retry;
 
@@ -425,7 +515,7 @@ retry:
 		return old;
 	} else {
 		int ret = rhltable_insert(&c->vfs.inodes_by_inum_table,
-					  &inode->by_inum_hash,
+					  &inode->ei_inum_hash.hash,
 					  bch2_vfs_inodes_by_inum_params);
 		BUG_ON(ret);
 
@@ -433,8 +523,7 @@ retry:
 
 		inode_sb_list_add(&inode->v);
 
-		scoped_guard(mutex, &c->vfs.inodes_lock)
-			list_add(&inode->ei_vfs_inode_list, &c->vfs.inodes_list);
+		fast_list_set(&c->vfs.inodes, inode->ei_inodes_idx, inode);
 		return inode;
 	}
 }
@@ -461,16 +550,26 @@ static struct bch_inode_info *__bch2_new_inode(struct bch_fs *c, gfp_t gfp)
 	if (!inode)
 		return NULL;
 
+	int idx = fast_list_get_idx(&c->vfs.inodes, gfp);
+	if (idx < 0) {
+		kmem_cache_free(bch2_inode_cache, inode);
+		return NULL;
+	}
+
 	inode_init_once(&inode->v);
+	spin_lock_init(&inode->ei_reserved_lock);
+	inode->ei_reserved_start	= 0;
+	inode->ei_reserved_end		= 0;
 	mutex_init(&inode->ei_update_lock);
 	two_state_lock_init(&inode->ei_pagecache_lock);
-	INIT_LIST_HEAD(&inode->ei_vfs_inode_list);
+	inode->ei_inodes_idx = idx;
 	inode->ei_flags = 0;
 	mutex_init(&inode->ei_quota_lock);
 	memset(&inode->ei_devs_need_flush, 0, sizeof(inode->ei_devs_need_flush));
 	INIT_DELAYED_WORK(&inode->ei_writeback_timer, bch2_vfs_writeback_fn);
 
 	if (unlikely(inode_init_always_gfp(c->vfs_sb, &inode->v, gfp))) {
+		fast_list_put_idx(&c->vfs.inodes, idx);
 		kmem_cache_free(bch2_inode_cache, inode);
 		return NULL;
 	}
@@ -486,9 +585,10 @@ static struct bch_inode_info *bch2_new_inode(struct btree_trans *trans)
 	struct bch_inode_info *inode = __bch2_new_inode(trans->c, GFP_NOWAIT);
 
 	if (unlikely(!inode)) {
-		int ret = drop_locks_do(trans, (inode = __bch2_new_inode(trans->c, GFP_NOFS)) ? 0 : -ENOMEM);
+		int ret = drop_locks_do(trans, (inode = __bch2_new_inode(trans->c, GFP_NOIO)) ? 0 : -ENOMEM);
 		if (ret && inode) {
 			__destroy_inode(&inode->v);
+			fast_list_put_idx(&trans->c->vfs.inodes, inode->ei_inodes_idx);
 			kmem_cache_free(bch2_inode_cache, inode);
 		}
 		if (ret)
@@ -513,6 +613,27 @@ static struct bch_inode_info *bch2_inode_hash_init_insert(struct btree_trans *tr
 
 }
 
+static inline struct bch_inode_info *
+__bch2_vfs_inode_get_trans(struct btree_trans *trans, subvol_inum inum, const char *warn)
+{
+	struct bch_inode_info *inode;
+	struct bch_inode_unpacked inode_u;
+	struct bch_subvolume subvol;
+	int ret = bch2_subvolume_get(trans, inum.subvol, warn, &subvol) ?:
+		bch2_inode_find_by_inum_snapshot2(trans, inum, le32_to_cpu(subvol.snapshot),
+						  &inode_u, 0, warn) ?:
+		PTR_ERR_OR_ZERO(inode = bch2_inode_hash_init_insert(trans, inum, &inode_u, &subvol));
+
+	return ret ? ERR_PTR(ret) : inode;
+}
+
+struct bch_inode_info *bch2_vfs_inode_get_trans(struct btree_trans *trans, subvol_inum inum,
+						const char *warn)
+{
+	return bch2_inode_hash_find(trans->c, trans, inum) ?:
+		__bch2_vfs_inode_get_trans(trans, inum, warn);
+}
+
 struct inode *bch2_vfs_inode_get(struct bch_fs *c, subvol_inum inum,
 				 const char *warn)
 {
@@ -522,15 +643,66 @@ struct inode *bch2_vfs_inode_get(struct bch_fs *c, subvol_inum inum,
 
 	CLASS(btree_trans, trans)(c);
 
-	struct bch_inode_unpacked inode_u;
-	struct bch_subvolume subvol;
 	int ret = lockrestart_do(trans,
-		bch2_subvolume_get(trans, inum.subvol, warn, &subvol) ?:
-		__bch2_inode_find_by_inum_trans(trans, inum, &inode_u, warn) ?:
-		PTR_ERR_OR_ZERO(inode = bch2_inode_hash_init_insert(trans, inum, &inode_u, &subvol)));
+		PTR_ERR_OR_ZERO(inode = bch2_vfs_inode_get_trans(trans, inum, warn)));
 
 	return ret ? ERR_PTR(ret) : &inode->v;
 }
+
+struct bch2_initxattrs_ctx {
+	struct btree_trans	*trans;
+	subvol_inum		inum;
+	struct bch_hash_info	hash;
+};
+
+static int bch2_initxattrs(struct inode *vinode,
+			   const struct xattr *xattr_array,
+			   void *fs_data)
+{
+	struct bch2_initxattrs_ctx *ctx = fs_data;
+	const struct xattr *xattr;
+
+	for (xattr = xattr_array; xattr->name; xattr++) {
+		int ret = __bch2_xattr_set(ctx->trans, ctx->inum, &ctx->hash,
+					   xattr->name, xattr->value,
+					   xattr->value_len,
+					   KEY_TYPE_XATTR_INDEX_SECURITY,
+					   XATTR_CREATE);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int bch2_inode_init_security(struct btree_trans *trans,
+				    struct bch_inode_info *dir,
+				    struct bch_inode_info *inode,
+				    const struct qstr *name,
+				    subvol_inum inum,
+				    struct bch_inode_unpacked *inode_u)
+{
+	struct bch2_initxattrs_ctx ctx = {
+		.trans	= trans,
+		.inum	= inum,
+	};
+
+	/*
+	 * The LSM computes the new label from the task, the dir, and the new
+	 * inode's mode; the vfs inode isn't initialized until after commit
+	 * (bch2_vfs_inode_init), so give it just enough identity here:
+	 */
+	inode->v.i_mode = inode_u->bi_mode;
+	i_uid_write(&inode->v, inode_u->bi_uid);
+	i_gid_write(&inode->v, inode_u->bi_gid);
+
+	try(bch2_hash_info_init(trans->c, inode_u, &ctx.hash));
+
+	return security_inode_init_security(&inode->v, &dir->v, name,
+					    bch2_initxattrs, &ctx);
+}
+
+DEFINE_FREE(posix_acl, struct posix_acl *, posix_acl_release(_T))
 
 struct bch_inode_info *
 __bch2_create(struct mnt_idmap *idmap,
@@ -542,28 +714,28 @@ __bch2_create(struct mnt_idmap *idmap,
 	struct bch_inode_unpacked dir_u;
 	struct bch_inode_info *inode;
 	struct bch_inode_unpacked inode_u;
-	struct posix_acl *default_acl = NULL, *acl = NULL;
+	struct posix_acl *default_acl __free(posix_acl) = NULL;
+	struct posix_acl *acl __free(posix_acl) = NULL;
 	subvol_inum inum;
 	struct bch_subvolume subvol;
-	u64 journal_seq = 0;
-	kuid_t kuid;
-	kgid_t kgid;
+	kuid_t kuid = mapped_fsuid(idmap, i_user_ns(&dir->v));
+	kgid_t kgid = mapped_fsgid(idmap, i_user_ns(&dir->v));
+	bool is_posixacl = IS_POSIXACL(&dir->v);
 	int ret;
 
 	/*
 	 * preallocate acls + vfs inode before btree transaction, so that
 	 * nothing can fail after the transaction succeeds:
 	 */
-	ret = posix_acl_create(&dir->v, &mode, &default_acl, &acl);
-	if (ret)
-		return ERR_PTR(ret);
-
-	inode = __bch2_new_inode(c, GFP_NOFS);
-	if (unlikely(!inode)) {
-		posix_acl_release(default_acl);
-		posix_acl_release(acl);
-		return ERR_PTR(-ENOMEM);
+	if (is_posixacl) {
+		ret = posix_acl_create(&dir->v, &mode, &default_acl, &acl);
+		if (ret)
+			return ERR_PTR(ret);
 	}
+
+	inode = __bch2_new_inode(c, GFP_NOIO);
+	if (unlikely(!inode))
+		return ERR_PTR(-ENOMEM);
 
 	bch2_inode_init_early(c, &inode_u);
 
@@ -574,14 +746,12 @@ __bch2_create(struct mnt_idmap *idmap,
 	 * ours until after, ei->update_lock must also be taken first:
 	 */
 	CLASS(btree_trans, trans)(c);
+	CLASS(inum_hash_guard, guard)(c);
 retry:
 	bch2_trans_begin(trans);
 
-	kuid = mapped_fsuid(idmap, i_user_ns(&dir->v));
-	kgid = mapped_fsgid(idmap, i_user_ns(&dir->v));
-	ret   = bch2_subvol_is_ro_trans(trans, dir->ei_inum.subvol) ?:
-		bch2_create_trans(trans,
-				  inode_inum(dir), &dir_u, &inode_u,
+	ret   = bch2_create_trans(trans,
+				  inode_inum(dir), &dir_u, &inode_u, &subvol,
 				  !(flags & BCH_CREATE_TMPFILE)
 				  ? &dentry->d_name : NULL,
 				  from_kuid(i_user_ns(&dir->v), kuid),
@@ -593,18 +763,35 @@ retry:
 	if (unlikely(ret))
 		goto err_before_quota;
 
-	inum.subvol = inode_u.bi_subvol ?: dir->ei_inum.subvol;
+	inum.subvol = inode_u.bi_subvol ?: inode_inum(dir).subvol;
 	inum.inum = inode_u.bi_inum;
 
-	ret   = bch2_subvolume_get(trans, inum.subvol, true, &subvol) ?:
-		bch2_trans_commit(trans, NULL, &journal_seq, 0);
+	/*
+	 * Before the commit publishes the key. Only a tmpfile needs it: every
+	 * other create commits with a dirent and nlink 1, which check_inode()
+	 * doesn't touch.
+	 */
+	ret =   ((flags & BCH_CREATE_TMPFILE)
+		 ? inum_hash_guard_set(&guard, inum)
+		 : 0) ?:
+		bch2_inode_init_security(trans, dir, inode,
+					 !(flags & BCH_CREATE_TMPFILE)
+					 ? &dentry->d_name : NULL,
+					 inum, &inode_u) ?:
+		bch2_trans_commit(trans, NULL, NULL, 0);
 	if (unlikely(ret)) {
 		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, -1,
 				KEY_TYPE_QUOTA_WARN);
 err_before_quota:
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			goto retry;
-		goto err_trans;
+
+		if (!(flags & BCH_CREATE_TMPFILE))
+			mutex_unlock(&dir->ei_update_lock);
+
+		make_bad_inode(&inode->v);
+		iput(&inode->v);
+		return ERR_PTR(ret);
 	}
 
 	if (!(flags & BCH_CREATE_TMPFILE)) {
@@ -615,8 +802,10 @@ err_before_quota:
 
 	bch2_vfs_inode_init(trans, inum, inode, &inode_u, &subvol);
 
-	set_cached_acl(&inode->v, ACL_TYPE_ACCESS, acl);
-	set_cached_acl(&inode->v, ACL_TYPE_DEFAULT, default_acl);
+	if (is_posixacl) {
+		set_cached_acl(&inode->v, ACL_TYPE_ACCESS, acl);
+		set_cached_acl(&inode->v, ACL_TYPE_DEFAULT, default_acl);
+	}
 
 	/*
 	 * we must insert the new inode into the inode cache before calling
@@ -631,22 +820,39 @@ err_before_quota:
 	 * that we just created, and we _really_ can't take a transaction
 	 * restart here.
 	 */
-	inode = bch2_inode_hash_insert(c, NULL, inode);
-err:
-	posix_acl_release(default_acl);
-	posix_acl_release(acl);
-	return inode;
-err_trans:
-	if (!(flags & BCH_CREATE_TMPFILE))
-		mutex_unlock(&dir->ei_update_lock);
-
-	make_bad_inode(&inode->v);
-	iput(&inode->v);
-	inode = ERR_PTR(ret);
-	goto err;
+	return bch2_inode_hash_insert(c, NULL, inode);
 }
 
 /* methods */
+
+static int dirent_to_missing_inode(struct btree_trans *trans,
+				   struct bkey_s_c_dirent d,
+				   subvol_inum dir,
+				   subvol_inum inum,
+				   u32 snapshot,
+				   int ret)
+{
+	struct bch_fs *c = trans->c;
+	CLASS(bch_log_msg, msg)(c);
+
+	prt_printf(&msg.m, "dirent to missing inode: (%s)\n", bch2_err_str(ret));
+	bch2_bkey_val_to_text(&msg.m, c, d.s_c);
+	prt_str(&msg.m, "\n in: ");
+	try(bch2_inum_to_path(trans, dir, &msg.m));
+	prt_printf(&msg.m, "\ndir subvol %llu inum subvol %llu snapshot %u\n",
+		   dir.subvol, inum.subvol, snapshot);
+
+	/*
+	 * Not a reason to take the whole filesystem read only: log it,
+	 * schedule check_dirents, and the lookup returns ENOENT.
+	 *
+	 * Scheduling the pass takes sb_lock and may write the superblock;
+	 * we're on the error return path, nothing here needs btree locks:
+	 */
+	bch2_trans_unlock(trans);
+	return bch2_run_explicit_recovery_pass(c, &msg.m,
+					       BCH_RECOVERY_PASS_check_dirents, 0);
+}
 
 static struct bch_inode_info *bch2_lookup_trans(struct btree_trans *trans,
 			subvol_inum dir, struct bch_hash_info *dir_hash_info,
@@ -654,7 +860,6 @@ static struct bch_inode_info *bch2_lookup_trans(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	subvol_inum inum = {};
-	CLASS(printbuf, buf)();
 
 	struct qstr lookup_name;
 	int ret = bch2_maybe_casefold(trans, dir_hash_info, name, &lookup_name);
@@ -690,7 +895,8 @@ static struct bch_inode_info *bch2_lookup_trans(struct btree_trans *trans,
 	struct bch_subvolume subvol;
 	struct bch_inode_unpacked inode_u;
 	ret =   bch2_subvolume_get(trans, inum.subvol, true, &subvol) ?:
-		bch2_inode_find_by_inum_nowarn_trans(trans, inum, &inode_u) ?:
+		bch2_inode_find_by_inum_snapshot(trans, inum.inum, le32_to_cpu(subvol.snapshot),
+						 &inode_u, BTREE_ITER_cached) ?:
 		bch2_check_dirent_target(trans, &dirent_iter, d, &inode_u, false) ?:
 		bch2_trans_commit(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc) ?:
 		PTR_ERR_OR_ZERO(inode = bch2_inode_hash_init_insert(trans, inum, &inode_u, &subvol));
@@ -699,13 +905,112 @@ static struct bch_inode_info *bch2_lookup_trans(struct btree_trans *trans,
 	 * don't remove it: check_inodes might find another inode that points
 	 * back to this dirent
 	 */
-	bch2_fs_inconsistent_on(bch2_err_matches(ret, ENOENT),
-				c, "dirent to missing inode:\n%s",
-				(bch2_bkey_val_to_text(&buf, c, d.s_c), buf.buf));
-	if (ret)
-		return ERR_PTR(ret);
-	return inode;
+	if (bch2_err_matches(ret, ENOENT))
+		ret = dirent_to_missing_inode(trans, d, dir, inum,
+					      le32_to_cpu(subvol.snapshot),
+					      ret) ?: ret;
+
+	return ret ? ERR_PTR(ret) : inode;
 }
+
+#if IS_ENABLED(CONFIG_UNICODE)
+/*
+ * Per-directory casefold d_ops: directory dentries that may become casefolded
+ * use d_ops with utf8 d_hash/d_compare, but DCACHE_OP_HASH/DCACHE_OP_COMPARE
+ * are set only while the directory is actually casefolded. __d_lookup_rcu gates
+ * the slow d_compare on the *parent* dentry's DCACHE_OP_COMPARE, so
+ * non-casefolded directories keep the inline dentry_cmp fast path.
+ *
+ * The d_op can't be chosen in .d_init: d_alloc calls it before the inode is
+ * attached and with d_parent still pointing at the dentry itself, so the
+ * dentry's own casefold state is not knowable yet. Instead, when a directory
+ * inode is attached, set d_op before publication and derive the OP flags from
+ * IS_CASEFOLDED(). Runtime casefold changes only update d_flags; d_op remains
+ * casefold-capable so lockless readers never see OP flags with missing
+ * callbacks.
+ */
+static const struct dentry_operations bch2_dentry_ops_casefolded = {
+	.d_hash		= generic_ci_d_hash,
+	.d_compare	= generic_ci_d_compare,
+};
+
+static inline unsigned bch2_dentry_casefold_flags(struct inode *vinode)
+{
+	return IS_CASEFOLDED(vinode)
+		? DCACHE_OP_HASH|DCACHE_OP_COMPARE
+		: 0;
+}
+
+static void bch2_dentry_apply_casefold_flags(struct dentry *dentry,
+					     unsigned flags)
+{
+	unsigned d_flags = READ_ONCE(dentry->d_flags);
+
+	if (flags)
+		d_flags |= flags;
+	else
+		d_flags &= ~(DCACHE_OP_HASH|DCACHE_OP_COMPARE);
+
+	WRITE_ONCE(dentry->d_flags, d_flags);
+}
+
+/*
+ * Set a directory dentry's casefold d_ops from its inode before the dentry is
+ * published. Not yet reachable by RCU lookups, so a plain assignment is safe.
+ */
+void bch2_dentry_set_casefold_ops(struct dentry *dentry, struct inode *vinode)
+{
+	if (!S_ISDIR(vinode->i_mode))
+		return;
+
+	dentry->d_op = &bch2_dentry_ops_casefolded;
+	bch2_dentry_apply_casefold_flags(dentry, bch2_dentry_casefold_flags(vinode));
+}
+
+/*
+ * d_obtain_alias() attaches the dentry before returning it. Disconnected
+ * aliases are not reachable by parent lookup yet, but existing aliases can be.
+ * Hold d_lock to serialize against other writers. Lockless readers may sample
+ * either the old or new flags, so keep the flag update to a single transition.
+ */
+static void bch2_dentry_set_casefold_ops_locked(struct dentry *dentry, struct inode *vinode)
+{
+	unsigned flags;
+
+	if (!S_ISDIR(vinode->i_mode))
+		return;
+
+	flags = bch2_dentry_casefold_flags(vinode);
+
+	spin_lock(&dentry->d_lock);
+	dentry->d_op = &bch2_dentry_ops_casefolded;
+	bch2_dentry_apply_casefold_flags(dentry, flags);
+	spin_unlock(&dentry->d_lock);
+}
+
+/*
+ * Refresh a published directory dentry's casefold OP flags after its casefold
+ * state changed at runtime. d_op is already casefold-capable and is not changed
+ * here, so lockless d_hash/d_compare users never see flags without callbacks.
+ */
+static void bch2_dentry_update_casefold_flags(struct dentry *dentry)
+{
+	unsigned flags = bch2_dentry_casefold_flags(d_inode(dentry));
+
+	spin_lock(&dentry->d_lock);
+	bch2_dentry_apply_casefold_flags(dentry, flags);
+	spin_unlock(&dentry->d_lock);
+}
+
+void bch2_dir_casefold_changed(struct dentry *dentry)
+{
+	if (!d_is_dir(dentry))
+		return;
+
+	shrink_dcache_parent(dentry);
+	bch2_dentry_update_casefold_flags(dentry);
+}
+#endif
 
 static struct dentry *bch2_lookup(struct inode *vdir, struct dentry *dentry,
 				  unsigned int flags)
@@ -741,7 +1046,11 @@ static struct dentry *bch2_lookup(struct inode *vdir, struct dentry *dentry,
 		return NULL;
 	}
 
-	return d_splice_alias(&inode->v, dentry);
+	struct inode *vinode = inode ? &inode->v : NULL;
+
+	if (vinode)
+		bch2_dentry_set_casefold_ops(dentry, vinode);
+	return d_splice_alias(vinode, dentry);
 }
 
 static int bch2_mknod(struct mnt_idmap *idmap,
@@ -755,6 +1064,7 @@ static int bch2_mknod(struct mnt_idmap *idmap,
 	if (IS_ERR(inode))
 		return bch2_err_class(PTR_ERR(inode));
 
+	bch2_dentry_set_casefold_ops(dentry, &inode->v);
 	d_instantiate(dentry, &inode->v);
 	return 0;
 }
@@ -802,8 +1112,8 @@ static int bch2_link(struct dentry *old_dentry, struct inode *vdir,
 
 	lockdep_assert_held(&inode->v.i_rwsem);
 
-	ret   = bch2_subvol_is_ro(c, dir->ei_inum.subvol) ?:
-		bch2_subvol_is_ro(c, inode->ei_inum.subvol) ?:
+	ret   = bch2_subvol_is_ro(c, inode_inum(dir).subvol) ?:
+		bch2_subvol_is_ro(c, inode_inum(inode).subvol) ?:
 		__bch2_link(c, inode, dir, dentry);
 	if (unlikely(ret))
 		return bch2_err_class(ret);
@@ -849,11 +1159,7 @@ err:
 
 static int bch2_unlink(struct inode *vdir, struct dentry *dentry)
 {
-	struct bch_inode_info *dir= to_bch_ei(vdir);
-	struct bch_fs *c = dir->v.i_sb->s_fs_info;
-
-	int ret = bch2_subvol_is_ro(c, dir->ei_inum.subvol) ?:
-		__bch2_unlink(vdir, dentry, false);
+	int ret = __bch2_unlink(vdir, dentry, false);
 	return bch2_err_class(ret);
 }
 
@@ -916,7 +1222,7 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 	int ret;
 
 	if (flags & ~(RENAME_NOREPLACE|RENAME_EXCHANGE|RENAME_WHITEOUT))
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_rename_bad_flags);
 
 	if (mode == BCH_RENAME_OVERWRITE)
 		try(filemap_write_and_wait_range(src_inode->v.i_mapping, 0, LLONG_MAX));
@@ -929,9 +1235,11 @@ static int bch2_rename2(struct mnt_idmap *idmap,
 
 	CLASS(btree_trans, trans)(c);
 
+	u32 src_snapshot, dst_snapshot;
+
 	ret = lockrestart_do(trans,
-		bch2_subvol_is_ro_trans(trans, src_dir->ei_inum.subvol) ?:
-		bch2_subvol_is_ro_trans(trans, dst_dir->ei_inum.subvol));
+		bch2_subvol_is_ro_trans(trans, inode_inum(src_dir).subvol, &src_snapshot) ?:
+		bch2_subvol_is_ro_trans(trans, inode_inum(dst_dir).subvol, &dst_snapshot));
 	if (ret)
 		goto err;
 
@@ -974,9 +1282,10 @@ retry:
 			goto err_tx_restart;
 		bch2_inode_init_early(c, whiteout_inode_u);
 
+		struct bch_subvolume new_subvol;
 		ret = bch2_create_trans(trans,
 					inode_inum(src_dir), &src_dir_u,
-					whiteout_inode_u,
+					whiteout_inode_u, &new_subvol,
 					&src_dentry->d_name,
 					from_kuid(i_user_ns(&src_dir->v), current_fsuid()),
 					from_kgid(i_user_ns(&src_dir->v), current_fsgid()),
@@ -996,9 +1305,9 @@ err_tx_restart:
 		goto err;
 	}
 
-	BUG_ON(src_inode->v.i_ino != src_inode_u.bi_inum);
+	BUG_ON(inode_inum(src_inode).inum != src_inode_u.bi_inum);
 	BUG_ON(dst_inode &&
-	       dst_inode->v.i_ino != dst_inode_u.bi_inum);
+	       inode_inum(dst_inode).inum != dst_inode_u.bi_inum);
 
 	bch2_inode_update_after_write(trans, src_dir, &src_dir_u,
 				      ATTR_MTIME|ATTR_CTIME|ATTR_SIZE);
@@ -1013,6 +1322,7 @@ err_tx_restart:
 	if (dst_inode)
 		bch2_inode_update_after_write(trans, dst_inode, &dst_inode_u,
 					      ATTR_CTIME);
+
 err:
 	bch2_fs_quota_transfer(c, src_inode,
 			       bch_qid(&src_inode->ei_inode),
@@ -1086,6 +1396,7 @@ static int bch2_setattr_nonsize_trans(struct btree_trans *trans,
 	struct bch_inode_unpacked inode_u;
 	try(bch2_inode_peek(trans, &inode_iter, &inode_u, inode_inum(inode), BTREE_ITER_intent));
 
+	bch2_inode_fold_atime(inode, &inode_u);
 	bch2_setattr_copy(idmap, inode, &inode_u, attr);
 
 	if (attr->ia_valid & ATTR_MODE)
@@ -1124,10 +1435,24 @@ int bch2_setattr_nonsize(struct mnt_idmap *idmap,
 		qid.q[QTYP_GRP] = from_kgid(i_user_ns(&inode->v), kgid);
 	}
 
+	struct bch_qid old_qid = inode->ei_qid;
+
 	try(bch2_fs_quota_transfer(c, inode, qid, ~0, KEY_TYPE_QUOTA_PREALLOC));
 
 	CLASS(btree_trans, trans)(c);
-	return lockrestart_do(trans, bch2_setattr_nonsize_trans(trans, idmap, inode, attr));
+	int ret = lockrestart_do(trans, bch2_setattr_nonsize_trans(trans, idmap, inode, attr));
+	if (unlikely(ret))
+		/*
+		 * Roll back the in-memory quota transfer: the btree commit
+		 * failed, so the inode on disk still has the old qid. Without
+		 * this rollback, in-memory quota counts diverge from what an
+		 * inode scan would compute - generic/270 catches it.
+		 *
+		 * NOCHECK because we're returning to a qid we just came from;
+		 * it had room.
+		 */
+		bch2_fs_quota_transfer(c, inode, old_qid, ~0, KEY_TYPE_QUOTA_NOCHECK);
+	return ret;
 }
 
 static int bch2_getattr(struct mnt_idmap *idmap,
@@ -1140,20 +1465,22 @@ static int bch2_getattr(struct mnt_idmap *idmap,
 	vfsgid_t vfsgid = i_gid_into_vfsgid(idmap, &inode->v);
 
 	stat->dev	= inode->v.i_sb->s_dev;
-	stat->ino	= inode->v.i_ino;
+	stat->ino	= inode_inum(inode).inum;
 	stat->mode	= inode->v.i_mode;
 	stat->nlink	= inode->v.i_nlink;
 	stat->uid	= vfsuid_into_kuid(vfsuid);
 	stat->gid	= vfsgid_into_kgid(vfsgid);
 	stat->rdev	= inode->v.i_rdev;
 	stat->size	= i_size_read(&inode->v);
+	if (!stat->size && S_ISDIR(inode->v.i_mode))
+		stat->size = block_bytes(c);
 	stat->atime	= inode_get_atime(&inode->v);
 	stat->mtime	= inode_get_mtime(&inode->v);
 	stat->ctime	= inode_get_ctime(&inode->v);
 	stat->blksize	= block_bytes(c);
 	stat->blocks	= inode->v.i_blocks;
 
-	stat->subvol	= inode->ei_inum.subvol;
+	stat->subvol	= inode_inum(inode).subvol;
 	stat->result_mask |= STATX_SUBVOL;
 
 	if ((request_mask & STATX_DIOALIGN) && S_ISREG(inode->v.i_mode)) {
@@ -1194,7 +1521,7 @@ static int bch2_setattr(struct mnt_idmap *idmap,
 
 	lockdep_assert_held(&inode->v.i_rwsem);
 
-	int ret = bch2_subvol_is_ro(c, inode->ei_inum.subvol) ?:
+	int ret = bch2_subvol_is_ro(c, inode_inum(inode).subvol) ?:
 		setattr_prepare(idmap, dentry, iattr) ?:
 		(iattr->ia_valid & ATTR_SIZE
 		 ? bchfs_truncate(idmap, inode, iattr)
@@ -1245,10 +1572,133 @@ static int bch2_mmap(struct file *file, struct vm_area_struct *vma)
 
 /* Directories: */
 
+struct bch_dir_cookie_state {
+	bool		valid;
+	loff_t		cookie;
+	u64		next_pos;
+};
+
+#define BCH2_READDIR_32_FIRST	2
+#define BCH2_READDIR_32_EOF	INT_MAX
+
+static inline bool bch2_dir_32bit_api(void)
+{
+#ifdef CONFIG_COMPAT
+	return in_compat_syscall();
+#else
+	return BITS_PER_LONG == 32;
+#endif
+}
+
+static inline bool bch2_dir_32bit_dirents(struct file *file)
+{
+	return (file->f_mode & FMODE_32BITHASH) ||
+		(!(file->f_mode & FMODE_64BITHASH) && bch2_dir_32bit_api());
+}
+
+static inline unsigned bch2_dir_cookie_shift(const struct bch_hash_info *hash)
+{
+	if (hash->is_31bit)
+		return 0;
+	if (hash->type == BCH_STR_HASH_crc32c)
+		return 1;
+	return 32;
+}
+
+/*
+ * 32-bit readdir ABIs have to round-trip d_off through signed long and d_ino
+ * through unsigned long. Keep bcachefs' internal cursor 64-bit, but hand the
+ * caller values that its dirent layout can represent.
+ *
+ * Position translation never produces BCH2_READDIR_32_EOF - it's a pure
+ * sentinel, set only when a readdir exhausts the directory, so stateless
+ * consumers (NFS) terminate instead of rescanning the final cookie granule
+ * forever:
+ */
+static inline loff_t bch2_dir_pos_to_32(const struct bch_hash_info *hash, u64 pos)
+{
+	unsigned shift = bch2_dir_cookie_shift(hash);
+
+	if (pos < BCH2_READDIR_32_FIRST || !shift)
+		return min_t(loff_t, pos, BCH2_READDIR_32_EOF - 1);
+
+	return min_t(loff_t, BCH2_READDIR_32_EOF - 1,
+		     max_t(loff_t, BCH2_READDIR_32_FIRST,
+			   pos >> shift));
+}
+
+static inline u64 bch2_dir_pos_from_32(const struct bch_hash_info *hash, loff_t pos)
+{
+	unsigned shift = bch2_dir_cookie_shift(hash);
+
+	if (pos < BCH2_READDIR_32_FIRST || !shift)
+		return pos;
+	if (pos == BCH2_READDIR_32_FIRST)
+		return BCH2_READDIR_32_FIRST;
+	if (pos >= BCH2_READDIR_32_EOF)
+		return U64_MAX;
+	return (u64) pos << shift;
+}
+
+static inline u32 bch2_dir_ino_to_32(u64 ino)
+{
+	u32 ret = ino;
+
+	return ret ?: 1;
+}
+
+struct bch_readdir_ctx32 {
+	struct dir_context		ctx;
+	struct dir_context		*dst;
+	struct bch_dir_cookie_state	*state;
+	struct bch_hash_info		*hash;
+	/* an entry was refused: the iteration stopped at a full buffer, not EOF */
+	bool				full;
+};
+
+static bool bch2_readdir_emit32(struct dir_context *ctx,
+				const char *name, int namelen,
+				loff_t offset, u64 ino, unsigned type)
+{
+	struct bch_readdir_ctx32 *src = container_of(ctx, struct bch_readdir_ctx32, ctx);
+	loff_t cookie = bch2_dir_pos_to_32(src->hash, offset);
+	u32 ino32 = bch2_dir_ino_to_32(ino);
+	bool ret = src->dst->actor(src->dst, name, namelen, cookie, ino32, type);
+
+	if (ret) {
+		if (src->state) {
+			src->state->valid = true;
+			src->state->cookie = cookie;
+			src->state->next_pos = offset + 1;
+		}
+	} else {
+		src->full = true;
+	}
+
+	return ret;
+}
+
+static int bch2_dir_open(struct inode *vinode, struct file *file)
+{
+	file->private_data = kzalloc(sizeof(struct bch_dir_cookie_state), GFP_KERNEL);
+	return file->private_data ? 0 : -ENOMEM;
+}
+
+static int bch2_dir_release(struct inode *vinode, struct file *file)
+{
+	kfree(file->private_data);
+	return 0;
+}
+
 static loff_t bch2_dir_llseek(struct file *file, loff_t offset, int whence)
 {
-	return generic_file_llseek_size(file, offset, whence,
-					S64_MAX, S64_MAX);
+	struct bch_dir_cookie_state *state = file->private_data;
+	loff_t max = bch2_dir_32bit_dirents(file) ? BCH2_READDIR_32_EOF : S64_MAX;
+
+	if (state)
+		state->valid = false;
+
+	return generic_file_llseek_size(file, offset, whence, max, max);
 }
 
 static int bch2_vfs_readdir(struct file *file, struct dir_context *ctx)
@@ -1259,10 +1709,40 @@ static int bch2_vfs_readdir(struct file *file, struct dir_context *ctx)
 	struct bch_hash_info hash;
 	try(bch2_hash_info_init(c, &inode->ei_inode, &hash));
 
-	if (!dir_emit_dots(file, ctx))
-		return 0;
+	int ret;
 
-	int ret = bch2_readdir(c, inode_inum(inode), &hash, ctx);
+	if (bch2_dir_32bit_dirents(file)) {
+		struct bch_dir_cookie_state *state = file->private_data;
+		u64 start = state && state->valid && state->cookie == ctx->pos
+			? state->next_pos
+			: bch2_dir_pos_from_32(&hash, ctx->pos);
+		struct bch_readdir_ctx32 ctx32 = {
+			.ctx	= { .actor = bch2_readdir_emit32, .pos = start, },
+			.dst	= ctx,
+			.state	= state,
+			.hash	= &hash,
+		};
+
+		if (!dir_emit_dots(file, &ctx32.ctx)) {
+			ctx->pos = bch2_dir_pos_to_32(&hash, ctx32.ctx.pos);
+			return 0;
+		}
+
+		ret = bch2_readdir(c, inode_inum(inode), &hash, &ctx32.ctx);
+
+		/*
+		 * bch2_readdir() returning 0 means it stopped at a full buffer
+		 * or ran out of dirents; only the actor knows which:
+		 */
+		ctx->pos = !ret && !ctx32.full
+			? BCH2_READDIR_32_EOF
+			: bch2_dir_pos_to_32(&hash, ctx32.ctx.pos);
+	} else {
+		if (!dir_emit_dots(file, ctx))
+			return 0;
+
+		ret = bch2_readdir(c, inode_inum(inode), &hash, ctx);
+	}
 
 	bch_err_fn(c, ret);
 	return bch2_err_class(ret);
@@ -1274,7 +1754,7 @@ static int bch2_open(struct inode *vinode, struct file *file)
 		struct bch_inode_info *inode = to_bch_ei(vinode);
 		struct bch_fs *c = inode->v.i_sb->s_fs_info;
 
-		try(bch2_subvol_is_ro(c, inode->ei_inum.subvol));
+		try(bch2_subvol_is_ro(c, inode_inum(inode).subvol));
 	}
 
 	file->f_mode |= FMODE_CAN_ODIRECT;
@@ -1346,7 +1826,7 @@ static int fssetxattr_inode_update_fn(struct btree_trans *trans,
 	if (!S_ISREG(bi->bi_mode) &&
 	    !S_ISDIR(bi->bi_mode) &&
 	    (s->flags & (BCH_INODE_nodump|BCH_INODE_noatime)) != s->flags)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_setattr_bad_file_type);
 
 	if (s->set_casefold &&
 	    s->casefold != bch2_inode_casefold(c, bi))
@@ -1415,13 +1895,16 @@ static int bch2_fileattr_set(struct mnt_idmap *idmap,
 	}
 
 	mutex_lock(&inode->ei_update_lock);
-	ret   = bch2_subvol_is_ro(c, inode->ei_inum.subvol) ?:
+	ret   = bch2_subvol_is_ro(c, inode_inum(inode).subvol) ?:
 		(s.set_project
 		 ? bch2_set_projid(c, inode, fa->fsx_projid)
 		 : 0) ?:
 		bch2_write_inode(c, inode, fssetxattr_inode_update_fn, &s,
 			       ATTR_CTIME);
 	mutex_unlock(&inode->ei_update_lock);
+
+	if (!ret && s.set_casefold)
+		bch2_dir_casefold_changed(dentry);
 err:
 	return bch2_err_class(ret);
 }
@@ -1480,6 +1963,8 @@ static const struct inode_operations bch_dir_inode_operations = {
 };
 
 static const struct file_operations bch_dir_file_operations = {
+	.open		= bch2_dir_open,
+	.release	= bch2_dir_release,
 	.llseek		= bch2_dir_llseek,
 	.read		= generic_read_dir,
 	.iterate_shared	= bch2_vfs_readdir,
@@ -1529,7 +2014,7 @@ static const struct address_space_operations bch_address_space_operations = {
 struct bcachefs_fid {
 	u64		inum;
 	u32		subvol;
-	u32		gen;
+	u32		generation;
 } __packed;
 
 struct bcachefs_fid_with_parent {
@@ -1552,9 +2037,9 @@ static int bcachefs_fid_valid(int fh_len, int fh_type)
 static struct bcachefs_fid bch2_inode_to_fid(struct bch_inode_info *inode)
 {
 	return (struct bcachefs_fid) {
-		.inum	= inode->ei_inum.inum,
-		.subvol	= inode->ei_inum.subvol,
-		.gen	= inode->ei_inode.bi_generation,
+		.inum	= inode_inum(inode).inum,
+		.subvol	= inode_inum(inode).subvol,
+		.generation	= inode->ei_inode.bi_generation,
 	};
 }
 
@@ -1602,11 +2087,22 @@ static struct inode *bch2_nfs_get_inode(struct super_block *sb,
 				    .subvol = fid.subvol,
 				    .inum = fid.inum,
 	}, NULL);
-	if (!IS_ERR(vinode) && vinode->i_generation != fid.gen) {
+	if (!IS_ERR(vinode) && vinode->i_generation != fid.generation) {
 		iput(vinode);
 		vinode = ERR_PTR(-ESTALE);
 	}
 	return vinode;
+}
+
+static struct dentry *bch2_fh_alias(struct super_block *sb, struct inode *vinode)
+{
+	struct dentry *dentry = d_obtain_alias(vinode);
+	if (!IS_ERR(dentry)) {
+#if IS_ENABLED(CONFIG_UNICODE)
+		bch2_dentry_set_casefold_ops_locked(dentry, vinode);
+#endif
+	}
+	return dentry;
 }
 
 static struct dentry *bch2_fh_to_dentry(struct super_block *sb, struct fid *_fid,
@@ -1617,7 +2113,7 @@ static struct dentry *bch2_fh_to_dentry(struct super_block *sb, struct fid *_fid
 	if (!bcachefs_fid_valid(fh_len, fh_type))
 		return NULL;
 
-	return d_obtain_alias(bch2_nfs_get_inode(sb, *fid));
+	return bch2_fh_alias(sb, bch2_nfs_get_inode(sb, *fid));
 }
 
 static struct dentry *bch2_fh_to_parent(struct super_block *sb, struct fid *_fid,
@@ -1629,7 +2125,7 @@ static struct dentry *bch2_fh_to_parent(struct super_block *sb, struct fid *_fid
 	    fh_type != FILEID_BCACHEFS_WITH_PARENT)
 		return NULL;
 
-	return d_obtain_alias(bch2_nfs_get_inode(sb, fid->dir));
+	return bch2_fh_alias(sb, bch2_nfs_get_inode(sb, fid->dir));
 }
 
 static struct dentry *bch2_get_parent(struct dentry *child)
@@ -1638,12 +2134,12 @@ static struct dentry *bch2_get_parent(struct dentry *child)
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
 	subvol_inum parent_inum = {
 		.subvol = inode->ei_inode.bi_parent_subvol ?:
-			inode->ei_inum.subvol,
+			inode_inum(inode).subvol,
 		.inum = inode->ei_inode.bi_dir,
 	};
 
 	/* needs nowarn */
-	return d_obtain_alias(bch2_vfs_inode_get(c, parent_inum, NULL));
+	return bch2_fh_alias(inode->v.i_sb, bch2_vfs_inode_get(c, parent_inum, NULL));
 }
 
 static int bch2_get_name(struct dentry *parent, char *name, struct dentry *child)
@@ -1661,7 +2157,7 @@ static int bch2_get_name(struct dentry *parent, char *name, struct dentry *child
 	int ret;
 
 	if (!S_ISDIR(dir->v.i_mode))
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_get_name_not_dir);
 
 	CLASS(btree_trans, trans)(c);
 	CLASS(btree_iter, iter1)(trans, BTREE_ID_dirents,
@@ -1671,7 +2167,7 @@ static int bch2_get_name(struct dentry *parent, char *name, struct dentry *child
 retry:
 	bch2_trans_begin(trans);
 
-	ret = bch2_subvolume_get_snapshot(trans, dir->ei_inum.subvol, &snapshot);
+	ret = bch2_subvolume_get_snapshot(trans, inode_inum(dir).subvol, &snapshot);
 	if (ret)
 		goto err;
 
@@ -1702,7 +2198,7 @@ retry:
 		if (ret)
 			goto err;
 
-		if (subvol_inum_eq(target, inode->ei_inum))
+		if (subvol_inum_eq(target, inode_inum(inode)))
 			goto found;
 	} else {
 		/*
@@ -1723,7 +2219,7 @@ retry:
 			if (ret)
 				continue;
 
-			if (subvol_inum_eq(target, inode->ei_inum))
+			if (subvol_inum_eq(target, inode_inum(inode)))
 				goto found;
 		}
 	}
@@ -1758,7 +2254,7 @@ static void bch2_vfs_inode_init(struct btree_trans *trans,
 				struct bch_subvolume *subvol)
 {
 	inode->v.i_ino		= inum.inum;
-	inode->ei_inum		= inum;
+	inode->ei_inum_hash.inum = inum;
 	inode->ei_inode.bi_inum	= inum.inum;
 	bch2_inode_update_after_write(trans, inode, bi, ~0);
 
@@ -1832,16 +2328,26 @@ static int bch2_vfs_write_inode(struct inode *vinode,
 	return bch2_err_class(ret);
 }
 
+#if 0
 static bool verify_i_size_at_evict;
 
 module_param_named(verify_i_size_at_evict, verify_i_size_at_evict, bool, 0644);
 MODULE_PARM_DESC(verify_i_size_at_evict, "");
+#endif
 
 static void bch2_evict_inode(struct inode *vinode)
 {
 	struct bch_fs *c = vinode->i_sb->s_fs_info;
 	struct bch_inode_info *inode = to_bch_ei(vinode);
-	bool delete = !inode->v.i_nlink && !is_bad_inode(&inode->v);
+	/*
+	 * An unlinked subvolume's root inode reads i_nlink == 0, but its
+	 * deletion belongs to the subvolume deletion path, not us (see
+	 * bch2_inode_is_subvolume_root()): this eviction completing is what
+	 * bch2_subvolume_wait_for_pagecache_and_delete() is waiting on to
+	 * tombstone the subvolume and hand the keys to the snapshot sweep.
+	 */
+	bool delete = !inode->v.i_nlink && !is_bad_inode(&inode->v) &&
+		!bch2_inode_is_subvolume_root(&inode->ei_inode);
 
 	/*
 	 * evict() has waited for outstanding writeback, we'll do no more IO
@@ -1855,7 +2361,17 @@ static void bch2_evict_inode(struct inode *vinode)
 
 	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG) && delete)
 		write_inode_now(&inode->v, true);
-
+	/*
+	 * Disabled: bch2_inode_find_by_inum() starts a new btree_trans, but
+	 * eviction can be called from inside an existing transaction — e.g.
+	 * discard_new_inode() from bch2_inode_hash_insert() during
+	 * bch2_lookup_trans(). The deadlock detector can't see locks held
+	 * by the outer transaction, so cycles involving both transactions
+	 * go undetected. Observed as a three-way deadlock between
+	 * btree_node_write_work, __bch2_unlink, and bch2_lookup (github
+	 * issue #1046).
+	 */
+#if 0
 	if (verify_i_size_at_evict) {
 		BUG_ON(inode_state_read_once(&inode->v) & I_DIRTY);
 
@@ -1886,7 +2402,7 @@ static void bch2_evict_inode(struct inode *vinode)
 			}
 		}
 	}
-
+#endif
 	truncate_inode_pages_final(&inode->v.i_data);
 
 	cancel_delayed_work_sync(&inode->ei_writeback_timer);
@@ -1909,73 +2425,65 @@ static void bch2_evict_inode(struct inode *vinode)
 		bch2_inode_hash_remove(c, inode);
 	}
 
-	scoped_guard(mutex, &c->vfs.inodes_lock)
-		list_del_init(&inode->ei_vfs_inode_list);
+	fast_list_remove(&c->vfs.inodes, inode->ei_inodes_idx);
+	inode->ei_inodes_idx = 0;
 }
 
 void bch2_evict_subvolume_inodes(struct bch_fs *c, snapshot_id_list *s)
 {
-	struct bch_inode_info *inode;
-	DARRAY(struct bch_inode_info *) grabbed;
-	bool clean_pass = false, this_pass_clean;
-
 	/*
 	 * Initially, we scan for inodes without I_DONTCACHE, then mark them to
 	 * be pruned with d_mark_dontcache().
 	 *
 	 * Once we've had a clean pass where we didn't find any inodes without
-	 * I_DONTCACHE, we wait for them to be freed:
+	 * I_DONTCACHE, we wait for them to be freed.
+	 *
+	 * fast_list_iter tracks position by integer index, so we can drop rcu
+	 * around the dcache work (held safe by our igrab ref) and resume from
+	 * the same slot on the next iteration.
 	 */
+	rcu_read_lock();
+	struct genradix_iter iter;
+	struct bch_inode_info *inode;
 
-	darray_init(&grabbed);
-	darray_make_room(&grabbed, 1024);
-again:
-	cond_resched();
-	this_pass_clean = true;
-
-	mutex_lock(&c->vfs.inodes_lock);
-	list_for_each_entry(inode, &c->vfs.inodes_list, ei_vfs_inode_list) {
-		if (!snapshot_list_has_id(s, inode->ei_inum.subvol))
+	fast_list_for_each(&c->vfs.inodes, iter, inode) {
+		if (!snapshot_list_has_id(s, inode_inum(inode).subvol))
 			continue;
 
-		if (!(inode_state_read_once(&inode->v) & (I_DONTCACHE|I_FREEING)) &&
+		if (!(inode_state_read_once(&inode->v) & I_DONTCACHE) &&
 		    igrab(&inode->v)) {
-			this_pass_clean = false;
+			rcu_read_unlock();
 
-			if (darray_push_gfp(&grabbed, inode, GFP_ATOMIC|__GFP_NOWARN)) {
-				iput(&inode->v);
-				break;
-			}
-		} else if (clean_pass && this_pass_clean) {
+			d_mark_dontcache(&inode->v);
+			d_prune_aliases(&inode->v);
+			iput(&inode->v);
+
+			rcu_read_lock();
+		}
+	}
+
+	bool found = false;
+	do {
+		found = false;
+
+		fast_list_for_each(&c->vfs.inodes, iter, inode) {
+			if (!snapshot_list_has_id(s, inode_inum(inode).subvol))
+				continue;
+
+			found = true;
+
 			struct wait_bit_queue_entry wqe;
-			struct wait_queue_head *wq_head;
-
-			wq_head = inode_bit_waitqueue(&wqe, &inode->v, __I_NEW);
+			struct wait_queue_head *wq_head = inode_bit_waitqueue(&wqe, &inode->v, __I_NEW);
 			prepare_to_wait_event(wq_head, &wqe.wq_entry,
 					      TASK_UNINTERRUPTIBLE);
-			mutex_unlock(&c->vfs.inodes_lock);
+			rcu_read_unlock();
 
 			schedule();
 			finish_wait(wq_head, &wqe.wq_entry);
-			goto again;
+			rcu_read_lock();
 		}
-	}
-	mutex_unlock(&c->vfs.inodes_lock);
-
-	darray_for_each(grabbed, i) {
-		inode = *i;
-		d_mark_dontcache(&inode->v);
-		d_prune_aliases(&inode->v);
-		iput(&inode->v);
-	}
-	grabbed.nr = 0;
-
-	if (!clean_pass || !this_pass_clean) {
-		clean_pass = this_pass_clean;
-		goto again;
-	}
-
-	darray_exit(&grabbed);
+	} while (found);
+	rcu_read_unlock();
 }
 
 static int bch2_statfs(struct dentry *dentry, struct kstatfs *buf)
@@ -2134,23 +2642,23 @@ static const struct super_operations bch_super_operations = {
 	.unfreeze_fs	= bch2_unfreeze,
 };
 
-static int bch2_set_super(struct super_block *s, void *data)
+static int bch2_set_super(struct super_block *s, struct fs_context *fc)
 {
-	s->s_fs_info = data;
+	s->s_fs_info = fc->s_fs_info;
 	return 0;
 }
 
-static int bch2_noset_super(struct super_block *s, void *data)
+static int bch2_noset_super(struct super_block *s, struct fs_context *fc)
 {
 	return -EBUSY;
 }
 
 typedef DARRAY(struct bch_fs *) darray_fs;
 
-static int bch2_test_super(struct super_block *s, void *data)
+static int bch2_test_super(struct super_block *s, struct fs_context *fc)
 {
 	struct bch_fs *c = s->s_fs_info;
-	darray_fs *d = data;
+	darray_fs *d = fc->s_fs_info;
 
 	if (!c)
 		return false;
@@ -2193,7 +2701,11 @@ static int bch2_fs_get_tree(struct fs_context *fc)
 			goto err;
 	}
 
-	sb = sget(fc->fs_type, bch2_test_super, bch2_noset_super, fc->sb_flags|SB_NOSEC, &devs_to_fs);
+	/* sget_fc() passes the payload to the callbacks via fc->s_fs_info, and
+	 * takes the sb flags from fc->sb_flags (no flags argument). */
+	fc->s_fs_info = &devs_to_fs;
+	fc->sb_flags |= SB_NOSEC;
+	sb = sget_fc(fc, bch2_test_super, bch2_noset_super);
 	if (!IS_ERR(sb))
 		goto got_sb;
 
@@ -2227,7 +2739,8 @@ static int bch2_fs_get_tree(struct fs_context *fc)
 	if (c->opts.read_only)
 		fc->sb_flags |= SB_RDONLY;
 
-	sb = sget(fc->fs_type, NULL, bch2_set_super, fc->sb_flags|SB_NOSEC, c);
+	fc->s_fs_info = c;
+	sb = sget_fc(fc, NULL, bch2_set_super);
 	ret = PTR_ERR_OR_ZERO(sb);
 	if (ret)
 		goto err_stop_fs;
@@ -2271,7 +2784,7 @@ got_sb:
 	if (ret)
 		goto err_put_super;
 
-	sb->s_bdi->ra_pages		= VM_READAHEAD_PAGES;
+	sb->s_bdi->ra_pages = bch2_fs_ra_pages(c);
 
 	scoped_guard(rcu) {
 		for_each_online_member_rcu(c, ca) {
@@ -2294,7 +2807,12 @@ got_sb:
 #if IS_ENABLED(CONFIG_UNICODE)
 	if (!bch2_fs_casefold_enabled(c))
 		sb->s_encoding = c->cf_encoding;
-	generic_set_sb_d_ops(sb);
+	/*
+	 * Avoid generic_set_sb_d_ops()'s generic_ci_dentry_ops default:
+	 * directory dentries that need casefold support get utf8 ops installed
+	 * when their inode is attached (see bch2_dentry_set_casefold_ops),
+	 * keeping DCACHE_OP_COMPARE clear on non-casefolded directories.
+	 */
 #endif
 
 	vinode = bch2_vfs_inode_get(c, BCACHEFS_ROOT_SUBVOL_INUM, __func__);
@@ -2309,6 +2827,11 @@ got_sb:
 		ret = -ENOMEM;
 		goto err_put_super;
 	}
+
+#if IS_ENABLED(CONFIG_UNICODE)
+	/* Root has no attach site of its own; set its ops from its own inode. */
+	bch2_dentry_set_casefold_ops(sb->s_root, d_inode(sb->s_root));
+#endif
 
 	sb->s_flags |= SB_ACTIVE;
 out:
@@ -2374,11 +2897,13 @@ static int bch2_fs_parse_param(struct fs_context *fc,
 	if (fc->root)
 		c = fc->root->d_sb->s_fs_info;
 
+	CLASS(printbuf, err)();
 	int ret = bch2_parse_one_mount_opt(c, &opts->opts,
 					   &opts->parse_later, param->key,
-					   param->string);
+					   param->string,
+					   &err);
 	if (ret)
-		pr_err("Error parsing option %s: %s", param->key, bch2_err_str(ret));
+		pr_err("Error parsing option %s", err.buf);
 
 	return bch2_err_class(ret);
 }
@@ -2407,7 +2932,7 @@ static int bch2_fs_reconfigure(struct fs_context *fc)
 			ret = bch2_fs_read_write(c);
 			if (ret) {
 				bch_err(c, "error going rw: %i", ret);
-				return -EINVAL;
+				return bch_err_throw(c, EINVAL_reconfigure_read_write);
 			}
 
 			sb->s_flags &= ~SB_RDONLY;
@@ -2450,6 +2975,7 @@ void bch2_fs_vfs_exit(struct bch_fs *c)
 	bioset_exit(&c->vfs.dio_read_bioset);
 	bioset_exit(&c->vfs.writepage_bioset);
 	bioset_exit(&c->vfs.nocow_flush_bioset);
+	mempool_exit(&c->vfs.writepage_buf_pool);
 
 	if (c->vfs.writeback_wq)
 		destroy_workqueue(c->vfs.writeback_wq);
@@ -2457,12 +2983,13 @@ void bch2_fs_vfs_exit(struct bch_fs *c)
 		rhltable_destroy(&c->vfs.inodes_by_inum_table);
 	if (c->vfs.inodes_table.tbl)
 		rhashtable_destroy(&c->vfs.inodes_table);
+	fast_list_exit(&c->vfs.inodes);
 }
 
 int bch2_fs_vfs_init(struct bch_fs *c)
 {
-	INIT_LIST_HEAD(&c->vfs.inodes_list);
-	mutex_init(&c->vfs.inodes_lock);
+	fdm_init(&c->fdm_table);
+	try(fast_list_init(&c->vfs.inodes));
 
 	try(rhashtable_init(&c->vfs.inodes_table, &bch2_vfs_inodes_params));
 	try(rhltable_init(&c->vfs.inodes_by_inum_table, &bch2_vfs_inodes_by_inum_params));
@@ -2482,6 +3009,10 @@ int bch2_fs_vfs_init_rw(struct bch_fs *c)
 			BIOSET_NEED_BVECS))
 		return bch_err_throw(c, ENOMEM_writepage_bioset_init);
 
+	if (mempool_init_kvmalloc_pool(&c->vfs.writepage_buf_pool, 4,
+				       BCH_WRITEPAGE_BUF_BYTES))
+		return bch_err_throw(c, ENOMEM_writepage_buf_pool_init);
+
 	if (bioset_init(&c->vfs.dio_write_bioset,
 			4, offsetof(struct dio_write, op.wbio.bio),
 			BIOSET_NEED_BVECS))
@@ -2492,7 +3023,7 @@ int bch2_fs_vfs_init_rw(struct bch_fs *c)
 		return bch_err_throw(c, ENOMEM_nocow_flush_bioset_init);
 
 	c->vfs.writeback_wq = alloc_workqueue("bcachefs_vfs_writeback",
-					      WQ_MEM_RECLAIM|WQ_FREEZABLE, 1);
+					      WQ_MEM_RECLAIM|WQ_FREEZABLE|WQ_UNBOUND, 1);
 	if (!c->vfs.writeback_wq)
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 

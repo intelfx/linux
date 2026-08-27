@@ -63,6 +63,7 @@
  * human readable bytes. prt_units() obeys it.
  */
 
+#include <linux/hex.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 
@@ -147,9 +148,11 @@ void bch2_printbuf_indent_add_nextline(struct printbuf *, unsigned);
 void bch2_printbuf_indent_sub(struct printbuf *, unsigned);
 
 void bch2_prt_newline(struct printbuf *);
+void bch2_printbuf_ensure_trailing_newline(struct printbuf *);
 void bch2_printbuf_strip_trailing_newline(struct printbuf *);
 void bch2_prt_tab(struct printbuf *);
 void bch2_prt_tab_rjust(struct printbuf *);
+void bch2_printbuf_tabstop_align(struct printbuf *);
 
 void bch2_prt_bytes_indented(struct printbuf *, const char *, unsigned);
 void bch2_prt_human_readable_u64(struct printbuf *, u64);
@@ -284,6 +287,17 @@ static inline void prt_hex_byte_upper(struct printbuf *out, u8 byte)
 	__prt_char_reserved(out, hex_asc_upper_hi(byte));
 	__prt_char_reserved(out, hex_asc_upper_lo(byte));
 	printbuf_nul_terminate_reserved(out);
+}
+
+/*
+ * Contiguous hex dump, same output as printk's %*phN - which the userspace
+ * build can't use: libc vsnprintf prints kernel %p extensions as raw
+ * pointers.
+ */
+static inline void prt_hex_bytes(struct printbuf *out, const void *b, unsigned n)
+{
+	for (unsigned i = 0; i < n; i++)
+		prt_hex_byte(out, ((const u8 *) b)[i]);
 }
 
 static inline void printbuf_reset_keep_tabstops(struct printbuf *buf)

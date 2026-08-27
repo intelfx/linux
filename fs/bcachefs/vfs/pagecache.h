@@ -59,6 +59,15 @@ struct bch_folio_sector {
 	u8			state;
 };
 
+/*
+ * Worst-case bytes for a per-folio bch_folio_sector snapshot: a folio can be up
+ * to MAX_PAGECACHE_ORDER pages, each contributing PAGE_SECTORS sector entries.
+ * Used to size the writepage_buf_pool reserve.
+ */
+#define BCH_WRITEPAGE_BUF_BYTES						\
+	((PAGE_SECTORS << MAX_PAGECACHE_ORDER) *			\
+	 sizeof(struct bch_folio_sector))
+
 struct bch_folio {
 	spinlock_t		lock;
 	atomic_t		write_count;
@@ -129,7 +138,8 @@ static inline void bch2_folio_reservation_init(struct bch_fs *c,
 	res->disk.nr_replicas = inode_nr_replicas(c, inode);
 }
 
-int bch2_folio_set(struct bch_fs *, subvol_inum, struct folio **, unsigned);
+int bch2_folio_set(struct bch_fs *, struct bch_inode_info *,
+		   struct folio **, unsigned);
 void bch2_bio_page_state_set(const struct bch_fs *, struct bio *, struct bkey_s_c);
 
 void bch2_mark_pagecache_unallocated(struct bch_inode_info *, u64, u64);

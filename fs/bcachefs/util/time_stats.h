@@ -24,6 +24,7 @@
 #ifndef _BCACHEFS_TIME_STATS_H
 #define _BCACHEFS_TIME_STATS_H
 
+#include <linux/local_lock.h>
 #include <linux/sched/clock.h>
 #include <linux/spinlock_types.h>
 #include <linux/string.h>
@@ -60,6 +61,14 @@ struct quantiles {
 };
 
 struct time_stat_buffer {
+	/*
+	 * Protects nr/entries on the owning cpu: irq/preempt disable on
+	 * !PREEMPT_RT, a real per-cpu lock on RT - which is what makes
+	 * taking stats->lock (sleeping on RT) from the buffer-full flush
+	 * legal there. Cross-cpu readers (to_seq_buf, reset) don't take
+	 * it; they race the owner by design, bounded by nr.
+	 */
+	local_lock_t	lock;
 	unsigned	nr;
 	struct time_stat_buffer_entry {
 		u64	start;
@@ -84,11 +93,11 @@ struct bch2_time_stats {
 	struct mean_and_variance	  duration_stats;
 	struct mean_and_variance	  freq_stats;
 
-/* default weight for weighted mean and variance calculations */
+/* default weight for streaming median+MAD: half-life ≈ 2^N samples */
 #define TIME_STATS_MV_WEIGHT	8
 
-	struct mean_and_variance_weighted duration_stats_weighted;
-	struct mean_and_variance_weighted freq_stats_weighted;
+	struct mean_and_variance	  duration_stats_weighted;
+	struct mean_and_variance	  freq_stats_weighted;
 };
 
 struct bch2_time_stats_quantiles {

@@ -38,7 +38,6 @@ struct inode_walker_entry {
 	struct bch_inode_unpacked inode;
 	bool			whiteout;
 	u64			count;
-	u64			i_size;
 };
 
 struct inode_walker {
@@ -46,6 +45,8 @@ struct inode_walker {
 	bool				have_inodes;
 	bool				recalculate_sums;
 	struct bpos			last_pos;
+	/* cached inodes are valid while trans->commit_count is unchanged: */
+	u32				commit_count;
 
 	DARRAY(struct inode_walker_entry) inodes;
 	snapshot_id_list		deletes;
@@ -75,6 +76,17 @@ void bch2_dirent_inode_mismatch_msg(struct printbuf *, struct bch_fs *,
 				    struct bch_inode_unpacked *);
 
 int bch2_reattach_inode(struct btree_trans *, struct bch_inode_unpacked *);
+
+/*
+ * Recreate a missing subvolume key: (snapshot, subvol, root inum). Pass 0 for
+ * the inum to have it found from the inode carrying bi_subvol.
+ *
+ * The snapshot must be a leaf - the key it writes sets that snapshot's subvol
+ * backref, and bch2_snapshot_validate() rejects a subvol on a node with
+ * children. check_snapshots() is the natural caller for that reason: the
+ * snapshot it's holding claims the subvolume, so it's a leaf by construction.
+ */
+int bch2_reconstruct_subvol(struct btree_trans *, u32, u32, u64);
 
 int bch2_fsck_update_backpointers(struct btree_trans *,
 				  struct snapshots_seen *,

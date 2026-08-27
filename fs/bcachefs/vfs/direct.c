@@ -27,7 +27,7 @@
 static void bio_check_or_release(struct bio *bio, bool check_dirty)
 {
 	if (check_dirty) {
-		bio_check_pages_dirty(bio);
+		bch2_bio_check_pages_dirty(bio);
 	} else {
 		bio_release_pages(bio, false);
 		bio_put(bio);
@@ -62,14 +62,15 @@ static void bch2_direct_IO_read_split_endio(struct bio *bio)
 	bio_check_or_release(bio, should_dirty);
 }
 
-static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
+static int __bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter,
+				enum bch_read_flags flags,
+				struct bch_read_err_report *err_report)
 {
 	struct file *file = req->ki_filp;
 	struct bch_inode_info *inode = file_bch_inode(file);
 	struct bch_fs *c = inode->v.i_sb->s_fs_info;
 	struct dio_read *dio;
 	struct bio *bio;
-	struct blk_plug plug;
 	loff_t offset = req->ki_pos;
 	bool sync = is_sync_kiocb(req);
 	bool split = false;
@@ -81,7 +82,7 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
 
 	/* bios must be 512 byte aligned: */
 	if ((offset|iter->count) & (SECTOR_SIZE - 1))
-		return bch_err_throw(c, unaligned_io);
+		return bch_err_throw(c, EINVAL_unaligned_io);
 
 	ret = min_t(loff_t, iter->count,
 		    max_t(loff_t, 0, i_size_read(&inode->v) - offset));
@@ -127,8 +128,6 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
 	 */
 	dio->should_dirty = user_backed_iter(iter);
 
-	blk_start_plug(&plug);
-
 	goto start;
 	while (iter->count) {
 		split = true;
@@ -139,26 +138,6 @@ static int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter)
 				       GFP_KERNEL,
 				       &c->bio_read);
 start:
-		bio->bi_opf		= REQ_OP_READ|REQ_SYNC;
-		bio->bi_iter.bi_sector	= offset >> 9;
-		bio->bi_private		= dio;
-
-		ret = bch2_bio_iov_iter_get_pages(bio, iter, 0);
-		if (ret < 0) {
-			/* XXX: fault inject this path */
-			to_rbio(bio)->ret = ret;
-			bio_endio(bio);
-			break;
-		}
-
-		offset += bio->bi_iter.bi_size;
-
-		if (dio->should_dirty)
-			bio_set_pages_dirty(bio);
-
-		if (iter->count)
-			closure_get(&dio->cl);
-
 		struct bch_read_bio *rbio =
 			rbio_init(bio,
 				  c,
@@ -167,10 +146,37 @@ start:
 				  ? bch2_direct_IO_read_split_endio
 				  : bch2_direct_IO_read_endio);
 
-		bch2_read(c, rbio, inode_inum(inode));
-	}
+		BUG_ON(rbio->_state);
+		rbio->err_report		= err_report;
+		rbio->subvol			= inode_inum(inode).subvol;
+		rbio->bio.bi_opf		= REQ_OP_READ|REQ_SYNC;
+		rbio->bio.bi_iter.bi_sector	= offset >> 9;
+		rbio->bio.bi_private		= dio;
 
-	blk_finish_plug(&plug);
+		ret = bch2_bio_iov_iter_get_pages(&rbio->bio, iter, 0);
+		if (ret < 0) {
+			/* XXX: fault inject this path */
+			rbio->ret = ret;
+			bio_endio(&rbio->bio);
+			break;
+		}
+
+		offset += rbio->bio.bi_iter.bi_size;
+
+		if (dio->should_dirty)
+			bch2_bio_set_pages_dirty(&rbio->bio);
+
+		if (iter->count)
+			closure_get(&dio->cl);
+
+		CLASS(btree_trans, trans)(c);
+		bch2_read(trans, rbio, rbio->bio.bi_iter, inode_inum(inode),
+			  NULL, NULL,
+			  BCH_READ_retry_if_stale|
+			  BCH_READ_may_promote|
+			  BCH_READ_user_mapped|
+			  flags);
+	}
 
 	iter->count += shorten;
 
@@ -185,41 +191,48 @@ start:
 	}
 }
 
+int bch2_direct_IO_read(struct kiocb *req, struct iov_iter *iter,
+			enum bch_read_flags flags,
+			struct bch_read_err_report *err_report)
+{
+	struct file *file = req->ki_filp;
+	struct address_space *mapping = file->f_mapping;
+
+	if (unlikely(mapping->nrpages)) {
+		ssize_t ret = filemap_write_and_wait_range(mapping,
+					req->ki_pos,
+					req->ki_pos + iov_iter_count(iter) - 1);
+		if (ret < 0)
+			return ret;
+	}
+
+	file_accessed(file);
+
+	struct blk_plug plug;
+	blk_start_plug(&plug);
+	ssize_t ret = __bch2_direct_IO_read(req, iter, flags, err_report);
+	blk_finish_plug(&plug);
+
+	if (ret >= 0)
+		req->ki_pos += ret;
+	return ret;
+}
+
 ssize_t bch2_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct file *file = iocb->ki_filp;
-	struct bch_inode_info *inode = file_bch_inode(file);
-	struct address_space *mapping = file->f_mapping;
-	size_t count = iov_iter_count(iter);
 	ssize_t ret = 0;
 
-	if (!count)
+	if (!iov_iter_count(iter))
 		return 0; /* skip atime */
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
-		struct blk_plug plug;
-
-		if (unlikely(mapping->nrpages)) {
-			ret = filemap_write_and_wait_range(mapping,
-						iocb->ki_pos,
-						iocb->ki_pos + count - 1);
-			if (ret < 0)
-				goto out;
-		}
-
-		file_accessed(file);
-
-		blk_start_plug(&plug);
-		ret = bch2_direct_IO_read(iocb, iter);
-		blk_finish_plug(&plug);
-
-		if (ret >= 0)
-			iocb->ki_pos += ret;
+		ret = bch2_direct_IO_read(iocb, iter, 0, NULL);
 	} else {
-		guard(bch2_pagecache_add)(inode);
+		guard(bch2_pagecache_add)(file_bch_inode(file));
 		ret = filemap_read(iocb, iter, ret);
 	}
-out:
+
 	return bch2_err_class(ret);
 }
 
@@ -250,8 +263,8 @@ retry:
 			break;
 
 		if (k.k->p.snapshot != snapshot ||
-		    nr_replicas > bch2_bkey_replicas(c, k) ||
-		    (!compressed && bch2_bkey_sectors_compressed(c, k)))
+		    nr_replicas > bch2_bkey_durability_safe(c, k).total ||
+		    (!compressed && bch2_bkey_durability_safe(c, k).sectors_compressed))
 			return false;
 	}
 err:
@@ -311,66 +324,18 @@ static noinline int bch2_dio_write_copy_iov(struct dio_write *dio)
 	return 0;
 }
 
-static CLOSURE_CALLBACK(bch2_dio_write_flush_done)
-{
-	closure_type(dio, struct dio_write, op.cl);
-	struct bch_fs *c = dio->op.c;
-
-	closure_debug_destroy(cl);
-
-	dio->op.error = bch2_journal_error(&c->journal);
-
-	bch2_dio_write_done(dio);
-}
-
-static noinline void bch2_dio_write_flush(struct dio_write *dio)
-{
-	struct bch_fs *c = dio->op.c;
-	struct bch_inode_unpacked inode;
-	int ret;
-
-	dio->flush = 0;
-
-	closure_init(&dio->op.cl, NULL);
-
-	if (!dio->op.error) {
-		ret = bch2_inode_find_by_inum(c, inode_inum(dio->inode), &inode);
-		if (ret) {
-			dio->op.error = ret;
-		} else {
-			bch2_journal_flush_seq_async(&c->journal, inode.bi_journal_seq,
-						     &dio->op.cl);
-			bch2_inode_flush_nocow_writes_async(c, dio->inode, &dio->op.cl);
-		}
-	}
-
-	if (dio->sync) {
-		closure_sync(&dio->op.cl);
-		closure_debug_destroy(&dio->op.cl);
-	} else {
-		continue_at(&dio->op.cl, bch2_dio_write_flush_done, NULL);
-	}
-}
-
 static __always_inline long bch2_dio_write_done(struct dio_write *dio)
 {
 	struct bch_fs *c = dio->op.c;
 	struct kiocb *req = dio->req;
 	struct bch_inode_info *inode = dio->inode;
 	bool sync = dio->sync;
-	long ret;
-
-	if (unlikely(dio->flush)) {
-		bch2_dio_write_flush(dio);
-		if (!sync)
-			return -EIOCBQUEUED;
-	}
 
 	bch2_pagecache_block_put(inode);
 
 	kfree(dio->iov);
 
-	ret = dio->op.error ?: ((long) dio->written << 9);
+	long ret = dio->op.error ?: ((long) dio->written << 9);
 	bio_put(&dio->op.wbio.bio);
 
 	enumerated_ref_put(&c->writes, BCH_WRITE_REF_dio_write);
@@ -440,14 +405,14 @@ static __always_inline long bch2_dio_write_loop(struct dio_write *dio)
 	while (1) {
 		iter_count = dio->iter.count;
 
-		EBUG_ON(current->faults_disabled_mapping);
-		current->faults_disabled_mapping = mapping;
+		EBUG_ON(faults_disabled_mapping(c));
+		fdm_set(&c->fdm_table, mapping);
 
 		ret = bch2_bio_iov_iter_get_pages(bio, &dio->iter, 0);
 
-		dropped_locks = fdm_dropped_locks();
+		dropped_locks = bch2_fdm_dropped_locks(c);
 
-		current->faults_disabled_mapping = NULL;
+		fdm_clear(&c->fdm_table);
 
 		/*
 		 * If the fault handler returned an error but also signalled
@@ -491,12 +456,14 @@ static __always_inline long bch2_dio_write_loop(struct dio_write *dio)
 		dio->op.target		= dio->op.opts.foreground_target;
 		dio->op.write_point	= writepoint_hashed((unsigned long) current);
 		dio->op.nr_replicas	= dio->op.opts.data_replicas;
-		dio->op.subvol		= inode->ei_inum.subvol;
-		dio->op.pos		= POS(inode->v.i_ino, (u64) req->ki_pos >> 9);
+		dio->op.subvol		= inode_inum(inode).subvol;
+		dio->op.pos		= POS(inode_inum(inode).inum, (u64) req->ki_pos >> 9);
 		dio->op.devs_need_flush	= &inode->ei_devs_need_flush;
 
 		if (sync)
 			dio->op.flags |= BCH_WRITE_sync;
+		if (dio->flush)
+			dio->op.flags |= BCH_WRITE_flush;
 		dio->op.flags |= BCH_WRITE_check_enospc;
 
 		ret = bch2_quota_reservation_add(c, inode, &dio->quota_res,
@@ -604,7 +571,7 @@ ssize_t bch2_direct_write(struct kiocb *req, struct iov_iter *iter)
 		goto err_put_write_ref;
 
 	if (unlikely((req->ki_pos|iter->count) & (block_bytes(c) - 1))) {
-		ret = bch_err_throw(c, unaligned_io);
+		ret = bch_err_throw(c, EINVAL_unaligned_io);
 		goto err_put_write_ref;
 	}
 

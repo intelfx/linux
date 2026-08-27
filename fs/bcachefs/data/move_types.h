@@ -4,6 +4,8 @@
 
 #include "btree/bbpos_types.h"
 #include "bcachefs_ioctl.h"
+#include "init/dev_types.h"
+#include "util/darray.h"
 
 struct bch_move_stats {
 	char			name[32];
@@ -28,11 +30,12 @@ struct bch_move_stats {
 	atomic64_t		sectors_raced;
 	atomic64_t		sectors_error_corrected;
 	atomic64_t		sectors_error_uncorrected;
+	struct bch_devs_mask	devs_error_uncorrected;
 };
 
 struct move_bucket_key {
 	struct bpos		bucket;
-	unsigned		gen;
+	unsigned		generation;
 };
 
 struct move_bucket {
@@ -42,5 +45,13 @@ struct move_bucket {
 	unsigned		sectors;
 	atomic_t		count;
 };
+
+typedef struct {
+	enum btree_id		btree_id;
+	unsigned		bad_devs;
+	__BKEY_PADDED(k, BKEY_EXTENT_VAL_U64s_MAX);
+} scrub_journal_repair;
+
+DEFINE_DARRAY(scrub_journal_repair);
 
 #endif /* _BCACHEFS_MOVE_TYPES_H */

@@ -10,7 +10,6 @@
 #include "bcachefs.h"
 
 #include "alloc/backpointers.h"
-#include "alloc/buckets_waiting_for_journal.h"
 #include "alloc/discard.h"
 #include "alloc/disk_groups.h"
 #include "alloc/foreground.h"
@@ -21,6 +20,7 @@
 #include "btree/init.h"
 #include "btree/interior.h"
 #include "btree/key_cache.h"
+#include "btree/locking.h"
 #include "btree/read.h"
 #include "btree/write.h"
 #include "btree/write_buffer.h"
@@ -43,6 +43,7 @@
 #include "debug/sysfs.h"
 
 #include "fs/check.h"
+#include "fs/dirent.h"
 #include "fs/inode.h"
 #include "fs/quota.h"
 
@@ -90,8 +91,6 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Kent Overstreet <kent.overstreet@gmail.com>");
 MODULE_DESCRIPTION("bcachefs filesystem");
-
-typedef DARRAY(struct bch_sb_handle) bch_sb_handles;
 
 #define x(n)		#n,
 const char * const bch2_fs_flag_strs[] = {
@@ -323,7 +322,6 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 	bch2_maybe_schedule_btree_bitmap_gc_stop(c);
 	bch2_fs_ec_stop(c);
 	bch2_open_buckets_stop(c, NULL, true);
-	bch2_reconcile_stop(c);
 	bch2_copygc_stop(c);
 	bch2_btree_write_buffer_stop(c);
 	bch2_fs_ec_flush(c);
@@ -337,8 +335,9 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 
 		bch2_do_discards_going_ro(c);
 
-		if (bch2_btree_interior_updates_flush(c) ||
-		    bch2_btree_write_buffer_flush_going_ro(c) ||
+		if (bch2_btree_write_buffer_flush_going_ro(c) ||
+		    bch2_btree_key_cache_flush_going_ro(c) ||
+		    bch2_btree_interior_updates_flush(c) ||
 		    bch2_journal_flush_all_pins(&c->journal) ||
 		    bch2_btree_flush_all_writes(c) ||
 		    seq != atomic64_read(&c->journal.seq)) {
@@ -346,6 +345,21 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 			clean_passes = 0;
 		}
 	} while (clean_passes < 2);
+
+	/*
+	 * On a dead journal the clean-shutdown loop above can't make dirty
+	 * btree nodes clean: journal_flush_all_pins doesn't push them out,
+	 * and __bch2_btree_node_write skips submission for journal_error, so
+	 * BTREE_NODE_dirty stays set on every node that hadn't been written
+	 * yet. The loop terminates (everything no-ops) but live[].dirty is
+	 * still populated. Force-cancel: drop dirty bits + transition DIRTY →
+	 * CLEAN, then drain any interior updates btree_node_write_update_key
+	 * may have kicked off before the journal died.
+	 */
+	if (bch2_journal_error(&c->journal)) {
+		bch2_btree_cancel_all_writes(c);
+		bch2_btree_interior_updates_flush(c);
+	}
 
 	bch_verbose(c, "flushing journal and stopping allocators complete, journal seq %llu",
 		    journal_cur_seq(&c->journal));
@@ -366,6 +380,13 @@ static void __bch2_fs_read_only(struct bch_fs *c)
 	for_each_member_device(c, ca) {
 		bch2_dev_io_ref_stop(ca, WRITE);
 		bch2_dev_allocator_remove(c, ca);
+
+		/*
+		 * Queued from bch2_journal_space_available(); not cancelled
+		 * anywhere else on the going-RO path, so cancel it here, after
+		 * the journal is stopped, or it can run against a freed device.
+		 */
+		cancel_work_sync(&ca->journal.discard);
 	}
 }
 
@@ -390,9 +411,20 @@ void bch2_fs_read_only(struct bch_fs *c)
 
 	/*
 	 * Block new foreground-end write operations from starting - any new
-	 * writes will return -EROFS:
+	 * writes will return -EROFS. Set before stopping reconcile so the
+	 * reconcile kthread's child workers (which check this flag to break
+	 * out) see it while bch2_reconcile_stop() is blocked waiting on them.
 	 */
 	set_bit(BCH_FS_going_ro, &c->flags);
+
+	/*
+	 * Stop background kthreads that issue writes (reconcile, etc.)
+	 * before disabling c->writes; otherwise they can dispatch
+	 * data_update operations that fail with erofs_no_writes once
+	 * c->writes is stopped, and the failure-rate threshold trips.
+	 */
+	bch2_reconcile_stop(c);
+
 	enumerated_ref_stop_async(&c->writes);
 
 	/*
@@ -434,16 +466,17 @@ void bch2_fs_read_only(struct bch_fs *c)
 	    c->recovery.pass_done >= BCH_RECOVERY_PASS_journal_replay) {
 		BUG_ON(c->journal.last_empty_seq != journal_cur_seq(&c->journal));
 		BUG_ON(!c->sb.clean);
-		BUG_ON(atomic_long_read(&c->btree.cache.nr_dirty));
+		BUG_ON(c->btree.cache.live[0].nr_dirty || c->btree.cache.live[1].nr_dirty);
 		BUG_ON(atomic_long_read(&c->btree.key_cache.nr_dirty));
-		BUG_ON(c->btree.write_buffer.inc.keys.nr);
-		BUG_ON(c->btree.write_buffer.flushing.keys.nr);
+		for (unsigned i = 0; i < BCH_WB_BTREE_NR; i++) {
+			BUG_ON(c->btree.write_buffer[i].inc.keys.nr);
+			BUG_ON(c->btree.write_buffer[i].flushing.keys.nr);
+		}
 		bch2_verify_replicas_refs_clean(c);
 		bch2_verify_accounting_clean(c);
 	} else {
 		/* Make sure error counts/counters are persisted */
-		guard(memalloc_flags)(PF_MEMALLOC_NOFS);
-		guard(mutex)(&c->sb_lock);
+		guard(mutex_noio)(&c->sb_lock);
 		bch2_write_super(c);
 
 		bch_verbose(c, "done going read-only, filesystem not clean");
@@ -474,6 +507,13 @@ static bool __bch2_fs_emergency_read_only(struct bch_fs *c, struct printbuf *out
 		bch2_journal_halt_locked(&c->journal);
 	bch2_fs_read_only_async(c);
 	wake_up(&bch2_read_only_wait);
+
+	/*
+	 * Wake threads parked in __bch2_wait_on_allocator: going-RO won't
+	 * complete while they hold open closures on freelist_wait, and they
+	 * won't otherwise notice the fs is shutting down.
+	 */
+	bch2_alloc_wake_all(c);
 
 	if (ret) {
 		prt_printf(out, "emergency read only at seq %llu\n",
@@ -514,6 +554,11 @@ static int __bch2_fs_read_write(struct bch_fs *c, bool early)
 		return bch_err_throw(c, erofs_filesystem_full);
 	}
 
+	if (c->sb.features & BIT_ULL(BCH_FEATURE_no_default_sb)) {
+		bch_err(c, "cannot go rw, run bcachefs migrate-superblock first");
+		return bch_err_throw(c, erofs_sb_not_migrated);
+	}
+
 	if (test_bit(BCH_FS_rw, &c->flags))
 		return 0;
 
@@ -542,6 +587,9 @@ static int __bch2_fs_read_write(struct bch_fs *c, bool early)
 	scoped_guard(spinlock, &c->journal.lock) {
 		set_bit(JOURNAL_need_flush_write, &c->journal.flags);
 		set_bit(JOURNAL_running, &c->journal.flags);
+#ifdef CONFIG_BCACHEFS_DEBUG
+		c->journal.stop_thread = NULL;
+#endif
 		bch2_journal_space_available(&c->journal);
 	}
 
@@ -553,21 +601,29 @@ static int __bch2_fs_read_write(struct bch_fs *c, bool early)
 	set_bit(BCH_FS_rw, &c->flags);
 	set_bit(BCH_FS_was_rw, &c->flags);
 
+	if (test_and_clear_bit(BCH_FS_sb_dirty, &c->flags)) {
+		guard(mutex_noio)(&c->sb_lock);
+		bch2_write_super(c);
+	}
+
 	enumerated_ref_start(&c->writes);
 
 	int ret = bch2_journal_reclaim_start(&c->journal) ?:
 		  bch2_btree_write_buffer_start(c) ?:
 		  bch2_copygc_start(c) ?:
-		  bch2_reconcile_start(c);
+		  (!c->opts.read_only
+		   ? bch2_reconcile_start(c)
+		   : 0);
 	if (ret) {
 		bch2_fs_read_only(c);
 		return ret;
 	}
 
-	bch2_do_discards(c);
+	bch2_do_discards_async(c);
 	bch2_do_invalidates(c);
 	bch2_do_stripe_deletes(c);
 	bch2_do_pending_node_rewrites(c);
+	bch2_scrub_journal_do_repairs(c);
 	bch2_maybe_schedule_btree_bitmap_gc(c);
 	return 0;
 }
@@ -624,14 +680,15 @@ static void __bch2_fs_free(struct bch_fs *c)
 	bch2_fs_errors_exit(c);
 	bch2_fs_encryption_exit(c);
 	bch2_fs_ec_exit(c);
+	bch2_fs_discards_exit(c);
 	bch2_fs_data_update_exit(c);
+	bch2_fs_move_exit(c);
 	bch2_fs_counters_exit(c);
 	bch2_fs_copygc_exit(c);
 	bch2_fs_compress_exit(c);
 	bch2_io_clock_exit(&c->io_clock[WRITE]);
 	bch2_io_clock_exit(&c->io_clock[READ]);
 	bch2_fs_capacity_exit(c);
-	bch2_fs_buckets_waiting_for_journal_exit(c);
 	bch2_fs_btree_exit(c);
 	bch2_fs_accounting_exit(c);
 
@@ -693,14 +750,13 @@ int bch2_fs_stop(struct bch_fs *c)
 		kobject_put(&c->time_stats_json);
 		kobject_put(&c->time_stats);
 		kobject_put(&c->opts_dir);
-		sysfs_remove_bin_file(&c->internal, &bin_attr_btree_trans_stats_json);
+		if (c->internal.state_in_sysfs)
+			sysfs_remove_bin_file(&c->internal, &bin_attr_btree_trans_stats_json);
 		kobject_put(&c->internal);
 
 		/* btree prefetch might have kicked off reads in the background: */
 		bch2_btree_flush_all_reads(c);
 
-		for_each_member_device(c, ca)
-			cancel_work_sync(&ca->io_error_work);
 
 		cancel_work_sync(&c->read_only_work);
 
@@ -792,14 +848,14 @@ int bch2_fs_init_rw(struct bch_fs *c)
 	if (!(c->btree_update_wq = alloc_workqueue("bcachefs",
 				WQ_HIGHPRI|WQ_FREEZABLE|WQ_MEM_RECLAIM|WQ_UNBOUND, 512)) ||
 	    !(c->write_ref_wq = alloc_workqueue("bcachefs_write_ref",
-				WQ_FREEZABLE, 0)) ||
+				WQ_FREEZABLE|WQ_PERCPU, 0)) ||
 	    !(c->promote_wq = alloc_workqueue("bcachefs_promotes",
-				WQ_FREEZABLE, 2)))
+				WQ_FREEZABLE|WQ_PERCPU, 2)))
 		return bch_err_throw(c, ENOMEM_fs_other_alloc);
 
 	try(bch2_fs_btree_init_rw(c));
 	try(bch2_fs_io_write_init(c));
-	try(bch2_fs_journal_init(&c->journal));
+	try(bch2_fs_journal_init_rw(&c->journal));
 	try(bch2_fs_vfs_init_rw(c));
 	try(bch2_journal_reclaim_start(&c->journal));
 	try(bch2_btree_write_buffer_start(c));
@@ -908,7 +964,8 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 	if (c->opts.journal_rewind)
 		c->opts.fsck = true;
 
-	if (!(c->sb.features & BIT_ULL(BCH_FEATURE_small_image)) ||
+	if (!(c->sb.features & (BIT_ULL(BCH_FEATURE_small_image)|
+			        BIT_ULL(BCH_FEATURE_no_default_sb))) ||
 	    bch2_fs_will_resize_on_mount(c))
 		set_bit(BCH_FS_may_upgrade_downgrade, &c->flags);
 
@@ -964,8 +1021,7 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 	if (c->opts.journal_rewind)
 		prt_printf(out, "rewinding journal, fsck required\n");
 
-	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-		guard(mutex)(&c->sb_lock);
+	scoped_guard(mutex_noio, &c->sb_lock) {
 		struct bch_sb_field_ext *ext = bch2_sb_field_get(c->disk_sb.sb, ext);
 
 		__le64 now = cpu_to_le64(ktime_get_real_seconds());
@@ -1028,7 +1084,7 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 			__set_bit_le64(BCH_FSCK_ERR_ptr_to_missing_backpointer, ext->errors_silent);
 		}
 
-		/* Don't write the superblock, defer that until we go rw */
+		set_bit(BCH_FS_sb_dirty, &c->flags);
 	}
 
 	if (c->sb.clean)
@@ -1048,15 +1104,34 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 	if (BCH_SB_INITIALIZED(c->disk_sb.sb)) {
 		if (!(c->sb.features & BIT_ULL(BCH_FEATURE_new_extent_overwrite))) {
 			prt_str(out, "feature new_extent_overwrite not set, filesystem no longer supported\n");
-			return -EINVAL;
+			return bch_err_throw(c, EINVAL_missing_new_extent_overwrite);
 		}
 
 		if (c->sb.version_min < bcachefs_metadata_version_btree_ptr_sectors_written) {
 			prt_str(out, "version_min < version_btree_ptr_sectors_written\n");
 			prt_str(out, "filesystem needs upgrade from older version; run fsck from older bcachefs-tools to fix\n");
-			return -EINVAL;
+			return bch_err_throw(c, EINVAL_version_min_too_old);
 		}
 	}
+
+#ifdef __KERNEL__
+#ifdef CONFIG_BCACHEFS_RUST
+	prt_str(out, "Rust support enabled\n");
+#else
+	/*
+	 * Not CONFIG_RUST: bcachefs vendors its own Rust stack, so a kernel
+	 * built without CONFIG_RUST is fine. What matters is what the module
+	 * build couldn't find, which fs/Makefile records here - telling someone
+	 * to go ask their distribution for CONFIG_RUST when the actual problem
+	 * is a missing bindgen wastes everyone's time.
+	 */
+	prt_str(out, "built without Rust support; this will be required in the near future\n");
+#ifdef BCACHEFS_NO_RUST_REASON
+	prt_printf(out, "  reason: %s\n", BCACHEFS_NO_RUST_REASON);
+#endif
+	prt_str(out, "  rebuild the module with rustc, bindgen and rust-src available to enable it\n");
+#endif
+#endif
 
 	bch2_fs_mi_field_upgrades(c);
 
@@ -1087,7 +1162,7 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	c->disk_sb.fs_sb	= true;
 
 	init_rwsem(&c->state_lock);
-	mutex_init(&c->sb_lock);
+	mutex_noio_init(&c->sb_lock);
 	INIT_WORK(&c->read_only_work, bch2_fs_read_only_work);
 
 	refcount_set(&c->ro_ref, 1);
@@ -1102,6 +1177,8 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	bch2_fs_btree_gc_init_early(c);
 	bch2_fs_btree_init_early(c);
 	bch2_fs_copygc_init(c);
+	bch2_fs_counters_init_early(c);
+	bch2_fs_discards_init_early(c);
 	bch2_fs_ec_init_early(c);
 	bch2_fs_errors_init_early(c);
 	bch2_fs_journal_init_early(&c->journal);
@@ -1125,21 +1202,81 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	c->journal.noflush_write_time	= &c->times[BCH_TIME_journal_noflush_write];
 	c->journal.flush_seq_time	= &c->times[BCH_TIME_journal_flush_seq];
 
+	/* must be initialized before we throw any errors */
+	c->counters.now = __alloc_percpu(sizeof(u64) * BCH_COUNTER_NR, sizeof(u64));
+	if (!c->counters.now)
+		return -BCH_ERR_ENOMEM_fs_counters_init;
+
 	try(bch2_fs_capacity_init(c));
 
-	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-		guard(mutex)(&c->sb_lock);
+	scoped_guard(mutex_noio, &c->sb_lock) {
 		try(bch2_sb_to_fs(c, sb));
+
+		sb = c->disk_sb.sb;
+
+		try(bch2_sb_members_v2_init(c));
+
+		/* Ensure sb_field_ext and members_v2 exist at current size
+		 * before reading opts, so ext opts see a fully-sized field: */
+		struct bch_sb_field_ext *ext =
+		    bch2_sb_field_get_minsize(&c->disk_sb, ext,
+				sizeof(struct bch_sb_field_ext) / sizeof(u64));
+		if (!ext)
+			return bch_err_throw(c, ENOSPC_sb);
+
+		sb = c->disk_sb.sb;
+
+		/* Compat: */
+		if (!BCH_SB_JOURNAL_FLUSH_DELAY(sb))
+			SET_BCH_SB_JOURNAL_FLUSH_DELAY(sb, 1000);
+		if (!BCH_SB_JOURNAL_RECLAIM_DELAY(sb))
+			SET_BCH_SB_JOURNAL_RECLAIM_DELAY(sb, 1000);
+
+		if (!BCH_SB_VERSION_UPGRADE_COMPLETE(sb))
+			SET_BCH_SB_VERSION_UPGRADE_COMPLETE(sb, le16_to_cpu(sb->version));
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2 &&
+		    !BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb))
+			SET_BCH_SB_ALLOCATOR_STUCK_TIMEOUT(sb, 30);
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_disk_accounting_v2)
+			SET_BCH_SB_PROMOTE_WHOLE_EXTENTS(sb, true);
+
+		if (!BCH_SB_WRITE_ERROR_TIMEOUT(sb))
+			SET_BCH_SB_WRITE_ERROR_TIMEOUT(sb, 30);
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_extent_flags &&
+		    !BCH_SB_CSUM_ERR_RETRY_NR(sb))
+			SET_BCH_SB_CSUM_ERR_RETRY_NR(sb, 3);
+
+		if (!BCH_SB_EXT_DEV_READAHEAD(ext))
+			SET_BCH_SB_EXT_DEV_READAHEAD(ext, SZ_2M >> 9);
+
+		if (!BCH_SB_EXT_EC_STRIPE_BUF_LIMIT(ext))
+			SET_BCH_SB_EXT_EC_STRIPE_BUF_LIMIT(ext, 5);
+
+		if (!BCH_SB_EXT_BTREE_CACHE_SHRINKER_SEEKS(ext))
+			SET_BCH_SB_EXT_BTREE_CACHE_SHRINKER_SEEKS(ext, 4);
+
+		if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_erasure_coding &&
+		    !BCH_SB_EXT_DISCARD_BUFFER(ext))
+			SET_BCH_SB_EXT_DISCARD_BUFFER(ext, 4);
+
+		for (unsigned opt_id = 0; opt_id < bch2_opts_nr; opt_id++) {
+			const struct bch_option *opt = bch2_opt_table + opt_id;
+
+			if (opt->get_sb || opt->get_ext) {
+				u64 v = bch2_opt_from_sb(sb, opt_id, -1);
+
+				CLASS(printbuf, err)();
+				int ret = bch2_opt_validate(opt, v, &err);
+				if (ret) {
+					prt_printf(out, "Invalid superblock option %s\n", err.buf);
+					return ret;
+				}
+			}
+		}
 	}
-
-	/* Compat: */
-	if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_inode_v2 &&
-	    !BCH_SB_JOURNAL_FLUSH_DELAY(sb))
-		SET_BCH_SB_JOURNAL_FLUSH_DELAY(sb, 1000);
-
-	if (le16_to_cpu(sb->version) <= bcachefs_metadata_version_inode_v2 &&
-	    !BCH_SB_JOURNAL_RECLAIM_DELAY(sb))
-		SET_BCH_SB_JOURNAL_RECLAIM_DELAY(sb, 100);
 
 	c->opts = bch2_opts_default;
 	try(bch2_opts_from_sb(&c->opts, sb));
@@ -1150,11 +1287,13 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
 	    c->opts.block_size > PAGE_SIZE) {
 		prt_printf(out, "cannot mount bs > ps filesystem without CONFIG_TRANSPARENT_HUGEPAGE\n");
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_block_size_needs_thp);
 	}
 #endif
 
 	c->block_bits		= ilog2(block_sectors(c));
+
+	bch2_fs_inode_shard_cpu_init(c);
 
 	if (bch2_fs_init_fault("fs_alloc")) {
 		prt_printf(out, "fs_alloc fault injected\n");
@@ -1179,14 +1318,16 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	try(bch2_fs_async_obj_init(c));
 #endif
 	try(bch2_fs_btree_init(c));
-	try(bch2_fs_buckets_waiting_for_journal_init(c));
 	try(bch2_fs_compress_init(c));
 	try(bch2_fs_counters_init(c));
 	try(bch2_fs_data_update_init(c));
+	try(bch2_fs_discards_init(c));
 	try(bch2_fs_ec_init(c));
 	try(bch2_fs_errors_init(c));
 	try(bch2_fs_encryption_init(c));
 	try(bch2_fs_io_read_init(c));
+	try(bch2_fs_journal_init(&c->journal));
+	try(bch2_fs_snapshots_init(c));
 	try(bch2_fs_vfs_init(c));
 	try(bch2_io_clock_init(&c->io_clock[READ]));
 	try(bch2_io_clock_init(&c->io_clock[WRITE]));
@@ -1200,13 +1341,13 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 				   unicode_major(BCH_FS_DEFAULT_UTF8_ENCODING),
 				   unicode_minor(BCH_FS_DEFAULT_UTF8_ENCODING),
 				   unicode_rev(BCH_FS_DEFAULT_UTF8_ENCODING));
-			return -EINVAL;
+			return bch_err_throw(c, EINVAL_utf8_load_failed);
 		}
 	}
 #else
 	if (c->sb.features & BIT_ULL(BCH_FEATURE_casefolding)) {
 		prt_printf(out, "Cannot mount a filesystem with casefolding on a kernel without CONFIG_UNICODE\n");
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_casefolding_no_unicode);
 	}
 #endif
 
@@ -1222,15 +1363,9 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 	bch2_journal_entry_res_resize(&c->journal,
 			&c->clock_journal_res,
 			(sizeof(struct jset_entry_clock) / sizeof(u64)) * 2);
-
-	scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-		guard(mutex)(&c->sb_lock);
-		if (!bch2_sb_field_get_minsize(&c->disk_sb, ext,
-				sizeof(struct bch_sb_field_ext) / sizeof(u64)))
-			return bch_err_throw(c, ENOSPC_sb);
-
-		try(bch2_sb_members_v2_init(c));
-	}
+	bch2_journal_entry_res_resize(&c->journal,
+			&c->rewind_limit_res,
+			sizeof(struct jset_entry_rewind_limit) / sizeof(u64));
 
 	scoped_guard(rwsem_write, &c->state_lock)
 		darray_for_each(*sbs, sb)
@@ -1243,6 +1378,9 @@ static int bch2_fs_init(struct bch_fs *c, struct bch_sb *sb,
 		 */
 		try(bch2_fs_opt_version_init(c, out));
 	}
+
+	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG))
+		prt_printf(out, "*** DEBUG BUILD ***\n");
 
 	scoped_guard(mutex, &bch2_fs_list_lock)
 		try(bch2_fs_online(c));
@@ -1267,7 +1405,7 @@ static struct bch_fs *bch2_fs_alloc(struct bch_sb *sb, struct bch_opts *opts,
 	return c;
 }
 
-void bch2_missing_devs_to_text(struct printbuf *out, struct bch_fs *c)
+__cold void bch2_missing_devs_to_text(struct printbuf *out, struct bch_fs *c)
 {
 	prt_printf(out, "Missing devices\n");
 	for_each_member_device(c, ca)
@@ -1284,7 +1422,7 @@ static int bch2_fs_may_start(struct bch_fs *c, struct printbuf *err)
 
 	if (c->opts.no_version_check) {
 		prt_printf(err, "Cannot start with opts.no_version_check\n");
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_no_version_check_start);
 	}
 
 	switch (c->opts.degraded) {
@@ -1336,6 +1474,18 @@ static int __bch2_fs_start(struct bch_fs *c, struct printbuf *err)
 
 	try(bch2_fs_reconcile_init(c));
 	try(bch2_fs_counters_init_late(c));
+
+	/*
+	 * Request no_sb_user_data_replicas eagerly at startup so it gets
+	 * persisted before any user-data accounting fires. Otherwise the
+	 * bump only happens lazily inside __bch2_accounting_maybe_kill (when
+	 * a user-data accounting entry zeroes), and a fresh fs that gets
+	 * forcibly shut down before that ever fires never persists the
+	 * version_incompat bump - on next mount, bch2_replicas_marked_locked
+	 * doesn't short-circuit for user data and accounting_read fsck_err's
+	 * for replicas not in the (no-longer-storing-them) sb.
+	 */
+	bch2_request_incompat_feature(c, bcachefs_metadata_version_no_sb_user_data_replicas);
 
 	/*
 	 * just make sure this is always allocated if we might need it - mount
@@ -1421,8 +1571,7 @@ int bch2_fs_resize_on_mount(struct bch_fs *c)
 				return ret;
 			}
 
-			scoped_guard(memalloc_flags, PF_MEMALLOC_NOFS) {
-				guard(mutex)(&c->sb_lock);
+			scoped_guard(mutex_noio, &c->sb_lock) {
 				struct bch_member *m =
 					bch2_members_v2_get_mut(c->disk_sb.sb, ca->dev_idx);
 				m->nbuckets = cpu_to_le64(new_nbuckets);
@@ -1453,13 +1602,54 @@ static inline int sb_cmp(struct bch_sb *l, struct bch_sb *r)
 		cmp_int(le64_to_cpu(l->write_time), le64_to_cpu(r->write_time));
 }
 
+int bch2_sbs_filter_dead(bch_sb_handles *sbs, struct bch_opts *opts, struct printbuf *out)
+{
+	struct bch_sb_handle *best = NULL;
+	int ret;
+
+	for (size_t i = 0; i < sbs->nr; i++)
+		if (!best || sb_cmp(sbs->data[i].sb, best->sb) > 0)
+			best = &sbs->data[i];
+
+	if (!best)
+		return 0;
+
+	for (size_t i = sbs->nr; i; --i) {
+		struct bch_sb_handle *sb = &sbs->data[i - 1];
+
+		ret = bch2_dev_in_fs(best, sb, opts);
+
+		if (ret == -BCH_ERR_device_has_been_removed ||
+		    ret == -BCH_ERR_device_splitbrain) {
+			if (out)
+				prt_printf(out, "Not using device %s: %s\n",
+					   sb->sb_name, bch2_err_str(ret));
+			bch2_free_super(sb);
+			array_remove_item(sbs->data, sbs->nr, i - 1);
+			best -= best > sb;
+			continue;
+		}
+
+		if (ret) {
+			if (out)
+				prt_printf(out, "Cannot mount with device %s: %s\n",
+					   sb->sb_name, bch2_err_str(ret));
+			return ret;
+		}
+	}
+
+	if (best != sbs->data)
+		swap(*best, sbs->data[0]);
+
+	return 0;
+}
+
 static struct bch_fs *__bch2_fs_open(darray_const_str *devices,
 				     struct bch_opts *opts,
 				     struct printbuf *out)
 {
 	bch_sb_handles sbs = {};
 	struct bch_fs *c = NULL;
-	struct bch_sb_handle *best = NULL;
 	int ret = 0;
 
 	if (!try_module_get(THIS_MODULE))
@@ -1484,32 +1674,11 @@ static struct bch_fs *__bch2_fs_open(darray_const_str *devices,
 		BUG_ON(darray_push(&sbs, sb));
 	}
 
-	darray_for_each(sbs, sb)
-		if (!best || sb_cmp(sb->sb, best->sb) > 0)
-			best = sb;
+	ret = bch2_sbs_filter_dead(&sbs, opts, out);
+	if (ret)
+		goto err;
 
-	darray_for_each_reverse(sbs, sb) {
-		ret = bch2_dev_in_fs(best, sb, opts);
-
-		if (ret == -BCH_ERR_device_has_been_removed ||
-		    ret == -BCH_ERR_device_splitbrain) {
-			prt_printf(out, "Not using device %s: %s\n",
-				   sb->sb_name, bch2_err_str(ret));
-			bch2_free_super(sb);
-			darray_remove_item(&sbs, sb);
-			best -= best > sb;
-			ret = 0;
-			continue;
-		}
-
-		if (ret) {
-			prt_printf(out, "Cannot mount with device %s: %s\n",
-				   sb->sb_name, bch2_err_str(ret));
-			goto err;
-		}
-	}
-
-	c = bch2_fs_alloc(best->sb, opts, &sbs, out);
+	c = bch2_fs_alloc(sbs.data->sb, opts, &sbs, out);
 	ret = PTR_ERR_OR_ZERO(c);
 	if (ret)
 		goto err;
@@ -1569,6 +1738,7 @@ static void bcachefs_exit(void)
 	bch2_vfs_exit();
 	bch2_chardev_exit();
 	bch2_btree_key_cache_exit();
+	bch2_lock_graph_exit();
 	kobject_put(&bcachefs_kobj);
 }
 
@@ -1576,9 +1746,12 @@ static int __init bcachefs_init(void)
 {
 	bch2_bkey_pack_test();
 
+	bch2_dirent_init();
+
 	kobject_init(&bcachefs_kobj, &bcachefs_ktype);
 
 	if (kobject_add(&bcachefs_kobj, fs_kobj, "bcachefs") ||
+	    bch2_lock_graph_init() ||
 	    bch2_btree_key_cache_init() ||
 	    bch2_chardev_init() ||
 	    bch2_vfs_init() ||
@@ -1618,7 +1791,7 @@ static int bch2_param_set_static_key_t(const char *val, const struct kernel_para
 static int bch2_param_get_static_key_t(char *buffer, const struct kernel_param *kp)
 {
 	struct static_key *key = kp->arg;
-	return sprintf(buffer, "%c\n", static_key_enabled(key) ? 'N' : 'Y');
+	return sprintf(buffer, "%c\n", static_key_enabled(key) ? 'Y' : 'N');
 }
 
 /* this is unused in userspace - silence the warning */

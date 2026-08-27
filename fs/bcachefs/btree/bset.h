@@ -190,14 +190,24 @@ static inline enum bset_aux_tree_type bset_aux_tree_type(const struct bset_tree 
 
 #define BSET_CACHELINE		256
 
+static inline size_t __btree_keys_cachelines(unsigned byte_order)
+{
+	return (1U << byte_order) / BSET_CACHELINE;
+}
+
+static inline size_t __btree_aux_data_bytes(unsigned byte_order)
+{
+	return __btree_keys_cachelines(byte_order) * 8;
+}
+
 static inline size_t btree_keys_cachelines(const struct btree *b)
 {
-	return (1U << b->byte_order) / BSET_CACHELINE;
+	return __btree_keys_cachelines(b->byte_order);
 }
 
 static inline size_t btree_aux_data_bytes(const struct btree *b)
 {
-	return btree_keys_cachelines(b) * 8;
+	return __btree_aux_data_bytes(b->byte_order);
 }
 
 static inline size_t btree_aux_data_u64s(const struct btree *b)
@@ -246,6 +256,8 @@ static inline void btree_node_set_format(struct btree *b,
 	b->format	= f;
 	b->nr_key_bits	= bkey_format_key_bits(&f);
 
+	bch2_compute_bkey_unpack_consts(b);
+
 	len = bch2_compile_bkey_format(&b->format, b->aux_data);
 	BUG_ON(len < 0 || len > U8_MAX);
 
@@ -275,23 +287,6 @@ void bch2_bset_insert(struct btree *, struct bkey_packed *, struct bkey_i *,
 void bch2_bset_delete(struct btree *, struct bkey_packed *, unsigned);
 
 /* Bkey utility code */
-
-/* packed or unpacked */
-static inline int bkey_cmp_p_or_unp(const struct btree *b,
-				    const struct bkey_packed *l,
-				    const struct bkey_packed *r_packed,
-				    const struct bpos *r)
-{
-	EBUG_ON(r_packed && !bkey_packed(r_packed));
-
-	if (unlikely(!bkey_packed(l)))
-		return bpos_cmp(packed_to_bkey_c(l)->p, *r);
-
-	if (likely(r_packed))
-		return __bch2_bkey_cmp_packed_format_checked(l, r_packed, b);
-
-	return __bch2_bkey_cmp_left_packed_format_checked(b, l, r);
-}
 
 static inline struct bset_tree *
 bch2_bkey_to_bset_inlined(struct btree *b, struct bkey_packed *k)
@@ -398,15 +393,6 @@ static inline int bkey_iter_pos_cmp(const struct btree *b,
 			const struct bpos *r)
 {
 	return bkey_cmp_left_packed(b, l, r)
-		?: -((int) bkey_deleted(l));
-}
-
-static inline int bkey_iter_cmp_p_or_unp(const struct btree *b,
-				    const struct bkey_packed *l,
-				    const struct bkey_packed *r_packed,
-				    const struct bpos *r)
-{
-	return bkey_cmp_p_or_unp(b, l, r_packed, r)
 		?: -((int) bkey_deleted(l));
 }
 
@@ -535,13 +521,15 @@ void __bch2_btree_node_iter_verify(struct btree_node_iter *, struct btree *);
 static inline void bch2_btree_node_iter_verify(struct btree_node_iter *iter,
 					       struct btree *b)
 {
-	if (static_branch_unlikely(&bch2_debug_check_bset_lookups))
+	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG) &&
+	    static_branch_unlikely(&bch2_debug_check_bset_lookups))
 		__bch2_btree_node_iter_verify(iter, b);
 }
 
 static inline void bch2_verify_btree_nr_keys(struct btree *b)
 {
-	if (static_branch_unlikely(&bch2_debug_check_btree_accounting))
+	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG) &&
+	    static_branch_unlikely(&bch2_debug_check_btree_accounting))
 		__bch2_verify_btree_nr_keys(b);
 }
 

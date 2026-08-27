@@ -31,6 +31,7 @@ void bch2_btree_insert_key_leaf(struct btree_trans *, struct btree_path *,
 	x(no_skip_noops, "don't drop noop updates")					\
 	x(journal_reclaim, "operation required for journal reclaim; may return error"	\
 			"instead of deadlocking if BCH_WATERMARK_reclaim not specified")\
+	x(journal_replay, "in journal replay")						\
 	x(skip_accounting_apply, "we're in journal replay - accounting updates have already been applied")
 
 enum __bch_trans_commit_flags {
@@ -55,7 +56,8 @@ int bch2_btree_delete(struct btree_trans *, enum btree_id, struct bpos,
 		      enum btree_iter_update_trigger_flags);
 
 int bch2_btree_insert_nonextent(struct btree_trans *, enum btree_id,
-				struct bkey_i *, enum btree_iter_update_trigger_flags);
+				struct bkey_i *, unsigned,
+				enum btree_iter_update_trigger_flags);
 
 int bch2_btree_insert_trans(struct btree_trans *, enum btree_id, struct bkey_i *,
 			enum btree_iter_update_trigger_flags);
@@ -135,14 +137,28 @@ int bch2_bkey_get_empty_slot(struct btree_trans *, struct btree_iter *,
 			     enum btree_id, struct bpos, struct bpos);
 
 int __must_check bch2_trans_update_ip(struct btree_trans *, struct btree_iter *,
-				      struct bkey_i *, enum btree_iter_update_trigger_flags,
+				      struct bkey_i *, unsigned,
+				      enum btree_iter_update_trigger_flags,
 				      unsigned long);
+
+int bch2_trigger_get_mutable_new(struct btree_trans *,
+				 struct btree_trigger_op,
+				 unsigned needed_u64s,
+				 struct bkey_s *);
+
+static inline int __must_check
+bch2_trans_update_buf(struct btree_trans *trans, struct btree_iter *iter,
+		      struct bkey_i *k, unsigned k_buf_u64s,
+		      enum btree_iter_update_trigger_flags flags)
+{
+	return bch2_trans_update_ip(trans, iter, k, k_buf_u64s, flags, _THIS_IP_);
+}
 
 static inline int __must_check
 bch2_trans_update(struct btree_trans *trans, struct btree_iter *iter,
 		  struct bkey_i *k, enum btree_iter_update_trigger_flags flags)
 {
-	return bch2_trans_update_ip(trans, iter, k, flags, _THIS_IP_);
+	return bch2_trans_update_ip(trans, iter, k, k->k.u64s, flags, _THIS_IP_);
 }
 
 static inline void *btree_trans_subbuf_base(struct btree_trans *trans,
@@ -160,6 +176,10 @@ static inline void *btree_trans_subbuf_top(struct btree_trans *trans,
 void *__bch2_trans_subbuf_alloc(struct btree_trans *,
 				struct btree_trans_subbuf *,
 				unsigned, ulong);
+
+int bch2_trans_subbuf_reserve(struct btree_trans *,
+			      struct btree_trans_subbuf *,
+			      unsigned);
 
 static inline void *
 bch2_trans_subbuf_alloc_ip(struct btree_trans *trans,
@@ -237,6 +257,7 @@ static inline int __must_check bch2_trans_update_buffered(struct btree_trans *tr
 	 * able to tell which updates need to be applied:
 	 */
 	if (k->k.type != KEY_TYPE_accounting &&
+	    btree != BTREE_ID_need_discard &&
 	    unlikely(trans->journal_replay_not_finished))
 		return bch2_btree_insert_clone_trans(trans, btree, k);
 
@@ -249,7 +270,7 @@ static inline int __must_check bch2_trans_update_buffered(struct btree_trans *tr
 
 void bch2_trans_commit_hook(struct btree_trans *,
 			    struct btree_trans_commit_hook *);
-int __bch2_trans_commit(struct btree_trans *, enum bch_trans_commit_flags);
+int __bch2_trans_commit(struct btree_trans *, enum bch_trans_commit_flags, bool);
 
 int bch2_trans_log_str(struct btree_trans *, const char *);
 int bch2_trans_log_msg(struct btree_trans *, struct printbuf *);
@@ -282,6 +303,8 @@ static inline void bch2_trans_reset_updates(struct btree_trans *trans)
 	trans->accounting.size		= 0;
 	trans->hooks			= NULL;
 	trans->extra_disk_res		= 0;
+	trans->extra_journal_u64s	= 0;
+	trans->has_interior_updates	= 0;
 }
 
 /**
@@ -300,8 +323,22 @@ static inline int bch2_trans_commit(struct btree_trans *trans,
 {
 	trans->disk_res		= disk_res;
 	trans->journal_seq	= journal_seq;
+	trans->flush		= NULL;
 
-	return __bch2_trans_commit(trans, flags);
+	return __bch2_trans_commit(trans, flags, false);
+}
+
+static inline int bch2_trans_commit_flush(struct btree_trans *trans,
+					  struct disk_reservation *disk_res,
+					  u64 *journal_seq,
+					  struct closure *flush,
+					  enum bch_trans_commit_flags flags)
+{
+	trans->disk_res		= disk_res;
+	trans->journal_seq	= journal_seq;
+	trans->flush		= flush;
+
+	return __bch2_trans_commit(trans, flags, false);
 }
 
 static inline int bch2_trans_commit_lazy(struct btree_trans *trans,
@@ -309,10 +346,39 @@ static inline int bch2_trans_commit_lazy(struct btree_trans *trans,
 					 u64 *journal_seq,
 					 unsigned flags)
 {
-	return bch2_trans_has_updates(trans)
-		? (bch2_trans_commit(trans, disk_res, journal_seq, flags) ?:
-		   bch_err_throw(trans->c, transaction_restart_commit))
-		: 0;
+	if (!bch2_trans_has_updates(trans))
+		return 0;
+
+	trans->disk_res		= disk_res;
+	trans->journal_seq	= journal_seq;
+	trans->flush		= NULL;
+
+	return __bch2_trans_commit(trans, flags, true);
+}
+
+/*
+ * For repair loops that batch unbounded work - an update per snapshot
+ * version, typically - into one transaction: once substantial work has
+ * accumulated, commit and signal a restart (transaction_restart_commit)
+ * so the caller's restart loop re-drives, instead of the bump allocator
+ * running into BTREE_TRANS_MEM_MAX.
+ *
+ * The re-drive runs with the partial batch committed: callers must
+ * re-check on-disk state and skip already-committed repairs, so the
+ * re-drive shrinks - otherwise it trips this at the same point again
+ * and the restart loop can't make forward progress.
+ */
+static inline int bch2_trans_commit_lazy_if_full(struct btree_trans *trans,
+						 struct disk_reservation *disk_res,
+						 u64 *journal_seq,
+						 unsigned flags)
+{
+	/* disk_accounting_mod allocations grow by powers of 2; max / 2 is too
+	 * small of a limit to avoid hiting ENOMEMS
+	 */
+	return likely(trans->mem_top < BTREE_TRANS_MEM_MAX / 4)
+		? 0
+		: bch2_trans_commit_lazy(trans, disk_res, journal_seq, flags);
 }
 
 #define commit_do(_trans, _disk_res, _journal_seq, _flags, _do)	\
@@ -341,6 +407,15 @@ static __always_inline struct bkey_i *__bch2_bkey_make_mut_noupdate(struct btree
 	if (!IS_ERR(mut)) {
 		bkey_reassemble(mut, k);
 
+		/*
+		 * Writes extend: the typed helpers pass min_bytes =
+		 * sizeof(struct bkey_i_<type>), and widening u64s is what lets
+		 * the caller assign any field of the current struct and have it
+		 * committed. Without it an assignment past the on-disk val
+		 * would land in memory we allocated, and be dropped on the
+		 * floor at commit. The bytes we add are zero, which is what
+		 * those fields already read as - see __bkey_val_copy_pad().
+		 */
 		if (unlikely(bytes > bkey_bytes(k.k))) {
 			memset((void *) mut + bkey_bytes(k.k), 0,
 			       bytes - bkey_bytes(k.k));

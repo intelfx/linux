@@ -79,6 +79,12 @@ struct btree_update {
 	unsigned			update_level_start;
 	unsigned			update_level_end;
 
+	/* size of the key that triggered split_leaf (0 if N/A) — drives
+	 * the split-vs-compact decision in btree_split() so we don't loop
+	 * trying to compact a leaf that can't fit the new key.
+	 */
+	unsigned			new_key_u64s;
+
 	struct disk_reservation		disk_res;
 
 	/*
@@ -100,10 +106,20 @@ struct btree_update {
 	 */
 	struct journal_entry_pin	journal;
 
-	/* Preallocated nodes we reserve when we start the update: */
+	/*
+	 * Preallocated nodes we reserve when we start the update.
+	 *
+	 * b[0..consumed) have been popped by bch2_btree_node_alloc and given
+	 * out to consumers (split/merge/rewrite/grow); b[consumed..nr) are
+	 * still in reserve.  bch2_btree_reserve_put walks both halves and
+	 * drops the as-owned intent+write refs uniformly — the consumed
+	 * half also runs path/state rollback (live → NONE, drops path
+	 * recurses).
+	 */
 	struct prealloc_nodes {
 		struct btree		*b[BTREE_UPDATE_NODES_MAX];
 		unsigned		nr;
+		unsigned		consumed;
 	}				prealloc_nodes[2];
 
 	btree_update_nodes		old_nodes;
@@ -142,21 +158,46 @@ struct btree *__bch2_btree_node_alloc_replacement(struct btree_update *,
 						  struct btree *,
 						  struct bkey_format);
 
-int bch2_btree_split_leaf(struct btree_trans *, btree_path_idx_t, enum bch_trans_commit_flags);
+int bch2_btree_split_leaf(struct btree_trans *, btree_path_idx_t,
+			  unsigned, enum bch_trans_commit_flags);
+
+struct bpos bch2_btree_node_shard_pivot(struct bch_fs *, const struct btree *);
+
+static inline int btree_node_shard(struct bch_fs *c, struct btree *b)
+{
+	if (!c->opts.shard_inode_numbers_bits)
+		return -1;
+
+	u64 field;
+	switch (b->c.btree_id) {
+	case BTREE_ID_inodes:
+		field = b->key.k.p.offset;
+		break;
+	case BTREE_ID_extents:
+	case BTREE_ID_dirents:
+	case BTREE_ID_xattrs:
+		field = b->key.k.p.inode;
+		break;
+	default:
+		return -1;
+	}
+
+	return (field << 1) >> (64 - c->opts.shard_inode_numbers_bits);
+}
 
 int bch2_btree_increase_depth(struct btree_trans *, btree_path_idx_t, unsigned);
 
 int __bch2_foreground_maybe_merge(struct btree_trans *, btree_path_idx_t,
 				  unsigned, enum bch_trans_commit_flags,
-				  u64 *, enum btree_node_sibling);
+				  u64 *);
 
-static inline bool btree_node_needs_merge(struct btree_trans *trans, struct btree *b, int d)
+static inline bool btree_node_needs_merge(struct bch_fs *c, struct btree *b, int d)
 {
 	if (static_branch_unlikely(&bch2_btree_node_merging_disabled))
 		return false;
 
 	return (int) min(b->sib_u64s[0], b->sib_u64s[1]) + d <=
-		(int) trans->c->btree.foreground_merge_threshold;
+		(int) c->btree.foreground_merge_threshold;
 }
 
 static inline int bch2_foreground_maybe_merge(struct btree_trans *trans,
@@ -172,15 +213,16 @@ static inline int bch2_foreground_maybe_merge(struct btree_trans *trans,
 
 	EBUG_ON(!btree_node_locked(path, level));
 
-	if (likely(!btree_node_needs_merge(trans, b, u64s_delta)))
+	if (likely(!btree_node_needs_merge(trans->c, b, u64s_delta)))
 		return 0;
 
-	return  __bch2_foreground_maybe_merge(trans, path_idx, level, flags, merge_count, btree_prev_sib) ?:
-		__bch2_foreground_maybe_merge(trans, path_idx, level, flags, merge_count, btree_next_sib);
+	return __bch2_foreground_maybe_merge(trans, path_idx, level, flags, merge_count);
 }
 
 int bch2_btree_node_get_iter(struct btree_trans *, struct btree_iter *, struct btree *);
 
+int bch2_btree_node_rewrite(struct btree_trans *, struct btree_iter *, struct btree *,
+			    unsigned, enum bch_trans_commit_flags, enum bch_write_flags);
 int bch2_btree_node_rewrite_key(struct btree_trans *,
 				enum btree_id, unsigned,
 				struct bkey_i *,
@@ -191,12 +233,19 @@ int bch2_btree_node_rewrite_pos(struct btree_trans *,
 				enum bch_trans_commit_flags,
 				enum bch_write_flags);
 
-void bch2_btree_node_rewrite_async(struct bch_fs *, struct btree *);
-void bch2_btree_node_merge_async(struct bch_fs *, struct btree *);
+enum async_btree_op {
+	ASYNC_BTREE_rewrite,
+	ASYNC_BTREE_merge,
+	ASYNC_BTREE_merge_no_read,
+};
+
+void bch2_async_btree_op(struct bch_fs *, struct btree *, enum async_btree_op);
 
 int bch2_btree_node_update_key(struct btree_trans *, struct btree_iter *,
 			       struct btree *, struct bkey_i *,
 			       unsigned, bool);
+int bch2_btree_node_update_key_at_pos(struct btree_trans *, enum btree_id,
+				      unsigned, struct bkey_i *);
 
 void bch2_btree_set_root_for_read(struct bch_fs *, struct btree *);
 
@@ -316,25 +365,7 @@ static inline struct btree_node_entry *want_new_bset(struct bch_fs *c, struct bt
 	return NULL;
 }
 
-static inline void push_whiteout(struct btree *b, struct bpos pos)
-{
-	struct bkey_packed k;
-
-	BUG_ON(bch2_btree_keys_u64s_remaining(b) < BKEY_U64s);
-	EBUG_ON(btree_node_just_written(b));
-
-	if (!bkey_pack_pos(&k, pos, b)) {
-		struct bkey *u = (void *) &k;
-
-		bkey_init(u);
-		u->p = pos;
-	}
-
-	k.needs_whiteout = true;
-
-	b->whiteout_u64s += k.u64s;
-	bkey_p_copy(unwritten_whiteouts_start(b), &k);
-}
+void bch2_push_whiteout(struct btree *b, struct bpos pos);
 
 /*
  * write lock must be held on @b (else the dirty bset that we were going to
@@ -348,9 +379,35 @@ static inline bool bch2_btree_node_insert_fits(struct btree *b, unsigned u64s)
 	return u64s <= bch2_btree_keys_u64s_remaining(b);
 }
 
+/*
+ * Will a new_key_u64s key fit after we compact @b down to a single sorted
+ * bset? Models __bch2_btree_node_write's space accounting exactly: each bset
+ * write rounds up to block_bytes(c), so a node whose live data rounds up to
+ * fill the entire sector budget is born exhausted post-compact - no room for
+ * a follow-on bset to land the new key, and the insert path will immediately
+ * trigger another btree_split. Caller must split in that case.
+ *
+ * +8 in each term matches the bch2_varint_decode read-past-end slack the
+ * write path adds before round_up.
+ */
+static inline bool bch2_btree_node_compact_fits(struct bch_fs *c,
+						struct btree *b,
+						unsigned new_key_u64s)
+{
+	size_t initial_bytes  = sizeof(struct btree_node) +
+				(size_t)b->nr.live_u64s * sizeof(u64) + 8;
+	size_t followon_bytes = sizeof(struct btree_node_entry) +
+				(size_t)new_key_u64s    * sizeof(u64) + 8;
+
+	size_t initial_sectors  = round_up(initial_bytes,  block_bytes(c)) >> 9;
+	size_t followon_sectors = round_up(followon_bytes, block_bytes(c)) >> 9;
+
+	return initial_sectors + followon_sectors <= btree_sectors(c);
+}
+
 static inline bool btree_bkey_and_val_eq(struct bkey_s_c l, struct bkey_s_c r)
 {
-	if (!bkey_fields_eq(*l.k, *r.k))
+	if (!bkey_fields_eq(l.k, r.k))
 		return false;
 
 	/* Skip mem_ptr field */
@@ -358,7 +415,7 @@ static inline bool btree_bkey_and_val_eq(struct bkey_s_c l, struct bkey_s_c r)
 		  ? offsetof(struct bch_btree_ptr_v2, seq)
 		  : 0;
 
-	return !memcmp(l.v + offset, r.v + offset, bkey_val_bytes(l.k) - offset);
+	return !memcmp((void *) l.v + offset, (void *) r.v + offset, bkey_val_bytes(l.k) - offset);
 }
 
 void bch2_btree_updates_to_text(struct printbuf *, struct bch_fs *);
@@ -383,6 +440,7 @@ void bch2_btree_reserve_cache_to_text(struct printbuf *, struct bch_fs *);
 
 void bch2_fs_btree_interior_update_exit(struct bch_fs *);
 void bch2_fs_btree_interior_update_init_early(struct bch_fs *);
+int bch2_fs_btree_node_rewrites_init(struct bch_fs *);
 int bch2_fs_btree_interior_update_init(struct bch_fs *);
 
 #endif /* _BCACHEFS_BTREE_INTERIOR_H */

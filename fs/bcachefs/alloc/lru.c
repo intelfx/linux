@@ -6,6 +6,7 @@
 #include "alloc/lru.h"
 
 #include "btree/bkey_buf.h"
+#include "btree/cache.h"
 #include "btree/iter.h"
 #include "btree/update.h"
 #include "btree/write_buffer.h"
@@ -18,7 +19,7 @@
 
 /* KEY_TYPE_lru is obsolete: */
 int bch2_lru_validate(struct bch_fs *c, struct bkey_s_c k,
-		      struct bkey_validate_context from)
+		      const struct bkey_validate_context *from)
 {
 	int ret = 0;
 
@@ -29,7 +30,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_lru_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_lru_to_text(struct printbuf *out, struct bch_fs *c,
 		      struct bkey_s_c k)
 {
 	const struct bch_lru *lru = bkey_s_c_to_lru(k).v;
@@ -37,7 +38,7 @@ void bch2_lru_to_text(struct printbuf *out, struct bch_fs *c,
 	prt_printf(out, "idx %llu", le64_to_cpu(lru->idx));
 }
 
-void bch2_lru_pos_to_text(struct printbuf *out, struct bpos lru)
+__cold void bch2_lru_pos_to_text(struct printbuf *out, struct bpos lru)
 {
 	prt_printf(out, "%llu:%llu -> %llu:%llu",
 		   lru_pos_id(lru),
@@ -55,7 +56,7 @@ static int __bch2_lru_set(struct btree_trans *trans, u16 lru_id,
 		: 0;
 }
 
-static int bch2_lru_set(struct btree_trans *trans, u16 lru_id, u64 dev_bucket, u64 time)
+int bch2_lru_set(struct btree_trans *trans, u16 lru_id, u64 dev_bucket, u64 time)
 {
 	return __bch2_lru_set(trans, lru_id, dev_bucket, time, true);
 }
@@ -118,12 +119,11 @@ static struct bbpos lru_pos_to_bp(struct bkey_s_c lru_k)
 	}
 }
 
-int bch2_dev_remove_lrus(struct bch_fs *c, struct bch_dev *ca)
+static int bch2_dev_remove_lrus_scan(struct bch_fs *c, struct bch_dev *ca)
 {
 	CLASS(btree_trans, trans)(c);
-	int ret = bch2_btree_write_buffer_flush_sync(trans) ?:
-		for_each_btree_key(trans, iter,
-				 BTREE_ID_lru, POS_MIN, BTREE_ITER_prefetch, k, ({
+	return for_each_btree_key(trans, iter,
+				  BTREE_ID_lru, POS_MIN, BTREE_ITER_prefetch, k, ({
 		struct bbpos bp = lru_pos_to_bp(k);
 
 		bp.btree == BTREE_ID_alloc && bp.pos.inode == ca->dev_idx
@@ -131,6 +131,48 @@ int bch2_dev_remove_lrus(struct bch_fs *c, struct bch_dev *ca)
 		   bch2_trans_commit(trans, NULL, NULL, 0))
 		: 0;
 	}));
+}
+
+static int bch2_dev_remove_lru_range(struct bch_fs *c, u16 lru_id)
+{
+	/*
+	 * lru_end(), not lru_start(lru_id + 1): bch2_btree_delete_range()'s
+	 * bound is inclusive - bch2_btree_iter_peek_max() returns keys <= end -
+	 * so the exclusive-bound spelling reaches one key into the next LRU.
+	 * (lru_id + 1, time 0, dev_bucket 0) is a real position.
+	 */
+	return bch2_btree_delete_range(c, BTREE_ID_lru,
+				       lru_start(lru_id),
+				       lru_end(lru_id), 0);
+}
+
+int bch2_dev_remove_lrus(struct bch_fs *c, struct bch_dev *ca)
+{
+	int ret;
+
+	{
+		CLASS(btree_trans, trans)(c);
+		ret = bch2_btree_write_buffer_flush_sync(trans);
+	}
+	if (ret)
+		goto err;
+
+	if (ca->dev_idx < BCH_LRU_READ_MAX) {
+		ret = bch2_dev_remove_lru_range(c, ca->dev_idx) ?:
+		      bch2_dev_remove_lru_range(c, bucket_fragmentation_lru(ca->dev_idx));
+	} else {
+		ret = bch2_dev_remove_lrus_scan(c, ca);
+	}
+	if (ret)
+		goto err;
+
+	/*
+	 * Old fs-wide fragmentation LRU entries are not grouped by device; only
+	 * pre-upgrade filesystems need the slower full scan to clean them out.
+	 */
+	if (c->sb.version_upgrade_complete < bcachefs_metadata_version_per_dev_fragmentation_lru)
+		ret = bch2_dev_remove_lrus_scan(c, ca);
+err:
 	bch_err_fn(c, ret);
 	return ret;
 }
@@ -173,6 +215,16 @@ static int bch2_check_lru_key(struct btree_trans *trans,
 	CLASS(printbuf, buf1)();
 	CLASS(printbuf, buf2)();
 
+	/*
+	 * per_dev_fragmentation_lru upgrade: delete entries in the old
+	 * fs-wide fragmentation lru unconditionally - no need to verify
+	 * against the backing alloc key, check_alloc_to_lru_refs is
+	 * recreating the per-device entries from the alloc btree:
+	 */
+	if (lru_pos_id(lru_k.k->p) == BCH_LRU_BUCKET_FRAGMENTATION_OLD &&
+	    c->sb.version_upgrade_complete < bcachefs_metadata_version_per_dev_fragmentation_lru)
+		return bch2_btree_bit_mod_buffered(trans, BTREE_ID_lru, lru_iter->pos, false);
+
 	struct bbpos bp = lru_pos_to_bp(lru_k);
 
 	CLASS(btree_iter, iter)(trans, bp.btree, bp.pos, 0);
@@ -181,20 +233,78 @@ static int bch2_check_lru_key(struct btree_trans *trans,
 	enum bch_lru_type type = lru_type(lru_k);
 	u64 idx = bkey_lru_type_idx(c, type, k);
 
-	if (lru_pos_time(lru_k.k->p) != idx) {
+	/*
+	 * Read and bucket fragmentation lrus are per-device: check the entry is
+	 * in the lru its bucket's device says it belongs to. This is also what
+	 * deletes stragglers in the old fs-wide fragmentation lru
+	 * (BCH_LRU_BUCKET_FRAGMENTATION_OLD) found after the
+	 * per_dev_fragmentation_lru upgrade completed:
+	 */
+	u16 lru_id = lru_pos_id(lru_k.k->p);
+	u16 want_id = lru_id;
+
+	switch (type) {
+	case BCH_LRU_read:
+		want_id = u64_to_bucket(lru_k.k->p.offset).inode;
+		break;
+	case BCH_LRU_fragmentation:
+		want_id = bucket_fragmentation_lru(u64_to_bucket(lru_k.k->p.offset).inode);
+		break;
+	default:
+		break;
+	}
+
+	if (lru_id != want_id ||
+	    lru_pos_time(lru_k.k->p) != idx) {
 		try(bch2_btree_write_buffer_maybe_flush(trans, lru_k, last_flushed));
 
 		if (ret_fsck_err(trans, lru_entry_bad,
-			     "incorrect lru entry: lru %s time %llu\n"
+			     "incorrect lru entry: lru %s, expected id %u time %llu\n"
 			     "%s\n"
 			     "for %s",
 			     bch2_lru_types[type],
-			     lru_pos_time(lru_k.k->p),
+			     want_id, idx,
 			     (bch2_bkey_val_to_text(&buf1, c, lru_k), buf1.buf),
 			     (bch2_bkey_val_to_text(&buf2, c, k), buf2.buf)))
 			return bch2_btree_bit_mod_buffered(trans, BTREE_ID_lru, lru_iter->pos, false);
 	}
 
+	return 0;
+}
+
+/*
+ * Pin the backing keyspace for one lru: a per-device lru's backing keys are
+ * that device's contiguous slice of the alloc btree, the stripe lru's are the
+ * whole stripes btree. Everything else - the obsolete fs-wide fragmentation
+ * lru, and ids nothing uses - gets no pin: those entries are scattered or
+ * bogus, and either way they're stragglers headed for deletion.
+ *
+ * See lru_id_to_dev() on why this range can be derived from the id at all,
+ * and why a misplaced entry falls outside it.
+ */
+static int check_lru_id_pin(struct btree_trans *trans, u16 lru_id)
+{
+	unsigned dev;
+
+	if (lru_id_to_dev(lru_id, &dev))
+		return bch2_btree_cache_pin_range(trans, BTREE_ID_alloc,
+						  POS(dev, 0),
+						  SPOS(dev, U64_MAX, U32_MAX));
+
+	if (lru_id == BCH_LRU_STRIPE_FRAGMENTATION)
+		return bch2_btree_cache_pin_range(trans, BTREE_ID_stripes,
+						  POS_MIN, SPOS_MAX);
+
+	bch2_btree_cache_unpin(trans->c);
+	return 0;
+}
+
+static int lru_peek_id(struct btree_trans *trans, struct bpos pos, int *lru_id)
+{
+	CLASS(btree_iter, iter)(trans, BTREE_ID_lru, pos, 0);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek(&iter));
+
+	*lru_id = k.k ? (int) lru_pos_id(k.k->p) : -1;
 	return 0;
 }
 
@@ -207,11 +317,39 @@ int bch2_check_lrus(struct bch_fs *c)
 	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_lru), 0);
 
 	CLASS(btree_trans, trans)(c);
-	return for_each_btree_key_commit(trans, iter,
-				BTREE_ID_lru, POS_MIN, BTREE_ITER_prefetch, k,
-				NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
-		bch2_progress_update_iter(trans, &progress, &iter) ?:
-		wb_maybe_flush_inc(&last_flushed) ?:
-		bch2_check_lru_key(trans, &iter, k, &last_flushed);
-	}));
+	struct bpos pos = POS_MIN;
+	int ret = 0;
+
+	/*
+	 * Scan one lru id at a time, with the backing keyspace prefetched and
+	 * pinned: the backing lookups are random-order, so on a cold cache
+	 * this turns per-key synchronous reads into cache hits.
+	 */
+	while (1) {
+		int lru_id;
+
+		ret = lockrestart_do(trans, lru_peek_id(trans, pos, &lru_id));
+		if (ret || lru_id < 0)
+			break;
+
+		ret = check_lru_id_pin(trans, lru_id);
+		if (ret)
+			break;
+
+		ret = for_each_btree_key_max_commit(trans, iter, BTREE_ID_lru,
+					lru_start(lru_id), lru_end(lru_id),
+					BTREE_ITER_prefetch, k,
+					NULL, NULL, BCH_TRANS_COMMIT_no_enospc, ({
+			bch2_progress_update_iter(trans, &progress, &iter) ?:
+			wb_maybe_flush_inc(&last_flushed) ?:
+			bch2_check_lru_key(trans, &iter, k, &last_flushed);
+		}));
+		if (ret || lru_id == U16_MAX)
+			break;
+
+		pos = lru_start(lru_id + 1);
+	}
+
+	bch2_btree_cache_unpin(c);
+	return ret;
 }

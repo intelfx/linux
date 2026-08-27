@@ -26,14 +26,35 @@ struct dev_alloc_list {
 	u8		data[BCH_SB_MEMBERS_MAX];
 };
 
+typedef struct {
+	u8	dev;
+	bool	new_stripe_alloc:1;
+	bool	will_retry_all_devices:1;
+	bool	will_retry_target_devices:1;
+	bool	will_retry_set_devices:1;
+	bool	copygc_can_make_progress:1;
+	bool	have_cl:1;
+	s16	err;
+	u32	wake_counter_snapshot;
+	u64	free_buckets;
+} alloc_trace_entry;
+
 struct alloc_request {
 	struct closure		*cl;
+	u32			wake_all_counter_snapshot;
 	u8			nr_replicas;
 	u8			ec_replicas;
+	u8			ec_max_data_blocks;	/* 0 = no cap */
 	unsigned		target;
 	bool			ec:1;
+	bool			new_stripe_alloc:1;
 	bool			will_retry_all_devices:1;
 	bool			will_retry_target_devices:1;
+	bool			will_retry_set_devices:1;
+	bool			copygc_can_make_progress:1;
+	bool			trace_alloc_failed:1;
+	/* failure domains are a hard requirement, not a preference (erasure coding): */
+	bool			failure_domains_required:1;
 	enum bch_watermark	watermark;
 	enum bch_write_flags	flags;
 	enum bch_data_type	data_type;
@@ -43,15 +64,34 @@ struct alloc_request {
 	/* These fields are used primarily by open_bucket_add_buckets */
 	struct open_buckets	ptrs;
 	unsigned		nr_effective;	/* sum of @ptrs durability */
-	bool			have_cache;	/* have we allocated from a 0 durability dev */
 	struct bch_devs_mask	devs_may_alloc;
+
+	/*
+	 * Devices already holding a replica of what we're allocating for -
+	 * devs_have plus buckets allocated so far - for spreading replicas
+	 * across failure domains, see bch2_dev_domain_key():
+	 */
+	struct bch_devs_mask	devs_chosen;
 
 	/* bch2_bucket_alloc_set_trans(): */
 	struct dev_alloc_list	devs_sorted;
+	u64			domain_keys[BCH_SB_MEMBERS_MAX];
 	struct bch_dev_usage	usage;
 
 	/* bch2_bucket_alloc_trans(): */
 	struct bch_dev		*ca;
+
+	/*
+	 * Allocate the free bucket nearest this device position (a 32.32
+	 * fixed point fraction of the device, see dev_frac_to_offset()),
+	 * instead of allocating from the device cursor; 0 = no target.
+	 *
+	 * A fraction rather than a sector offset so it means the same thing
+	 * on devices of different sizes: erasure coding uses it to allocate
+	 * a stripe's blocks at equivalent positions on each device, and the
+	 * device is chosen after the target is set:
+	 */
+	u64			target_frac;
 
 	enum {
 				BTREE_BITMAP_NO,
@@ -71,16 +111,54 @@ struct alloc_request {
 
 	unsigned		scratch_nr_replicas;
 	unsigned		scratch_nr_effective;
+	enum bch_write_flags	scratch_flags;
 	bool			scratch_have_cache;
 	enum bch_data_type	scratch_data_type;
 	struct open_buckets	scratch_ptrs;
 	struct bch_devs_mask	scratch_devs_may_alloc;
+
+	/* Allocation attempt trace — dumped on allocator stuck */
+	DARRAY_PREALLOCATED(alloc_trace_entry, 16) trace;
 };
 
+/*
+ * wake_counter_snapshot must be sampled by the caller *before* it adds
+ * itself to freelist_wait via closure_wait(), otherwise a wake racing
+ * between closure_wait() and the snapshot read is lost (we'd record the
+ * already-bumped counter and then never notice the bump in the wait loop).
+ */
+static inline int alloc_trace_add(struct alloc_request *req,
+				  u8 dev, int err,
+				  u32 wake_counter_snapshot,
+				  u64 free_buckets,
+				  bool copygc_can_make_progress)
+{
+	if (darray_push(&req->trace, ((alloc_trace_entry) {
+		.dev				= dev,
+		.new_stripe_alloc		= req->new_stripe_alloc,
+		.will_retry_all_devices		= req->will_retry_all_devices,
+		.will_retry_target_devices	= req->will_retry_target_devices,
+		.will_retry_set_devices		= req->will_retry_set_devices,
+		.copygc_can_make_progress	= copygc_can_make_progress,
+		.have_cl			= req->cl != NULL,
+		.err				= err,
+		.wake_counter_snapshot		= wake_counter_snapshot,
+		.free_buckets			= free_buckets,
+	    })))
+		req->trace_alloc_failed = true;
+
+	return err;
+}
+
+void bch2_dev_alloc_list_devs(struct bch_fs *,
+			      struct dev_stripe_state *,
+			      struct bch_devs_mask *,
+			      const struct bch_devs_mask *,
+			      u64 *,
+			      struct dev_alloc_list *);
 void bch2_dev_alloc_list(struct bch_fs *,
 			 struct dev_stripe_state *,
-			 struct bch_devs_mask *,
-			 struct dev_alloc_list *);
+			 struct alloc_request *);
 void bch2_dev_stripe_increment(struct bch_dev *, struct dev_stripe_state *);
 
 static inline struct bch_dev *ob_dev(struct bch_fs *c, struct open_bucket *ob)
@@ -105,9 +183,42 @@ static inline unsigned bch2_open_buckets_reserved(enum bch_watermark watermark)
 	}
 }
 
-struct open_bucket *bch2_bucket_alloc(struct bch_fs *, struct bch_dev *,
-				      enum bch_watermark, enum bch_data_type,
-				      struct closure *);
+/*
+ * Free open buckets we keep in reserve for the reclaim path (write-buffer flush
+ * -> journal -> writeback), which both frees open buckets and needs them to make
+ * progress. When free drops below this, bch2_journal_set_watermark() raises the
+ * journal watermark so new journal-reserving work throttles at reservation time,
+ * before it can drain the pool below the reclaim reserve (BCH_WATERMARK_reclaim).
+ */
+static inline unsigned bch2_open_buckets_journal_reserved(void)
+{
+	return OPEN_BUCKETS_COUNT / 4;
+}
+
+struct open_bucket *bch2_bucket_alloc_trans(struct btree_trans *, struct alloc_request *);
+
+/*
+ * freelist_wait wake helpers. Every wake_up site on
+ * c->allocator.freelist_wait should go through these so the wake counters
+ * are maintained in lockstep with waitlist wakeups — they're the signal
+ * waiters use to filter spurious wakes they don't care about.
+ *
+ * _dev: bump one device's alloc_wake_counter and wake (use when the caller
+ *       knows which device changed state in a way that might unblock
+ *       allocs). Waiters retry only if a device in their failed-alloc trace
+ *       advanced.
+ * _all: bump the fs-wide wake_all_counter and wake (use for events that
+ *       might unblock allocs on any device — capacity/device changes,
+ *       journal state changes, fsck progress, debug knobs). This forces a
+ *       full allocator retry, since eligibility may have changed for a
+ *       device outside any waiter's trace (e.g. a newly added device).
+ * _waiters_unpark: wake without bumping any counter; used to drop our own
+ *       closure off the waitlist when we can't continue waiting. Real
+ *       waiters see no counter advance and re-park silently.
+ */
+void bch2_alloc_wake_dev(struct bch_dev *);
+void bch2_alloc_wake_all(struct bch_fs *);
+void bch2_alloc_waiters_unpark(struct bch_fs *);
 
 static inline void ob_push(struct bch_fs *c, struct open_buckets *obs,
 			   struct open_bucket *ob)
@@ -172,12 +283,37 @@ static inline void bch2_alloc_sectors_done_inlined(struct bch_fs *c, struct writ
 
 	unsigned sectors = wp->prev_sectors_free - wp->sectors_free;
 	event_add_trace(c, sectors_alloc, sectors, buf, ({
-		prt_str(&buf, __bch2_data_types[wp->data_type]);
+		prt_str(&buf, bch2_data_type_str(wp->data_type));
 	}));
 
 	mutex_unlock(&wp->lock);
 
 	bch2_open_buckets_put(c, &ptrs);
+}
+
+/*
+ * Give up on the open buckets in @wp that have less than @sectors free, so the
+ * next allocation gets fresh ones instead of handing the same too-small write
+ * point straight back.
+ *
+ * For writes that can't be split and so need that much contiguous room: a btree
+ * node, or a compressed extent we can't decompress. The tail of each retired
+ * bucket is fragmentation, which copygc reclaims.
+ *
+ * Only ask for something a fresh bucket can hold, or the caller loops.
+ */
+static inline void bch2_alloc_sectors_retire_short(struct bch_fs *c,
+						   struct write_point *wp,
+						   unsigned sectors)
+{
+	struct open_bucket *ob;
+	unsigned i;
+
+	open_bucket_for_each(c, &wp->ptrs, ob, i)
+		if (ob->sectors_free < sectors)
+			ob->sectors_free = 0;
+
+	bch2_alloc_sectors_done_inlined(c, wp);
 }
 
 static inline void bch2_open_bucket_get(struct bch_fs *c,
@@ -202,7 +338,7 @@ static inline open_bucket_idx_t *open_bucket_hashslot(struct bch_fs *c,
 		 (OPEN_BUCKETS_COUNT - 1));
 }
 
-static inline bool bch2_bucket_is_open(struct bch_fs *c, unsigned dev, u64 bucket)
+static inline struct open_bucket *bch2_bucket_is_open(struct bch_fs *c, unsigned dev, u64 bucket)
 {
 	open_bucket_idx_t slot = *open_bucket_hashslot(c, dev, bucket);
 
@@ -210,12 +346,12 @@ static inline bool bch2_bucket_is_open(struct bch_fs *c, unsigned dev, u64 bucke
 		struct open_bucket *ob = &c->allocator.open_buckets[slot];
 
 		if (ob->dev == dev && ob->bucket == bucket)
-			return true;
+			return ob;
 
 		slot = ob->hash;
 	}
 
-	return false;
+	return NULL;
 }
 
 static inline bool bch2_bucket_is_open_safe(struct bch_fs *c, unsigned dev, u64 bucket)
@@ -227,6 +363,20 @@ static inline bool bch2_bucket_is_open_safe(struct bch_fs *c, unsigned dev, u64 
 	return bch2_bucket_is_open(c, dev, bucket);
 }
 
+static inline bool bch2_bucket_set_discard_fast(struct bch_fs *c, unsigned dev, u64 bucket)
+{
+	struct open_bucket *ob = bch2_bucket_is_open(c, dev, bucket);
+	if (ob) {
+		guard(spinlock)(&ob->lock);
+		if (ob->dev == dev && ob->bucket == bucket) {
+			ob->do_discards_fast = true;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 enum bch_write_flags;
 int bch2_bucket_alloc_set_trans(struct btree_trans *, struct alloc_request *,
 				struct dev_stripe_state *);
@@ -234,6 +384,9 @@ int bch2_bucket_alloc_set_trans(struct btree_trans *, struct alloc_request *,
 int bch2_alloc_sectors_req(struct btree_trans *, struct alloc_request *,
 			   struct write_point_specifier,
 			   struct write_point **);
+
+DEFINE_FREE(alloc_request_put, struct alloc_request *,
+	    if (!IS_ERR_OR_NULL(_T)) darray_exit(&_T->trace))
 
 static inline struct alloc_request *alloc_request_get(struct btree_trans *trans,
 						      unsigned target,
@@ -249,20 +402,33 @@ static inline struct alloc_request *alloc_request_get(struct btree_trans *trans,
 	if (IS_ERR(req))
 		return req;
 
-	if (!IS_ENABLED(CONFIG_BCACHEFS_ERASURE_CODING))
-		erasure_code = false;
-
 	if (ec_replicas < 2)
 		erasure_code = false;
 
-	req->cl			= cl;
-	req->nr_replicas	= nr_replicas;
-	req->ec_replicas	= ec_replicas;
-	req->ec			= erasure_code;
-	req->target		= target;
-	req->watermark		= watermark;
-	req->flags		= flags;
-	req->devs_have		= devs_have;
+	req->ca				= NULL;
+	req->cl				= cl;
+	req->wake_all_counter_snapshot	= atomic_read(&trans->c->allocator.wake_all_counter);
+	req->nr_replicas		= nr_replicas;
+	req->nr_effective		= 0;
+	req->ec_replicas		= ec_replicas;
+	req->ec				= erasure_code;
+	req->target			= target;
+	req->watermark			= watermark;
+	req->flags			= flags;
+	req->devs_have			= devs_have;
+	req->will_retry_all_devices	= false;
+	req->will_retry_target_devices	= false;
+	req->will_retry_set_devices	= false;
+	req->copygc_can_make_progress	= false;
+	req->failure_domains_required	= false;
+	req->trace_alloc_failed		= false;
+	req->target_frac			= 0;
+	req->devs_sorted.nr		= 0;
+	/* bch2_alloc_sectors_req() overwrites these; bch2_bucket_alloc_trans()
+	 * callers (e.g. journal resize) don't, so zero them here for them: */
+	memset(&req->devs_may_alloc, 0, sizeof(req->devs_may_alloc));
+	memset(&req->devs_chosen, 0, sizeof(req->devs_chosen));
+	darray_init(&req->trace);
 	return req;
 }
 
@@ -283,7 +449,9 @@ static inline int bch2_alloc_sectors_start_trans(struct btree_trans *trans,
 								 nr_replicas,
 								 ec_replicas,
 								 watermark, flags, cl));
-	return bch2_alloc_sectors_req(trans, req, write_point, wp_ret);
+	int ret = bch2_alloc_sectors_req(trans, req, write_point, wp_ret);
+	darray_exit(&req->trace);
+	return ret;
 }
 
 static inline struct bch_extent_ptr bch2_ob_ptr(struct bch_fs *c, struct open_bucket *ob)
@@ -292,7 +460,7 @@ static inline struct bch_extent_ptr bch2_ob_ptr(struct bch_fs *c, struct open_bu
 
 	return (struct bch_extent_ptr) {
 		.type	= 1 << BCH_EXTENT_ENTRY_ptr,
-		.gen	= ob->gen,
+		.generation	= ob->generation,
 		.dev	= ob->dev,
 		.offset	= bucket_to_sector(ca, ob->bucket) +
 			ca->mi.bucket_size -
@@ -359,15 +527,18 @@ void bch2_fs_open_buckets_to_text(struct printbuf *, struct bch_fs *);
 void bch2_fs_alloc_debug_to_text(struct printbuf *, struct bch_fs *);
 void bch2_dev_alloc_debug_to_text(struct printbuf *, struct bch_dev *);
 
-void __bch2_wait_on_allocator(struct bch_fs *, struct alloc_request *, int, struct closure *);
+void bch2_alloc_request_to_text(struct printbuf *, struct bch_fs *,
+				struct alloc_request *);
+void __bch2_wait_on_allocator(struct btree_trans *, struct alloc_request *,
+			      int, struct closure *);
 
-static inline void bch2_wait_on_allocator(struct bch_fs *c,
+static inline void bch2_wait_on_allocator(struct btree_trans *trans,
 					  struct alloc_request *req,
 					  int err,
 					  struct closure *cl)
 {
 	if (closure_nr_remaining(cl) > 1)
-		__bch2_wait_on_allocator(c, req, err, cl);
+		__bch2_wait_on_allocator(trans, req, err, cl);
 }
 
 #endif /* _BCACHEFS_ALLOC_FOREGROUND_H */

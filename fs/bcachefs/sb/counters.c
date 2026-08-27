@@ -19,6 +19,18 @@ const char * const bch2_counter_names[] = {
 	NULL
 };
 
+const enum bch_counters_flags bch2_counter_flags_map[] = {
+#define x(t, n, flags, ...) [BCH_COUNTER_##t] = flags,
+	BCH_PERSISTENT_COUNTERS()
+#undef x
+};
+
+const u16 bch2_counter_stable_map[] = {
+#define x(n, id, ...) [BCH_COUNTER_##n] = BCH_COUNTER_STABLE_##n,
+	BCH_PERSISTENT_COUNTERS()
+#undef x
+};
+
 static size_t bch2_sb_counter_nr_entries(struct bch_sb_field_counters *ctrs)
 {
 	if (!ctrs)
@@ -33,7 +45,7 @@ static int bch2_sb_counters_validate(struct bch_sb *sb, struct bch_sb_field *f,
 	return 0;
 }
 
-static void bch2_sb_counters_to_text(struct printbuf *out,
+static __cold void bch2_sb_counters_to_text(struct printbuf *out,
 				     struct bch_fs *c, struct bch_sb *sb,
 				     struct bch_sb_field *f)
 {
@@ -109,7 +121,7 @@ static void bch2_sb_counters_work(struct work_struct *work)
 	queue_delayed_work(system_dfl_wq, &c->work, HZ / 2);
 }
 
-void bch2_sb_recent_counters_to_text(struct printbuf *out, struct bch_fs_counters *c)
+__cold void bch2_sb_recent_counters_to_text(struct printbuf *out, struct bch_fs_counters *c)
 {
 	unsigned long active[BITS_TO_LONGS(BCH_COUNTER_NR)];
 	memset(active, 0, sizeof(active));
@@ -140,15 +152,14 @@ void bch2_fs_counters_exit(struct bch_fs *c)
 	free_percpu(c->counters.now);
 }
 
+void bch2_fs_counters_init_early(struct bch_fs *c)
+{
+	INIT_DELAYED_WORK(&c->counters.work, bch2_sb_counters_work);
+}
+
 int bch2_fs_counters_init(struct bch_fs *c)
 {
-	c->counters.now = __alloc_percpu(sizeof(u64) * BCH_COUNTER_NR, sizeof(u64));
-	if (!c->counters.now)
-		return -BCH_ERR_ENOMEM_fs_counters_init;
-
 	try(bch2_sb_counters_to_cpu(c));
-
-	INIT_DELAYED_WORK(&c->counters.work, bch2_sb_counters_work);
 	return 0;
 }
 
@@ -156,6 +167,12 @@ int bch2_fs_counters_init_late(struct bch_fs *c)
 {
 	queue_delayed_work(system_dfl_wq, &c->counters.work, HZ / 2);
 	return 0;
+}
+
+void bch2_counter_reset(struct bch_fs *c, unsigned idx)
+{
+	if (idx < BCH_COUNTER_NR)
+		percpu_u64_set(&c->counters.now[idx], 0);
 }
 
 const struct bch_sb_field_ops bch_sb_field_ops_counters = {
@@ -172,7 +189,7 @@ long bch2_ioctl_query_counters(struct bch_fs *c,
 
 	if ((arg.flags & ~BCH_IOCTL_QUERY_COUNTERS_MOUNT) ||
 	    arg.pad)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_ioctl_query_counters_bad_flags);
 
 	arg.nr = min(arg.nr, BCH_COUNTER_NR);
 	try(put_user(arg.nr, &user_arg->nr));

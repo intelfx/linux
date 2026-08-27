@@ -9,8 +9,11 @@
 #define _BUCKETS_H
 
 #include "alloc/buckets_types.h"
+#include "alloc/format.h"
 #include "data/extents.h"
 #include "sb/members.h"
+
+/* Bucket addressing: */
 
 static inline u64 sector_to_bucket(const struct bch_dev *ca, sector_t s)
 {
@@ -35,9 +38,31 @@ static inline u64 sector_to_bucket_and_offset(const struct bch_dev *ca, sector_t
 	return div_u64_rem(s, ca->mi.bucket_size, offset);
 }
 
+/*
+ * Device position fractions: a device-relative sector offset as a 32.32
+ * fixed point fraction of the device's size, for comparing and averaging
+ * positions across devices of different sizes (same fraction ~= same zone
+ * on rotational media):
+ */
+#define BCH_DEV_POS_FRAC_BITS	32
+
+static inline u64 dev_offset_to_frac(const struct bch_dev *ca, u64 offset)
+{
+	return mul_u64_u64_div_u64(offset, 1ULL << BCH_DEV_POS_FRAC_BITS,
+				   bucket_to_sector(ca, ca->mi.nbuckets));
+}
+
+static inline u64 dev_frac_to_offset(const struct bch_dev *ca, u64 frac)
+{
+	return mul_u64_u64_div_u64(frac, bucket_to_sector(ca, ca->mi.nbuckets),
+				   1ULL << BCH_DEV_POS_FRAC_BITS);
+}
+
 #define for_each_bucket(_b, _buckets)				\
 	for (_b = (_buckets)->b + (_buckets)->first_bucket;	\
 	     _b < (_buckets)->b + (_buckets)->nbuckets; _b++)
+
+/* Bucket locking: */
 
 static inline void bucket_unlock(struct bucket *b)
 {
@@ -58,12 +83,16 @@ DEFINE_GUARD(bucket_lock, struct bucket *,
 	     bucket_lock(_T),
 	     bucket_unlock(_T));
 
+/* GC bucket access: */
+
 static inline struct bucket *gc_bucket(struct bch_dev *ca, size_t b)
 {
 	return bucket_valid(ca, b)
 		? genradix_ptr(&ca->buckets_gc, b)
 		: NULL;
 }
+
+/* Bucket generation: */
 
 static inline struct bucket_gens *bucket_gens(struct bch_dev *ca)
 {
@@ -92,6 +121,18 @@ static inline int bucket_gen_get(struct bch_dev *ca, size_t b)
 	return bucket_gen_get_rcu(ca, b);
 }
 
+static inline int gen_cmp(u8 a, u8 b)
+{
+	return (s8) (a - b);
+}
+
+static inline int gen_after(u8 a, u8 b)
+{
+	return max(0, gen_cmp(a, b));
+}
+
+/* Pointer → bucket mapping: */
+
 static inline size_t PTR_BUCKET_NR(const struct bch_dev *ca,
 				   const struct bch_extent_ptr *ptr)
 {
@@ -117,6 +158,35 @@ static inline struct bucket *PTR_GC_BUCKET(struct bch_dev *ca,
 	return gc_bucket(ca, PTR_BUCKET_NR(ca, ptr));
 }
 
+/* GC bucket ↔ alloc_v4 conversion: */
+
+static inline void alloc_to_bucket(struct bucket *dst, struct bch_alloc_v4 src)
+{
+	dst->generation		= src.generation;
+	dst->data_type		= src.data_type;
+	dst->stripe_sectors	= src.stripe_sectors;
+	dst->dirty_sectors	= src.dirty_sectors;
+	dst->cached_sectors	= src.cached_sectors;
+}
+
+static inline void __bucket_m_to_alloc(struct bch_alloc_v4 *dst, struct bucket src)
+{
+	dst->generation		= src.generation;
+	dst->data_type		= src.data_type;
+	dst->stripe_sectors	= src.stripe_sectors;
+	dst->dirty_sectors	= src.dirty_sectors;
+	dst->cached_sectors	= src.cached_sectors;
+}
+
+static inline struct bch_alloc_v4 bucket_m_to_alloc(struct bucket b)
+{
+	struct bch_alloc_v4 ret = {};
+	__bucket_m_to_alloc(&ret, b);
+	return ret;
+}
+
+/* Extent pointer helpers: */
+
 static inline enum bch_data_type ptr_data_type(const struct bkey *k,
 					       const struct bch_extent_ptr *ptr)
 {
@@ -136,20 +206,12 @@ static inline s64 ptr_disk_sectors(s64 sectors, struct extent_ptr_decoded p)
 		: sectors;
 }
 
-static inline int gen_cmp(u8 a, u8 b)
-{
-	return (s8) (a - b);
-}
-
-static inline int gen_after(u8 a, u8 b)
-{
-	return max(0, gen_cmp(a, b));
-}
+/* Pointer staleness: */
 
 static inline int dev_ptr_stale_rcu(struct bch_dev *ca, const struct bch_extent_ptr *ptr)
 {
 	int gen = bucket_gen_get_rcu(ca, PTR_BUCKET_NR(ca, ptr));
-	return gen < 0 ? gen : gen_after(gen, ptr->gen);
+	return gen < 0 ? gen : gen_after(gen, ptr->generation);
 }
 
 /**
@@ -252,20 +314,32 @@ static inline u64 dev_buckets_available(struct bch_dev *ca,
 struct bch_fs_usage_short
 bch2_fs_usage_read_short(struct bch_fs *);
 
-int bch2_bucket_ref_update(struct btree_trans *, struct bch_dev *,
-			   struct bkey_s_c, const struct bch_extent_ptr *,
-			   s64, enum bch_data_type, u8, u8, u32 *);
+int __bch2_bucket_ref_update(struct btree_trans *, struct bch_dev *,
+			     struct bkey_s_c, const struct bch_extent_ptr *,
+			     s64, enum bch_data_type, u8, u8 *, u32 *);
 
-int bch2_check_fix_ptrs(struct btree_trans *,
-			enum btree_id, unsigned, struct bkey_s_c,
-			enum btree_iter_update_trigger_flags);
+static inline int bch2_bucket_ref_update(struct btree_trans *trans, struct bch_dev *ca,
+					 struct bkey_s_c k,
+					 const struct bch_extent_ptr *ptr,
+					 s64 sectors, enum bch_data_type ptr_data_type,
+					 u8 b_gen, u8 *bucket_data_type,
+					 u32 *bucket_sectors)
+{
+	BUG_ON(!sectors);
 
-int bch2_trigger_extent(struct btree_trans *, enum btree_id, unsigned,
-			struct bkey_s_c, struct bkey_s,
-			enum btree_iter_update_trigger_flags);
-int bch2_trigger_reservation(struct btree_trans *, enum btree_id, unsigned,
-			  struct bkey_s_c, struct bkey_s,
-			  enum btree_iter_update_trigger_flags);
+	if (unlikely(b_gen != ptr->generation ||
+		     bucket_data_type_mismatch(*bucket_data_type, ptr_data_type) ||
+		     (u64) *bucket_sectors + sectors > U32_MAX))
+		return __bch2_bucket_ref_update(trans, ca, k, ptr, sectors, ptr_data_type,
+						b_gen, bucket_data_type, bucket_sectors);
+
+	*bucket_sectors += sectors;
+	return 0;
+}
+
+int bch2_trigger_extent(struct btree_trans *, struct btree_trigger_op);
+int bch2_trigger_reservation(struct btree_trans *, struct btree_trigger_op);
+int bch2_trigger_snapshot_nr_keys(struct btree_trans *, struct btree_trigger_op);
 
 #define trigger_run_overwrite_then_insert(_fn, _trans, _btree_id, _level, _old, _new, _flags)\
 ({												\
@@ -298,7 +372,7 @@ static inline const char *bch2_data_type_str(enum bch_data_type type)
 		: "(invalid data type)";
 }
 
-/* disk reservations: */
+/* Disk reservations: */
 
 static inline void bch2_disk_reservation_put(struct bch_fs *c,
 					     struct disk_reservation *res)
@@ -346,7 +420,7 @@ bch2_disk_reservation_init(struct bch_fs *c, unsigned nr_replicas)
 		.sectors	= 0,
 #if 0
 		/* not used yet: */
-		.gen		= c->capacity_gen,
+		.generation		= c->capacity_gen,
 #endif
 		.nr_replicas	= nr_replicas,
 	};
@@ -381,6 +455,11 @@ static inline u64 avail_factor(u64 r)
 
 void bch2_buckets_nouse_free(struct bch_fs *);
 int bch2_buckets_nouse_alloc(struct bch_fs *);
+
+static inline bool bch2_bucket_nouse(struct bch_dev *ca, u64 bucket)
+{
+	return unlikely(ca->buckets_nouse && test_bit(bucket, ca->buckets_nouse));
+}
 
 int bch2_dev_buckets_resize(struct bch_fs *, struct bch_dev *, u64);
 void bch2_dev_buckets_free(struct bch_dev *);

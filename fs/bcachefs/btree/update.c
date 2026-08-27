@@ -31,15 +31,17 @@ static inline int btree_insert_entry_cmp(const struct btree_insert_entry *l,
 		 bpos_cmp(l->k->k.p,	r->k->k.p);
 }
 
-static int __must_check
-bch2_trans_update_by_path(struct btree_trans *, btree_path_idx_t,
-			  struct bkey_i *, enum btree_iter_update_trigger_flags,
-			  unsigned long ip);
+static struct btree_insert_entry *
+btree_trans_update_by_path(struct btree_trans *, btree_path_idx_t,
+			   struct bkey_i *, unsigned,
+			   enum btree_iter_update_trigger_flags,
+			   unsigned long ip);
 
 static noinline int extent_front_merge(struct btree_trans *trans,
 				       struct btree_iter *iter,
 				       struct bkey_s_c k,
 				       struct bkey_i **insert,
+				       unsigned *k_buf_u64s,
 				       enum btree_iter_update_trigger_flags flags)
 {
 	if (unlikely(trans->journal_replay_not_finished))
@@ -60,6 +62,7 @@ static noinline int extent_front_merge(struct btree_trans *trans,
 	try(bch2_btree_delete_at(trans, iter, flags));
 
 	*insert = update;
+	*k_buf_u64s = update->k.u64s;
 	return 0;
 }
 
@@ -122,6 +125,18 @@ int __bch2_insert_snapshot_whiteouts(struct btree_trans *trans,
 				     snapshot_id_list *s)
 {
 	darray_for_each(*s, id) {
+		/*
+		 * In fsck, a repair can fan whiteouts across an unbounded
+		 * number of snapshots: commit and restart before the batch
+		 * hits the trans mem cap. The re-drive converges - committed
+		 * whiteouts fail the KEY_TYPE_deleted check below and are
+		 * skipped. Runtime callers (extent splits) are excluded so
+		 * their whiteouts stay atomic with the extent update:
+		 */
+		if (test_bit(BCH_FS_in_fsck, &trans->c->flags))
+			try(bch2_trans_commit_lazy_if_full(trans, NULL, NULL,
+						BCH_TRANS_COMMIT_no_enospc));
+
 		pos.snapshot = *id;
 
 		CLASS(btree_iter, iter)(trans, btree, pos, BTREE_ITER_not_extents|BTREE_ITER_intent);
@@ -152,6 +167,14 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 	struct bch_fs *c = trans->c;
 	enum btree_id btree_id = iter->btree_id;
 	struct bkey_i *update;
+
+	/*
+	 * Split fragments below are fresh kkeys derived from @old, so the
+	 * caller's BTREE_TRIGGER_set_needs_reconcile_done (asserting "I
+	 * already set the reconcile field on the kkey I'm inserting") doesn't
+	 * apply to them — let the trigger compute it.
+	 */
+	flags &= ~BTREE_TRIGGER_set_needs_reconcile_done;
 	struct bpos new_start = bkey_start_pos(new.k);
 	unsigned front_split = bkey_lt(bkey_start_pos(old.k), new_start);
 	unsigned back_split  = bkey_gt(old.k->p, new.k->p);
@@ -166,7 +189,7 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 	 * reservation:
 	 */
 	if (nr_splits > 1 &&
-	    (compressed_sectors = bch2_bkey_sectors_compressed(c, old)))
+	    (compressed_sectors = bch2_bkey_durability_safe(c, old).sectors_compressed))
 		trans->extra_disk_res += compressed_sectors * (nr_splits - 1);
 
 	if (front_split) {
@@ -175,7 +198,7 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 		bch2_cut_back(new_start, update);
 
 		try(bch2_insert_snapshot_whiteouts(trans, btree_id, old.k->p, update->k.p));
-		try(bch2_btree_insert_nonextent(trans, btree_id, update,
+		try(bch2_btree_insert_nonextent(trans, btree_id, update, update->k.u64s,
 					BTREE_UPDATE_internal_snapshot_node|flags));
 	}
 
@@ -187,7 +210,7 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 		bch2_cut_back(new.k->p, update);
 
 		try(bch2_insert_snapshot_whiteouts(trans, btree_id, old.k->p, update->k.p));
-		try(bch2_btree_insert_nonextent(trans, btree_id, update,
+		try(bch2_btree_insert_nonextent(trans, btree_id, update, update->k.u64s,
 					  BTREE_UPDATE_internal_snapshot_node|flags));
 	}
 
@@ -208,16 +231,16 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 				update->k.type = extent_whiteout_type(trans->c, iter->btree_id, new.k);
 		}
 
-		try(bch2_btree_insert_nonextent(trans, btree_id, update,
+		try(bch2_btree_insert_nonextent(trans, btree_id, update, update->k.u64s,
 					  BTREE_UPDATE_internal_snapshot_node|flags));
 	} else {
 		update = errptr_try(bch2_bkey_make_mut_noupdate(trans, old));
 
 		bch2_cut_front(c, new.k->p, update);
 
-		try(bch2_trans_update_by_path(trans, iter->path, update,
-					  BTREE_UPDATE_internal_snapshot_node|
-					  flags, _RET_IP_));
+		btree_trans_update_by_path(trans, iter->path, update, update->k.u64s,
+					   BTREE_UPDATE_internal_snapshot_node|
+					   flags, _RET_IP_);
 	}
 
 	return 0;
@@ -225,7 +248,7 @@ int bch2_trans_update_extent_overwrite(struct btree_trans *trans,
 
 static int bch2_trans_update_extent(struct btree_trans *trans,
 				    struct btree_iter *orig_iter,
-				    struct bkey_i *insert,
+				    struct bkey_i *insert, unsigned k_buf_u64s,
 				    enum btree_iter_update_trigger_flags flags)
 {
 	enum btree_id btree_id = orig_iter->btree_id;
@@ -234,13 +257,13 @@ static int bch2_trans_update_extent(struct btree_trans *trans,
 				BTREE_ITER_intent|
 				BTREE_ITER_not_extents|
 				BTREE_ITER_nofilter_whiteouts);
-	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(&iter, POS(insert->k.p.inode, U64_MAX)));
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(&iter, &POS(insert->k.p.inode, U64_MAX)));
 	if (!k.k)
 		goto out;
 
 	if (bkey_eq(k.k->p, bkey_start_pos(&insert->k))) {
 		if (bch2_bkey_maybe_mergable(k.k, &insert->k))
-			try(extent_front_merge(trans, &iter, k, &insert, flags));
+			try(extent_front_merge(trans, &iter, k, &insert, &k_buf_u64s, flags));
 
 		goto next;
 	}
@@ -277,7 +300,7 @@ static int bch2_trans_update_extent(struct btree_trans *trans,
 			goto out;
 next:
 		bch2_btree_iter_advance(&iter);
-		k = bkey_try(bch2_btree_iter_peek_max(&iter, POS(insert->k.p.inode, U64_MAX)));
+		k = bkey_try(bch2_btree_iter_peek_max(&iter, &POS(insert->k.p.inode, U64_MAX)));
 		if (!k.k)
 			goto out;
 	}
@@ -286,15 +309,27 @@ next:
 		try(extent_back_merge(trans, &iter, insert, k));
 out:
 	return !bkey_deleted(&insert->k)
-		? bch2_btree_insert_nonextent(trans, btree_id, insert, flags)
+		? bch2_btree_insert_nonextent(trans, btree_id, insert, k_buf_u64s, flags)
 		: 0;
 }
 
-static inline struct btree_insert_entry *
-__btree_trans_update_by_path(struct btree_trans *trans,
-			     btree_path_idx_t path_idx,
-			     struct bkey_i *k, enum btree_iter_update_trigger_flags flags,
-			     unsigned long ip)
+static noinline __cold
+void __update_by_path_trace(struct btree_trans *trans, unsigned overwrite,
+			    btree_path_idx_t path_idx, struct bkey_i *k)
+{
+	__event_trace(trans->c, update_by_path, buf, ({
+		prt_printf(&buf, "%s overwrite %u\n", trans->fn, overwrite);
+		bch2_btree_path_to_text_short(&buf, trans, path_idx, trans->paths + path_idx);
+		bch2_bkey_val_to_text(&buf, trans->c, bkey_i_to_s_c(k));
+	}));
+}
+
+static struct btree_insert_entry *
+btree_trans_update_by_path(struct btree_trans *trans,
+			   btree_path_idx_t path_idx,
+			   struct bkey_i *k, unsigned k_buf_u64s,
+			   enum btree_iter_update_trigger_flags flags,
+			   unsigned long ip)
 {
 	struct bch_fs *c = trans->c;
 	struct btree_insert_entry *i, n;
@@ -304,11 +339,7 @@ __btree_trans_update_by_path(struct btree_trans *trans,
 	EBUG_ON(!path->should_be_locked);
 	EBUG_ON(trans->nr_updates >= trans->nr_paths);
 	EBUG_ON(!bpos_eq(k->k.p, path->pos));
-	EBUG_ON(!path->level &&
-		btree_type_has_snapshots(path->btree_id) &&
-		!bkey_deleted(&k->k) &&
-		test_bit(JOURNAL_replay_done, &c->journal.flags) &&
-		!bch2_snapshot_exists(c, k->k.p.snapshot));
+	BUG_ON(k_buf_u64s < k->k.u64s);
 
 	trans->has_interior_updates |= path->level != 0;
 
@@ -319,6 +350,7 @@ __btree_trans_update_by_path(struct btree_trans *trans,
 		.btree_id	= path->btree_id,
 		.level		= path->level,
 		.cached		= path->cached,
+		.k_buf_u64s	= k_buf_u64s,
 		.path		= path_idx,
 		.k		= k,
 		.ip_allocated	= ip,
@@ -343,11 +375,19 @@ __btree_trans_update_by_path(struct btree_trans *trans,
 	bool overwrite = !cmp && i < trans->updates + trans->nr_updates;
 
 	if (overwrite) {
-		EBUG_ON(i->insert_trigger_run || i->overwrite_trigger_run);
+		/*
+		 * Overwriting an update whose triggers already ran normally
+		 * loses or duplicates their effects - unless the caller has
+		 * handled that, e.g. deleting a key from its own trigger, where
+		 * the new (deleted) key re-runs triggers via the key cache flush.
+		 */
+		EBUG_ON((i->insert_trigger_run || i->overwrite_trigger_run) &&
+			!(flags & BTREE_UPDATE_overwrite_triggered));
 
 		bch2_path_put(trans, i->path, true);
 		i->flags	= n.flags;
 		i->cached	= n.cached;
+		i->k_buf_u64s	= n.k_buf_u64s;
 		i->k		= n.k;
 		i->path		= n.path;
 		i->ip_allocated	= n.ip_allocated;
@@ -371,11 +411,8 @@ __btree_trans_update_by_path(struct btree_trans *trans,
 
 	__btree_path_get(trans, trans->paths + i->path, true);
 
-	event_trace(c, update_by_path, buf, ({
-		prt_printf(&buf, "%s overwrite %u\n", trans->fn, overwrite);
-		bch2_btree_path_to_text_short(&buf, trans, path_idx, path);
-		bch2_bkey_val_to_text(&buf, c, bkey_i_to_s_c(k));
-	}));
+	event_trace_fn(c, update_by_path,
+		       __update_by_path_trace(trans, overwrite, path_idx, k));
 
 	return i;
 }
@@ -410,7 +447,7 @@ static noinline int flush_new_cached_update(struct btree_trans *trans,
 	struct bkey old_k		= i->old_k;
 	const struct bch_val *old_v	= i->old_v;
 
-	i = __btree_trans_update_by_path(trans, iter.path, i->k, flags, ip);
+	i = btree_trans_update_by_path(trans, iter.path, i->k, i->k_buf_u64s, flags, ip);
 
 	i->old_k		= old_k;
 	i->old_v		= old_v;
@@ -421,33 +458,11 @@ static noinline int flush_new_cached_update(struct btree_trans *trans,
 static inline bool key_cache_needs_flush(struct btree_path *path)
 {
 	struct bkey_cached *ck = (void *) path->l[0].b;
-	return ck->needs_immediate_flush;
-}
-
-static int __must_check
-bch2_trans_update_by_path(struct btree_trans *trans, btree_path_idx_t path_idx,
-			  struct bkey_i *k, enum btree_iter_update_trigger_flags flags,
-			  unsigned long ip)
-{
-	struct btree_insert_entry *i = __btree_trans_update_by_path(trans, path_idx, k, flags, ip);
-
-	/*
-	 * If a key is present in the key cache, it must also exist in the
-	 * btree - this is necessary for cache coherency. When iterating over
-	 * a btree that's cached in the key cache, the btree iter code checks
-	 * the key cache - but the key has to exist in the btree for that to
-	 * work:
-	 */
-	return i->cached && (!i->old_btree_u64s ||
-			     bkey_deleted(&k->k) ||
-			     key_cache_needs_flush(trans->paths + path_idx))
-		? flush_new_cached_update(trans, i, flags, ip)
-		: 0;
+	return test_bit(BKEY_CACHED_IMMEDIATE_FLUSH, &ck->flags);
 }
 
 static noinline int bch2_trans_update_get_key_cache(struct btree_trans *trans,
-						    struct btree_iter *iter,
-						    struct btree_path *path)
+						    struct btree_iter *iter)
 {
 	struct btree_path *key_cache_path = btree_iter_key_cache_path(trans, iter);
 
@@ -456,12 +471,12 @@ static noinline int bch2_trans_update_get_key_cache(struct btree_trans *trans,
 	    !bpos_eq(key_cache_path->pos, iter->pos)) {
 		if (!iter->key_cache_path)
 			iter->key_cache_path =
-				bch2_path_get(trans, path->btree_id, path->pos, 1, 0,
+				bch2_path_get(trans, iter->btree_id, &iter->pos, 1, 0,
 					      BTREE_ITER_intent|
 					      BTREE_ITER_cached, _THIS_IP_);
 
 		iter->key_cache_path =
-			bch2_btree_path_set_pos(trans, iter->key_cache_path, path->pos,
+			bch2_btree_path_set_pos(trans, iter->key_cache_path, &iter->pos,
 						iter->flags & BTREE_ITER_intent,
 						_THIS_IP_);
 
@@ -481,15 +496,14 @@ static noinline int bch2_trans_update_get_key_cache(struct btree_trans *trans,
 }
 
 int __must_check bch2_trans_update_ip(struct btree_trans *trans, struct btree_iter *iter,
-				      struct bkey_i *k, enum btree_iter_update_trigger_flags flags,
+				      struct bkey_i *k, unsigned k_buf_u64s,
+				      enum btree_iter_update_trigger_flags flags,
 				      unsigned long ip)
 {
 	kmsan_check_memory(k, bkey_bytes(&k->k));
 
-	btree_path_idx_t path_idx = iter->update_path ?: iter->path;
-
 	if (iter->flags & BTREE_ITER_is_extents)
-		return bch2_trans_update_extent(trans, iter, k, flags);
+		return bch2_trans_update_extent(trans, iter, k, k_buf_u64s, flags);
 
 	if (bkey_deleted(&k->k) &&
 	    !(flags & BTREE_UPDATE_key_cache_reclaim) &&
@@ -502,20 +516,94 @@ int __must_check bch2_trans_update_ip(struct btree_trans *trans, struct btree_it
 			k->k.type = KEY_TYPE_whiteout;
 	}
 
+	btree_path_idx_t path_idx = iter->update_path ?: iter->path;
+	struct btree_path *path = trans->paths + path_idx;
+
+	if (IS_ENABLED(CONFIG_BCACHEFS_DEBUG)) {
+		BUG_ON(!bpos_eq(k->k.p, iter->pos));
+		if (!bpos_eq(k->k.p, path->pos)) {
+			BUG_ON(!(iter->flags & BTREE_ITER_filter_snapshots));
+			BUG_ON(!bkey_eq(k->k.p, path->pos));
+			BUG_ON(!bch2_snapshot_is_ancestor(trans, k->k.p.snapshot, path->pos.snapshot));
+		}
+	}
+
 	/*
 	 * Ensure that updates to cached btrees go to the key cache:
 	 */
-	struct btree_path *path = trans->paths + path_idx;
 	if (!(flags & BTREE_UPDATE_key_cache_reclaim) &&
 	    !path->cached &&
 	    !path->level &&
 	    btree_id_cached(path->btree_id)) {
-		try(bch2_trans_update_get_key_cache(trans, iter, path));
+		try(bch2_trans_update_get_key_cache(trans, iter));
 
 		path_idx = iter->key_cache_path;
 	}
 
-	return bch2_trans_update_by_path(trans, path_idx, k, flags, ip);
+	struct btree_insert_entry *i = btree_trans_update_by_path(trans, path_idx, k,
+								  k_buf_u64s, flags, ip);
+
+	/*
+	 * If a key is present in the key cache, it must also exist in the
+	 * btree - this is necessary for cache coherency. When iterating over
+	 * a btree that's cached in the key cache, the btree iter code checks
+	 * the key cache - but the key has to exist in the btree for that to
+	 * work:
+	 */
+	return i->cached && (!i->old_btree_u64s ||
+			     bkey_deleted(&k->k) ||
+			     key_cache_needs_flush(trans->paths + path_idx))
+		? flush_new_cached_update(trans, i, flags, ip)
+		: 0;
+}
+
+/*
+ * Triggers may need to mutate (and possibly grow) the in-flight new key.
+ *
+ * Fast path: if the existing buffer is already big enough, hand back @op.new
+ * unchanged — no trans->updates walk needed.
+ *
+ * Slow path (growth required): find the queued update by (btree, level, pos),
+ * kmalloc a fresh buffer, and rewire i->k / i->k_buf_u64s. We re-find on each
+ * call because nested updates can grow trans->updates and invalidate any
+ * pointer captured earlier.
+ *
+ * Mem-trigger phase forbids growth: the journal layout is already committed
+ * to. Overwrite-only callers (no BTREE_TRIGGER_insert) have no business
+ * mutating @new (it's the deleted-dummy stub).
+ */
+int bch2_trigger_get_mutable_new(struct btree_trans *trans,
+				 struct btree_trigger_op op,
+				 unsigned needed_u64s,
+				 struct bkey_s *out)
+{
+	BUG_ON(!(op.flags & BTREE_TRIGGER_insert));
+
+	if (needed_u64s <= op.new_buf_u64s) {
+		*out = op.new;
+		return 0;
+	}
+
+	BUG_ON(op.flags & BTREE_TRIGGER_atomic);
+
+	struct btree_insert_entry *i = NULL;
+	trans_for_each_update(trans, e)
+		if (e->btree_id == op.btree &&
+		    e->level == op.level &&
+		    bpos_eq(e->k->k.p, op.new.k->p)) {
+			i = e;
+			break;
+		}
+	BUG_ON(!i);
+
+	struct bkey_i *new_buf =
+		errptr_try(bch2_trans_kmalloc(trans, needed_u64s * sizeof(u64)));
+	bkey_copy(new_buf, i->k);
+	i->k		= new_buf;
+	i->k_buf_u64s	= needed_u64s;
+
+	*out = bkey_i_to_s(i->k);
+	return 0;
 }
 
 int bch2_btree_insert_clone_trans(struct btree_trans *trans,
@@ -559,6 +647,20 @@ void *__bch2_trans_subbuf_alloc(struct btree_trans *trans,
 	return p;
 }
 
+int bch2_trans_subbuf_reserve(struct btree_trans *trans,
+			      struct btree_trans_subbuf *buf,
+			      unsigned u64s)
+{
+	if (buf->u64s + u64s > buf->size) {
+		unsigned old_u64s = buf->u64s;
+		void *p = __bch2_trans_subbuf_alloc(trans, buf, u64s, _THIS_IP_);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+		buf->u64s = old_u64s;
+	}
+	return 0;
+}
+
 int bch2_bkey_get_empty_slot(struct btree_trans *trans, struct btree_iter *iter,
 			     enum btree_id btree, struct bpos start, struct bpos end)
 {
@@ -588,6 +690,7 @@ void bch2_trans_commit_hook(struct btree_trans *trans,
 
 int bch2_btree_insert_nonextent(struct btree_trans *trans,
 				enum btree_id btree, struct bkey_i *k,
+				unsigned k_buf_u64s,
 				enum btree_iter_update_trigger_flags flags)
 {
 	CLASS(btree_iter, iter)(trans, btree, k->k.p,
@@ -595,16 +698,16 @@ int bch2_btree_insert_nonextent(struct btree_trans *trans,
 				BTREE_ITER_not_extents|
 				BTREE_ITER_intent);
 	return  bch2_btree_iter_traverse(&iter) ?:
-		bch2_trans_update_ip(trans, &iter, k, flags, _RET_IP_);
+		bch2_trans_update_ip(trans, &iter, k, k_buf_u64s, flags, _RET_IP_);
 }
 
 int bch2_btree_insert_trans(struct btree_trans *trans, enum btree_id btree,
 			    struct bkey_i *k, enum btree_iter_update_trigger_flags flags)
 {
-	CLASS(btree_iter, iter)(trans, btree, bkey_start_pos(&k->k),
+	CLASS(btree_iter, iter)(trans, btree, k->k.p,
 				BTREE_ITER_intent|flags);
 	return  bch2_btree_iter_traverse(&iter) ?:
-		bch2_trans_update_ip(trans, &iter, k, flags, _RET_IP_);
+		bch2_trans_update_ip(trans, &iter, k, k->k.u64s, flags, _RET_IP_);
 }
 
 /**
@@ -653,7 +756,7 @@ int bch2_btree_delete(struct btree_trans *trans,
 static int delete_range_one(struct btree_trans *trans, struct btree_iter *iter,
 			    struct bpos end, enum btree_iter_update_trigger_flags flags)
 {
-	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(iter, end));
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_max(iter, &end));
 
 	if (!k.k)
 		return 1;

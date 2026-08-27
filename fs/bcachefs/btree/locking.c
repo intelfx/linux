@@ -1,13 +1,144 @@
 // SPDX-License-Identifier: GPL-2.0
 
+/* DOC_LATEX(btree-locking)
+ *
+ * Bcachefs uses SIX locks (shared, intent, exclusive) for btree nodes rather
+ * than traditional read/write locks. The three states are:
+ *
+ * \begin{itemize}
+ * \item \textbf{Shared}: Does not conflict with other shared locks (like a read lock)
+ * \item \textbf{Intent}: Conflicts with other intent locks but not shared locks
+ * \item \textbf{Exclusive}: Conflicts with everything (like a write lock)
+ * \end{itemize}
+ *
+ * \paragraph{Why intent locks?}
+ *
+ * With a regular read/write lock, a read lock cannot be upgraded to a write
+ * lock---that leads to deadlock when multiple threads with read locks try to
+ * upgrade simultaneously. With complicated data structures like btrees, updates
+ * often need to hold write locks for exclusion with other updates for much
+ * longer than the part where they actually modify data that needs exclusion
+ * from readers.
+ *
+ * Consider a btree node split. The update starts at a leaf node and discovers
+ * it needs to split. Before starting the split, it must acquire a write lock
+ * on the parent node---primarily to avoid deadlocking with other splits. It
+ * needs at least a read lock on the parent to lock the path to the child node,
+ * but it cannot upgrade that read lock to a write lock (to update the parent
+ * with pointers to the new children) because that would deadlock with threads
+ * splitting sibling leaf nodes.
+ *
+ * Intent locks solve this. When doing a split, we acquire an intent lock on
+ * the parent---exclusive locks (for the actual in-memory modification) are
+ * only ever held while modifying in-memory btree contents, which is a much
+ * shorter duration than the entire split operation (which requires waiting for
+ * new nodes to be written to disk). Readers can continue accessing the parent
+ * throughout the split; only the final pointer update requires exclusive
+ * access.
+ *
+ * \paragraph{Parent-child ordering}
+ *
+ * Intent locks with only three states do introduce another potential deadlock:
+ *
+ * \begin{verbatim}
+ *     Thread A                        Thread B
+ *     read            | Parent |      intent
+ *     intent          | Child  |      intent
+ * \end{verbatim}
+ *
+ * Thread B is splitting the child node: it has allocated new nodes and written
+ * them out, and now needs an exclusive lock on the parent to add the new
+ * pointers (after which it will free the old child). Thread A just wants to
+ * insert into the child---it has a read lock on the parent, has looked up the
+ * child node, and is waiting on thread B to get an intent lock on the child.
+ *
+ * But thread A has blocked thread B from taking its exclusive lock on the
+ * parent, and thread B cannot drop its intent lock on the child until after
+ * the new nodes are visible and the old child is freed.
+ *
+ * The solution: we drop read locks on parent nodes \emph{before} taking intent
+ * locks on child nodes. This might cause us to race with the node being freed,
+ * so after grabbing the intent lock we verify the node is still valid and redo
+ * the traversal if necessary.
+ *
+ * \paragraph{Sequence numbers and optimistic relocking}
+ *
+ * SIX locks include embedded sequence numbers, incremented when taking and
+ * releasing exclusive locks (much like seqlocks). This allows us to
+ * aggressively drop locks---we can usually retake the lock by checking the
+ * sequence number rather than redoing the full btree traversal. We also use
+ * this for \texttt{try\_upgrade()}: if we discover we need an intent lock (e.g.
+ * for a split, or because the caller is inserting into a leaf node they did
+ * not get an intent lock for), we can often upgrade without unwinding and
+ * redoing the traversal.
+ *
+ * \paragraph{Cycle detection}
+ *
+ * Bcachefs uses database-style cycle detection to avoid deadlocks entirely.
+ * Before a transaction sleeps waiting on a contended lock, it invokes
+ * \texttt{bch2\_check\_for\_deadlock()}, which walks the graph of transactions
+ * waiting on locks. The algorithm follows the chain of dependencies: for each
+ * lock a transaction holds, check if any other transaction is waiting on that
+ * lock; if so, recursively check what locks \emph{that} transaction holds, and
+ * so on.
+ *
+ * If the walk returns to the original transaction, a cycle exists. One
+ * transaction in the cycle is selected to abort: it releases all its locks and
+ * restarts from the beginning. The transaction layer is designed so that all
+ * operations are idempotent and can be safely restarted at any point.
+ *
+ * This approach eliminates deadlocks entirely and keeps worst-case latency
+ * bounded, at the cost of requiring restartable transactions. The same
+ * restart infrastructure also provides crash resilience: since every operation
+ * can be interrupted and restarted, the filesystem is inherently resilient to
+ * interruption at any point---including during recovery itself.
+ *
+ * The cycle detector runs only when a transaction would block, so it adds no
+ * overhead to the fast path. When cycles are detected, they are broken
+ * immediately rather than timing out, keeping latency predictable.
+ */
+
 #include "bcachefs.h"
 
+#include "btree/bbpos.h"
 #include "btree/cache.h"
 #include "btree/locking.h"
+#include "btree/write.h"
 
 #include "sb/counters.h"
 
 static struct lock_class_key bch2_btree_node_lock_key;
+
+DEFINE_PER_CPU(struct lock_graph, bch2_lock_graph);
+
+void bch2_lock_graph_init_one(struct lock_graph *g)
+{
+	for (unsigned i = 0; i < ARRAY_SIZE(g->g); i++)
+		darray_init(&g->g[i].waitlist);
+}
+
+void bch2_lock_graph_exit_one(struct lock_graph *g)
+{
+	for (unsigned i = 0; i < ARRAY_SIZE(g->g); i++)
+		darray_exit(&g->g[i].waitlist);
+}
+
+int bch2_lock_graph_init(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		bch2_lock_graph_init_one(per_cpu_ptr(&bch2_lock_graph, cpu));
+	return 0;
+}
+
+void bch2_lock_graph_exit(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu)
+		bch2_lock_graph_exit_one(per_cpu_ptr(&bch2_lock_graph, cpu));
+}
 
 void bch2_btree_lock_init(struct btree_bkey_cached_common *b,
 			  enum six_lock_init_flags flags,
@@ -54,26 +185,6 @@ void bch2_btree_node_unlock_write(struct btree_trans *trans,
 
 /* lock */
 
-/*
- * @trans wants to lock @b with type @type
- */
-struct trans_waiting_for_lock {
-	struct btree_trans		*trans;
-	struct btree_bkey_cached_common	*node_want;
-	enum six_lock_type		lock_want;
-
-	/* for iterating over held locks :*/
-	u8				path_idx;
-	u8				level;
-	u64				lock_start_time;
-};
-
-struct lock_graph {
-	struct trans_waiting_for_lock	g[8];
-	unsigned			nr;
-	bool				printed_chain;
-};
-
 static noinline void print_cycle(struct printbuf *out, struct lock_graph *g)
 {
 	struct trans_waiting_for_lock *i;
@@ -107,39 +218,58 @@ static noinline void print_chain(struct printbuf *out, struct lock_graph *g)
 	prt_newline(out);
 }
 
-static void lock_graph_up(struct lock_graph *g)
+static void lock_graph_pop_all(struct lock_graph *g)
 {
-	closure_put(&g->g[--g->nr].trans->ref);
-}
-
-static noinline void lock_graph_pop_all(struct lock_graph *g)
-{
-	while (g->nr)
-		lock_graph_up(g);
+	g->nr = 0;
 }
 
 static noinline void lock_graph_pop_from(struct lock_graph *g, struct trans_waiting_for_lock *i)
 {
-	while (g->g + g->nr > i)
-		lock_graph_up(g);
-}
-
-static void __lock_graph_down(struct lock_graph *g, struct btree_trans *trans)
-{
-	g->g[g->nr++] = (struct trans_waiting_for_lock) {
-		.trans		= trans,
-		.node_want	= trans->locking,
-		.lock_want	= trans->locking_wait.lock_want,
-	};
-	g->printed_chain = false;
+	g->nr = i - g->g;
 }
 
 static void lock_graph_down(struct lock_graph *g, struct btree_trans *trans)
 {
-	closure_get(&trans->ref);
-	__lock_graph_down(g, trans);
+	/*
+	 * Field-by-field init rather than aggregate: we keep waitlist_snap's
+	 * data/size across walks so any grown heap buffer is reused.
+	 */
+	struct trans_waiting_for_lock *top = &g->g[g->nr++];
+
+	top->trans			= trans;
+	top->node_want			= trans->locking;
+	top->lock_want			= READ_ONCE(trans->locking_wait.lock_want);
+	top->level			= 0;
+	top->path_idx			= 0;
+	top->waitlist_idx		= 0;
+	top->node_have			= NULL;
+	top->waitlist.nr		= 0;
+
+	g->printed_chain = false;
+
+	if (unlikely(top > g->g &&
+		     top->node_want != top[-1].node_have))
+		--g->nr;
 }
 
+/*
+ * Revalidate the "who is blocked on whom" chain we've built up in @g before
+ * acting on a suspected cycle.
+ *
+ * Between the time we descended into frame @i and now, @i's trans could have
+ * acquired its lock and moved on (possibly blocked waiting on something else
+ * entirely). Two staleness checks, per frame:
+ *
+ *   - @from->trans->locking != @from->node_want
+ *     @from's trans is no longer waiting for the node we recorded at descent.
+ *
+ *   - i[0].node_have != i[1].node_want
+ *     The parent frame is no longer looking at the node the child frame was
+ *     blocked on - the edge we built between them is stale.
+ *
+ * Either makes the cycle hypothesis invalid; pop from the stale frame down
+ * and let the caller retry.
+ */
 static bool lock_graph_remove_non_waiters(struct lock_graph *g,
 					  struct trans_waiting_for_lock *from)
 {
@@ -150,10 +280,9 @@ static bool lock_graph_remove_non_waiters(struct lock_graph *g,
 		return true;
 	}
 
-	for (i = from + 1; i < g->g + g->nr; i++)
-		if (i->trans->locking != i->node_want ||
-		    i->trans->locking_wait.start_time != i[-1].lock_start_time) {
-			lock_graph_pop_from(g, i);
+	for (i = from ; i + 1 < g->g + g->nr; i++)
+		if (i[0].node_have != i[1].node_want) {
+			lock_graph_pop_from(g, i + 1);
 			return true;
 		}
 
@@ -169,29 +298,40 @@ static void trace_would_deadlock(struct lock_graph *g, struct btree_trans *trans
 	}));
 }
 
-static int abort_lock(struct lock_graph *g, struct trans_waiting_for_lock *i)
+static void wake_up_trans(struct btree_trans *trans)
+{
+	if (closure_get_not_zero(&trans->ref)) {
+		wake_up_process(trans->locking_wait.task);
+		closure_put(&trans->ref);
+	}
+}
+
+static int abort_lock(struct lock_graph *g, struct trans_waiting_for_lock *i,
+		      int err)
 {
 	if (i == g->g) {
 		trace_would_deadlock(g, i->trans);
-		return btree_trans_restart_foreign_task(i->trans,
+		return bch2_trans_restart_foreign_task(i->trans,
 					BCH_ERR_transaction_restart_would_deadlock,
 					_THIS_IP_);
 	} else {
 		i->trans->lock_must_abort = true;
-		wake_up_process(i->trans->locking_wait.task);
+		wake_up_trans(i->trans);
 		return 0;
 	}
 }
 
-static int btree_trans_abort_preference(struct btree_trans *trans)
+static struct trans_waiting_for_lock *
+btree_trans_abort_preference(struct trans_waiting_for_lock *l,
+			     struct trans_waiting_for_lock *r)
 {
-	if (trans->lock_may_not_fail)
-		return 0;
-	if (trans->locking_wait.lock_want == SIX_LOCK_write)
-		return 1;
-	if (!trans->in_traverse_all)
-		return 2;
-	return 3;
+	if (l->trans->lock_may_not_fail !=
+	    r->trans->lock_may_not_fail)
+		return l->trans->lock_may_not_fail ? r : l;
+
+	return time_after64(l->trans->locking_wait.trans_start_time,
+			    r->trans->locking_wait.trans_start_time)
+		? l : r;
 }
 
 static noinline __noreturn void break_cycle_fail(struct lock_graph *g)
@@ -217,10 +357,10 @@ static noinline __noreturn void break_cycle_fail(struct lock_graph *g)
 }
 
 static noinline int break_cycle(struct lock_graph *g, struct printbuf *cycle,
-				struct trans_waiting_for_lock *from)
+				struct trans_waiting_for_lock *from,
+				int err)
 {
 	struct trans_waiting_for_lock *i, *abort = NULL;
-	unsigned best = 0, pref;
 	int ret;
 
 	if (lock_graph_remove_non_waiters(g, from))
@@ -231,18 +371,13 @@ static noinline int break_cycle(struct lock_graph *g, struct printbuf *cycle,
 		print_cycle(cycle, g);
 		ret = -1;
 	} else {
-		for (i = from; i < g->g + g->nr; i++) {
-			pref = btree_trans_abort_preference(i->trans);
-			if (pref > best) {
-				abort = i;
-				best = pref;
-			}
-		}
+		for (i = from; i < g->g + g->nr; i++)
+			abort = !abort ? i : btree_trans_abort_preference(abort, i);
 
-		if (unlikely(!best))
+		if (unlikely(abort->trans->lock_may_not_fail))
 			break_cycle_fail(g);
 
-		ret = abort_lock(g, abort);
+		ret = abort_lock(g, abort, BCH_ERR_transaction_restart_would_deadlock);
 	}
 
 	if (ret)
@@ -252,40 +387,39 @@ static noinline int break_cycle(struct lock_graph *g, struct printbuf *cycle,
 	return ret;
 }
 
-static int lock_graph_descend(struct lock_graph *g, struct btree_trans *trans,
-			      struct printbuf *cycle)
+noinline __cold
+static int lock_graph_recursion_limit(struct lock_graph *g, struct btree_trans *trans,
+				      struct printbuf *cycle)
 {
-	struct btree_trans *orig_trans = g->g->trans;
-
-	for (struct trans_waiting_for_lock *i = g->g; i < g->g + g->nr; i++)
-		if (i->trans == trans) {
-			closure_put(&trans->ref);
-			return break_cycle(g, cycle, i);
-		}
-
-	if (unlikely(g->nr == ARRAY_SIZE(g->g))) {
-		closure_put(&trans->ref);
-
-		if (orig_trans->lock_may_not_fail) {
-			/* Other threads will have to rerun the cycle detector: */
-			for (struct trans_waiting_for_lock *i = g->g + 1; i < g->g + g->nr; i++)
-				wake_up_process(i->trans->locking_wait.task);
-			return 0;
-		}
-
-		lock_graph_pop_all(g);
-
-		if (cycle)
-			return 0;
-
+	if (!cycle)
 		event_inc_trace(trans->c, trans_restart_would_deadlock_recursion_limit, buf, ({
 			guard(printbuf_atomic)(&buf);
 			prt_str(&buf, trans->fn);
 		}));
-		return btree_trans_restart(orig_trans, BCH_ERR_transaction_restart_deadlock_recursion_limit);
+
+	struct btree_trans *orig_trans = g->g->trans;
+
+	if (orig_trans->lock_may_not_fail) {
+		/* Other threads will have to rerun the cycle detector: */
+		for (struct trans_waiting_for_lock *i = g->g + 1; i < g->g + g->nr; i++)
+			wake_up_trans(i->trans);
+		return 0;
 	}
 
-	__lock_graph_down(g, trans);
+	return break_cycle(g, cycle, g->g, BCH_ERR_transaction_restart_deadlock_recursion_limit);
+}
+
+static inline int lock_graph_descend(struct lock_graph *g, struct btree_trans *trans,
+				     struct printbuf *cycle)
+{
+	for (struct trans_waiting_for_lock *i = g->g; i < g->g + g->nr; i++)
+		if (i->trans == trans)
+			return break_cycle(g, cycle, i, BCH_ERR_transaction_restart_would_deadlock);
+
+	if (unlikely(g->nr == ARRAY_SIZE(g->g)))
+		return lock_graph_recursion_limit(g, trans, cycle);
+
+	lock_graph_down(g, trans);
 	return 0;
 }
 
@@ -294,35 +428,57 @@ static bool lock_type_conflicts(enum six_lock_type t1, enum six_lock_type t2)
 	return t1 + t2 > 1;
 }
 
+noinline __cold
+static int waitlist_alloc_failed(struct lock_graph *g, struct printbuf *cycle)
+{
+	struct bch_fs *c = g->g->trans->c;
+
+	if (cycle)
+		return -1;
+
+	event_inc_trace(c, trans_restart_deadlock_waitlist_alloc, buf, ({
+		guard(printbuf_atomic)(&buf);
+		prt_str(&buf, g->g->trans->fn);
+	}));
+
+	return btree_trans_restart(g->g->trans, BCH_ERR_transaction_restart_deadlock_waitlist_alloc);
+}
+
 int bch2_check_for_deadlock(struct btree_trans *trans, struct printbuf *cycle)
 {
-	struct lock_graph g;
-	struct trans_waiting_for_lock *top;
-	struct btree_bkey_cached_common *b;
 	btree_path_idx_t path_idx;
-	int ret = 0;
 
-	g.nr = 0;
+	EBUG_ON(cycle && !cycle->atomic);
+
+	/* trans->paths is rcu protected vs. freeing */
+	guard(rcu)();
+	guard(preempt)();
+
+	struct lock_graph *g = this_cpu_ptr(&bch2_lock_graph);
+	g->nr = 0;
 
 	if (trans->lock_must_abort && !trans->lock_may_not_fail) {
 		if (cycle)
 			return -1;
 
-		trace_would_deadlock(&g, trans);
+		trace_would_deadlock(g, trans);
 		return btree_trans_restart(trans, BCH_ERR_transaction_restart_would_deadlock);
 	}
 
-	lock_graph_down(&g, trans);
-
-	/* trans->paths is rcu protected vs. freeing */
-	guard(rcu)();
-	if (cycle)
-		cycle->atomic++;
+	lock_graph_down(g, trans);
 next:
-	if (!g.nr)
-		goto out;
+	if (!g->nr)
+		return 0;
 
-	top = &g.g[g.nr - 1];
+	struct trans_waiting_for_lock *top = &g->g[g->nr - 1];
+
+	if (top->waitlist_idx < top->waitlist.nr) {
+		try(lock_graph_descend(g, top->waitlist.data[top->waitlist_idx++], cycle));
+
+		goto next;
+	}
+
+	top->waitlist_idx = top->waitlist.nr = 0;
 
 	struct btree_path *paths = rcu_dereference(top->trans->paths);
 	if (!paths)
@@ -339,27 +495,25 @@ next:
 		if (path_idx != top->path_idx) {
 			top->path_idx		= path_idx;
 			top->level		= 0;
-			top->lock_start_time	= 0;
 		}
 
-		for (;
-		     top->level < BTREE_MAX_DEPTH;
-		     top->level++, top->lock_start_time = 0) {
+		while (top->level < BTREE_MAX_DEPTH) {
 			int lock_held = btree_node_locked_type(path, top->level);
 
-			if (lock_held == BTREE_NODE_UNLOCKED)
+			if (lock_held == BTREE_NODE_UNLOCKED) {
+				top->level++;
 				continue;
+			}
 
-			b = &READ_ONCE(path->l[top->level].b)->c;
-
-			if (IS_ERR_OR_NULL(b)) {
+			top->node_have = &READ_ONCE(path->l[top->level].b)->c;
+			if (unlikely(IS_ERR_OR_NULL(top->node_have))) {
 				/*
 				 * If we get here, it means we raced with the
 				 * other thread updating its btree_path
 				 * structures - which means it can't be blocked
 				 * waiting on a lock:
 				 */
-				if (!lock_graph_remove_non_waiters(&g, g.g)) {
+				if (!lock_graph_remove_non_waiters(g, g->g)) {
 					/*
 					 * If lock_graph_remove_non_waiters()
 					 * didn't do anything, it must be
@@ -369,66 +523,213 @@ next:
 					 * aren't actually waiting on anything.
 					 * Just bail out:
 					 */
-					lock_graph_pop_all(&g);
+					lock_graph_pop_all(g);
 				}
 
 				goto next;
 			}
 
-			if (list_empty_careful(&b->lock.wait_list))
-				continue;
+			/*
+			 * Lockless walk of wait_fifo: we're under guard(rcu).
+			 * The fifo is rcu_dereference'd and, on realloc, the old
+			 * buffer is freed via kfree_rcu_mightsleep; trans memory
+			 * is RCU-deferred in bch2_trans_put; and slots only
+			 * transition between NULL and a valid pointer (never torn -
+			 * insert publishes .w via smp_store_release). Per-CPU cache
+			 * reuse inside a grace period can aim us at a reused trans —
+			 * benign, cycles missed this pass are caught next.
+			 *
+			 * Snapshot the conflicting trans pointers into a per-frame
+			 * darray so iteration is stable across concurrent wakeups.
+			 * Heap allocation is GFP_NOWAIT|__GFP_NOWARN (can't sleep
+			 * under rcu+preempt). If growth past the inline buffer
+			 * fails, silently truncating would risk missing a cycle;
+			 * bail out with a dedicated restart type + counter so we
+			 * can tell if this ever actually fires in the wild.
+			 */
+			struct six_lock_wait_fifo *wf =
+				rcu_dereference(top->node_have->lock.wait_fifo);
+			darray_for_each(*wf, i) {
+				/*
+				 * Acquire pairs with the smp_store_release(&.w)
+				 * in six_lock_wait_fifo_insert: orders this slot's
+				 * sibling .start_time read and the container_of(.w)
+				 * -> trans held-lock reads after we observe .w.
+				 */
+				struct six_lock_waiter *w = smp_load_acquire(&i->w);
+				trans = container_of_or_null(w, struct btree_trans, locking_wait);
 
-			raw_spin_lock(&b->lock.wait_lock);
-			list_for_each_entry(trans, &b->lock.wait_list, locking_wait.list) {
-				BUG_ON(b != trans->locking);
-
-				if (top->lock_start_time &&
-				    time_after_eq64(top->lock_start_time, trans->locking_wait.start_time))
-					continue;
-
-				top->lock_start_time = trans->locking_wait.start_time;
-
-				/* Don't check for self deadlock: */
-				if (trans == top->trans ||
-				    !lock_type_conflicts(lock_held, trans->locking_wait.lock_want))
-					continue;
-
-				closure_get(&trans->ref);
-				raw_spin_unlock(&b->lock.wait_lock);
-
-				ret = lock_graph_descend(&g, trans, cycle);
-				if (ret)
-					goto out;
-				goto next;
-
+				if (trans &&
+				    trans != top->trans &&
+				    lock_type_conflicts(lock_held, i->start_time & SIX_LOCK_WANT_MASK)) {
+					if (unlikely(darray_push_gfp(&top->waitlist, trans,
+								     GFP_NOWAIT|__GFP_NOWARN))) {
+						return waitlist_alloc_failed(g, cycle);
+					}
+				}
 			}
-			raw_spin_unlock(&b->lock.wait_lock);
+
+			top->level++;
+
+			if (top->waitlist_idx < top->waitlist.nr)
+				goto next;
 		}
 	}
 up:
 	if (cycle)
-		print_chain(cycle, &g);
-	lock_graph_up(&g);
+		print_chain(cycle, g);
+	--g->nr;
 	goto next;
-out:
-	if (cycle)
-		--cycle->atomic;
-	return ret;
 }
 
-int bch2_six_check_for_deadlock(struct six_lock *lock, void *p)
+static inline struct btree *locking_node(struct six_lock *lock)
 {
-	struct btree_trans *trans = p;
+	struct btree_bkey_cached_common *b = container_of(lock, struct btree_bkey_cached_common, lock);
+	return !b->cached
+		? container_of(b, struct btree, c)
+		: NULL;
+}
+
+static inline bool node_reuse_race(struct btree_trans *trans, struct btree *b)
+{
+	if (trans->locking_hash_val)
+		return trans->locking_hash_val != b->hash_val;
+	else if (trans->locking_root_id != -1)
+		return bch2_btree_id_root_b(trans->c, trans->locking_root_id) != b;
+	else
+		return false;
+}
+
+int bch2_six_check_for_deadlock(struct six_lock *lock, struct six_lock_waiter *w)
+{
+	/*
+	 * Store->load fence: orders publishing ourselves as a waiter (done by
+	 * six_lock_wait_fifo_insert before should_sleep_fn ran) before the two
+	 * reads of shared state that follow. Both are the store-buffer litmus
+	 * test - {publish self; read shared state} racing the mirror op on
+	 * another CPU - and only a full barrier forbids the both-miss outcome.
+	 * smp_rmb() is not enough (it orders load->load, but the publish is a
+	 * store), and the fence cannot fold into the publish as a release: a
+	 * release is one-way, it orders the publish after prior writes but
+	 * can't fence it before these later reads. So one full barrier here,
+	 * serving both reads:
+	 *
+	 *  1. The walk below reads every other waiter. Two waiters closing a
+	 *     cycle each do {publish; look for the other}; both missing means
+	 *     both park with the cycle undetected - and once every participant
+	 *     is parked there is no next lock request, hence no next pass to
+	 *     catch it ("missed this pass, caught next" does not fire). The
+	 *     cycle must be caught on the spot.
+	 *
+	 *  2. The node-reuse check just below reads b->hash_val, pairing with
+	 *     the reclaim side (clear hash_val; smp_mb; six_lock_wakeup_all in
+	 *     bch2_btree_node_transition_state_locked). Both missing means we
+	 *     read a stale-valid hash_val and park on a reused node while the
+	 *     waker misses our just-published entry.
+	 *
+	 * Per-edge ordering - reading a waiter's held-lock state once we
+	 * observe its slot - is the separate smp_store_release(&.w)/
+	 * smp_load_acquire(&.w) pair in the wait_fifo, not this barrier.
+	 */
+	smp_mb();
+
+	/*
+	 * The btree node we're about to sleep on may have been reclaimed/reused
+	 * since the caller picked the lock — the path's b pointer is still
+	 * valid memory, but the identity behind it is gone. Don't sleep on a
+	 * phantom; force a restart so the trans re-traverses to the real
+	 * current node (or learns there isn't one).
+	 *
+	 * Only btree nodes need this: interior updates take node locks
+	 * off-path (e.g. via btree_node_reclaim's six_trylock_intent), so the
+	 * cycle detector can't see the holder. Key cache entries don't have
+	 * that pattern — they're always held via a path the detector walks.
+	 *
+	 * Compare against the hash_val snapshotted at lock-attempt time in
+	 * btree_node_lock_nopath. Checking !hash_val alone is insufficient:
+	 * the node may already have been freed *and* re-hashed to a different
+	 * identity, in which case hash_val is non-zero but ≠ what we wanted.
+	 *
+	 * The store->load ordering against the reclaim side
+	 * (bch2_btree_node_transition_state_locked) is the smp_mb() above,
+	 * point 2.
+	 */
+	struct btree_trans *trans = container_of(w, struct btree_trans, locking_wait);
+	struct btree *b = locking_node(lock);
+	if (b && node_reuse_race(trans, b))
+		return bch_err_throw(trans->c, no_btree_node_reused);
+
+#if defined(__KERNEL__) && !defined(CONFIG_SCHED_ALT)
+	/*
+	 * Wake-CPU hint, set at the moment of sleep: nudge the scheduler
+	 * toward the CPU whose L1/L2 owns this task's shard's btree-node
+	 * working set. Soft — sched is free to override under load; writes
+	 * nothing when already matched. Placed here (vs. trans_begin)
+	 * because select_task_rq_fair() consults wake_cpu only at wakeup,
+	 * so the hint has to survive from the schedule() that follows.
+	 *
+	 * Compiled out under CONFIG_SCHED_ALT (BMQ/PDS): those schedulers
+	 * don't have select_task_rq_fair() and drop task_struct.wake_cpu.
+	 */
+	if (trans->shard_cpu >= 0 &&
+	    trans->shard_cpu != raw_smp_processor_id())
+		WRITE_ONCE(current->wake_cpu, trans->shard_cpu);
+#endif
 
 	return bch2_check_for_deadlock(trans, NULL);
 }
 
-int __bch2_btree_node_lock_write(struct btree_trans *trans, struct btree_path *path,
+/*
+ * Lock a btree node if we already have it locked on one of our linked
+ * iterators:
+ */
+static inline bool btree_node_lock_increment(struct btree_trans *trans,
+					     struct btree_bkey_cached_common *b,
+					     unsigned level,
+					     enum btree_node_locked_type want)
+{
+	struct btree_path *path;
+	unsigned i;
+
+	trans_for_each_path(trans, path, i)
+		if (&path->l[level].b->c == b &&
+		    btree_node_locked_type(path, level) >= want) {
+			six_lock_increment(&b->lock, (enum six_lock_type) want);
+			return true;
+		}
+
+	return false;
+}
+
+int bch2_btree_node_lock_slowpath(struct btree_trans *trans,
+			struct btree_path *path,
+			struct btree_bkey_cached_common *b,
+			unsigned level,
+			enum six_lock_type type)
+{
+	if (!btree_node_lock_increment(trans, b, level, (enum btree_node_locked_type) type)) {
+#ifdef CONFIG_BCACHEFS_LOCK_TIME_STATS
+		u64 contended_start = local_clock();
+#endif
+		int ret = btree_node_lock_nopath(trans, b, type, false,
+						 btree_path_ip_allocated(path), true);
+#ifdef CONFIG_BCACHEFS_LOCK_TIME_STATS
+		__bch2_time_stats_update(&btree_trans_stats(trans)->lock_wait_times,
+					 contended_start, local_clock());
+#endif
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+int bch2_btree_node_lock_write_contended(struct btree_trans *trans, struct btree_path *path,
 				 struct btree_bkey_cached_common *b,
 				 bool lock_may_not_fail)
 {
-	int readers = bch2_btree_node_lock_counts(trans, NULL, b, b->level).n[SIX_LOCK_read];
-	int ret;
+	trans->locking_hash_val = 0;
+	trans->locking_root_id	= -1;
 
 	/*
 	 * Must drop our read locks before calling six_lock_write() -
@@ -436,10 +737,14 @@ int __bch2_btree_node_lock_write(struct btree_trans *trans, struct btree_path *p
 	 * goes to 0, and it's safe because we have the node intent
 	 * locked:
 	 */
-	six_lock_readers_add(&b->lock, -readers);
-	ret = __btree_node_lock_nopath(trans, b, SIX_LOCK_write,
-				       lock_may_not_fail, _RET_IP_);
-	six_lock_readers_add(&b->lock, readers);
+	int readers = bch2_btree_node_lock_counts(trans, NULL, b, b->level).n[SIX_LOCK_read];
+	if (readers)
+		six_lock_readers_add(&b->lock, -readers);
+
+	int ret = btree_node_lock_nopath(trans, b, SIX_LOCK_write,
+					 lock_may_not_fail, _RET_IP_, !readers);
+	if (readers)
+		six_lock_readers_add(&b->lock, readers);
 
 	if (ret)
 		mark_btree_node_locked_noreset(path, b->level, BTREE_NODE_INTENT_LOCKED);
@@ -447,15 +752,84 @@ int __bch2_btree_node_lock_write(struct btree_trans *trans, struct btree_path *p
 	return ret;
 }
 
-void bch2_btree_node_lock_write_nofail(struct btree_trans *trans,
-				       struct btree_path *path,
-				       struct btree_bkey_cached_common *b)
+/*
+ * Lock @b when the caller doesn't already have a path for it: create a
+ * temporary unlocked path, take the lock, then record the lock on the path
+ * so the cycle detector can find us as the holder.
+ *
+ * @hash_val is the node's expected identity — btree_ptr_hash_val() of the key
+ * it was found under, or a snapshot of b->hash_val taken while the pointer
+ * was known valid. It arms the node-reuse check in
+ * bch2_six_check_for_deadlock(): if the identity is gone by the time we'd
+ * sleep, the lock attempt aborts with no_btree_node_reused rather than
+ * parking behind an off-path holder (btree_node_reclaim's trylocks) that may
+ * hold the reused node's lock indefinitely.
+ *
+ * Pass 0 only when reclaim genuinely can't take the node — e.g. the write
+ * completion path, which owns the write_in_flight that blocks reclaim — or
+ * for key cache locks, which the check doesn't cover. Beware flags another
+ * thread can clear: a journal pin doesn't pin (the node can be written and
+ * the pin dropped concurrently), and neither does dirty on its own.
+ *
+ * Caller releases via bch2_btree_node_unlock_with_path().
+ *
+ * May return a transaction_restart; wrap in lockrestart_do().
+ */
+int __must_check
+bch2_btree_node_lock_with_path(struct btree_trans *trans,
+			       struct btree_bkey_cached_common *b,
+			       enum six_lock_type type,
+			       u64 hash_val,
+			       btree_path_idx_t *path_idx_out)
 {
-	int ret = __btree_node_lock_write(trans, path, b, true);
-	BUG_ON(ret);
+	btree_path_idx_t path_idx = bch2_path_get_unlocked_mut(trans,
+				b->btree_id, b->level, btree_node_pos(b), b->cached);
+
+	struct btree_path *path = trans->paths + path_idx;
+	trans->locking_hash_val = hash_val;
+	trans->locking_root_id	= -1;
+	int ret = btree_node_lock(trans, path, b, b->level, type);
+	if (ret) {
+		bch2_path_put(trans, path_idx, true);
+		return ret;
+	}
+
+	mark_btree_node_locked(trans, path, b->level,
+			       (enum btree_node_locked_type) type);
+	path->l[b->level].lock_seq	= six_lock_seq(&b->lock);
+	path->l[b->level].b		= (struct btree *) b;
+
+	*path_idx_out = path_idx;
+	return 0;
 }
 
 /* relock */
+
+static void get_locks_fail_to_text(struct printbuf *out, struct btree_trans *trans,
+				   struct btree_path *old_path,
+				   struct btree_path *path,
+				   struct get_locks_fail *f)
+{
+	bch2_bpos_to_text(out, path->pos);
+	prt_printf(out, " %s l=%u seq=%u node seq=",
+		   bch2_btree_id_str(path->btree_id),
+		   f->l, path->l[f->l].lock_seq);
+	if (IS_ERR_OR_NULL(f->b)) {
+		prt_str(out, bch2_err_str(PTR_ERR(f->b)));
+	} else {
+		prt_printf(out, "%u", f->b->c.lock.seq);
+
+		struct six_lock_count c =
+			bch2_btree_node_lock_counts(trans, NULL, &f->b->c, f->l);
+		prt_printf(out, " self locked %u.%u.%u", c.n[0], c.n[1], c.n[2]);
+
+		c = six_lock_counts(&f->b->c.lock);
+		prt_printf(out, " total locked %u.%u.%u", c.n[0], c.n[1], c.n[2]);
+	}
+
+	prt_newline(out);
+	bch2_btree_path_to_text(out, trans, path - trans->paths, old_path);
+}
 
 static int btree_path_get_locks(struct btree_trans *trans,
 				struct btree_path *path,
@@ -477,10 +851,7 @@ static int btree_path_get_locks(struct btree_trans *trans,
 		l++;
 	} while (l < path->locks_want);
 
-	if (path->uptodate == BTREE_ITER_NEED_RELOCK)
-		path->uptodate = BTREE_ITER_UPTODATE;
-
-	return path->uptodate < BTREE_ITER_NEED_RELOCK ? 0 : -1;
+	return 0;
 err:
 	if (f) {
 		f->l	= l;
@@ -500,7 +871,6 @@ err:
 	}
 
 	__bch2_btree_path_unlock(trans, path);
-	btree_path_set_dirty(trans, path, BTREE_ITER_NEED_TRAVERSE);
 
 	/*
 	 * When we fail to get a lock, we have to ensure that any child nodes
@@ -553,10 +923,10 @@ bool bch2_btree_node_upgrade(struct btree_trans *trans,
 
 	switch (btree_lock_want(path, level)) {
 	case BTREE_NODE_UNLOCKED:
-		BUG_ON(btree_node_locked(path, level));
+		EBUG_ON(btree_node_locked(path, level));
 		return true;
 	case BTREE_NODE_READ_LOCKED:
-		BUG_ON(btree_node_intent_locked(path, level));
+		EBUG_ON(btree_node_intent_locked(path, level));
 		return bch2_btree_node_relock(trans, path, level);
 	case BTREE_NODE_INTENT_LOCKED:
 		break;
@@ -593,33 +963,6 @@ success:
 
 /* Btree path locking: */
 
-/*
- * Only for btree_cache.c - only relocks intent locks
- */
-int bch2_btree_path_relock_intent(struct btree_trans *trans,
-				  struct btree_path *path)
-{
-	unsigned l;
-
-	for (l = path->level;
-	     l < path->locks_want && btree_path_node(path, l);
-	     l++) {
-		if (!bch2_btree_node_relock(trans, path, l)) {
-			__bch2_btree_path_unlock(trans, path);
-			btree_path_set_dirty(trans, path, BTREE_ITER_NEED_TRAVERSE);
-
-			event_inc_trace(trans->c, trans_restart_relock_path_intent, buf, ({
-				prt_printf(&buf, "%s\n", trans->fn);
-				bch2_btree_path_to_text(&buf, trans, path - trans->paths, path);
-			}));
-
-			return btree_trans_restart(trans, BCH_ERR_transaction_restart_relock_path_intent);
-		}
-	}
-
-	return 0;
-}
-
 __flatten
 bool bch2_btree_path_relock_norestart(struct btree_trans *trans, struct btree_path *path)
 {
@@ -628,18 +971,38 @@ bool bch2_btree_path_relock_norestart(struct btree_trans *trans, struct btree_pa
 	return ret;
 }
 
-int __bch2_btree_path_relock(struct btree_trans *trans,
-			struct btree_path *path, unsigned long trace_ip)
+noinline __cold
+static int bch2_btree_path_relock_trace(struct btree_trans *trans, struct btree_path *path)
 {
-	if (!bch2_btree_path_relock_norestart(trans, path)) {
+	struct get_locks_fail f;
+	struct btree_path old_path = *path;
+	int ret = 0;
+
+	if (btree_path_get_locks(trans, path, false, &f, 0)) {
 		event_inc_trace(trans->c, trans_restart_relock_path, buf, ({
 			prt_printf(&buf, "%s\n", trans->fn);
-			bch2_btree_path_to_text(&buf, trans, path - trans->paths, path);
+			get_locks_fail_to_text(&buf, trans, &old_path, path, &f);
 		}));
-		return btree_trans_restart(trans, BCH_ERR_transaction_restart_relock_path);
+		ret = btree_trans_restart(trans, BCH_ERR_transaction_restart_relock_path);
 	}
 
-	return 0;
+	bch2_trans_verify_locks(trans);
+	return ret;
+}
+
+int __bch2_btree_path_relock(struct btree_trans *trans, struct btree_path *path)
+{
+	if (unlikely(trace_trans_restart_relock_path_enabled()))
+		return bch2_btree_path_relock_trace(trans, path);
+
+	int ret = 0;
+	if (btree_path_get_locks(trans, path, false, NULL, 0)) {
+		event_inc(trans->c, trans_restart_relock_path);
+		ret = btree_trans_restart(trans, BCH_ERR_transaction_restart_relock_path);
+	}
+
+	bch2_trans_verify_locks(trans);
+	return ret;
 }
 
 bool __bch2_btree_path_upgrade_norestart(struct btree_trans *trans,
@@ -711,17 +1074,27 @@ int __bch2_btree_path_upgrade(struct btree_trans *trans,
 	event_inc_trace(trans->c, trans_restart_upgrade, buf, ({
 		prt_printf(&buf, "%s\n", trans->fn);
 		prt_printf(&buf, "%s %pS\n", trans->fn, (void *) _RET_IP_);
-		prt_printf(&buf, "btree %s pos\n", bch2_btree_id_str(path->btree_id));
-		bch2_bpos_to_text(&buf, path->pos);
+		bch2_bbpos_to_text(&buf, BBPOS(path->btree_id, path->pos));
+		prt_newline(&buf);
 		prt_printf(&buf, "locks want %u -> %u level %u\n",
 			   old_locks_want, new_locks_want, f.l);
 		prt_printf(&buf, "nodes_locked %x -> %x\n",
 			   old_locks, path->nodes_locked);
 		prt_printf(&buf, "node %s ", IS_ERR(f.b) ? bch2_err_str(PTR_ERR(f.b)) :
 			   !f.b ? "(null)" : "(node)");
-		prt_printf(&buf, "path seq %u node seq %u\n",
+		prt_printf(&buf, "path seq %u node seq %u",
 			   IS_ERR_OR_NULL(f.b) ? 0 : f.b->c.lock.seq,
 			   path->l[f.l].lock_seq);
+
+		if (!IS_ERR_OR_NULL(f.b)) {
+			struct six_lock_count c = six_lock_counts(&f.b->c.lock);
+			prt_printf(&buf, " locked %u.%u.%u", c.n[0], c.n[1], c.n[2]);
+		}
+		prt_printf(&buf, "\npath idx %zu", path - trans->paths);
+#ifdef TRACK_PATH_ALLOCATED
+		prt_printf(&buf, " allocated: %ps", (void *) path->ip_allocated);
+#endif
+		prt_newline(&buf);
 	}));
 out:
 	bch2_trans_verify_locks(trans);
@@ -732,7 +1105,9 @@ void __bch2_btree_path_downgrade(struct btree_trans *trans,
 				 struct btree_path *path,
 				 unsigned new_locks_want)
 {
-	unsigned l, old_locks_want = path->locks_want;
+#ifdef CONFIG_BCACHEFS_DEBUG
+	unsigned old_locks_want = path->locks_want;
+#endif
 
 	if (trans->restarted)
 		return;
@@ -741,6 +1116,7 @@ void __bch2_btree_path_downgrade(struct btree_trans *trans,
 
 	path->locks_want = new_locks_want;
 
+	unsigned l;
 	while (path->nodes_locked &&
 	       (l = btree_path_highest_level_locked(path)) >= path->locks_want) {
 		if (l > path->level) {
@@ -755,12 +1131,13 @@ void __bch2_btree_path_downgrade(struct btree_trans *trans,
 	}
 
 	bch2_btree_path_verify_locks(trans, path);
-
+#ifdef CONFIG_BCACHEFS_DEBUG
 	event_trace(trans->c, path_downgrade, buf, ({
 		prt_printf(&buf, "%s\n", trans->fn);
 		prt_printf(&buf, "old locks_want: %u\n", old_locks_want);
 		bch2_btree_path_to_text(&buf, trans, path - trans->paths, path);
 	}));
+#endif
 }
 
 /* Btree transaction locking: */
@@ -785,16 +1162,56 @@ static inline void __bch2_trans_unlock(struct btree_trans *trans)
 
 	trans_for_each_path(trans, path, i)
 		__bch2_btree_path_unlock(trans, path);
+
+	/*
+	 * All locks dropped: submit any btree node writes queued in this
+	 * trans's context.
+	 */
+	if (unlikely(trans->queued_write_bios))
+		bch2_trans_submit_write_bios(trans);
 }
 
-static inline int __bch2_trans_relock(struct btree_trans *trans, bool trace, ulong ip)
+noinline __cold
+static int bch2_trans_relock_trace(struct btree_trans *trans)
+{
+	struct btree_path *path;
+	unsigned i;
+
+	trans_for_each_path(trans, path, i) {
+		if (!path->should_be_locked)
+			continue;
+
+		struct get_locks_fail f;
+		struct btree_path old_path = *path;
+		int ret = btree_path_get_locks(trans, path, false, &f,
+					       BCH_ERR_transaction_restart_relock);
+		if (ret) {
+			event_inc_trace(trans->c, trans_restart_relock, buf, ({
+				prt_printf(&buf, "%s\n", trans->fn);
+				get_locks_fail_to_text(&buf, trans, &old_path, path, &f);
+			}));
+
+			__bch2_trans_unlock(trans);
+			bch2_trans_verify_locks(trans);
+			return ret;
+		}
+	}
+
+	trans_set_locked(trans, true);
+	/* Fresh locked section — re-arm the srcu-held-too-long warning. */
+	trans->srcu_io_submitted = false;
+	bch2_trans_verify_locks(trans);
+	return 0;
+}
+
+int __bch2_trans_relock(struct btree_trans *trans, bool trace)
 {
 	bch2_trans_verify_locks(trans);
 
 	if (unlikely(trans->restarted))
 		return -((int) trans->restarted);
-	if (unlikely(trans->locked))
-		goto out;
+	if (unlikely(trace_trans_restart_relock_enabled() && trace))
+		return bch2_trans_relock_trace(trans);
 
 	struct btree_path *path;
 	unsigned i;
@@ -803,66 +1220,27 @@ static inline int __bch2_trans_relock(struct btree_trans *trans, bool trace, ulo
 		if (!path->should_be_locked)
 			continue;
 
-		if (likely(!trace_trans_restart_relock_enabled() || !trace)) {
-			int ret = btree_path_get_locks(trans, path, false, NULL,
-						       BCH_ERR_transaction_restart_relock);
-			if (ret) {
-				if (trace)
-					event_inc(trans->c, trans_restart_relock);
-				__bch2_trans_unlock(trans);
-				bch2_trans_verify_locks(trans);
-				return ret;
-			}
-		} else {
-			struct get_locks_fail f;
-			struct btree_path old_path = *path;
-			int ret = btree_path_get_locks(trans, path, false, &f,
-						       BCH_ERR_transaction_restart_relock);
-			if (ret) {
-				event_inc_trace(trans->c, trans_restart_relock, buf, ({
-					prt_printf(&buf, "%s\n", trans->fn);
-					bch2_bpos_to_text(&buf, path->pos);
-					prt_printf(&buf, " %s l=%u seq=%u node seq=",
-						   bch2_btree_id_str(path->btree_id),
-						   f.l, path->l[f.l].lock_seq);
-					if (IS_ERR_OR_NULL(f.b)) {
-						prt_str(&buf, bch2_err_str(PTR_ERR(f.b)));
-					} else {
-						prt_printf(&buf, "%u", f.b->c.lock.seq);
-
-						struct six_lock_count c =
-							bch2_btree_node_lock_counts(trans, NULL, &f.b->c, f.l);
-						prt_printf(&buf, " self locked %u.%u.%u", c.n[0], c.n[1], c.n[2]);
-
-						c = six_lock_counts(&f.b->c.lock);
-						prt_printf(&buf, " total locked %u.%u.%u", c.n[0], c.n[1], c.n[2]);
-					}
-
-					prt_newline(&buf);
-					bch2_btree_path_to_text(&buf, trans, path - trans->paths, &old_path);
-				}));
-
-				__bch2_trans_unlock(trans);
-				bch2_trans_verify_locks(trans);
-				return ret;
-			}
+		int ret = btree_path_get_locks(trans, path, false, NULL,
+					       BCH_ERR_transaction_restart_relock);
+		if (ret) {
+			if (trace)
+				event_inc(trans->c, trans_restart_relock);
+			__bch2_trans_unlock(trans);
+			bch2_trans_verify_locks(trans);
+			return ret;
 		}
 	}
 
 	trans_set_locked(trans, true);
-out:
+	/* Fresh locked section — re-arm the srcu-held-too-long warning. */
+	trans->srcu_io_submitted = false;
 	bch2_trans_verify_locks(trans);
 	return 0;
 }
 
-int bch2_trans_relock(struct btree_trans *trans)
-{
-	return __bch2_trans_relock(trans, true, _RET_IP_);
-}
-
 int bch2_trans_relock_notrace(struct btree_trans *trans)
 {
-	return __bch2_trans_relock(trans, false, _RET_IP_);
+	return __bch2_trans_relock(trans, false);
 }
 
 void bch2_trans_unlock(struct btree_trans *trans)
@@ -870,12 +1248,64 @@ void bch2_trans_unlock(struct btree_trans *trans)
 	trans_set_unlocked(trans);
 
 	__bch2_trans_unlock(trans);
+
+	/*
+	 * Drop the btree cache cannibalize lock too. Holding it across a
+	 * trans_unlock - i.e. across a sleep - is the recipe for a resource
+	 * deadlock: cannibalize-holder sleeps waiting on the allocator,
+	 * allocator needs to grow the btree cache, growing the cache needs
+	 * cannibalize, but we're holding it. Releasing on trans_unlock means
+	 * cannibalize is only held over non-sleeping critical sections;
+	 * callers that need it after a wake re-acquire normally.
+	 */
+	if (unlikely(trans->btree_cache_cannibalize_locked))
+		bch2_btree_cache_cannibalize_unlock(trans);
+}
+
+/*
+ * Slow devices legitimately hold the srcu lock across submit_bio() for a long
+ * time (e.g. scanning the inodes btree off a slow disk during snapshot
+ * deletion), so scale the "held too long" warning past the worst observed
+ * device latency rather than spamming the log when the real problem is just
+ * slow storage. The lock is held over btree node reads on any online device,
+ * so that's the latency we key off.
+ */
+static unsigned long srcu_hold_warn_thresh(struct bch_fs *c)
+{
+	return max(bch2_dev_latency_max(c, &c->devs_online, READ) * 2, HZ * 10UL);
 }
 
 void bch2_trans_unlock_long(struct btree_trans *trans)
 {
 	bch2_trans_unlock(trans);
-	bch2_trans_srcu_unlock(trans);
+	trans_enable_migrate(trans);
+
+	if (trans->srcu_held) {
+		struct bch_fs *c = trans->c;
+		struct btree_path *path;
+		unsigned i;
+
+		trans_for_each_path(trans, path, i)
+			if (path->cached && !btree_node_locked(path, 0))
+				path->l[0].b = ERR_PTR(-BCH_ERR_no_btree_node_srcu_reset);
+
+		if (unlikely(trans->srcu_held &&
+			     !trans->srcu_io_submitted &&
+			     time_after(jiffies, trans->srcu_lock_time + HZ * 10) &&
+			     time_after(jiffies, trans->srcu_lock_time +
+					srcu_hold_warn_thresh(c)))) {
+			CLASS(bch_log_msg_ratelimited, msg)(c);
+
+			prt_printf(&msg.m, "btree trans held srcu lock (delaying memory reclaim) for %lu seconds\n",
+				   (jiffies - trans->srcu_lock_time) / HZ);
+			bch2_sb_recent_counters_to_text(&msg.m, &trans->c->counters);
+
+			bch2_prt_task_backtrace(&msg.m, current, 1, GFP_KERNEL);
+		}
+
+		srcu_read_unlock(&c->btree.trans.barrier, trans->srcu_idx);
+		trans->srcu_held = false;
+	}
 }
 
 void bch2_trans_unlock_write(struct btree_trans *trans)
@@ -909,7 +1339,6 @@ void __bch2_btree_path_verify_locks(struct btree_trans *trans, struct btree_path
 		 * there is no node at path->level, which generally means we were
 		 * iterating over all nodes and got to the end of the btree
 		 */
-		BUG_ON(path->uptodate == BTREE_ITER_UPTODATE);
 		BUG_ON(path->should_be_locked && trans->locked && !trans->restarted);
 	}
 

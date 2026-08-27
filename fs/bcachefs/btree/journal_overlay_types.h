@@ -49,6 +49,7 @@ struct journal_keys {
 	/* must match layout in darray_types.h */
 	size_t			nr, size;
 	struct journal_key	*data;
+	struct journal_key	preallocated[0];
 	/*
 	 * Gap buffer: instead of all the empty space in the array being at the
 	 * end of the buffer - from @nr to @size - the empty space is at @gap.
@@ -57,6 +58,14 @@ struct journal_keys {
 	size_t			gap;
 	atomic_t		ref;
 	bool			initial_ref_held;
+
+	/*
+	 * Keys inserted before journal_keys_sort() (e.g. from
+	 * bch2_dev_usage_init during offline device add). These survive
+	 * the reset in journal_keys_sort and get merged into the main
+	 * array after sorting.
+	 */
+	DARRAY(struct journal_key) pre_sort;
 
 	struct mutex		overwrite_lock;
 	DARRAY(struct journal_key_range_overwritten) overwrites;

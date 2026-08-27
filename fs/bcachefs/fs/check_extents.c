@@ -63,6 +63,8 @@ static int check_i_sectors_notnested(struct btree_trans *trans, struct inode_wal
 			bch2_inum_snapshot_to_path(trans,
 						   i->inode.bi_inum,
 						   i->inode.bi_snapshot, NULL, &buf));
+		prt_newline(&buf);
+		bch2_inode_unpacked_to_text(&buf, &i->inode);
 
 		count2 = bch2_count_inode_sectors(trans, w->last_pos.inode, i->inode.bi_snapshot);
 
@@ -93,9 +95,18 @@ fsck_err:
 
 static int check_i_sectors(struct btree_trans *trans, struct inode_walker *w)
 {
+	/*
+	 * Counting i_sectors spans too many extents to fit one transaction, so
+	 * this is a nested transaction: the inner commits (bch2_fsck_write_inode)
+	 * discard the fsck_err logs queued here and we return a restart. Exempt
+	 * those begins from the dropped-updates warning for the duration.
+	 */
 	u32 restart_count = trans->restart_count;
-	return check_i_sectors_notnested(trans, w) ?:
-		trans_was_restarted(trans, restart_count);
+	trans->begin_may_drop_updates = true;
+	int ret = check_i_sectors_notnested(trans, w);
+	trans->begin_may_drop_updates = false;
+
+	return ret ?: trans_was_restarted(trans, restart_count);
 }
 
 struct extent_end {
@@ -172,14 +183,13 @@ static int overlapping_extents_found(struct btree_trans *trans,
 {
 	struct bch_fs *c = trans->c;
 	CLASS(printbuf, buf)();
-	int ret = 0;
 
 	BUG_ON(bkey_le(pos1, bkey_start_pos(&pos2)));
 
 	CLASS(btree_iter, iter1)(trans, btree, pos1,
 				 BTREE_ITER_all_snapshots|
 				 BTREE_ITER_not_extents);
-	struct bkey_s_c k1 = bkey_try(bch2_btree_iter_peek_max(&iter1, POS(pos1.inode, U64_MAX)));
+	struct bkey_s_c k1 = bkey_try(bch2_btree_iter_peek_max(&iter1, &POS(pos1.inode, U64_MAX)));
 
 	prt_printf(&buf, "overlapping extents in ");
 	try(bch2_inum_snapshot_to_path(trans, pos1.inode,
@@ -204,7 +214,7 @@ static int overlapping_extents_found(struct btree_trans *trans,
 	struct bkey_s_c k2;
 	do {
 		bch2_btree_iter_advance(&iter2);
-		k2 = bkey_try(bch2_btree_iter_peek_max(&iter2, POS(pos1.inode, U64_MAX)));
+		k2 = bkey_try(bch2_btree_iter_peek_max(&iter2, &POS(pos1.inode, U64_MAX)));
 	} while (bpos_lt(k2.k->p, pos2.p));
 
 	prt_newline(&buf);
@@ -217,22 +227,34 @@ static int overlapping_extents_found(struct btree_trans *trans,
 		return bch_err_throw(c, internal_fsck_err);
 	}
 
-	prt_printf(&buf, "\noverwriting %s extent",
-		   pos1.snapshot >= pos2.p.snapshot ? "first" : "second");
+	bool first = (k1.k->type == KEY_TYPE_extent_whiteout ||
+		      k2.k->type == KEY_TYPE_extent_whiteout)
+		? k1.k->type == KEY_TYPE_extent_whiteout
+		: pos1.snapshot >= pos2.p.snapshot;
 
-	if (fsck_err(trans, extent_overlapping, "%s", buf.buf)) {
+	prt_printf(&buf, "\noverwriting %s extent", first ? "first" : "second");
+
+	if (ret_inode_fsck_err(trans, k1.k->p,
+			       extent_overlapping, "%s", buf.buf)) {
 		struct btree_iter *old_iter = &iter1;
 
-		if (pos1.snapshot < pos2.p.snapshot) {
+		if (!first) {
 			old_iter = &iter2;
 			swap(k1, k2);
 		}
 
-		trans->extra_disk_res += bch2_bkey_sectors_compressed(c, k2);
+		if (k1.k->type == KEY_TYPE_extent_whiteout) {
+			struct bkey_i *n = errptr_try(bch2_bkey_make_mut(trans,
+								old_iter, &k1,
+								BTREE_UPDATE_internal_snapshot_node));
+			n->k.type = KEY_TYPE_whiteout;
+		} else {
+			trans->extra_disk_res += bch2_bkey_durability_safe(c, k2).sectors_compressed;
 
-		try(bch2_trans_update_extent_overwrite(trans, old_iter,
-					BTREE_UPDATE_internal_snapshot_node,
-					k1, k2));
+			try(bch2_trans_update_extent_overwrite(trans, old_iter,
+						BTREE_UPDATE_internal_snapshot_node,
+						k1, k2));
+		}
 		try(bch2_trans_commit(trans, res, NULL, BCH_TRANS_COMMIT_no_enospc));
 
 		*fixed = true;
@@ -247,17 +269,17 @@ static int overlapping_extents_found(struct btree_trans *trans,
 			/*
 			 * We overwrote the first extent in pos2's snapshot:
 			 */
-			ret = snapshots_seen_add_inorder(c, pos1_seen, pos2.p.snapshot);
+			try(snapshots_seen_add_inorder(c, pos1_seen, pos2.p.snapshot));
 		} else {
 			/*
 			 * We overwrote the second extent - restart
 			 * check_extent() from the top:
 			 */
-			ret = bch_err_throw(c, transaction_restart_nested);
+			return bch_err_throw(c, transaction_restart_nested);
 		}
 	}
-fsck_err:
-	return ret;
+
+	return 0;
 }
 
 static int check_overlapping_extents(struct btree_trans *trans,
@@ -374,14 +396,17 @@ static int check_extent(struct btree_trans *trans, struct btree_iter *iter,
 					i->inode.bi_inum, i->inode.bi_snapshot, i->inode.bi_size,
 					(bch2_bkey_val_to_text(&buf, c, k), buf.buf))) {
 				try(snapshots_seen_add_inorder(c, s, i->inode.bi_snapshot));
+
+				/*
+				 * fpunch_snapshot() commits internally, so it
+				 * always returns transaction_restart_nested —
+				 * this try() never falls through
+				 */
 				try(bch2_fpunch_snapshot(trans,
 							 SPOS(i->inode.bi_inum,
 							      last_block,
 							      i->inode.bi_snapshot),
 							 POS(i->inode.bi_inum, U64_MAX)));
-
-				iter->k.type = KEY_TYPE_whiteout;
-				break;
 			}
 		}
 	}
@@ -425,14 +450,29 @@ int bch2_check_extents(struct bch_fs *c)
 	struct progress_indicator progress;
 	bch2_progress_init(&progress, __func__, c, BIT_ULL(BTREE_ID_extents), 0);
 
-	return for_each_btree_key(trans, iter, BTREE_ID_extents,
+	int ret = for_each_btree_key(trans, iter, BTREE_ID_extents,
 				POS(BCACHEFS_ROOT_INO, 0),
 				BTREE_ITER_prefetch|BTREE_ITER_all_snapshots, k, ({
 		bch2_disk_reservation_put(c, &res.r);
 		bch2_progress_update_iter(trans, &progress, &iter) ?:
 		check_extent(trans, &iter, k, &w, &s, &extent_ends, &res.r);
-	})) ?:
-	check_i_sectors_notnested(trans, &w);
+	}));
+	if (!ret) {
+		/*
+		 * Final flush of the last inode's i_sectors. The inner
+		 * fsck_write_inode() commits must be exempt from the trans_begin
+		 * dropped-updates warning, so set begin_may_drop_updates as
+		 * check_i_sectors() does - but call _notnested directly, NOT the
+		 * nested check_i_sectors(): that returns trans_was_restarted()
+		 * for an in-loop caller to retry on, and at this post-loop flush
+		 * the restart has no handler and faults recovery (it broke every
+		 * transaction-restart-injection test).
+		 */
+		trans->begin_may_drop_updates = true;
+		ret = check_i_sectors_notnested(trans, &w);
+		trans->begin_may_drop_updates = false;
+	}
+	return ret;
 }
 
 int bch2_check_indirect_extents(struct bch_fs *c)

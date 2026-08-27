@@ -15,6 +15,7 @@
 #include "data/ec/init.h"
 #include "data/ec/io.h"
 #include "data/ec/trigger.h"
+#include "data/reconcile/trigger.h"
 
 #include "init/error.h"
 
@@ -22,21 +23,48 @@ int bch2_invalidate_stripe_to_dev(struct btree_trans *trans,
 				  struct btree_iter *iter,
 				  struct bkey_s_c k,
 				  unsigned dev_idx,
-				  unsigned flags, struct printbuf *err)
+				  unsigned flags, struct printbuf *err,
+				  bool *had_open)
 {
 	if (k.k->type != KEY_TYPE_stripe)
 		return 0;
 
 	struct bch_fs *c = trans->c;
+
+	/*
+	 * An open stripe is being rewritten by the EC machinery - typically
+	 * the reconcile create that an earlier invalidate pass provoked by
+	 * setting needs_reconcile. That create owns the stripe's blocks,
+	 * including their buckets' gens: invalidating out from under it
+	 * means its in-flight reads, validated against the old key, see
+	 * stale pointers (stripe_read_ptr_stale, an alloc inconsistency).
+	 * Skip - the create rewrites the stripe without the dying device,
+	 * and the data-drop scan retries until the device is empty.
+	 *
+	 * Important: check stripe_is_open with the stripe key intent-locked
+	 * (both callers' iterators), same discipline as ec_stripe_delete() -
+	 * otherwise a create can open the stripe and load the pre-update key
+	 * between our check and commit.
+	 */
+	if (bch2_stripe_is_open(c, k.k->p.offset)) {
+		*had_open = true;
+		return 0;
+	}
+
 	struct bkey_i_stripe *s =
 		errptr_try(bch2_bkey_make_mut_typed(trans, iter, &k, 0, stripe));
 
-	struct disk_accounting_pos acc;
+	struct bch_inode_opts opts;
+	bch2_inode_opts_get(c, &opts, false);
+	try(bch2_bkey_set_needs_reconcile(trans, NULL, &opts, bkey_i_to_s(&s->k_i),
+					  s->k.u64s,
+					  SET_NEEDS_RECONCILE_opt_change, 0));
 
 	s64 sectors = 0;
 	for (unsigned i = 0; i < s->v.nr_blocks; i++)
 		sectors -= stripe_blockcount_get(&s->v, i);
 
+	struct disk_accounting_pos acc;
 	memset(&acc, 0, sizeof(acc));
 	acc.type = BCH_DISK_ACCOUNTING_replicas;
 	bch2_bkey_to_replicas(c, &acc.replicas, bkey_i_to_s_c(&s->k_i));
@@ -44,8 +72,6 @@ int bch2_invalidate_stripe_to_dev(struct btree_trans *trans,
 	try(bch2_disk_accounting_mod(trans, &acc, &sectors, 1, false));
 
 	struct bkey_ptrs ptrs = bch2_bkey_ptrs(bkey_i_to_s(&s->k_i));
-
-	/* XXX: how much redundancy do we still have? check degraded flags */
 
 	unsigned nr_good = 0;
 
@@ -85,26 +111,58 @@ int bch2_invalidate_stripe_to_dev(struct btree_trans *trans,
 
 static int bch2_invalidate_stripe_to_dev_from_alloc(struct btree_trans *trans,
 						    unsigned dev_idx, u64 stripe_idx,
-						    unsigned flags, struct printbuf *err)
+						    unsigned flags, struct printbuf *err,
+						    bool *had_open)
 {
-	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, POS(0, stripe_idx), 0);
-	struct bkey_s_c_stripe s = bkey_try(bch2_bkey_get_typed(&iter, stripe));
+	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, POS(0, stripe_idx),
+				BTREE_ITER_intent);
+	/*
+	 * Raw peek, not get_typed: the stripe may have been deleted since the
+	 * bucket_to_stripe scan (the flush in our caller lets creates finish,
+	 * and stripe reshape deletes the old idx) - a vanished stripe no
+	 * longer references the device, which is success, not an error.
+	 * bch2_invalidate_stripe_to_dev() returns 0 for non-stripe keys.
+	 */
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 
-	return bch2_invalidate_stripe_to_dev(trans, &iter, s.s_c, dev_idx, flags, err);
+	return bch2_invalidate_stripe_to_dev(trans, &iter, k, dev_idx, flags, err, had_open);
 }
 
 int bch2_dev_remove_stripes(struct bch_fs *c, unsigned dev_idx,
 			    unsigned flags, struct printbuf *err)
 {
 	CLASS(btree_trans, trans)(c);
-	int ret = for_each_btree_key_max_commit(trans, iter,
-				  BTREE_ID_bucket_to_stripe,
-				  POS(bucket_to_u64(POS(dev_idx, 0)), 0),
-				  POS(bucket_to_u64(POS(dev_idx, U64_MAX)), U64_MAX),
-				  BTREE_ITER_intent, k,
-				  NULL, NULL, 0, ({
-		bch2_invalidate_stripe_to_dev_from_alloc(trans, dev_idx, k.k->p.offset, flags, err);
-	}));
+	int ret = 0;
+
+	/*
+	 * Open stripes are skipped - the EC machinery owns their migration -
+	 * so flush in-flight creates and retry until a pass encounters none,
+	 * or we'd return with stripes still pointing at the device.
+	 */
+	unsigned max_iter = 10, i;
+	for (i = 0; i < max_iter; i++) {
+		bool had_open = false;
+
+		ret = for_each_btree_key_max_commit(trans, iter,
+					  BTREE_ID_bucket_to_stripe,
+					  POS(bucket_to_u64(POS(dev_idx, 0)), 0),
+					  POS(bucket_to_u64(POS(dev_idx, U64_MAX)), U64_MAX),
+					  BTREE_ITER_intent, k,
+					  NULL, NULL, 0, ({
+			bch2_invalidate_stripe_to_dev_from_alloc(trans, dev_idx, k.k->p.offset,
+								 flags, err, &had_open);
+		}));
+		if (ret || !had_open)
+			goto out;
+
+		bch2_trans_unlock(trans);
+		bch2_fs_ec_flush_outstanding(c);
+	}
+
+	prt_printf(err, "%s(): stripes still open after %u iterations\n",
+		   __func__, i);
+	ret = bch_err_throw(c, remove_stripes_did_not_terminate);
+out:
 	bch_err_fn(c, ret);
 	return ret;
 }
@@ -116,12 +174,24 @@ static bool should_cancel_stripe(struct bch_fs *c, struct ec_stripe_new *s, stru
 	if (!ca)
 		return true;
 
-	for (unsigned i = 0; i < s->new_stripe.key.v.nr_blocks; i++) {
-		if (!s->blocks[i])
-			continue;
+	struct bch_stripe *v = &s->new_stripe.key.v;
 
-		struct open_bucket *ob = c->allocator.open_buckets + s->blocks[i];
-		if (ob->dev == ca->dev_idx)
+	for (unsigned i = 0; i < v->nr_blocks; i++) {
+		/* Freshly allocated block - check the open_bucket's device: */
+		if (s->blocks[i]) {
+			struct open_bucket *ob = c->allocator.open_buckets + s->blocks[i];
+			if (ob->dev == ca->dev_idx)
+				return true;
+		}
+
+		/*
+		 * Reused block from an existing stripe: init_new_stripe_from_old()
+		 * copies the old ptr directly into new_stripe.key.v.ptrs[i] and
+		 * doesn't populate s->blocks[i], so we have to check the key's
+		 * ptrs explicitly for the reuse path.
+		 */
+		if (test_bit(i, s->blocks_allocated) &&
+		    v->ptrs[i].dev == ca->dev_idx)
 			return true;
 	}
 
@@ -163,6 +233,41 @@ void bch2_fs_ec_flush(struct bch_fs *c)
 	wait_event(c->ec.stripe_new_wait, bch2_fs_ec_flush_done(c));
 }
 
+static bool bch2_fs_ec_flush_outstanding_done(struct bch_fs *c, u64 wait_seq)
+{
+	sched_annotate_sleep();
+
+	guard(mutex)(&c->ec.stripe_new_lock);
+	struct ec_stripe_new *s;
+	list_for_each_entry(s, &c->ec.stripe_new_list, list)
+		/*
+		 * seq == 0: stripe still has writes in flight (accumulating).
+		 * seq is assigned when STRIPE_REF_io hits zero, which is the
+		 * point at which the stripe is ready to commit. We only wait
+		 * for stripes that reached commit-ready before our snapshot
+		 * — accumulating stripes either complete after us (new seq >
+		 * wait_seq, skipped) or get cancelled via their io_refs,
+		 * which we shouldn't block on from under state_lock.
+		 */
+		if (s->seq && s->seq <= wait_seq)
+			return false;
+	return true;
+}
+
+/*
+ * Wait for all stripe_new entries that had transitioned to commit-ready
+ * (STRIPE_REF_io drained, seq assigned) at call time to finish committing.
+ * Accumulating-write stripes (seq == 0) are skipped — they must be cancelled
+ * by the caller's own teardown path (e.g. bch2_ec_stop_dev) before this call
+ * so their writers drop refs.
+ */
+void bch2_fs_ec_flush_outstanding(struct bch_fs *c)
+{
+	u64 wait_seq = atomic64_read(&c->ec.stripe_new_seq);
+	wait_event(c->ec.stripe_new_wait,
+		   bch2_fs_ec_flush_outstanding_done(c, wait_seq));
+}
+
 int bch2_stripes_read(struct bch_fs *c)
 {
 	return 0;
@@ -198,12 +303,15 @@ void bch2_fs_ec_exit(struct bch_fs *c)
 
 	BUG_ON(!list_empty(&c->ec.stripe_new_list));
 
+	if (c->ec.stripe_create_wq)
+		destroy_workqueue(c->ec.stripe_create_wq);
 	bioset_exit(&c->ec.block_bioset);
 }
 
 void bch2_fs_ec_init_early(struct bch_fs *c)
 {
 	spin_lock_init(&c->ec.stripes_new_lock);
+	spin_lock_init(&c->ec.stripe_buf_lock);
 
 	INIT_LIST_HEAD(&c->ec.stripe_head_list);
 	mutex_init(&c->ec.stripe_head_lock);
@@ -215,12 +323,16 @@ void bch2_fs_ec_init_early(struct bch_fs *c)
 	mutex_init(&c->ec.stripe_new_lock);
 	init_waitqueue_head(&c->ec.stripe_new_wait);
 
-	INIT_WORK(&c->ec.stripe_create_work, bch2_ec_stripe_create_work);
 	INIT_WORK(&c->ec.stripe_delete_work, bch2_ec_stripe_delete_work);
 }
 
 int bch2_fs_ec_init(struct bch_fs *c)
 {
+	c->ec.stripe_create_wq = alloc_workqueue("bcachefs_ec_create",
+						 WQ_UNBOUND, 0);
+	if (!c->ec.stripe_create_wq)
+		return -BCH_ERR_ENOMEM_fs_other_alloc;
+
 	return bioset_init(&c->ec.block_bioset, 1, offsetof(struct ec_bio, bio),
 			   BIOSET_NEED_BVECS);
 }

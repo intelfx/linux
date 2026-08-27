@@ -76,7 +76,7 @@ const struct bch_hash_desc bch2_xattr_hash_desc = {
 };
 
 int bch2_xattr_validate(struct bch_fs *c, struct bkey_s_c k,
-			struct bkey_validate_context from)
+			const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_xattr xattr = bkey_s_c_to_xattr(k);
 	unsigned val_u64s = xattr_val_u64s(xattr.v->x_name_len,
@@ -108,7 +108,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_xattr_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_xattr_to_text(struct printbuf *out, struct bch_fs *c,
 			struct bkey_s_c k)
 {
 	const struct xattr_handler *handler;
@@ -163,6 +163,36 @@ static int bch2_xattr_get_trans(struct btree_trans *trans, struct bch_inode_info
 	return ret;
 }
 
+int __bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
+		     const struct bch_hash_info *hash_info,
+		     const char *name, const void *value, size_t size,
+		     int type, int flags)
+{
+	struct bkey_i_xattr *xattr;
+	unsigned namelen = strlen(name);
+	unsigned u64s = BKEY_U64s + xattr_val_u64s(namelen, size);
+
+	if (u64s > U8_MAX)
+		return -ERANGE;
+
+	xattr = bch2_trans_kmalloc(trans, u64s * sizeof(u64));
+	if (IS_ERR(xattr))
+		return PTR_ERR(xattr);
+
+	bkey_xattr_init(&xattr->k_i);
+	xattr->k.u64s		= u64s;
+	xattr->v.x_type		= type;
+	xattr->v.x_name_len	= namelen;
+	xattr->v.x_val_len	= cpu_to_le16(size);
+	memcpy(xattr->v.x_name_and_value, name, namelen);
+	memcpy(xattr_val(&xattr->v), value, size);
+
+	return bch2_hash_set(trans, bch2_xattr_hash_desc, hash_info,
+		      inum, &xattr->k_i,
+		      (flags & XATTR_CREATE ? STR_HASH_must_create : 0)|
+		      (flags & XATTR_REPLACE ? STR_HASH_must_replace : 0));
+}
+
 int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 		   struct bch_inode_unpacked *inode_u,
 		   const char *name, const void *value, size_t size,
@@ -170,7 +200,8 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 {
 	struct bch_fs *c = trans->c;
 
-	try(bch2_subvol_is_ro_trans(trans, inum.subvol));
+	u32 snapshot;
+	try(bch2_subvol_is_ro_trans(trans, inum.subvol, &snapshot));
 
 	CLASS(btree_iter_uninit, inode_iter)(trans);
 	try(bch2_inode_peek(trans, &inode_iter, inode_u, inum, BTREE_ITER_intent));
@@ -189,30 +220,8 @@ int bch2_xattr_set(struct btree_trans *trans, subvol_inum inum,
 
 	int ret;
 	if (value) {
-		struct bkey_i_xattr *xattr;
-		unsigned namelen = strlen(name);
-		unsigned u64s = BKEY_U64s +
-			xattr_val_u64s(namelen, size);
-
-		if (u64s > U8_MAX)
-			return -ERANGE;
-
-		xattr = bch2_trans_kmalloc(trans, u64s * sizeof(u64));
-		if (IS_ERR(xattr))
-			return PTR_ERR(xattr);
-
-		bkey_xattr_init(&xattr->k_i);
-		xattr->k.u64s		= u64s;
-		xattr->v.x_type		= type;
-		xattr->v.x_name_len	= namelen;
-		xattr->v.x_val_len	= cpu_to_le16(size);
-		memcpy(xattr->v.x_name_and_value, name, namelen);
-		memcpy(xattr_val(&xattr->v), value, size);
-
-		ret = bch2_hash_set(trans, bch2_xattr_hash_desc, &hash_info,
-			      inum, &xattr->k_i,
-			      (flags & XATTR_CREATE ? STR_HASH_must_create : 0)|
-			      (flags & XATTR_REPLACE ? STR_HASH_must_replace : 0));
+		ret = __bch2_xattr_set(trans, inum, &hash_info,
+				       name, value, size, type, flags);
 	} else {
 		struct xattr_search_key search =
 			X_SEARCH(type, name, strlen(name));
@@ -316,7 +325,7 @@ ssize_t bch2_xattr_list(struct dentry *dentry, char *buffer, size_t buffer_size)
 	int ret = for_each_btree_key_in_subvolume_max(trans, iter, BTREE_ID_xattrs,
 				   POS(inum, offset),
 				   POS(inum, U64_MAX),
-				   inode->ei_inum.subvol, 0, k, ({
+				   inode_inum(inode).subvol, 0, k, ({
 			if (k.k->type != KEY_TYPE_xattr)
 				continue;
 
@@ -421,11 +430,11 @@ static int __bch2_xattr_bcachefs_get(const struct xattr_handler *handler,
 
 	id = bch2_opt_lookup(name);
 	if (id < 0 || !bch2_opt_is_inode_opt(id))
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_xattr_get_bad_opt);
 
 	inode_opt_id = opt_to_inode_opt(id);
 	if (inode_opt_id < 0)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_xattr_get_not_inode_opt);
 
 	opt = bch2_opt_table + id;
 
@@ -513,19 +522,20 @@ static int __bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
 
 	int opt_id = bch2_opt_lookup(name);
 	if (opt_id < 0)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_xattr_set_bad_opt);
 
 	const struct bch_option *opt = bch2_opt_table + opt_id;
 
 	int inode_opt_id = opt_to_inode_opt(opt_id);
 	if (inode_opt_id < 0)
-		return -EINVAL;
+		return bch_err_throw(c, EINVAL_xattr_set_not_inode_opt);
 
 	struct inode_opt_set s = { .id = inode_opt_id, .defined = value != NULL };
 	u64 v = 0;
 
-	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
+	guard(memalloc_flags)(PF_MEMALLOC_NOIO);
 	guard(opt_change_lock)(c);
+	CLASS(opt_change_scope, opt_scope)(c);
 
 	if (value) {
 		char *buf __free(kfree) = kmalloc(size + 1, GFP_KERNEL);
@@ -535,7 +545,7 @@ static int __bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
 		buf[size] = '\0';
 
 		try(bch2_opt_parse(c, opt, buf, &v, NULL));
-		try(bch2_opt_hook_pre_set(c, NULL, inode->ei_inode.bi_inum, opt_id, v, true));
+		try(bch2_opt_hook_pre_set(c, NULL, inode->ei_inode.bi_inum, opt_id, v, true, &opt_scope));
 
 		/* +1 bias for inode options: */
 		s.v = v + 1;
@@ -566,6 +576,9 @@ static int __bch2_xattr_bcachefs_set(const struct xattr_handler *handler,
 
 		try(bch2_write_inode(c, inode, inode_opt_set_fn, &s, 0));
 	}
+
+	if (inode_opt_id == Inode_opt_casefold)
+		bch2_dir_casefold_changed(dentry);
 
 	bch2_opt_hook_post_set(c, NULL, inode->ei_inode.bi_inum, opt_id, v);
 	return 0;

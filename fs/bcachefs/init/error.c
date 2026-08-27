@@ -134,6 +134,8 @@ void bch2_fatal_error(struct bch_fs *c, const char *func, const char *fmt, ...)
 	prt_vprintf(&msg.m, fmt, args);
 	va_end(args);
 
+	prt_newline(&msg.m);
+
 	bch2_fs_emergency_read_only(c, &msg.m);
 	prt_printf(&msg.m, "fatal error - emergency read only");
 }
@@ -145,32 +147,44 @@ void bch2_io_error_work(struct work_struct *work)
 
 	/* XXX: if it's reads or checksums that are failing, set it to failed */
 
-	guard(rwsem_write)(&c->state_lock);
 	unsigned long write_errors_start = READ_ONCE(ca->write_errors_start);
 
 	if (write_errors_start &&
 	    time_after(jiffies,
 		       write_errors_start + c->opts.write_error_timeout * HZ)) {
-		if (ca->mi.state >= BCH_MEMBER_STATE_ro)
-			return;
+		guard(rwsem_write)(&c->state_lock);
 
-		bool print = true;
-		CLASS(printbuf, buf)();
-		__bch2_log_msg_start(ca->name, &buf);
+		/*
+		 * We hold ref_outer, not ca->ref: device removal may have
+		 * completed while we waited for state_lock, and the member
+		 * slot is no longer ours to touch. Same if the fs is
+		 * shutting down - don't flip member states mid-teardown.
+		 * Never cancelled: we own a ref, so teardown drains us
+		 * instead (bch2_dev_free()) and we always run and put:
+		 */
+		if (!READ_ONCE(ca->removing) &&
+		    !test_bit(BCH_FS_stopping, &c->flags) &&
+		    ca->mi.state < BCH_MEMBER_STATE_ro) {
+			bool print = true;
+			CLASS(printbuf, buf)();
+			__bch2_log_msg_start(ca->name, &buf);
 
-		prt_printf(&buf, "writes erroring for %u seconds\n",
-			c->opts.write_error_timeout);
+			prt_printf(&buf, "writes erroring for %u seconds\n",
+				c->opts.write_error_timeout);
 
-		bool dev = !__bch2_dev_set_state(c, ca, BCH_MEMBER_STATE_ro,
-						 BCH_FORCE_IF_DEGRADED, &buf);
+			bool dev = !__bch2_dev_set_state(c, ca, BCH_MEMBER_STATE_ro,
+							 BCH_FORCE_IF_DEGRADED, &buf);
 
-		prt_printf(&buf, "setting %s ro", dev ? "device" : "filesystem");
-		if (!dev)
-			print = bch2_fs_emergency_read_only(c, &buf);
+			prt_printf(&buf, "setting %s ro", dev ? "device" : "filesystem");
+			if (!dev)
+				print = bch2_fs_emergency_read_only(c, &buf);
 
-		if (print)
-			bch2_print_str(c, KERN_ERR, buf.buf);
+			if (print)
+				bch2_print_str(c, KERN_ERR, buf.buf);
+		}
 	}
+
+	bch2_dev_put_outer(ca);
 }
 
 void bch2_io_error(struct bch_dev *ca, enum bch_member_error_type type)
@@ -180,7 +194,14 @@ void bch2_io_error(struct bch_dev *ca, enum bch_member_error_type type)
 	if (type == BCH_MEMBER_ERROR_write && !ca->write_errors_start)
 		ca->write_errors_start = jiffies;
 
-	queue_work(system_long_wq, &ca->io_error_work);
+	/*
+	 * The work blocks on state_lock, which device removal holds while
+	 * draining ca->ref - so it owns a ref_outer (memory lifetime only),
+	 * never a ca->ref. One ref per queued instance:
+	 */
+	bch2_dev_get_outer(ca);
+	if (!queue_work(system_long_wq, &ca->io_error_work))
+		bch2_dev_put_outer(ca);
 }
 
 enum ask_yn {
@@ -279,19 +300,11 @@ static enum ask_yn bch2_fsck_ask_yn(struct bch_fs *c, struct btree_trans *trans)
 static struct fsck_err_state *fsck_err_get(struct bch_fs *c,
 					   enum bch_sb_error_id id)
 {
-	struct fsck_err_state *s;
+	darray_for_each(c->errors.msgs, i)
+		if ((*i)->id == id)
+			return *i;
 
-	list_for_each_entry(s, &c->errors.msgs, list)
-		if (s->id == id) {
-			/*
-			 * move it to the head of the list: repeated fsck errors
-			 * are common
-			 */
-			list_move(&s->list, &c->errors.msgs);
-			return s;
-		}
-
-	s = kzalloc(sizeof(*s), GFP_NOFS);
+	struct fsck_err_state *s = kzalloc(sizeof(*s), GFP_NOIO);
 	if (!s) {
 		if (!c->errors.msgs_alloc_err)
 			bch_err(c, "kmalloc err, cannot ratelimit fsck errs");
@@ -299,10 +312,38 @@ static struct fsck_err_state *fsck_err_get(struct bch_fs *c,
 		return NULL;
 	}
 
-	INIT_LIST_HEAD(&s->list);
 	s->id = id;
-	list_add(&s->list, &c->errors.msgs);
+
+	if (darray_push(&c->errors.msgs, s)) {
+		if (!c->errors.msgs_alloc_err)
+			bch_err(c, "kmalloc err, cannot ratelimit fsck errs");
+		c->errors.msgs_alloc_err = true;
+		kfree(s);
+		return NULL;
+	}
+
 	return s;
+}
+
+static int fsck_err_nr_cmp(const void *_l, const void *_r)
+{
+	const struct fsck_err_state *l = *((const struct fsck_err_state **) _l);
+	const struct fsck_err_state *r = *((const struct fsck_err_state **) _r);
+
+	return cmp_int(r->nr, l->nr);
+}
+
+void bch2_fsck_err_counts_to_text(struct printbuf *out, struct bch_fs *c)
+{
+	guard(mutex)(&c->errors.msgs_lock);
+
+	sort_nonatomic(c->errors.msgs.data, c->errors.msgs.nr,
+		       sizeof(c->errors.msgs.data[0]), fsck_err_nr_cmp, NULL);
+
+	darray_for_each(c->errors.msgs, i) {
+		bch2_sb_error_id_to_text(out, (*i)->id);
+		prt_printf(out, "\t%llu\n", (*i)->nr);
+	}
 }
 
 /* s/fix?/fixing/ s/recreate?/recreating/ */
@@ -446,6 +487,7 @@ int bch2_fsck_err_opt(struct bch_fs *c,
 
 int __bch2_fsck_err(struct bch_fs *c,
 		  struct btree_trans *trans,
+		  struct bpos pos,
 		  enum bch_fsck_flags flags,
 		  enum bch_sb_error_id err,
 		  const char *fmt, ...)
@@ -463,6 +505,15 @@ int __bch2_fsck_err(struct bch_fs *c,
 
 	if (!c)
 		c = trans->c;
+
+	/*
+	 * An inode-scoped error (pos != POS_MIN) records damage against the
+	 * inode before the outcome below is decided: the error is the damage,
+	 * whether or not we fix it - and silent/ratelimited instances still
+	 * record (recording is idempotent).
+	 */
+	if (!bpos_eq(pos, POS_MIN) && !WARN_ON(!trans))
+		try(bch2_damage_record(trans, pos, err));
 
 	/*
 	 * Ugly: if there's a transaction in the current task it has to be
@@ -539,9 +590,19 @@ int __bch2_fsck_err(struct bch_fs *c,
 	} else if (!test_bit(BCH_FS_in_fsck, &c->flags)) {
 		if (c->opts.errors != BCH_ON_ERROR_continue ||
 		    !(flags & (FSCK_CAN_FIX|FSCK_CAN_IGNORE))) {
-			prt_str(out, ", shutting down\n"
-					 "error not marked as autofix and not in fsck\n"
-					 "run fsck, and forward to devs so error can be marked for self-healing");
+			if (flags & FSCK_AUTOFIX)
+				prt_printf(out, ", shutting down\n"
+						 "error is autofix, but errors=%s prevents self-healing\n"
+						 "run fsck or set errors=fix_safe to allow self-healing",
+					   bch2_error_actions[c->opts.errors]);
+			else if (flags & (FSCK_CAN_FIX|FSCK_CAN_IGNORE))
+				prt_str(out, ", shutting down\n"
+						 "error is fixable, but not marked safe for self-healing\n"
+						 "run fsck");
+			else
+				prt_str(out, ", shutting down\n"
+						 "error not marked as autofix and not in fsck\n"
+						 "run fsck, and forward to devs so error can be marked for self-healing");
 			inconsistent = true;
 			print = true;
 			ret = bch_err_throw(c, fsck_errors_not_fixed);
@@ -670,15 +731,15 @@ static const char * const bch2_bkey_validate_contexts[] = {
 
 int __bch2_bkey_fsck_err(struct bch_fs *c,
 			 struct bkey_s_c k,
-			 struct bkey_validate_context from,
+			 const struct bkey_validate_context *from,
 			 enum bch_sb_error_id err,
 			 const char *fmt, ...)
 {
-	if (from.flags & BCH_VALIDATE_silent)
+	if (from->flags & BCH_VALIDATE_silent)
 		return bch_err_throw(c, fsck_delete_bkey);
 
 	unsigned fsck_flags = 0;
-	if (!(from.flags & (BCH_VALIDATE_write|BCH_VALIDATE_commit))) {
+	if (!(from->flags & (BCH_VALIDATE_write|BCH_VALIDATE_commit))) {
 		if (test_bit(err, c->sb.errors_silent))
 			return bch_err_throw(c, fsck_delete_bkey);
 
@@ -689,15 +750,15 @@ int __bch2_bkey_fsck_err(struct bch_fs *c,
 
 	CLASS(printbuf, buf)();
 	prt_printf(&buf, "invalid bkey in %s",
-		   bch2_bkey_validate_contexts[from.from]);
+		   bch2_bkey_validate_contexts[from->from]);
 
-	if (from.from == BKEY_VALIDATE_journal)
+	if (from->from == BKEY_VALIDATE_journal)
 		prt_printf(&buf, " journal seq=%llu offset=%u",
-			   from.journal_seq, from.journal_offset);
+			   from->journal_seq, from->journal_offset);
 
 	prt_str(&buf, " btree=");
-	bch2_btree_id_to_text(&buf, from.btree);
-	prt_printf(&buf, " level=%u: ", from.level);
+	bch2_btree_id_to_text(&buf, from->btree);
+	prt_printf(&buf, " level=%u: ", from->level);
 
 	bch2_bkey_val_to_text(&buf, c, k);
 	prt_newline(&buf);
@@ -707,24 +768,25 @@ int __bch2_bkey_fsck_err(struct bch_fs *c,
 	prt_vprintf(&buf, fmt, args);
 	va_end(args);
 
-	int ret = __bch2_fsck_err(c, NULL, fsck_flags, err, "%s, delete?", buf.buf);
+	int ret = __bch2_fsck_err(c, NULL, POS_MIN, fsck_flags, err, "%s, delete?", buf.buf);
 	return ret;
 }
 
 static void __bch2_flush_fsck_errs(struct bch_fs *c, bool print)
 {
-	struct fsck_err_state *s, *n;
-
 	guard(mutex)(&c->errors.msgs_lock);
 
-	list_for_each_entry_safe(s, n, &c->errors.msgs, list) {
+	darray_for_each(c->errors.msgs, i) {
+		struct fsck_err_state *s = *i;
+
 		if (print && s->ratelimited && s->last_msg)
 			bch_err(c, "Saw %llu errors like:\n  %s", s->nr, s->last_msg);
 
-		list_del(&s->list);
 		kfree(s->last_msg);
 		kfree(s);
 	}
+
+	darray_exit(&c->errors.msgs);
 }
 
 void bch2_flush_fsck_errs(struct bch_fs *c)
@@ -735,6 +797,155 @@ void bch2_flush_fsck_errs(struct bch_fs *c)
 void bch2_free_fsck_errs(struct bch_fs *c)
 {
 	__bch2_flush_fsck_errs(c, false);
+}
+
+/*
+ * Paths damaged during fsck, remembered for the end-of-fsck summary - see
+ * struct fsck_damaged_path. Recorded when an inode-scoped error is reported
+ * (__bch2_fsck_err() with a pos), deduped by (inum, snapshot) with error ids
+ * merged. Dedup is what makes this restart-safe: an error re-reported after a
+ * transaction restart just re-merges the same id.
+ */
+
+#define FSCK_DAMAGED_PATHS_MAX	4096
+#define FSCK_DAMAGED_PATHS_PRINT 200
+
+static void fsck_damaged_path_add_err(struct fsck_damaged_path *i,
+				      enum bch_sb_error_id err)
+{
+	for (unsigned j = 0; j < i->nr_errors; j++)
+		if (i->errors[j] == err)
+			return;
+
+	if (i->nr_errors < ARRAY_SIZE(i->errors))
+		i->errors[i->nr_errors++] = err;
+}
+
+/*
+ * The in-memory half of damage recording, feeding the end-of-fsck summary
+ * and the fsck_damaged_paths debugfs file; called from bch2_damage_record()
+ * alongside the durable damage btree write. Goes away once reporting reads
+ * the damage btree.
+ */
+void bch2_fsck_damaged(struct btree_trans *trans, struct bpos pos,
+		       enum bch_sb_error_id err)
+{
+	struct bch_fs *c = trans->c;
+
+	/*
+	 * Both key-position conventions land here: extent-style keys carry
+	 * the inum in pos.inode; inode keys live at (0, inum, snapshot), so
+	 * a zero inode field means the inum is in the offset field:
+	 */
+	u64 inum = pos.inode ?: pos.offset;
+
+	guard(mutex)(&c->errors.msgs_lock);
+
+	/* Damage on one inode arrives in runs - check the last entry first: */
+	if (c->errors.damaged_paths.nr) {
+		struct fsck_damaged_path *last = &darray_last(c->errors.damaged_paths);
+		if (last->inum == inum && last->snapshot == pos.snapshot) {
+			fsck_damaged_path_add_err(last, err);
+			return;
+		}
+	}
+
+	darray_for_each(c->errors.damaged_paths, i)
+		if (i->inum == inum && i->snapshot == pos.snapshot) {
+			fsck_damaged_path_add_err(i, err);
+			return;
+		}
+
+	if (c->errors.damaged_paths.nr >= FSCK_DAMAGED_PATHS_MAX ||
+	    darray_push(&c->errors.damaged_paths, ((struct fsck_damaged_path) {
+			.inum		= inum,
+			.snapshot	= pos.snapshot,
+			.nr_errors	= 1,
+			.errors		= { err },
+		})))
+		c->errors.damaged_paths_alloc_err = true;
+}
+
+/*
+ * A damage entry's snapshot may itself be dead by report time - that's
+ * exactly how keys_deleted entries arise - so a failed resolution retries
+ * through the inode's surviving snapshot versions: the path in a live view
+ * still names the file for the user.
+ */
+static int damaged_path_resolve(struct btree_trans *trans, u64 inum,
+				u32 snapshot, struct printbuf *path)
+{
+	printbuf_reset(path);
+	int ret = bch2_inum_snapshot_to_path(trans, inum, snapshot, NULL, path);
+	if (!ret || bch2_err_matches(ret, BCH_ERR_transaction_restart))
+		return ret;
+
+	struct bkey_s_c k;
+	for_each_btree_key_norestart(trans, iter, BTREE_ID_inodes, POS(0, inum),
+				     BTREE_ITER_all_snapshots, k, ret) {
+		if (k.k->p.offset != inum)
+			break;
+		if (k.k->p.snapshot == snapshot || !bkey_is_inode(k.k))
+			continue;
+
+		printbuf_reset(path);
+		ret = bch2_inum_snapshot_to_path(trans, inum, k.k->p.snapshot,
+						 NULL, path);
+		if (!ret || bch2_err_matches(ret, BCH_ERR_transaction_restart))
+			return ret;
+	}
+
+	return ret ?: bch_err_throw(trans->c, ENOENT_inode);
+}
+
+void bch2_fsck_damaged_path_to_text(struct printbuf *out, struct btree_trans *trans,
+				    const struct fsck_damaged_path *i)
+{
+	CLASS(printbuf, path)();
+
+	/* Resolve into a temp buffer so a restart doesn't duplicate output: */
+	int ret = lockrestart_do(trans,
+		damaged_path_resolve(trans, i->inum, i->snapshot, &path));
+	if (!ret)
+		prt_str(out, path.buf);
+	else
+		prt_printf(out, "inum %llu:%u", i->inum, i->snapshot);
+
+	prt_str(out, ": ");
+
+	for (unsigned j = 0; j < i->nr_errors; j++) {
+		if (j)
+			prt_str(out, ", ");
+		prt_str(out, bch2_sb_error_strs[i->errors[j]]);
+	}
+	prt_newline(out);
+}
+
+void bch2_fsck_damaged_paths_to_text(struct printbuf *out, struct bch_fs *c)
+{
+	if (!c->errors.damaged_paths.nr)
+		return;
+
+	prt_printf(out, "%zu paths damaged by fsck", c->errors.damaged_paths.nr);
+	if (c->errors.damaged_paths_alloc_err)
+		prt_str(out, " (list incomplete)");
+	prt_str(out, ":\n");
+	bch2_printbuf_indent_add(out, 2);
+
+	CLASS(btree_trans, trans)(c);
+	u32 nr_printed = 0;
+
+	darray_for_each(c->errors.damaged_paths, i) {
+		if (nr_printed++ >= FSCK_DAMAGED_PATHS_PRINT) {
+			prt_printf(out, "... and %zu more (untruncated list in debugfs: fsck_damaged_paths)\n",
+				   c->errors.damaged_paths.nr - FSCK_DAMAGED_PATHS_PRINT);
+			break;
+		}
+
+		bch2_fsck_damaged_path_to_text(out, trans, i);
+	}
+
+	bch2_printbuf_indent_sub(out, 2);
 }
 
 int bch2_inum_offset_err_msg_trans_norestart(struct btree_trans *trans, struct printbuf *out,
@@ -765,12 +976,14 @@ void bch2_inum_offset_err_msg_trans(struct btree_trans *trans, struct printbuf *
 
 void bch2_fs_errors_exit(struct bch_fs *c)
 {
+	darray_exit(&c->errors.damaged_paths);
 	darray_exit(&c->errors.counts);
 }
 
 void bch2_fs_errors_init_early(struct bch_fs *c)
 {
-	INIT_LIST_HEAD(&c->errors.msgs);
+	darray_init(&c->errors.msgs);
+	darray_init(&c->errors.damaged_paths);
 	mutex_init(&c->errors.msgs_lock);
 
 	mutex_init(&c->errors.counts_lock);

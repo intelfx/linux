@@ -19,6 +19,7 @@
 
 #include "data/checksum.h"
 #include "data/compress.h"
+#include "data/ec/trigger.h"
 #include "data/extents.h"
 #include "data/reconcile/trigger.h"
 
@@ -54,31 +55,38 @@ static void bch2_extent_crc_pack(union bch_extent_crc *,
 				 struct bch_extent_crc_unpacked,
 				 enum bch_extent_entry_type);
 
-void bch2_io_failures_to_text(struct printbuf *out,
+__cold void bch2_io_failures_to_text(struct printbuf *out,
 			      struct bch_fs *c,
 			      struct bch_io_failures *failed)
 {
-	darray_for_each(*failed, f) {
-		bch2_printbuf_make_room(out, 1024);
-		scoped_guard(rcu) {
-			guard(printbuf_atomic)(out);
-			struct bch_dev *ca = bch2_dev_rcu_noerror(c, f->dev);
-			if (ca)
-				prt_str(out, ca->name);
-			else
-				prt_printf(out, "(invalid device %u)", f->dev);
+	scoped_guard(printbuf_indent, out)
+		darray_for_each(*failed, f) {
+			bch2_printbuf_make_room(out, 1024);
+			scoped_guard(rcu) {
+				guard(printbuf_atomic)(out);
+				struct bch_dev *ca = bch2_dev_rcu_noerror(c, f->dev);
+				if (ca)
+					prt_str(out, ca->name);
+				else
+					prt_printf(out, "(invalid device %u)", f->dev);
+			}
+
+			if (!f->csum_nr && !f->ec_errcode && !f->errcode)
+				prt_str(out, " no error - confused");
+
+			if (f->csum_nr)
+				prt_printf(out, " checksum (%u)", f->csum_nr);
+			if (f->errcode)
+				prt_printf(out, " io: %s", bch2_err_str(f->errcode));
+			if (f->ec_errcode)
+				prt_printf(out, " ec reconstruct: %s", bch2_err_str(f->ec_errcode));
+			prt_newline(out);
 		}
 
-		if (!f->csum_nr && !f->ec_errcode && !f->errcode)
-			prt_str(out, " no error - confused");
-
-		if (f->csum_nr)
-			prt_printf(out, " checksum (%u)", f->csum_nr);
-		if (f->errcode)
-			prt_printf(out, " %s", bch2_err_str(f->errcode));
-		prt_newline(out);
-		if (f->ec_errcode)
-			prt_printf(out, "  ec reconstruct %s\n", bch2_err_str(f->ec_errcode));
+	if (failed->ec_msg.pos) {
+		prt_printf(out, "ec reconstruct:\n");
+		guard(printbuf_indent)(out);
+		prt_str(out, failed->ec_msg.buf);
 	}
 }
 
@@ -305,7 +313,7 @@ int bch2_bkey_pick_read_device(struct bch_fs *c, struct bkey_s_c k,
 /* KEY_TYPE_btree_ptr: */
 
 int bch2_btree_ptr_validate(struct bch_fs *c, struct bkey_s_c k,
-			    struct bkey_validate_context from)
+			    const struct bkey_validate_context *from)
 {
 	int ret = 0;
 
@@ -318,14 +326,14 @@ fsck_err:
 	return ret;
 }
 
-void bch2_btree_ptr_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_btree_ptr_to_text(struct printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	bch2_bkey_ptrs_to_text(out, c, k);
 }
 
 int bch2_btree_ptr_v2_validate(struct bch_fs *c, struct bkey_s_c k,
-			       struct bkey_validate_context from)
+			       const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_btree_ptr_v2 bp = bkey_s_c_to_btree_ptr_v2(k);
 	int ret = 0;
@@ -339,7 +347,7 @@ int bch2_btree_ptr_v2_validate(struct bch_fs *c, struct bkey_s_c k,
 			 c, btree_ptr_v2_min_key_bad,
 			 "min_key > key");
 
-	if ((from.flags & BCH_VALIDATE_write) &&
+	if ((from->flags & BCH_VALIDATE_write) &&
 	    c->sb.version_min >= bcachefs_metadata_version_btree_ptr_sectors_written)
 		bkey_fsck_err_on(!bp.v->sectors_written,
 				 c, btree_ptr_v2_written_0,
@@ -350,7 +358,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_btree_ptr_v2_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_btree_ptr_v2_to_text(struct printbuf *out, struct bch_fs *c,
 			       struct bkey_s_c k)
 {
 	struct bkey_s_c_btree_ptr_v2 bp = bkey_s_c_to_btree_ptr_v2(k);
@@ -417,7 +425,7 @@ bool bch2_extent_merge(struct bch_fs *c, struct bkey_s l, struct bkey_s_c r)
 		if (lp.ptr.offset + lp.crc.offset + lp.crc.live_size !=
 		    rp.ptr.offset + rp.crc.offset ||
 		    lp.ptr.dev			!= rp.ptr.dev ||
-		    lp.ptr.gen			!= rp.ptr.gen ||
+		    lp.ptr.generation			!= rp.ptr.generation ||
 		    lp.ptr.unwritten		!= rp.ptr.unwritten ||
 		    lp.has_ec			!= rp.has_ec)
 			return false;
@@ -438,6 +446,22 @@ bool bch2_extent_merge(struct bch_fs *c, struct bkey_s l, struct bkey_s_c r)
 
 		if (lp.crc.compression_type	!= rp.crc.compression_type ||
 		    lp.crc.nonce		!= rp.crc.nonce)
+			return false;
+
+		/*
+		 * Compressed extents may only merge if they're pieces of the
+		 * same compressed blob. The address continuity check above
+		 * doesn't establish that: for compressed extents it adds
+		 * uncompressed sectors (crc.offset, live_size) to a device
+		 * address (ptr.offset), so pieces of two different blobs can
+		 * satisfy it by coincidence - and then merging remaps one
+		 * range onto the other blob's data:
+		 */
+		if (crc_is_compressed(lp.crc) &&
+		    (lp.ptr.offset		!= rp.ptr.offset ||
+		     lp.crc.uncompressed_size	!= rp.crc.uncompressed_size ||
+		     lp.crc.compressed_size	!= rp.crc.compressed_size ||
+		     bch2_crc_cmp(lp.crc.csum, rp.crc.csum)))
 			return false;
 
 		if (lp.crc.offset + lp.crc.live_size + rp.crc.live_size <=
@@ -532,7 +556,7 @@ bool bch2_extent_merge(struct bch_fs *c, struct bkey_s l, struct bkey_s_c r)
 /* KEY_TYPE_reservation: */
 
 int bch2_reservation_validate(struct bch_fs *c, struct bkey_s_c k,
-			      struct bkey_validate_context from)
+			      const struct bkey_validate_context *from)
 {
 	struct bkey_s_c_reservation r = bkey_s_c_to_reservation(k);
 	int ret = 0;
@@ -544,7 +568,7 @@ fsck_err:
 	return ret;
 }
 
-void bch2_reservation_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_reservation_to_text(struct printbuf *out, struct bch_fs *c,
 			      struct bkey_s_c k)
 {
 	struct bkey_s_c_reservation r = bkey_s_c_to_reservation(k);
@@ -704,60 +728,6 @@ void bch2_extent_crc_append(const struct bch_fs *c,
 
 /* Generic code for keys with pointers: */
 
-unsigned bch2_bkey_nr_dirty_ptrs(const struct bch_fs *c, struct bkey_s_c k)
-{
-	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
-	unsigned ret = 0;
-
-	bkey_for_each_ptr(ptrs, ptr)
-		ret += !ptr->cached && ptr->dev != BCH_SB_MEMBER_INVALID;
-	return ret;
-}
-
-unsigned bch2_bkey_nr_ptrs_allocated(const struct bch_fs *c, struct bkey_s_c k)
-{
-	if (k.k->type == KEY_TYPE_reservation) {
-		return bkey_s_c_to_reservation(k).v->nr_replicas;
-	} else {
-		unsigned ret = 0;
-		struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
-
-		bkey_for_each_ptr(ptrs, ptr)
-			ret += !ptr->cached;
-		return ret;
-	}
-}
-
-unsigned bch2_bkey_nr_ptrs_fully_allocated(const struct bch_fs *c, struct bkey_s_c k)
-{
-	if (k.k->type == KEY_TYPE_reservation) {
-		return bkey_s_c_to_reservation(k).v->nr_replicas;
-	} else {
-		struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
-		const union bch_extent_entry *entry;
-		struct extent_ptr_decoded p;
-		unsigned ret = 0;
-
-		bkey_for_each_ptr_decode(k.k, ptrs, p, entry)
-			ret += !p.ptr.cached && !crc_is_compressed(p.crc);
-		return ret;
-	}
-}
-
-unsigned bch2_bkey_sectors_compressed(const struct bch_fs *c, struct bkey_s_c k)
-{
-	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
-	const union bch_extent_entry *entry;
-	struct extent_ptr_decoded p;
-	unsigned ret = 0;
-
-	bkey_for_each_ptr_decode(k.k, ptrs, p, entry)
-		if (!p.ptr.cached && crc_is_compressed(p.crc))
-			ret += p.crc.compressed_size;
-
-	return ret;
-}
-
 bool bch2_bkey_is_incompressible(const struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
@@ -803,26 +773,6 @@ void bch2_bkey_propagate_incompressible(const struct bch_fs *c, struct bkey_i *d
 	}
 }
 
-unsigned bch2_bkey_replicas(struct bch_fs *c, struct bkey_s_c k)
-{
-	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
-	const union bch_extent_entry *entry;
-	struct extent_ptr_decoded p = { 0 };
-	unsigned replicas = 0;
-
-	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
-		if (p.ptr.cached)
-			continue;
-
-		if (p.has_ec)
-			replicas += p.ec.redundancy;
-
-		replicas++;
-
-	}
-
-	return replicas;
-}
 
 unsigned bch2_dev_durability(struct bch_fs *c, unsigned dev)
 {
@@ -834,38 +784,201 @@ unsigned bch2_dev_durability(struct bch_fs *c, unsigned dev)
 		: 0;
 }
 
-static inline unsigned __extent_ptr_durability(struct bch_dev *ca, struct extent_ptr_decoded *p)
+static unsigned bch2_dev_durability_desired(struct bch_fs *c, unsigned dev)
+{
+	struct bch_dev *ca = bch2_dev_rcu_noerror(c, dev);
+
+	return ca ? ca->mi.durability : 0;
+}
+
+static unsigned __bch2_dev_durability(struct bch_fs *c, unsigned dev, bool desired)
+{
+	return desired
+		? bch2_dev_durability_desired(c, dev)
+		: bch2_dev_durability(c, dev);
+}
+
+struct stripe_dev_durability {
+	u8	dev;
+	u8	durability;
+	u8	durability_desired;
+	bool	online;
+};
+
+/*
+ * Devices already counted toward a key's durability. A device shared between
+ * two of the key's stripe pointers - or between a stripe and a plain pointer -
+ * may fail only once, so it must count toward durability only once. Total and
+ * online select different device sets, so they're deduplicated separately.
+ */
+struct durability_dedup {
+	struct bch_devs_mask	total;
+	struct bch_devs_mask	online;
+};
+
+static int bch2_stripe_durability(struct btree_trans *trans, struct extent_ptr_decoded p,
+				  struct bkey_durability *ret,
+				  struct durability_dedup *seen,
+				  unsigned *desired_total)
+{
+	struct bch_fs *c = trans->c;
+	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, POS(0, p.ec.idx), BTREE_ITER_cached);
+	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
+
+	if (k.k->type != KEY_TYPE_stripe)
+		return 0;
+
+	struct bkey_s_c_stripe s = bkey_s_c_to_stripe(k);
+
+	/*
+	 * The pointer must actually match the stripe: a stale stripe pointer
+	 * (e.g. the bucket was reused and the gen no longer matches) gets no
+	 * durability from it, or we'd report redundancy the data doesn't have.
+	 * Same check the stripe_ptr trigger uses to gate stripe accounting.
+	 */
+	if (!bch2_ptr_matches_stripe(s.v, p))
+		return 0;
+
+	unsigned nr_data = s.v->nr_blocks - s.v->nr_redundant;
+
+	/*
+	 * Sort the stripe's devices by durability so we can sum the least
+	 * durable few. nr_blocks is bounded by the stripe width; the
+	 * preallocated buffer covers the common case, growing (before taking
+	 * rcu, since it can't allocate under it) only for unusually wide stripes.
+	 */
+	DARRAY_PREALLOCATED(struct stripe_dev_durability, BCH_BKEY_PTRS_MAX) devs;
+	darray_init(&devs);
+	int ret2 = darray_make_room(&devs, s.v->nr_blocks);
+	if (ret2)
+		goto out;
+
+	unsigned online_count = 0;
+
+	scoped_guard(rcu)
+		for (unsigned i = 0; i < s.v->nr_blocks; i++) {
+			unsigned dev = s.v->ptrs[i].dev;
+			struct stripe_dev_durability d = {
+				.dev			= dev,
+				.durability		= bch2_dev_durability(c, dev),
+				.durability_desired	= bch2_dev_durability_desired(c, dev),
+				.online			= test_bit(dev, c->devs_online.d),
+			};
+			online_count += d.online;
+
+			unsigned pos = devs.nr;
+			while (pos && d.durability < devs.data[pos - 1].durability) {
+				devs.data[pos] = devs.data[pos - 1];
+				--pos;
+			}
+			devs.data[pos] = d;
+			devs.nr++;
+		}
+
+	/*
+	 * Durability is the number of device failures the data survives, plus
+	 * one. The data survives losing nr_redundant of nr_blocks devices, so
+	 * total durability is the sum of the nr_redundant + 1 least durable
+	 * devices. Online durability is the same over only online devices: the
+	 * data is readable now if at least nr_data are online, so the online
+	 * redundancy is online_count - nr_data, and online durability is the sum
+	 * of the (online_count - nr_data + 1) least durable online devices - zero
+	 * when fewer than nr_data are online. A device already counted (via @seen)
+	 * by another of the key's stripe pointers fills its slot but isn't summed
+	 * again.
+	 */
+	unsigned total_keep = s.v->nr_redundant + 1;
+	int online_keep = (int) online_count - (int) nr_data + 1;
+	unsigned online_taken = 0;
+
+	for (unsigned i = 0; i < devs.nr; i++) {
+		struct stripe_dev_durability *d = &devs.data[i];
+
+		if (i < total_keep && !__test_and_set_bit(d->dev, seen->total.d))
+			ret->total += d->durability;
+
+		if (online_keep > 0 && d->online &&
+		    online_taken < (unsigned) online_keep) {
+			online_taken++;
+			if (!__test_and_set_bit(d->dev, seen->online.d))
+				ret->online += d->durability;
+		}
+	}
+
+	/*
+	 * Desired durability - what the stripe will hold once degraded devices
+	 * recover - is the same least-durable-few sum over desired per-device
+	 * durability. Deduped within the stripe (a device backing two of its
+	 * blocks fails once, so counts once) but per-pointer, not across the
+	 * key's stripes via @seen: it feeds the per-pointer accounting, not the
+	 * whole-key total. Computed from the same stripe read.
+	 */
+	if (desired_total) {
+		for (unsigned i = 1; i < devs.nr; i++) {
+			struct stripe_dev_durability d = devs.data[i];
+			unsigned pos = i;
+			while (pos && d.durability_desired < devs.data[pos - 1].durability_desired) {
+				devs.data[pos] = devs.data[pos - 1];
+				--pos;
+			}
+			devs.data[pos] = d;
+		}
+
+		struct bch_devs_mask desired_seen = {};
+		for (unsigned i = 0; i < devs.nr && i < total_keep; i++)
+			if (!__test_and_set_bit(devs.data[i].dev, desired_seen.d))
+				*desired_total += devs.data[i].durability_desired;
+	}
+out:
+	darray_exit(&devs);
+	return ret2;
+}
+
+int __bch2_extent_ptr_durability(struct btree_trans *trans, struct extent_ptr_decoded *p, bool desired)
 {
 	if (p->ptr.cached)
 		return 0;
 
-	return p->has_ec
-		? p->ec.redundancy + 1
-		: ca->mi.durability;
+	if (likely(!p->has_ec)) {
+		guard(rcu)();
+		return __bch2_dev_durability(trans->c, p->ptr.dev, desired);
+	}
+
+	struct durability_dedup seen = {};
+	struct bkey_durability d = {};
+	unsigned desired_total = 0;
+	int ret = bch2_stripe_durability(trans, *p, &d, &seen,
+					 desired ? &desired_total : NULL);
+	return ret ?: (int) (desired ? desired_total : d.total);
 }
 
-int bch2_extent_ptr_desired_durability(struct btree_trans *trans, struct extent_ptr_decoded *p)
+/*
+ * A reservation is space promised but not yet written: it has no pointers, so
+ * the walk below would report nothing at all. What it does have is a replica
+ * count, and that is the answer to every question this struct is asked about
+ * how much space the key accounts for - so report it as the durability.
+ *
+ * online == total because nothing about a reservation depends on which devices
+ * are up; it is a claim against the filesystem's free space, not data sitting
+ * somewhere. nr_ptrs stays 0, which is the truth and what the pointer walk
+ * would have said.
+ */
+static bool bkey_reservation_durability(struct bkey_s_c k, struct bkey_durability *ret)
 {
-	guard(rcu)();
-	struct bch_dev *ca = bch2_dev_rcu_noerror(trans->c, p->ptr.dev);
+	if (k.k->type != KEY_TYPE_reservation)
+		return false;
 
-	return ca ? __extent_ptr_durability(ca, p) : 0;
-}
+	u8 nr_replicas = bkey_s_c_to_reservation(k).v->nr_replicas;
 
-static unsigned bch2_extent_ptr_durability_rcu(struct bch_fs *c, struct extent_ptr_decoded *p)
-{
-	struct bch_dev *ca = bch2_dev_rcu_noerror(c, p->ptr.dev);
-
-	if (!ca || ca->mi.state == BCH_MEMBER_STATE_evacuating)
-		return 0;
-
-	return __extent_ptr_durability(ca, p);
-}
-
-int bch2_extent_ptr_durability(struct btree_trans *trans, struct extent_ptr_decoded *p)
-{
-	guard(rcu)();
-	return bch2_extent_ptr_durability_rcu(trans->c, p);
+	*ret = (struct bkey_durability) {
+		.online			= nr_replicas,
+		.total			= nr_replicas,
+		.nr_overwritable	= nr_replicas,
+		.nr_replicas		= nr_replicas,
+		.replicas		= nr_replicas,
+		.min_durability		= U8_MAX,
+	};
+	return true;
 }
 
 int bch2_bkey_durability(struct btree_trans *trans, struct bkey_s_c k, struct bkey_durability *ret)
@@ -874,20 +987,60 @@ int bch2_bkey_durability(struct btree_trans *trans, struct bkey_s_c k, struct bk
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
 	const union bch_extent_entry *entry;
 	struct extent_ptr_decoded p;
+	struct durability_dedup seen = {};
 
-	*ret = (struct bkey_durability) {};
+	if (bkey_reservation_durability(k, ret))
+		return 0;
+
+	*ret = (struct bkey_durability) { .min_durability = U8_MAX };
 
 	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
-		if (p.ptr.dev == BCH_SB_MEMBER_INVALID)
+		if (p.ptr.cached)
 			continue;
 
-		int d = bch2_extent_ptr_durability(trans, &p);
-		if (d < 0)
-			return d;
+		ret->nr_ptrs		+= p.ptr.dev != BCH_SB_MEMBER_INVALID;
+		ret->nr_replicas	+= p.ptr.dev != BCH_SB_MEMBER_INVALID;
+		ret->replicas		+= 1 + (p.has_ec ? p.ec.redundancy : 0);
+		ret->nr_overwritable	+= !crc_is_compressed(p.crc);
+		if (crc_is_compressed(p.crc))
+			ret->sectors_compressed += p.crc.compressed_size;
 
-		if (bch2_dev_idx_is_online(c, p.ptr.dev))
-			ret->online += d;
-		ret->total += d;
+		unsigned desired = 0;
+
+		if (p.has_ec) {
+			/*
+			 * An erasure coded pointer - including a
+			 * BCH_SB_MEMBER_INVALID placeholder for data not yet moved -
+			 * gets its durability, online vs total, from the stripe's
+			 * devices rather than its own (placeholder) device. @seen
+			 * dedups devices shared with the key's other stripes.
+			 */
+			int ret2 = bch2_stripe_durability(trans, p, ret, &seen, &desired);
+			if (ret2 < 0)
+				return ret2;
+		} else if (p.ptr.dev != BCH_SB_MEMBER_INVALID) {
+			guard(rcu)();
+			unsigned cur = bch2_dev_durability(c, p.ptr.dev);
+			desired = bch2_dev_durability_desired(c, p.ptr.dev);
+
+			if (!__test_and_set_bit(p.ptr.dev, seen.total.d))
+				ret->total += cur;
+			if (bch2_dev_idx_is_online(c, p.ptr.dev) &&
+			    !__test_and_set_bit(p.ptr.dev, seen.online.d))
+				ret->online += cur;
+		}
+		/* else: BCH_SB_MEMBER_INVALID placeholder contributes nothing */
+
+		/*
+		 * durability_acct (per-pointer desired sum) and min_durability are
+		 * what the reconcile trigger needs alongside the whole-key total;
+		 * gathering them here keeps it to one stripe read per pointer. An
+		 * evacuating device reads as durability 0 for the minimum.
+		 */
+		ret->acct += desired;
+		unsigned d_min = !p.has_ec && bch2_dev_bad_or_evacuating(c, p.ptr.dev)
+			? 0 : desired;
+		ret->min_durability = min(ret->min_durability, d_min);
 	}
 	return 0;
 }
@@ -897,21 +1050,18 @@ struct bkey_durability bch2_btree_ptr_durability(struct bch_fs *c, struct bkey_s
 	BUG_ON(!bkey_is_btree_ptr(k.k));
 
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
-	const union bch_extent_entry *entry;
-	struct extent_ptr_decoded p;
 	struct bkey_durability ret = {};
 
 	guard(rcu)();
-	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
-		if (p.ptr.dev == BCH_SB_MEMBER_INVALID)
-			continue;
+	bkey_for_each_ptr(ptrs, ptr)
+		if (!ptr->cached &&
+		    ptr->dev != BCH_SB_MEMBER_INVALID) {
+			unsigned d = bch2_dev_durability(c, ptr->dev);
 
-		unsigned d = bch2_extent_ptr_durability_rcu(c, &p);
-
-		if (test_bit(p.ptr.dev, c->devs_online.d))
-			ret.online += d;
-		ret.total += d;
-	}
+			if (test_bit(ptr->dev, c->devs_online.d))
+				ret.online += d;
+			ret.total += d;
+		}
 	return ret;
 }
 
@@ -923,25 +1073,52 @@ bool bch2_bkey_can_read(const struct bch_fs *c, struct bkey_s_c k)
 
 	bkey_for_each_ptr_decode(k.k, ptrs, p, entry)
 		if (!p.ptr.cached &&
-		    (p.ptr.dev != BCH_SB_MEMBER_INVALID ||
-		     p.has_ec))
+		    (p.ptr.dev != BCH_SB_MEMBER_INVALID || p.has_ec))
 			return true;
 
 	return false;
 }
 
-static unsigned bch2_bkey_durability_safe(struct bch_fs *c, struct bkey_s_c k)
+/*
+ * As bch2_bkey_durability(), but without the btree lookups: an erasure coded
+ * pointer's durability is taken as redundancy + 1 rather than read from the
+ * stripe, so this needs no transaction and can't fail. Online vs total isn't
+ * distinguishable without those lookups, so only @total is filled in.
+ */
+struct bkey_durability bch2_bkey_durability_safe(const struct bch_fs *c, struct bkey_s_c k)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
 	const union bch_extent_entry *entry;
-	struct extent_ptr_decoded p;
-	unsigned durability = 0;
+	/* p.ec is only filled in when p.has_ec; zero it so gcc can see that */
+	struct extent_ptr_decoded p = { 0 };
+	struct bkey_durability ret;
+
+	if (bkey_reservation_durability(k, &ret))
+		return ret;
+
+	ret = (struct bkey_durability) { .min_durability = U8_MAX };
 
 	guard(rcu)();
-	bkey_for_each_ptr_decode(k.k, ptrs, p, entry)
-		if (p.ptr.dev < c->sb.nr_devices && c->devs[p.ptr.dev])
-			durability += bch2_extent_ptr_durability_rcu(c, &p);
-	return durability;
+	bkey_for_each_ptr_decode(k.k, ptrs, p, entry) {
+		if (p.ptr.cached)
+			continue;
+
+		ret.nr_ptrs		+= p.ptr.dev != BCH_SB_MEMBER_INVALID;
+		ret.nr_replicas		+= p.ptr.dev != BCH_SB_MEMBER_INVALID;
+		ret.replicas		+= 1 + (p.has_ec ? p.ec.redundancy : 0);
+		ret.nr_overwritable	+= !crc_is_compressed(p.crc);
+		if (crc_is_compressed(p.crc))
+			ret.sectors_compressed += p.crc.compressed_size;
+
+		if (p.has_ec) {
+			ret.total += p.ec.redundancy + 1;
+		} else if (p.ptr.dev != BCH_SB_MEMBER_INVALID) {
+			struct bch_dev *ca = bch2_dev_rcu_noerror(c, p.ptr.dev);
+			ret.total += ca ? ca->mi.durability : 1;
+		}
+	}
+
+	return ret;
 }
 
 void bch2_bkey_extent_entry_drop_s(const struct bch_fs *c, struct bkey_s k, union bch_extent_entry *entry)
@@ -1156,7 +1333,7 @@ bool bch2_bkey_devs_rw(struct bch_fs *c, struct bkey_s_c k)
 
 	guard(rcu)();
 	bkey_for_each_ptr(ptrs, ptr) {
-		struct bch_dev *ca = bch2_dev_rcu(c, ptr->dev);
+		struct bch_dev *ca = bch2_dev_rcu_noerror(c, ptr->dev);
 		if (!ca || ca->mi.state != BCH_MEMBER_STATE_rw)
 			return false;
 	}
@@ -1211,7 +1388,7 @@ bool bch2_bkey_matches_ptr(struct bch_fs *c, struct bkey_s_c k,
 
 	bkey_for_each_ptr_decode(k.k, ptrs, p, entry)
 		if (p.ptr.dev	== m.dev &&
-		    p.ptr.gen	== m.gen &&
+		    p.ptr.generation	== m.generation &&
 		    (s64) p.ptr.offset + p.crc.offset - bkey_start_offset(k.k) ==
 		    (s64) m.offset  - offset)
 			return true;
@@ -1227,7 +1404,7 @@ bool bch2_bkey_ptrs_match(struct bkey_s_c k1, struct extent_ptr_decoded p1,
 		  p1.ec.idx		== p2.ec.idx &&
 		  p1.ec.block		== p2.ec.block)) &&
 
-		p1.ptr.gen		== p2.ptr.gen &&
+		p1.ptr.generation		== p2.ptr.generation &&
 
 		/*
 		 * This checks that the two pointers point
@@ -1292,7 +1469,7 @@ bch2_extent_has_ptr(const struct bch_fs *c, struct bkey_s_c k1,
 
 	bkey_for_each_ptr_decode(k2.k, ptrs2, p2, entry2)
 		if (p1.ptr.dev		== p2.ptr.dev &&
-		    p1.ptr.gen		== p2.ptr.gen &&
+		    p1.ptr.generation		== p2.ptr.generation &&
 		    (s64) p1.ptr.offset + p1.crc.offset - bkey_start_offset(k1.k) ==
 		    (s64) p2.ptr.offset + p2.crc.offset - bkey_start_offset(k2.k))
 			return &entry2->ptr;
@@ -1315,6 +1492,17 @@ static bool drop_cached_pointer_trace(struct bch_fs *c, struct bkey_s k,
 	return true;
 }
 
+static bool ptr_has_ec(struct bch_fs *c, struct bkey_s k, struct bch_extent_ptr *ptr)
+{
+	struct extent_ptr_decoded p;
+	union bch_extent_entry *entry;
+
+	bkey_for_each_ptr_decode(k.k, bch2_bkey_ptrs(k), p, entry)
+		if (&entry->ptr == ptr)
+			return p.has_ec;
+	return false;
+}
+
 static bool maybe_drop_cached_ptr(struct bch_fs *c, struct bch_inode_opts *opts,
 				  struct bkey_s k,
 				  struct bch_extent_ptr *ptr, bool have_cached_ptr)
@@ -1322,6 +1510,9 @@ static bool maybe_drop_cached_ptr(struct bch_fs *c, struct bch_inode_opts *opts,
 	if (ptr->cached) {
 		if (have_cached_ptr)
 			return drop_cached_pointer_trace(c, k, ptr, "extent already has another cached pointer");
+
+		if (ptr_has_ec(c, k, ptr))
+			return drop_cached_pointer_trace(c, k, ptr, "cached ptr incompatible with erasure coding");
 
 		struct bch_dev *ca = bch2_dev_rcu_noerror(c, ptr->dev);
 		if (ca && dev_ptr_stale_rcu(ca, ptr))
@@ -1486,42 +1677,35 @@ int bch2_bkey_drop_extra_durability(struct btree_trans *trans,
 		return 0;
 
 	struct bch_fs *c = trans->c;
-	u8 ptr_durability[BCH_BKEY_PTRS_MAX];
-	unsigned durability = 0, nr_ptrs = 0;
 
-	memset(ptr_durability, 0, sizeof(ptr_durability));
+	/*
+	 * Work on a copy: tentatively mark each candidate cached (excluding it
+	 * from durability) and keep the drop only if durability still clears
+	 * data_replicas. Recomputing over the whole key accounts for device
+	 * sharing and the online/total split, which a per-pointer delta can't.
+	 * online <= total always, so checking online is the binding constraint.
+	 */
+	struct bkey_i *n = errptr_try(bch2_bkey_make_mut_noupdate(trans, bkey_i_to_s_c(k)));
 
-	union bch_extent_entry *entry;
-	struct extent_ptr_decoded p;
+	unsigned ptr_bit = 1, ptrs_kill = 0;
+	struct bkey_ptrs ptrs = bch2_bkey_ptrs(bkey_i_to_s(n));
 
-	bkey_for_each_ptr_decode(&k->k, bch2_bkey_ptrs(bkey_i_to_s(k)), p, entry) {
-		BUG_ON(nr_ptrs >= ARRAY_SIZE(ptr_durability));
+	bkey_for_each_ptr(ptrs, ptr) {
+		if ((mask & ptr_bit) && !ptr->cached) {
+			ptr->cached = true;
 
-		if (p.ptr.cached)
-			mask &= ~BIT(nr_ptrs);
+			struct bkey_durability durability;
+			try(bch2_bkey_durability(trans, bkey_i_to_s_c(n), &durability));
 
-		int d = bch2_dev_idx_is_online(c, p.ptr.dev)
-			? bch2_extent_ptr_durability(trans, &p)
-			: 0;
-		if (d < 0)
-			return d;
-
-		BUG_ON(d > U8_MAX);
-
-		ptr_durability[nr_ptrs++] = d;
-		durability += d;
+			if (durability.online >= opts->data_replicas)
+				ptrs_kill |= ptr_bit;
+			else
+				ptr->cached = false;
+		}
+		ptr_bit <<= 1;
 	}
 
-	u8 ptrs_kill = 0;
-	for (unsigned i = 0; i < nr_ptrs; i++)
-		if ((mask & BIT(i)) &&
-		    durability - ptr_durability[i] >= opts->data_replicas) {
-			durability -= ptr_durability[i];
-			ptr_durability[i] = 0;
-			ptrs_kill |= BIT(i);
-		}
-
-	if (ptrs_kill)
+	if (kill)
 		bch2_bkey_drop_ptrs_mask(c, k, ptrs_kill);
 	else
 		bch2_bkey_set_ptrs_cached_mask(c, opts, k, ptrs_kill);
@@ -1535,50 +1719,52 @@ int bch2_bkey_drop_extra_ec_durability(struct btree_trans *trans,
 	if (!mask)
 		return 0;
 
-	struct bkey_durability durability;
-	try(bch2_bkey_durability(trans, bkey_i_to_s_c(k), &durability));
-
 	struct bch_fs *c = trans->c;
-	union bch_extent_entry *entry;
-	struct extent_ptr_decoded p;
-	unsigned ptr_bit = 1;
 
-	bkey_for_each_ptr_decode(&k->k, bch2_bkey_ptrs(bkey_i_to_s(k)), p, entry) {
-		if (mask & ptr_bit) {
-			int d;
-			if (bch2_dev_idx_is_online(c, p.ptr.dev)) {
-				d = bch2_extent_ptr_durability(trans, &p);
-				if (d < 0)
-					return d;
+	/*
+	 * Gather the candidate devices up front: dropping a stripe pointer
+	 * rewrites the entry list, so we can't iterate and drop at once. Then,
+	 * for each, measure a copy of the key with that stripe pointer dropped
+	 * and commit the drop to @k only if durability still clears
+	 * data_replicas - recomputed whole-key, so device sharing and the
+	 * online/total split are accounted for (online <= total, so online is
+	 * the binding check).
+	 */
+	u8 devs[BCH_BKEY_PTRS_MAX];
+	unsigned ptr_bit = 1, nr_devs = 0;
 
-				d -= bch2_dev_durability(c, p.ptr.dev);
-			} else {
-				d = 0;
-			}
-
-			if (durability.online - d >= opts->data_replicas) {
-				durability.online -= d;
-				bch2_bkey_drop_ec(c, k, p.ptr.dev);
-			}
-		}
+	bkey_for_each_ptr(bch2_bkey_ptrs(bkey_i_to_s(k)), ptr) {
+		if (mask & ptr_bit)
+			devs[nr_devs++] = ptr->dev;
 		ptr_bit <<= 1;
+	}
+
+	for (unsigned i = 0; i < nr_devs; i++) {
+		struct bkey_i *n = errptr_try(bch2_bkey_make_mut_noupdate(trans, bkey_i_to_s_c(k)));
+		bch2_bkey_drop_ec(c, n, devs[i]);
+
+		struct bkey_durability durability;
+		try(bch2_bkey_durability(trans, bkey_i_to_s_c(n), &durability));
+
+		if (durability.online >= opts->data_replicas)
+			bch2_bkey_drop_ec(c, k, devs[i]);
 	}
 
 	return 0;
 }
 
-void bch2_extent_ptr_to_text(struct printbuf *out, struct bch_fs *c, const struct bch_extent_ptr *ptr)
+__cold void bch2_extent_ptr_to_text(struct printbuf *out, struct bch_fs *c, const struct bch_extent_ptr *ptr)
 {
 	struct bch_dev *ca = c ? bch2_dev_rcu_noerror(c, ptr->dev) : NULL;
 	if (!ca) {
 		prt_printf(out, "%u:%llu gen %u", ptr->dev,
-			   (u64) ptr->offset, ptr->gen);
+			   (u64) ptr->offset, ptr->generation);
 	} else {
 		u32 offset;
 		u64 b = sector_to_bucket_and_offset(ca, ptr->offset, &offset);
 
 		prt_printf(out, "%6s %u:%llu:%u gen %u",
-			   ca->name, ptr->dev, b, offset, ptr->gen);
+			   ca->name, ptr->dev, b, offset, ptr->generation);
 		if (ca->mi.durability != 1)
 			prt_printf(out, " d=%u", ca->mi.durability);
 		int stale = dev_ptr_stale_rcu(ca, ptr);
@@ -1592,7 +1778,7 @@ void bch2_extent_ptr_to_text(struct printbuf *out, struct bch_fs *c, const struc
 		prt_str(out, " unwritten");
 }
 
-void bch2_extent_crc_unpacked_to_text(struct printbuf *out, struct bch_extent_crc_unpacked *crc)
+__cold void bch2_extent_crc_unpacked_to_text(struct printbuf *out, struct bch_extent_crc_unpacked *crc)
 {
 	prt_printf(out, "c_size %u size %u offset %u nonce %u csum ",
 		   crc->compressed_size,
@@ -1611,7 +1797,7 @@ const char * const bch2_extent_entry_types[] = {
 	NULL
 };
 
-void bch2_bkey_ptrs_to_text(struct printbuf *out, struct bch_fs *c,
+__cold void bch2_bkey_ptrs_to_text(struct printbuf *out, struct bch_fs *c,
 			    struct bkey_s_c k)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
@@ -1622,7 +1808,7 @@ void bch2_bkey_ptrs_to_text(struct printbuf *out, struct bch_fs *c,
 		return;
 	}
 
-	prt_printf(out, "durability: %u ", bch2_bkey_durability_safe(c, k));
+	prt_printf(out, "durability: %u ", bch2_bkey_durability_safe(c, k).total);
 
 	guard(printbuf_atomic)(out);
 	guard(rcu)();
@@ -1681,7 +1867,7 @@ void bch2_bkey_ptrs_to_text(struct printbuf *out, struct bch_fs *c,
 
 static int extent_ptr_validate(struct bch_fs *c,
 			       struct bkey_s_c k,
-			       struct bkey_validate_context from,
+			       const struct bkey_validate_context *from,
 			       const struct bch_extent_ptr *ptr,
 			       unsigned size_ondisk,
 			       bool metadata)
@@ -1738,7 +1924,7 @@ static inline bool btree_ptr_entry_type_allowed(enum bch_extent_entry_type type)
 }
 
 int bch2_bkey_ptrs_validate(struct bch_fs *c, struct bkey_s_c k,
-			    struct bkey_validate_context from)
+			    const struct bkey_validate_context *from)
 {
 	struct bkey_ptrs_c ptrs = bch2_bkey_ptrs_c(k);
 	const union bch_extent_entry *entry;
@@ -1776,10 +1962,12 @@ int bch2_bkey_ptrs_validate(struct bch_fs *c, struct bkey_s_c k,
 					 c, ptr_cached_and_erasure_coded,
 					 "cached, erasure coded ptr");
 
-			if (!entry->ptr.unwritten)
-				have_written = true;
-			else
-				have_unwritten = true;
+			if (entry->ptr.dev != BCH_SB_MEMBER_INVALID) {
+				if (!entry->ptr.unwritten)
+					have_written = true;
+				else
+					have_unwritten = true;
+			}
 
 			if (entry->ptr.dev != BCH_SB_MEMBER_INVALID || have_ec) {
 				if (!entry->ptr.cached)
@@ -1808,7 +1996,7 @@ int bch2_bkey_ptrs_validate(struct bch_fs *c, struct bkey_s_c k,
 					 "checksum offset + key size > uncompressed size");
 			bkey_fsck_err_on(crc_is_encoded(crc) &&
 					 (crc.uncompressed_size > c->opts.encoded_extent_max >> 9) &&
-					 (from.flags & (BCH_VALIDATE_write|BCH_VALIDATE_commit)),
+					 (from->flags & (BCH_VALIDATE_write|BCH_VALIDATE_commit)),
 					 c, ptr_crc_uncompressed_size_too_big,
 					 "too large encoded extent");
 			bkey_fsck_err_on(!crc_is_compressed(crc) &&
@@ -1878,7 +2066,7 @@ int bch2_bkey_ptrs_validate(struct bch_fs *c, struct bkey_s_c k,
 				 c, extent_ptrs_all_invalid,
 				 "extent without valid pointers");
 
-		bkey_fsck_err_on(from.from == BKEY_VALIDATE_commit &&
+		bkey_fsck_err_on(from->from == BKEY_VALIDATE_commit &&
 				 !have_non_inval_dev_ptrs_dirty,
 				 c, extent_ptrs_all_invalid,
 				 "extent without valid dirty pointers");
@@ -2060,7 +2248,7 @@ int bch2_cut_back_s(struct bpos where, struct bkey_s k)
 	case KEY_TYPE_inline_data:
 	case KEY_TYPE_indirect_inline_data:
 		new_val_u64s = (bkey_inline_data_offset(k.k) +
-				min(bkey_inline_data_bytes(k.k), k.k->size << 9)) >> 3;
+				min(bkey_inline_data_bytes(k.k), (u64) k.k->size << 9)) >> 3;
 		break;
 	}
 

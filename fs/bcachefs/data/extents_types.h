@@ -36,6 +36,8 @@ struct bch_io_failures {
 		s16		ec_errcode;
 		s16		errcode;
 	}			data[BCH_REPLICAS_MAX + 1];
+
+	struct printbuf		ec_msg;
 };
 
 #define BCH_READ_FLAGS()		\
@@ -47,7 +49,8 @@ struct bch_io_failures {
 	x(last_fragment)		\
 	x(must_bounce)			\
 	x(must_clone)			\
-	x(in_retry)
+	x(in_retry)			\
+	x(no_poison_check)
 
 enum __bch_read_flags {
 #define x(n)	__BCH_READ_##n,

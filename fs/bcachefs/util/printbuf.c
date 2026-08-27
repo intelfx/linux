@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/string_helpers.h>
 
+#include "darray.h"
 #include "printbuf.h"
 
 static inline unsigned __printbuf_linelen(struct printbuf *buf, unsigned pos)
@@ -138,6 +139,7 @@ static void __printbuf_do_indent(struct printbuf *out, unsigned pos)
 				pos += pad;
 			}
 
+			pos = min(pos, out->pos);
 			out->last_field = pos;
 			out->cur_tabstop++;
 			break;
@@ -152,6 +154,7 @@ static void __printbuf_do_indent(struct printbuf *out, unsigned pos)
 				--out->pos;
 			}
 
+			pos = min(pos, out->pos);
 			out->last_field = pos;
 			out->cur_tabstop++;
 			break;
@@ -345,6 +348,18 @@ void bch2_prt_newline(struct printbuf *buf)
 	buf->cur_tabstop	= 0;
 }
 
+/*
+ * Terminate @out with a newline if it doesn't already have one, for callers
+ * that embed a printbuf in a larger message: a to_text/validate helper appends
+ * its reason without a trailing newline - correct, since the caller frames it -
+ * and unterminated it runs into whatever gets printed next.
+ */
+void bch2_printbuf_ensure_trailing_newline(struct printbuf *out)
+{
+	if (out->pos && out->buf[out->pos - 1] != '\n')
+		bch2_prt_newline(out);
+}
+
 void bch2_printbuf_strip_trailing_newline(struct printbuf *out)
 {
 	for (int p = out->pos - 1; p >= 0; --p) {
@@ -377,8 +392,10 @@ static void __prt_tab(struct printbuf *out)
  */
 void bch2_prt_tab(struct printbuf *out)
 {
-	if (WARN_ON_ONCE(!cur_tabstop(out)))
+	if (!cur_tabstop(out)) {
+		prt_char(out, '\t');
 		return;
+	}
 
 	__prt_tab(out);
 }
@@ -404,8 +421,10 @@ static void __prt_tab_rjust(struct printbuf *buf)
  */
 void bch2_prt_tab_rjust(struct printbuf *buf)
 {
-	if (WARN_ON_ONCE(!cur_tabstop(buf)))
+	if (!cur_tabstop(buf)) {
+		prt_char(buf, '\r');
 		return;
+	}
 
 	__prt_tab_rjust(buf);
 }
@@ -441,36 +460,42 @@ void bch2_prt_human_readable_u64(struct printbuf *out, u64 v)
 	bch2_printbuf_make_room(out, 10);
 
 	static const char units[] = { 0, 'k', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y' };
-	unsigned u = 0, r, base = out->si_units ? 1000 : 1024;
+	unsigned u = 0, r = 0, base = out->si_units ? 1000 : 1024;
 
 	while (u + 1 < ARRAY_SIZE(units) && v >= base) {
 		r = do_div(v, base);
 		u++;
 	}
 
-	unsigned prev_pos = out->pos;
-	bch2_prt_printf(out, "%llu", v);
-
-	if (u) {
-		int prec = 3 - (out->pos - prev_pos);
-		if (prec > 0) {
-			if (!out->si_units) {
-				/* express the remainder as a decimal.  It's currently the
-				 * numerator of a fraction whose denominator is
-				 * divisor[units_base], which is 1 << 10 for STRING_UNITS_2 */
-				r *= 1000;
-				r >>= 10;
-			}
-
-			prt_char(out, '.');
-			prev_pos = out->pos;
-			bch2_prt_printf(out, "%03u", r);
-			out->pos = min(out->pos, prev_pos + prec);
-			out->buf[out->pos] = '\0';
-		}
-
-		prt_char(out, units[u]);
+	if (!u) {
+		bch2_prt_printf(out, "%llu", v);
+		return;
 	}
+
+	/*
+	 * Up to three significant digits, decimals rounded to nearest -
+	 * not truncated, and not rounded up like df -h. Remainders from
+	 * earlier divisions (under a thousandth of the last digit shown)
+	 * are ignored:
+	 */
+	unsigned prec	= v < 10 ? 2 : v < 100 ? 1 : 0;
+	unsigned scale	= prec == 2 ? 100 : prec == 1 ? 10 : 1;
+	unsigned frac	= (r * scale + base / 2) / base;
+
+	if (frac >= scale) {	/* rounded all the way up: carry */
+		frac = 0;
+		v++;
+		if (v >= base && u + 1 < ARRAY_SIZE(units)) {
+			v = 1;
+			u++;
+		}
+		prec = v < 10 ? 2 : v < 100 ? 1 : 0;
+	}
+
+	if (prec)
+		bch2_prt_printf(out, "%llu.%0*u%c", v, prec, frac, units[u]);
+	else
+		bch2_prt_printf(out, "%llu%c", v, units[u]);
 }
 
 /**
@@ -563,4 +588,96 @@ void bch2_prt_bitflags_vector(struct printbuf *out,
 		first = false;
 		bch2_prt_printf(out, "%s", list[i]);
 	}
+}
+
+/**
+ * bch2_printbuf_tabstop_align() - Apply elastic tabstop alignment
+ * @buf: printbuf to align
+ *
+ * Post-processing pass that aligns columns separated by raw \t and \r
+ * characters that weren't consumed by preset tabstops. \t columns are
+ * left-aligned, \r columns are right-aligned.
+ *
+ * Can coexist with preset tabstops: preset tabstops handle early columns
+ * during printing, this function handles any remaining raw tab characters.
+ */
+void bch2_printbuf_tabstop_align(struct printbuf *buf)
+{
+	DARRAY(unsigned) col_widths = {};
+	unsigned col = 0, col_start = 0;
+
+	if (!buf->pos)
+		return;
+
+	/* First pass: measure max column widths */
+	for (unsigned i = 0; i <= buf->pos; i++) {
+		char c = i < buf->pos ? buf->buf[i] : '\n';
+
+		if (c != '\t' && c != '\r' && c != '\n')
+			continue;
+
+		unsigned width = i - col_start;
+
+		while (col >= col_widths.nr)
+			if (darray_push(&col_widths, 0))
+				goto err;
+
+		col_widths.data[col] = max(col_widths.data[col], width);
+
+		if (c == '\n') {
+			col = 0;
+		} else {
+			col++;
+		}
+		col_start = i + 1;
+	}
+
+	if (!col_widths.nr)
+		goto err;
+
+	/* Second pass: rebuild with aligned columns */
+	struct printbuf aligned = PRINTBUF;
+
+	col = 0;
+	col_start = 0;
+
+	for (unsigned i = 0; i <= buf->pos; i++) {
+		char c = i < buf->pos ? buf->buf[i] : '\n';
+
+		if (c != '\t' && c != '\r' && c != '\n')
+			continue;
+
+		unsigned content_len = i - col_start;
+		unsigned target = col < col_widths.nr
+			? col_widths.data[col] : 0;
+		unsigned pad = target > content_len
+			? target - content_len : 0;
+
+		if (c == '\r')
+			prt_chars(&aligned, ' ', pad);
+
+		prt_bytes(&aligned, buf->buf + col_start, content_len);
+
+		if (c == '\t')
+			prt_chars(&aligned, ' ', pad);
+
+		if (c == '\n') {
+			prt_char(&aligned, '\n');
+			col = 0;
+		} else {
+			prt_chars(&aligned, ' ', 2);
+			col++;
+		}
+		col_start = i + 1;
+	}
+
+	if (buf->heap_allocated)
+		kfree(buf->buf);
+
+	buf->buf		= aligned.buf;
+	buf->size		= aligned.size;
+	buf->pos		= aligned.pos;
+	buf->heap_allocated	= aligned.heap_allocated;
+err:
+	darray_exit(&col_widths);
 }

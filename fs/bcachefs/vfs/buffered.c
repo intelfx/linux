@@ -10,6 +10,8 @@
 #include "data/read.h"
 #include "data/write.h"
 
+#include "snapshots/snapshot.h"
+
 #include "vfs/io.h"
 #include "vfs/buffered.h"
 #include "vfs/direct.h"
@@ -244,36 +246,28 @@ static void bchfs_read(struct btree_trans *trans,
 
 		if (rbio->bio.bi_iter.bi_size == bytes)
 			flags |= BCH_READ_last_fragment;
+		else
+			flags |= BCH_READ_must_clone;
 
 		bch2_bio_page_state_set(c, &rbio->bio, k);
 
-		bch2_read_extent(trans, rbio, iter.pos,
-				 data_btree, k, offset_into_extent, flags);
-		/*
-		 * Careful there's a landmine here if bch2_read_extent() ever
-		 * starts returning transaction restarts here.
-		 *
-		 * We've changed rbio->bi_iter.bi_size to be "bytes we can read
-		 * from this extent" with the swap call, and we restore it
-		 * below. That restore needs to come before checking for
-		 * errors.
-		 *
-		 * But unlike __bch2_read(), we use the rbio bvec iter, not one
-		 * on the stack, so we can't do the restore right after the
-		 * bch2_read_extent() call: we don't own that iterator anymore
-		 * if BCH_READ_last_fragment is set, since we may have submitted
-		 * that rbio instead of cloning it.
-		 */
+		ret = bch2_read_extent(trans, rbio, iter.pos,
+				       data_btree, k, offset_into_extent, flags);
 
-		if (flags & BCH_READ_last_fragment)
+		/* On successful BCH_READ_last_fragment submit we no longer own rbio: */
+		if (!ret && (flags & BCH_READ_last_fragment))
 			break;
 
 		swap(rbio->bio.bi_iter.bi_size, bytes);
-		bio_advance(&rbio->bio, bytes);
 err:
-		if (ret &&
-		    !bch2_err_matches(ret, BCH_ERR_transaction_restart))
+		if (bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
+			flags &= ~BCH_READ_last_fragment;
+			continue;
+		}
+		if (ret)
 			break;
+
+		bio_advance(&rbio->bio, bytes);
 	}
 
 	if (ret) {
@@ -409,7 +403,6 @@ struct bch_writepage_state {
 	struct bch_writepage_io	*io;
 	struct bch_inode_opts	opts;
 	struct bch_folio_sector	*tmp;
-	unsigned		tmp_sectors;
 	struct blk_plug		plug;
 };
 
@@ -524,8 +517,8 @@ static void bch2_writepage_io_alloc(struct bch_fs *c,
 	op->nr_replicas		= nr_replicas;
 	op->res.nr_replicas	= nr_replicas;
 	op->write_point		= writepoint_hashed(inode->ei_last_dirtied);
-	op->subvol		= inode->ei_inum.subvol;
-	op->pos			= POS(inode->v.i_ino, sector);
+	op->subvol		= inode_inum(inode).subvol;
+	op->pos			= POS(inode_inum(inode).inum, sector);
 	op->end_io		= bch2_writepage_io_done;
 	op->devs_need_flush	= &inode->ei_devs_need_flush;
 	op->wbio.bio.bi_iter.bi_sector = sector;
@@ -605,12 +598,6 @@ do_io:
 	f_sectors = folio_sectors(folio);
 	s = bch2_folio(folio);
 	BUG_ON(!s);
-
-	if (f_sectors > w->tmp_sectors) {
-		kfree(w->tmp);
-		w->tmp = kcalloc(f_sectors, sizeof(struct bch_folio_sector), GFP_NOFS|__GFP_NOFAIL);
-		w->tmp_sectors = f_sectors;
-	}
 
 	/*
 	 * Things get really hairy with errors during writeback:
@@ -706,7 +693,9 @@ do_io:
 int bch2_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
 	struct bch_fs *c = mapping->host->i_sb->s_fs_info;
-	struct bch_writepage_state *w = kzalloc(sizeof(*w), GFP_NOFS|__GFP_NOFAIL);
+	struct bch_writepage_state *w = kzalloc(sizeof(*w), GFP_NOIO|__GFP_NOFAIL);
+
+	w->tmp = mempool_alloc(&c->vfs.writepage_buf_pool, GFP_NOIO);
 
 	bch2_inode_opts_get_inode(c, &to_bch_ei(mapping->host)->ei_inode, &w->opts);
 
@@ -724,7 +713,7 @@ int bch2_writepages(struct address_space *mapping, struct writeback_control *wbc
 	if (w->io)
 		bch2_writepage_do_io(w);
 	blk_finish_plug(&w->plug);
-	kfree(w->tmp);
+	mempool_free(w->tmp, &c->vfs.writepage_buf_pool);
 	kfree(w);
 	return bch2_err_class(ret);
 }
@@ -792,7 +781,7 @@ readpage:
 	if (ret)
 		goto err;
 out:
-	ret = bch2_folio_set(c, inode_inum(inode), &folio, 1);
+	ret = bch2_folio_set(c, inode, &folio, 1);
 	if (ret)
 		goto err;
 
@@ -932,7 +921,7 @@ static int __bch2_buffered_write(struct bch_fs *c,
 		}
 	}
 
-	ret = bch2_folio_set(c, inode_inum(inode), fs.data, fs.nr);
+	ret = bch2_folio_set(c, inode, fs.data, fs.nr);
 	if (ret)
 		goto out;
 
@@ -1133,6 +1122,7 @@ ssize_t bch2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
 	struct bch_inode_info *inode = file_bch_inode(file);
+	struct bch_fs *c = inode->v.i_sb->s_fs_info;
 	ssize_t ret;
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
@@ -1140,7 +1130,22 @@ ssize_t bch2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		goto out;
 	}
 
+	/*
+	 * Buffered write: dirties page cache; must be serialized against snapshot
+	 * creation so the snapshot doesn't capture a half-flushed inconsistent
+	 * state. O_DIRECT doesn't need this — btree commits are already atomic
+	 * w.r.t. snapshot — so we take the lock only on this side of the branch.
+	 *
+	 * NB: this assumes buffered writes are synchronous — submit and dirty
+	 * happen in the same task. If async buffered IO is ever added (e.g.
+	 * io_uring buffered writes via worker threads), the up_read here will
+	 * happen in a different task than down_read, which percpu_rwsem's lockdep
+	 * tracking won't tolerate. At that point switch this lock to a plain
+	 * rwsem + down_read_non_owner / up_read_non_owner under CONFIG_LOCKDEP,
+	 * or rethink the model.
+	 */
 	inode_lock(&inode->v);
+	percpu_down_read(&c->snapshots.create_lock);
 
 	ret = generic_write_checks(iocb, from);
 	if (ret <= 0)
@@ -1158,6 +1163,7 @@ ssize_t bch2_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (likely(ret > 0))
 		iocb->ki_pos += ret;
 unlock:
+	percpu_up_read(&c->snapshots.create_lock);
 	inode_unlock(&inode->v);
 
 	if (ret > 0)

@@ -63,7 +63,8 @@ struct bch_accounting {
 	x(stripe,	7)		\
 	x(need_gc_gens,	8)		\
 	x(need_discard,	9)		\
-	x(unstriped,	10)
+	x(unstriped,	10)		\
+	x(multiple,	11)
 
 enum bch_data_type {
 #define x(t, n) BCH_DATA_##t,
@@ -107,7 +108,7 @@ static inline bool data_type_is_hidden(enum bch_data_type type)
 	x(replicas,		2,	1)	\
 	x(dev_data_type,	3,	3)	\
 	x(compression,		4,	3)	\
-	x(snapshot,		5,	1)	\
+	x(snapshot,		5,	3)	\
 	x(btree,		6,	3)	\
 	x(rebalance_work,	7,	1)	\
 	x(inum,			8,	3)	\
@@ -126,16 +127,18 @@ enum disk_accounting_type {
  *
  * XXX: perhaps we could add a per-subvolume counter?
  */
-struct bch_acct_nr_inodes {
-};
+typedef struct {
+} bch_acct_nr_inodes;
 
 /*
  * Tracks KEY_TYPE_reservation sectors, broken out by number of replicas for the
  * reservation:
  */
-struct bch_acct_persistent_reserved {
+typedef struct {
 	__u8			nr_replicas;
-};
+} bch_acct_persistent_reserved;
+
+typedef struct bch_replicas_entry_v1 bch_acct_replicas;
 
 /*
  * device, data type counter fields:
@@ -156,10 +159,10 @@ struct bch_acct_persistent_reserved {
  * The fragmentation counter handles this by first clamping bucket sector counts
  * to the bucket size.
  */
-struct bch_acct_dev_data_type {
+typedef struct {
 	__u8			dev;
 	__u8			data_type;
-};
+} bch_acct_dev_data_type;
 
 /*
  * Compression type fields:
@@ -171,17 +174,27 @@ struct bch_acct_dev_data_type {
  *
  * Compression ratio, average extent size (fragmentation).
  */
-struct bch_acct_compression {
+typedef struct {
 	__u8			type;
-};
+} bch_acct_compression;
 
 /*
- * On disk usage by snapshot id; counts same values as replicas counter, but
- * aggregated differently
+ * Per-(snapshot id, btree) accounting, three counters:
+ * [
+ *   number of keys stamped with this snapshot id in this btree, excluding
+ *     whiteouts: snapshot deletion checks this is zero before splicing a node
+ *     out of the tree, to catch keys that would otherwise be stranded
+ *   total bkey_bytes() of those keys: the in-btree metadata footprint, and an
+ *     independent cross-check on the key count
+ *   external (on-disk data) sectors: same values as the replicas counter,
+ *     aggregated by snapshot id (reservations included); only nonzero for the
+ *     extents btree
+ * ]
  */
-struct bch_acct_snapshot {
+typedef struct {
 	__u32			id;
-} __packed;
+	__u32			btree;
+} __packed bch_acct_snapshot;
 
 /*
  * Metadata accounting per btree id:
@@ -191,9 +204,9 @@ struct bch_acct_snapshot {
  *   number of non-leaf btree nodes
  * ]
  */
-struct bch_acct_btree {
+typedef struct {
 	__u32			id;
-} __packed;
+} __packed bch_acct_btree;
 
 /*
  * inum counter fields:
@@ -208,41 +221,33 @@ struct bch_acct_btree {
  *
  * This tracks on disk fragmentation.
  */
-struct bch_acct_inum {
+typedef struct {
 	__u64			inum;
-} __packed;
+} __packed bch_acct_inum;
 
 /*
  * Simple counter of the amount of data (on disk sectors) rebalance needs to
  * move, extents counted here are also in the rebalance_work btree.
  */
-struct bch_acct_rebalance_work {
-};
+typedef struct {
+} bch_acct_rebalance_work;
 
-struct bch_acct_reconcile_work {
+typedef struct {
 	__u8			type;
-};
+} bch_acct_reconcile_work;
 
-struct bch_acct_dev_leaving {
+typedef struct {
 	__u32			dev;
-};
+} __packed bch_acct_dev_leaving;
 
 struct disk_accounting_pos {
 	union {
 	struct {
 		__u8				type;
 		union {
-		struct bch_acct_nr_inodes	nr_inodes;
-		struct bch_acct_persistent_reserved	persistent_reserved;
-		struct bch_replicas_entry_v1	replicas;
-		struct bch_acct_dev_data_type	dev_data_type;
-		struct bch_acct_compression	compression;
-		struct bch_acct_snapshot	snapshot;
-		struct bch_acct_btree		btree;
-		struct bch_acct_rebalance_work	rebalance_work;
-		struct bch_acct_inum		inum;
-		struct bch_acct_reconcile_work	reconcile_work;
-		struct bch_acct_dev_leaving	dev_leaving;
+#define x(f, nr, ...)	bch_acct_##f	f;
+		BCH_DISK_ACCOUNTING_TYPES()
+#undef x
 		} __packed;
 	} __packed;
 		struct bpos			_pad;
