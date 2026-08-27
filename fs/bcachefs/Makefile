@@ -422,6 +422,15 @@ bcachefs-codegen-skip-cflags := \
 # pass filters the same group via bindgen_c_flags_lto.
 bcachefs-codegen-skip-cflags += $(CC_FLAGS_LTO)
 
+# For cross builds, compute a target to pass to bindgen. We cannot use kernel's
+# per-arch BINDGEN_TARGET table as it isn't reachable from here (or from an
+# out-of-tree build). Instead of duplicating it, under LLVM=1, --target is
+# already in $(KBUILD_CPPFLAGS) and thus there's nothing to add.
+# For GCC, query the target from the cross compiler. The GCC target triple is
+# sometimes different from LLVM, but it is good enough for bindgen/libclang
+# for all supported arches.
+bcachefs-codegen-target := $(if $(CONFIG_CC_IS_CLANG),,--target=$(shell $(CC) -dumpmachine))
+
 # Also drop -funsigned-char: the kernel builds char unsigned, which makes bindgen
 # bind `char *` as `*const u8`, but the fs/ Rust (shared with userspace, where
 # char is signed) expects `c_char`. Char signedness doesn't affect layout, so
@@ -431,7 +440,7 @@ bcachefs-codegen-cflags := \
 	$(filter-out -funsigned-char $(bcachefs-codegen-skip-cflags),$(KBUILD_CFLAGS)) \
 	$(bcachefs-config-cppflags) \
 	-I$(src) -include $(srctree)/include/linux/compiler_types.h \
-	-w -D__BINDGEN__ -DRUST_BINDGEN
+	-w -D__BINDGEN__ -DRUST_BINDGEN $(bcachefs-codegen-target)
 
 # Types defined outside fs/bcachefs/ are blocklisted and resolved through
 # `kernel::bindings` (see mod.rs, cfg(kernel)) — mirroring how the userspace
@@ -453,7 +462,8 @@ $(obj)/codegen: $(src)/codegen_main.rs $(src)/codegen.rs FORCE
 	$(call if_changed,bch_codegen_host)
 
 # Run it: emits bcachefs.rs, the *_gen.rs files, and extern.c into $(obj)/rust/.
-# --target is left to default to the host triple (native DKMS builds only).
+# We do not pass codegen tool's own --target, since non-empty clang driver args
+# always override it.
 #
 # The clang flags go after `--`, as separate shell words — exactly as the C
 # compile receives them — NOT wrapped in --cflags '$(...)'. A KBUILD flag like

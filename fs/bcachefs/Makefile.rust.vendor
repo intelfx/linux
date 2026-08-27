@@ -48,15 +48,15 @@ bch-vr-pflags = $(bch-vr-hflags) $(bch-vr-cfg) -Clinker-flavor=gcc -Clinker=$(HO
 # bindgen_parameters (same as the kernel's rule); c_flags parse the kernel
 # headers (libclang-incompatible gcc flags filtered out, as the kernel does).
 bch-vr-bindgen-params := $(shell grep -Ev '^\#|^$$' $(VENDOR)/bindgen_parameters)
-# No --target: let clang default to the host triple (native DKMS builds), as
-# bcachefs's own codegen does — the kernel's BINDGEN_TARGET var isn't reachable
-# out-of-tree, and an empty --target makes clang reject every x86 flag.
+# $(bcachefs-bindgen-target) comes from fs/bcachefs/Makefile (which includes us)
+# and points libclang at the kernel's architecture rather than the host's.
 # -I the kernel's rust/bindings: the vendored *_helper.h keep the kernel's
 # relative includes (e.g. "../../drivers/base/base.h"), which resolve from
 # $(srctree)/rust/bindings (2 dirs up = srctree), not from our vendored copy.
 bch-vr-bindgen-cflags := $(LINUXINCLUDE) -I$(srctree)/rust/bindings $(KBUILD_CPPFLAGS) \
 	$(filter-out $(bcachefs-codegen-skip-cflags),$(KBUILD_CFLAGS)) \
-	-fno-builtin -D__BINDGEN__ -DMODULE -DKBUILD_MODNAME='"bcachefs"' -w
+	-fno-builtin -D__BINDGEN__ -DMODULE -DKBUILD_MODNAME='"bcachefs"' -w \
+	$(bcachefs-bindgen-target)
 
 # ---- generic build commands (per-crate specifics via `private vr-*` vars) ----
 quiet_cmd_bch_vr_lib = VRUSTC L $@
@@ -131,7 +131,7 @@ vr-redirect-intrinsics := __addsf3 __eqsf2 __extendsfdf2 __gesf2 __lesf2 __ltsf2
 	__muldf3 __unorddf2 __muloti4 __multi3 __udivmodti4 __udivti3 __umodti3
 $(VRD)/core.o: private vr-name := core
 $(VRD)/core.o: private vr-flags := --edition=2024 --cfg no_fp_fmt_parse
-$(VRD)/core.o: private vr-post = ; objcopy $(foreach s,$(vr-redirect-intrinsics),--redefine-sym $(s)=__rust$(s)) $@
+$(VRD)/core.o: private vr-post = ; $(OBJCOPY) $(foreach s,$(vr-redirect-intrinsics),--redefine-sym $(s)=__rust$(s)) $@
 $(VRD)/core.o: $(RUST_LIB_SRC)/core/src/lib.rs FORCE
 	$(call if_changed,bch_vr_lib)
 
@@ -143,7 +143,7 @@ $(obj)/bitfield.o $(obj)/bitflags.o $(obj)/uuid.o: $(VRD)/core.o $(VRD)/compiler
 vr-core-extern = --extern core=$(VRD)/libcore.rmeta
 $(VRD)/compiler_builtins.o: private vr-name := compiler_builtins
 $(VRD)/compiler_builtins.o: private vr-flags := --edition=2021 $(vr-core-extern)
-$(VRD)/compiler_builtins.o: private vr-post = ; objcopy -w -W '__*' $@
+$(VRD)/compiler_builtins.o: private vr-post = ; $(OBJCOPY) -w -W '__*' $@
 $(VRD)/compiler_builtins.o: $(VENDOR)/compiler_builtins.rs $(VRD)/core.o FORCE
 	$(call if_changed,bch_vr_lib)
 
